@@ -15,6 +15,9 @@ gem "turbo-rails"
 # Hotwire's modest JavaScript framework [https://stimulus.hotwired.dev]
 gem "stimulus-rails"
 
+# Load .env file into ENV
+gem "dotenv-rails"
+
 # Use Active Model has_secure_password
 gem "bcrypt", "~> 3.1.7"
 
