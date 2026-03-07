@@ -9,10 +9,6 @@
     <% if user %>
       <p><strong>Alias:</strong> <%= user.alias %></p>
       <p><strong>UUID:</strong> <code><%= user.uuid %></code></p>
-      <% kp = user.active_key_pair %>
-      <% if kp %>
-        <p><strong>Active Public Key:</strong> <code style="word-break:break-all;"><%= kp.public_key %></code></p>
-      <% end %>
     <% end %>
   </section>
 
@@ -22,6 +18,10 @@
     <% if device %>
       <p><strong>Alias:</strong> <%= device.alias %></p>
       <p><strong>UUID:</strong> <code><%= device.uuid %></code></p>
+      <% kp = device.active_key_pair %>
+      <% if kp %>
+        <p><strong>Public Key:</strong> <code style="word-break:break-all;"><%= kp.public_key %></code></p>
+      <% end %>
       <% conn = device.active_connection %>
       <% if conn %>
         <p><strong>Connection:</strong> <%= conn.host_name %> (<%= conn.protocol %>)</p>

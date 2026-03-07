@@ -12,7 +12,7 @@ class ReceiveUdpPacket::DecryptPayload
     box = if eke&.complete? && !eke.expired?
       eke.shared_secret
     else
-      connection.static_shared_secret(Node.instance&.user)
+      connection.static_shared_secret(Node.instance&.device)
     end
 
     context.fail!(message: "No shared secret available for this connection") unless box

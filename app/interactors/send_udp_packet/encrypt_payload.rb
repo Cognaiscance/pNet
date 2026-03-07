@@ -10,7 +10,7 @@ class SendUdpPacket::EncryptPayload
     end
 
     box = if context.use_static_keys
-      context.destination_connection.static_shared_secret(Node.instance&.user)
+      context.destination_connection.static_shared_secret(Node.instance&.device)
     else
       context.ephemeral_key_exchange&.shared_secret
     end

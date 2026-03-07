@@ -7,9 +7,16 @@ class Ui::SetupController < Ui::BaseController
 
   def create
     ActiveRecord::Base.transaction do
-      user = User.create!(alias: params[:user_alias])
+      user = if params[:user_uuid].present?
+        u = User.find_or_initialize_by(uuid: params[:user_uuid])
+        u.alias = params[:user_alias]
+        u.save!
+        u
+      else
+        User.create!(alias: params[:user_alias])
+      end
       device = Device.create!(alias: params[:device_alias], user: user)
-      KeyPair.generate_for(user)
+      KeyPair.generate_for(device)
       Node.create!(user: user, device: device)
     end
 

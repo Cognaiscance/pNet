@@ -1,7 +1,15 @@
 <h1>Welcome to pNet &mdash; Initial Setup</h1>
 <p>Configure your node by entering a user alias and device alias.</p>
+<p style="color:#555;font-size:0.9rem;">
+  If this is a second device for an existing user, enter your User UUID from
+  the other device's dashboard. Leave it blank to create a new identity.
+</p>
 
 <%= form_with url: ui_setup_path, method: :post do |f| %>
+  <div style="margin-bottom:1rem;">
+    <%= f.label :user_uuid, "Existing User UUID (optional)" %><br>
+    <%= f.text_field :user_uuid, placeholder: "Leave blank to create a new identity", style: "padding:0.5rem;width:400px;font-family:monospace;" %>
+  </div>
   <div style="margin-bottom:1rem;">
     <%= f.label :user_alias, "Your alias (display name)" %><br>
     <%= f.text_field :user_alias, placeholder: "e.g. Alice", required: true, style: "padding:0.5rem;width:300px;" %>

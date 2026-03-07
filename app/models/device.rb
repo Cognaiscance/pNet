@@ -2,6 +2,7 @@ class Device < ApplicationRecord
   belongs_to :user
   has_many :connections, as: :connectable, dependent: :destroy
   has_many :apps, dependent: :destroy
+  has_many :key_pairs, as: :owner, dependent: :destroy
 
   validates :uuid, presence: true, uniqueness: true
   validates :alias, presence: true
@@ -10,6 +11,10 @@ class Device < ApplicationRecord
 
   def active_connection
     connections.order(created_at: :desc).first
+  end
+
+  def active_key_pair
+    key_pairs.order(created_at: :desc).first
   end
 
   private

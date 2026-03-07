@@ -10,7 +10,7 @@ class Ui::ConnectionCodesController < Ui::BaseController
     port = ENV.fetch("PNET_UDP_PORT", 7777).to_i
     host = ENV.fetch("PNET_HOST", nil)
 
-    key_pair = user&.active_key_pair || (user && KeyPair.generate_for(user))
+    key_pair = device&.active_key_pair || (device && KeyPair.generate_for(device))
 
     payload = {
       v: 1,
@@ -58,11 +58,19 @@ class Ui::ConnectionCodesController < Ui::BaseController
       peer_public_key: data["public_key"]
     )
 
-    Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
+    own_device = remote_user.uuid == local_user.uuid
+
+    unless own_device
+      Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
+    end
 
     send_peer_introduction("#{data["host"]}:#{data["port"]}")
 
-    redirect_to ui_contacts_path, notice: "#{remote_user.alias} added as a contact."
+    if own_device
+      redirect_to ui_devices_path, notice: "#{device.alias} added as your device."
+    else
+      redirect_to ui_contacts_path, notice: "#{remote_user.alias} added as a contact."
+    end
   rescue ArgumentError, JSON::ParserError
     redirect_to ui_connection_code_path, alert: "Invalid connection code."
   rescue ActiveRecord::RecordInvalid => e
@@ -86,7 +94,7 @@ class Ui::ConnectionCodesController < Ui::BaseController
       device_alias: device.alias,
       host:        host,
       port:        ENV.fetch("PNET_UDP_PORT", 7777).to_i,
-      public_key:  user.active_key_pair&.public_key
+      public_key:  device.active_key_pair&.public_key
     }.to_json
 
     remote_host, remote_port = remote_host_name.split(":")

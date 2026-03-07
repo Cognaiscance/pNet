@@ -49,6 +49,11 @@ class UdpServer
       return
     end
 
+    if packet["type"] == "contact_sync"
+      handle_contact_sync(packet)
+      return
+    end
+
     result = ReceiveUdpPacket::Organizer.call(raw_packet: packet)
     unless result.success?
       Rails.logger.warn("UdpServer: failed to process packet from #{addr[3]}: #{result.message}")
@@ -76,11 +81,106 @@ class UdpServer
       peer_public_key: packet["public_key"]
     )
 
-    Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
-
-    Rails.logger.info("UdpServer: peer introduction received from #{remote_user.alias} (#{packet["host"]}:#{packet["port"]})")
+    if remote_user.uuid == local_user.uuid
+      send_contact_sync_to("#{packet["host"]}:#{packet["port"]}")
+      Rails.logger.info("UdpServer: own device introduction from #{device.alias} — contact sync sent")
+    else
+      Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
+      Rails.logger.info("UdpServer: peer introduction received from #{remote_user.alias} (#{packet["host"]}:#{packet["port"]})")
+    end
   rescue => e
     Rails.logger.error("UdpServer: failed to handle peer introduction: #{e.message}")
+  end
+
+  def send_contact_sync_to(host_name)
+    return unless host_name.present?
+    node   = Node.instance
+    user   = node&.user
+    device = node&.device
+    return unless user && device
+
+    contacts_data = user.contacts.map do |contact|
+      {
+        user_uuid:  contact.uuid,
+        user_alias: contact.alias,
+        devices:    contact.devices.filter_map do |dev|
+          conn = dev.active_connection
+          next unless conn
+          remote_host, remote_port = conn.host_name.split(":")
+          { device_uuid: dev.uuid, device_alias: dev.alias, host: remote_host, port: remote_port.to_i }
+        end
+      }
+    end
+
+    packet = { type: "contact_sync", sender_user_uuid: user.uuid, sender_device_uuid: device.uuid, contacts: contacts_data }.to_json
+    remote_host, remote_port = host_name.split(":")
+    @socket.send(packet, 0, remote_host, remote_port.to_i)
+  rescue => e
+    Rails.logger.warn("UdpServer: failed to send contact sync to #{host_name}: #{e.message}")
+  end
+
+  def handle_contact_sync(packet)
+    local_user = Node.instance&.user
+    return unless local_user
+    return unless packet["sender_user_uuid"] == local_user.uuid
+
+    sender_device = local_user.devices.find_by(uuid: packet["sender_device_uuid"])
+    return unless sender_device
+
+    addresses_to_introduce = []
+
+    (packet["contacts"] || []).each do |contact_data|
+      next if contact_data["user_uuid"] == local_user.uuid
+
+      remote_user = User.find_or_initialize_by(uuid: contact_data["user_uuid"])
+      remote_user.alias = contact_data["user_alias"]
+      remote_user.save!
+
+      Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
+
+      (contact_data["devices"] || []).each do |device_data|
+        dev = Device.find_or_initialize_by(uuid: device_data["device_uuid"])
+        dev.alias = device_data["device_alias"]
+        dev.user  = remote_user
+        dev.save!
+
+        # No peer_public_key — Device B will use EKE on first send
+        host_name = "#{device_data["host"]}:#{device_data["port"]}"
+        dev.connections.find_or_create_by!(host_name: host_name, protocol: "udp")
+        addresses_to_introduce << host_name
+      end
+    end
+
+    addresses_to_introduce.uniq.each { |addr| send_peer_introduction_to(addr) }
+
+    Rails.logger.info("UdpServer: contact sync from #{sender_device.alias} — #{(packet["contacts"] || []).size} contacts synced")
+  rescue => e
+    Rails.logger.error("UdpServer: failed to handle contact sync: #{e.message}")
+  end
+
+  def send_peer_introduction_to(host_name)
+    return unless host_name.present?
+    node   = Node.instance
+    user   = node&.user
+    device = node&.device
+    host   = ENV.fetch("PNET_HOST", nil)
+    return unless user && device && host
+
+    packet = {
+      type:         "peer_introduction",
+      user_uuid:    user.uuid,
+      user_alias:   user.alias,
+      device_uuid:  device.uuid,
+      device_alias: device.alias,
+      host:         host,
+      port:         ENV.fetch("PNET_UDP_PORT", 7777).to_i,
+      public_key:   device.active_key_pair&.public_key
+    }.to_json
+
+    remote_host, remote_port = host_name.split(":")
+    @socket.send(packet, 0, remote_host, remote_port.to_i)
+  rescue => e
+    Rails.logger.warn("UdpServer: failed to send peer introduction to #{host_name}: #{e.message}")
   end
 
   def handle_key_exchange(packet, addr)
