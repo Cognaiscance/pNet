@@ -62,7 +62,9 @@ class UdpServer
 
     # Create or update the ephemeral key exchange with the peer's public key
     eke = connection.active_ephemeral_key_exchange
-    if eke.nil? || eke.expired?
+    initiator = eke && !eke.expired?
+
+    if !initiator
       eke = EphemeralKeyExchange.create!(
         connection: connection,
         timeout: 24.hours.from_now
@@ -72,18 +74,22 @@ class UdpServer
 
     eke.update!(peer_public_key: packet["public_key"])
 
-    # Send our public key back
-    response = {
-      type: "key_exchange",
-      sender_user_uuid: Node.instance&.user&.uuid,
-      sender_device_uuid: Node.instance&.device&.uuid,
-      public_key: eke.key_pair.public_key
-    }
-
     host = addr[3]
     port = packet["reply_port"] || DEFAULT_PORT
-    @socket.send(response.to_json, 0, host, port.to_i)
 
-    Rails.logger.info("UdpServer: completed key exchange with #{host}:#{port}")
+    if initiator
+      # We started this exchange — peer just sent their key back, we're done
+      Rails.logger.info("UdpServer: key exchange completed with #{host}:#{port}")
+    else
+      # We're the responder — send our public key back
+      response = {
+        type: "key_exchange",
+        sender_user_uuid: Node.instance&.user&.uuid,
+        sender_device_uuid: Node.instance&.device&.uuid,
+        public_key: eke.key_pair.public_key
+      }
+      @socket.send(response.to_json, 0, host, port.to_i)
+      Rails.logger.info("UdpServer: key exchange responded to #{host}:#{port}")
+    end
   end
 end
