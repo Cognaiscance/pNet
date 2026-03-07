@@ -58,19 +58,11 @@ class Ui::ConnectionCodesController < Ui::BaseController
       peer_public_key: data["public_key"]
     )
 
-    own_device = remote_user.uuid == local_user.uuid
-
-    unless own_device
-      Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
-    end
+    Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
 
     send_peer_introduction("#{data["host"]}:#{data["port"]}")
 
-    if own_device
-      redirect_to ui_devices_path, notice: "#{device.alias} added as your device."
-    else
-      redirect_to ui_contacts_path, notice: "#{remote_user.alias} added as a contact."
-    end
+    redirect_to ui_contacts_path, notice: "#{remote_user.alias} added as a contact."
   rescue ArgumentError, JSON::ParserError
     redirect_to ui_connection_code_path, alert: "Invalid connection code."
   rescue ActiveRecord::RecordInvalid => e

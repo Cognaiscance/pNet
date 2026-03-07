@@ -1,0 +1,22 @@
+<h1>Pair a New Device</h1>
+
+<p style="background:#fff3cd;border:1px solid #ffc107;padding:0.75rem;border-radius:4px;">
+  <strong>Keep this code private.</strong> Anyone who scans it can join your account as a device
+  and receive your full contact list. Only use it on your own new device.
+</p>
+
+<% if @host_missing %>
+  <p style="background:#f8d7da;border:1px solid #f5c6cb;padding:0.75rem;border-radius:4px;">
+    <strong>Warning:</strong> <code>PNET_HOST</code> is not set. The new device will not be able
+    to reach this one for contact sync.
+  </p>
+<% end %>
+
+<p>This code expires at <strong><%= @expires_at %></strong>. Paste it into the setup form on your new device.</p>
+
+<textarea readonly rows="4" style="width:100%;font-family:monospace;padding:0.5rem;word-break:break-all;"><%= @code %></textarea>
+
+<button onclick="navigator.clipboard.writeText(document.querySelector('textarea').value)"
+        style="margin-top:0.5rem;padding:0.5rem 1rem;background:#1a1a2e;color:#fff;border:none;border-radius:4px;cursor:pointer;">
+  Copy to Clipboard
+</button>

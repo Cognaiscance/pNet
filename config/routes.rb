@@ -21,6 +21,7 @@ Rails.application.routes.draw do
 
     resources :contacts, only: [ :index, :create, :destroy ]
     resource :connection_code, only: [ :show, :create ]
+    resource :device_pairing_code, only: [ :show ]
     resources :devices, only: [ :index ]
 
     get  "setup", to: "setup#new",    as: :setup

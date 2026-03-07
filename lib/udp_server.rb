@@ -54,6 +54,11 @@ class UdpServer
       return
     end
 
+    if packet["type"] == "device_pairing"
+      handle_device_pairing(packet)
+      return
+    end
+
     result = ReceiveUdpPacket::Organizer.call(raw_packet: packet)
     unless result.success?
       Rails.logger.warn("UdpServer: failed to process packet from #{addr[3]}: #{result.message}")
@@ -81,15 +86,32 @@ class UdpServer
       peer_public_key: packet["public_key"]
     )
 
-    if remote_user.uuid == local_user.uuid
-      send_contact_sync_to("#{packet["host"]}:#{packet["port"]}")
-      Rails.logger.info("UdpServer: own device introduction from #{device.alias} — contact sync sent")
-    else
-      Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
-      Rails.logger.info("UdpServer: peer introduction received from #{remote_user.alias} (#{packet["host"]}:#{packet["port"]})")
-    end
+    Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
+    Rails.logger.info("UdpServer: peer introduction received from #{remote_user.alias} (#{packet["host"]}:#{packet["port"]})")
   rescue => e
     Rails.logger.error("UdpServer: failed to handle peer introduction: #{e.message}")
+  end
+
+  def handle_device_pairing(packet)
+    local_user = Node.instance&.user
+    return unless local_user
+    return unless packet["user_uuid"] == local_user.uuid
+
+    device = Device.find_or_initialize_by(uuid: packet["device_uuid"])
+    device.alias = packet["device_alias"]
+    device.user  = local_user
+    device.save!
+
+    device.connections.create!(
+      host_name:       "#{packet["host"]}:#{packet["port"]}",
+      protocol:        "udp",
+      peer_public_key: packet["public_key"]
+    )
+
+    send_contact_sync_to("#{packet["host"]}:#{packet["port"]}")
+    Rails.logger.info("UdpServer: device pairing from #{device.alias} — contact sync sent")
+  rescue => e
+    Rails.logger.error("UdpServer: failed to handle device pairing: #{e.message}")
   end
 
   def send_contact_sync_to(host_name)
