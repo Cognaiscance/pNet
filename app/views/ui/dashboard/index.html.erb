@@ -37,4 +37,39 @@
       <%= link_to "Review now", ui_pending_apps_path %>
     </p>
   <% end %>
+
+  <% if @pending_key_exchanges.any? %>
+    <section style="margin-top:2rem;">
+      <h2>Pending Key Exchanges</h2>
+      <p style="color:#666;">These connections initiated a handshake but haven't received the peer's public key yet. Messages to them will return HTTP 503 until the exchange completes.</p>
+      <table style="width:100%;border-collapse:collapse;">
+        <thead>
+          <tr style="background:#f0f0f0;">
+            <th style="padding:0.5rem;text-align:left;">Peer</th>
+            <th style="padding:0.5rem;text-align:left;">Connection</th>
+            <th style="padding:0.5rem;text-align:left;">Waiting since</th>
+            <th style="padding:0.5rem;text-align:left;">Expires</th>
+          </tr>
+        </thead>
+        <tbody>
+          <% @pending_key_exchanges.each do |eke| %>
+            <% conn = eke.connection %>
+            <% peer = conn.connectable %>
+            <tr style="border-bottom:1px solid #ddd;">
+              <td style="padding:0.5rem;">
+                <% if peer.is_a?(Device) %>
+                  <%= peer.alias %> (<code><%= peer.user&.alias %></code>)
+                <% else %>
+                  <%= peer.try(:app_name) || peer.class.name %>
+                <% end %>
+              </td>
+              <td style="padding:0.5rem;"><code><%= conn.host_name %></code></td>
+              <td style="padding:0.5rem;"><%= eke.created_at.strftime("%H:%M:%S %Z") %></td>
+              <td style="padding:0.5rem;"><%= eke.timeout ? eke.timeout.strftime("%H:%M:%S %Z") : "—" %></td>
+            </tr>
+          <% end %>
+        </tbody>
+      </table>
+    </section>
+  <% end %>
 <% end %>

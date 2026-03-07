@@ -17,6 +17,9 @@ class Api::NodeController < Api::BaseController
 
     if result.success?
       render json: { status: "queued", sent_at: result.sent_at }, status: :ok
+    elsif result.awaiting_key_exchange
+      response.set_header("Retry-After", "2")
+      render json: { error: result.message, retry_after: 2 }, status: :service_unavailable
     else
       render json: { error: result.message }, status: :unprocessable_entity
     end

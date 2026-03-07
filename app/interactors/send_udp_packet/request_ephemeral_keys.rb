@@ -9,6 +9,12 @@ class SendUdpPacket::RequestEphemeralKeys
 
     connection = context.destination_connection
 
+    if connection.peer_public_key.present?
+      # Both sides exchanged connection codes — use static keys immediately, no round-trip needed
+      context.use_static_keys = true
+      return
+    end
+
     # Generate a new ephemeral key pair for this exchange
     eke = EphemeralKeyExchange.create!(
       connection: connection,

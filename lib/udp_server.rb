@@ -44,12 +44,43 @@ class UdpServer
       return
     end
 
+    if packet["type"] == "peer_introduction"
+      handle_peer_introduction(packet)
+      return
+    end
+
     result = ReceiveUdpPacket::Organizer.call(raw_packet: packet)
     unless result.success?
       Rails.logger.warn("UdpServer: failed to process packet from #{addr[3]}: #{result.message}")
     end
   rescue JSON::ParserError => e
     Rails.logger.warn("UdpServer: received invalid JSON from #{addr[3]}: #{e.message}")
+  end
+
+  def handle_peer_introduction(packet)
+    local_user = Node.instance&.user
+    return unless local_user
+
+    remote_user = User.find_or_initialize_by(uuid: packet["user_uuid"])
+    remote_user.alias = packet["user_alias"]
+    remote_user.save!
+
+    device = Device.find_or_initialize_by(uuid: packet["device_uuid"])
+    device.alias  = packet["device_alias"]
+    device.user   = remote_user
+    device.save!
+
+    device.connections.create!(
+      host_name:       "#{packet["host"]}:#{packet["port"]}",
+      protocol:        "udp",
+      peer_public_key: packet["public_key"]
+    )
+
+    Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
+
+    Rails.logger.info("UdpServer: peer introduction received from #{remote_user.alias} (#{packet["host"]}:#{packet["port"]})")
+  rescue => e
+    Rails.logger.error("UdpServer: failed to handle peer introduction: #{e.message}")
   end
 
   def handle_key_exchange(packet, addr)

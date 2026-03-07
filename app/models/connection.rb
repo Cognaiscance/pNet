@@ -11,4 +11,12 @@ class Connection < ApplicationRecord
   def expired?
     timeout.present? && timeout < Time.current
   end
+
+  def static_shared_secret(local_user)
+    return nil unless peer_public_key.present? && local_user&.active_key_pair
+
+    local_private = RbNaCl::PrivateKey.new(local_user.active_key_pair.private_key_bytes)
+    peer_public   = RbNaCl::PublicKey.new(Base64.strict_decode64(peer_public_key))
+    RbNaCl::Box.new(peer_public, local_private)
+  end
 end

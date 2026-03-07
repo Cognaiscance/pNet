@@ -9,10 +9,13 @@ class ReceiveUdpPacket::DecryptPayload
     connection = context.sender_connection
     eke = connection.active_ephemeral_key_exchange
 
-    context.fail!(message: "No ephemeral key exchange for this connection") unless eke&.complete?
-    context.fail!(message: "Ephemeral keys expired") if eke.expired?
+    box = if eke&.complete? && !eke.expired?
+      eke.shared_secret
+    else
+      connection.static_shared_secret(Node.instance&.user)
+    end
 
-    box = eke.shared_secret
+    context.fail!(message: "No shared secret available for this connection") unless box
     nonce = Base64.strict_decode64(packet["nonce"])
     ciphertext = Base64.strict_decode64(packet["payload"])
 

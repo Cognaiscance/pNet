@@ -9,8 +9,11 @@ class SendUdpPacket::EncryptPayload
       context.fail!(message: "Awaiting key exchange completion. Retry after handshake.")
     end
 
-    eke = context.ephemeral_key_exchange
-    box = eke.shared_secret
+    box = if context.use_static_keys
+      context.destination_connection.static_shared_secret(Node.instance&.user)
+    else
+      context.ephemeral_key_exchange&.shared_secret
+    end
     context.fail!(message: "Cannot establish shared secret") unless box
 
     nonce = RbNaCl::Random.random_bytes(box.nonce_bytes)
