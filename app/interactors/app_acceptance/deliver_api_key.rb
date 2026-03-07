@@ -1,3 +1,5 @@
+require "net/http"
+
 class AppAcceptance::DeliverApiKey
   include Interactor
 
