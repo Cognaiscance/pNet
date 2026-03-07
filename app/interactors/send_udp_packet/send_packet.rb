@@ -11,7 +11,7 @@ class SendUdpPacket::SendPacket
     packet = {
       sender_user_uuid: node&.user&.uuid,
       sender_device_uuid: node&.device&.uuid,
-      target_app_uuid: context.from_app.app_uuid,
+      target_app_uuid: context.to_app_uuid,
       nonce: context.nonce,
       payload: context.encrypted_payload
     }.to_json

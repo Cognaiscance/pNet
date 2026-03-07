@@ -10,6 +10,7 @@ class Api::NodeController < Api::BaseController
     result = SendUdpPacket::Organizer.call(
       to_user_uuid: params[:to_user_uuid],
       to_device_uuid: params[:to_device_uuid],
+      to_app_uuid: params[:to_app_uuid],
       payload: params[:payload],
       from_app: @current_app
     )
