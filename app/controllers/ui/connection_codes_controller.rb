@@ -1,0 +1,64 @@
+require "base64"
+require "json"
+
+class Ui::ConnectionCodesController < Ui::BaseController
+  def show
+    node = Node.instance
+    user = node&.user
+    device = node&.device
+    port = ENV.fetch("PNET_UDP_PORT", 7777).to_i
+    host = ENV.fetch("PNET_HOST", nil)
+
+    payload = {
+      v: 1,
+      user_uuid: user&.uuid,
+      user_alias: user&.alias,
+      device_uuid: device&.uuid,
+      device_alias: device&.alias,
+      host: host || "SET_PNET_HOST_ENV_VAR",
+      port: port,
+      expires_at: 15.minutes.from_now.utc.iso8601
+    }
+
+    @host_missing = host.nil?
+    @code = Base64.urlsafe_encode64(JSON.generate(payload))
+    @expires_at = payload[:expires_at]
+  end
+
+  def create
+    raw = Base64.urlsafe_decode64(params[:code].to_s.strip)
+    data = JSON.parse(raw)
+
+    unless data["v"] == 1
+      redirect_to ui_connection_code_path, alert: "Unsupported connection code version." and return
+    end
+
+    if Time.parse(data["expires_at"]) < Time.current
+      redirect_to ui_connection_code_path, alert: "Connection code has expired." and return
+    end
+
+    local_user = Node.instance&.user
+
+    remote_user = User.find_or_initialize_by(uuid: data["user_uuid"])
+    remote_user.alias = data["user_alias"]
+    remote_user.save!
+
+    device = Device.find_or_initialize_by(uuid: data["device_uuid"])
+    device.alias = data["device_alias"]
+    device.user = remote_user
+    device.save!
+
+    device.connections.create!(
+      host_name: "#{data["host"]}:#{data["port"]}",
+      protocol: "udp"
+    )
+
+    Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
+
+    redirect_to ui_contacts_path, notice: "#{remote_user.alias} added as a contact."
+  rescue ArgumentError, JSON::ParserError
+    redirect_to ui_connection_code_path, alert: "Invalid connection code."
+  rescue ActiveRecord::RecordInvalid => e
+    redirect_to ui_connection_code_path, alert: e.message
+  end
+end

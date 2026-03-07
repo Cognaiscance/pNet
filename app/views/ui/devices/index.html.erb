@@ -1,0 +1,19 @@
+<h1>My Devices</h1>
+
+<% if @devices.empty? %>
+  <p>No devices configured.</p>
+<% else %>
+  <% @devices.each do |device| %>
+    <div style="border:1px solid #ddd;border-radius:6px;padding:1rem;margin-bottom:1rem;">
+      <h3><%= device.alias %></h3>
+      <p><strong>UUID:</strong> <code><%= device.uuid %></code></p>
+      <% conn = device.active_connection %>
+      <% if conn %>
+        <p><strong>Connection:</strong> <%= conn.host_name %> (<%= conn.protocol %>)</p>
+        <p><strong>Last updated:</strong> <%= conn.created_at.strftime("%Y-%m-%d %H:%M") %></p>
+      <% else %>
+        <p><em>No active connection.</em></p>
+      <% end %>
+    </div>
+  <% end %>
+<% end %>

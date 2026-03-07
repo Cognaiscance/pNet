@@ -1,0 +1,46 @@
+<h1>Contacts</h1>
+
+<p><%= link_to "Connection Code (generate / import)", ui_connection_code_path,
+    style: "display:inline-block;padding:0.5rem 1rem;background:#1a1a2e;color:#fff;text-decoration:none;border-radius:4px;" %></p>
+
+<section style="margin-bottom:2rem;">
+  <h2>Add Contact</h2>
+  <%= form_with url: ui_contacts_path, method: :post do |f| %>
+    <%= f.label :contact_uuid, "Contact UUID" %><br>
+    <%= f.text_field :contact_uuid, placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+        style: "padding:0.5rem;width:380px;margin-right:0.5rem;" %>
+    <%= f.submit "Add", style: "padding:0.5rem 1rem;background:#1a1a2e;color:#fff;border:none;border-radius:4px;cursor:pointer;" %>
+  <% end %>
+</section>
+
+<% if @contacts.empty? %>
+  <p>No contacts yet.</p>
+<% else %>
+  <table style="width:100%;border-collapse:collapse;">
+    <thead>
+      <tr style="background:#f0f0f0;">
+        <th style="padding:0.5rem;text-align:left;">Alias</th>
+        <th style="padding:0.5rem;text-align:left;">UUID</th>
+        <th style="padding:0.5rem;text-align:left;">Devices</th>
+        <th style="padding:0.5rem;text-align:left;">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      <% @contacts.each do |contact| %>
+        <tr style="border-bottom:1px solid #ddd;">
+          <td style="padding:0.5rem;"><%= contact.alias %></td>
+          <td style="padding:0.5rem;"><code><%= contact.uuid %></code></td>
+          <td style="padding:0.5rem;">
+            <% contact.devices.each do |d| %>
+              <div><%= d.alias %> &mdash; <code><%= d.uuid %></code></div>
+            <% end %>
+          </td>
+          <td style="padding:0.5rem;">
+            <%= button_to "Remove", ui_contact_path(contact), method: :delete,
+                style: "background:#dc3545;color:#fff;border:none;padding:0.25rem 0.75rem;border-radius:3px;cursor:pointer;" %>
+          </td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+<% end %>

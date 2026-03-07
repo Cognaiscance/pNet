@@ -1,0 +1,40 @@
+<h1>Node Dashboard</h1>
+
+<% if @node.nil? %>
+  <p>Node not configured yet. <%= link_to "Run setup", ui_setup_path %>.</p>
+<% else %>
+  <section style="margin-bottom:2rem;">
+    <h2>Node Owner</h2>
+    <% user = @node.user %>
+    <% if user %>
+      <p><strong>Alias:</strong> <%= user.alias %></p>
+      <p><strong>UUID:</strong> <code><%= user.uuid %></code></p>
+      <% kp = user.active_key_pair %>
+      <% if kp %>
+        <p><strong>Active Public Key:</strong> <code style="word-break:break-all;"><%= kp.public_key %></code></p>
+      <% end %>
+    <% end %>
+  </section>
+
+  <section style="margin-bottom:2rem;">
+    <h2>This Device</h2>
+    <% device = @node.device %>
+    <% if device %>
+      <p><strong>Alias:</strong> <%= device.alias %></p>
+      <p><strong>UUID:</strong> <code><%= device.uuid %></code></p>
+      <% conn = device.active_connection %>
+      <% if conn %>
+        <p><strong>Connection:</strong> <%= conn.host_name %> (<%= conn.protocol %>)</p>
+      <% else %>
+        <p><em>No active connection configured.</em></p>
+      <% end %>
+    <% end %>
+  </section>
+
+  <% if @pending_apps_count > 0 %>
+    <p style="background:#fff3cd;color:#856404;padding:0.75rem;border-radius:4px;">
+      <%= @pending_apps_count %> app(s) awaiting approval.
+      <%= link_to "Review now", ui_pending_apps_path %>
+    </p>
+  <% end %>
+<% end %>
