@@ -59,6 +59,11 @@ class UdpServer
       return
     end
 
+    if packet["type"] == "app_sync"
+      handle_app_sync(packet)
+      return
+    end
+
     result = ReceiveUdpPacket::Organizer.call(raw_packet: packet)
     unless result.success?
       Rails.logger.warn("UdpServer: failed to process packet from #{addr[3]}: #{result.message}")
@@ -134,7 +139,8 @@ class UdpServer
       }
     end
 
-    packet = { type: "contact_sync", sender_user_uuid: user.uuid, sender_device_uuid: device.uuid, contacts: contacts_data }.to_json
+    my_apps = device.apps.accepted.map { |a| { app_uuid: a.app_uuid, app_name: a.app_name } }
+    packet = { type: "contact_sync", sender_user_uuid: user.uuid, sender_device_uuid: device.uuid, contacts: contacts_data, my_apps: my_apps }.to_json
     remote_host, remote_port = host_name.split(":")
     @socket.send(packet, 0, remote_host, remote_port.to_i)
   rescue => e
@@ -175,7 +181,15 @@ class UdpServer
 
     addresses_to_introduce.uniq.each { |addr| send_peer_introduction_to(addr) }
 
-    Rails.logger.info("UdpServer: contact sync from #{sender_device.alias} — #{(packet["contacts"] || []).size} contacts synced")
+    (packet["my_apps"] || []).each do |app_data|
+      app = App.find_or_initialize_by(app_uuid: app_data["app_uuid"])
+      app.app_name = app_data["app_name"]
+      app.device   = sender_device
+      app.status   = :accepted
+      app.save!
+    end
+
+    Rails.logger.info("UdpServer: contact sync from #{sender_device.alias} — #{(packet["contacts"] || []).size} contacts, #{(packet["my_apps"] || []).size} apps synced")
   rescue => e
     Rails.logger.error("UdpServer: failed to handle contact sync: #{e.message}")
   end
@@ -203,6 +217,27 @@ class UdpServer
     @socket.send(packet, 0, remote_host, remote_port.to_i)
   rescue => e
     Rails.logger.warn("UdpServer: failed to send peer introduction to #{host_name}: #{e.message}")
+  end
+
+  def handle_app_sync(packet)
+    local_user = Node.instance&.user
+    return unless local_user
+    return unless packet["sender_user_uuid"] == local_user.uuid
+
+    sender_device = local_user.devices.find_by(uuid: packet["sender_device_uuid"])
+    return unless sender_device
+
+    (packet["apps"] || []).each do |app_data|
+      app = App.find_or_initialize_by(app_uuid: app_data["app_uuid"])
+      app.app_name = app_data["app_name"]
+      app.device   = sender_device
+      app.status   = :accepted
+      app.save!
+    end
+
+    Rails.logger.info("UdpServer: app sync from #{sender_device.alias} — #{(packet["apps"] || []).size} apps")
+  rescue => e
+    Rails.logger.error("UdpServer: failed to handle app sync: #{e.message}")
   end
 
   def handle_key_exchange(packet, addr)
