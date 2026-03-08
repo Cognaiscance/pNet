@@ -3,7 +3,7 @@ class Api::NodeController < Api::BaseController
 
   def show
     node = Node.instance
-    render json: node_json(node)
+    render json: node_json(node).merge(app: app_json(@current_app))
   end
 
   def send_message
@@ -69,6 +69,17 @@ class Api::NodeController < Api::BaseController
       uuid: device.uuid,
       alias: device.alias,
       apps: device.apps.accepted.map { |a| { app_uuid: a.app_uuid, app_name: a.app_name } }
+    }
+  end
+
+  def app_json(app)
+    return nil unless app
+
+    {
+      app_uuid: app.app_uuid,
+      app_name: app.app_name,
+      device_uuid: app.device.uuid,
+      device_alias: app.device.alias
     }
   end
 end
