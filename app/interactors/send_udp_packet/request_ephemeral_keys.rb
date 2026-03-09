@@ -25,17 +25,23 @@ class SendUdpPacket::RequestEphemeralKeys
 
     # Send a handshake packet to the remote node to initiate key exchange
     # The remote node will respond with its public key via UDP
+    message_id = SecureRandom.uuid
     handshake_packet = {
-      type: "key_exchange",
-      sender_user_uuid: Node.instance&.user&.uuid,
+      type:               "key_exchange",
+      sender_user_uuid:   Node.instance&.user&.uuid,
       sender_device_uuid: Node.instance&.device&.uuid,
-      public_key: key_pair.public_key
+      public_key:         key_pair.public_key,
+      message_id:         message_id,
+      reply_port:         ENV.fetch("PNET_UDP_PORT", 7777).to_i
     }
 
     host, port = connection.host_name.split(":")
+    packet_json = handshake_packet.to_json
     socket = UDPSocket.new
-    socket.send(handshake_packet.to_json, 0, host, port.to_i)
+    socket.send(packet_json, 0, host, port.to_i)
     socket.close
+
+    OutboundMessage.register(message_id: message_id, packet_json: packet_json, host: host, port: port.to_i)
 
     context.ephemeral_key_exchange = eke
     context.awaiting_key_exchange = true

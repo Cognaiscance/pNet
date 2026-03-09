@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_03_09_224914) do
+ActiveRecord::Schema[8.1].define(version: 2026_03_09_234341) do
   create_table "apps", force: :cascade do |t|
     t.string "api_key_digest"
     t.string "app_api_key"
@@ -83,6 +83,20 @@ ActiveRecord::Schema[8.1].define(version: 2026_03_09_224914) do
     t.integer "user_id"
     t.index ["device_id"], name: "index_nodes_on_device_id"
     t.index ["user_id"], name: "index_nodes_on_user_id"
+  end
+
+  create_table "outbound_messages", force: :cascade do |t|
+    t.datetime "acked_at"
+    t.datetime "created_at", null: false
+    t.string "host"
+    t.string "message_id"
+    t.datetime "next_retry_at"
+    t.text "packet_json"
+    t.integer "port"
+    t.integer "retry_count", default: 0, null: false
+    t.datetime "sent_at"
+    t.datetime "updated_at", null: false
+    t.index ["message_id"], name: "index_outbound_messages_on_message_id", unique: true
   end
 
   create_table "users", force: :cascade do |t|

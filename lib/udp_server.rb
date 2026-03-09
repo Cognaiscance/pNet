@@ -24,6 +24,7 @@ class UdpServer
     Rails.logger.info("UdpServer: listening on port #{@port}")
 
     @heartbeat_thread = Thread.new { heartbeat_loop }
+    @retry_thread     = Thread.new { retry_loop }
 
     while @running
       begin
@@ -37,6 +38,7 @@ class UdpServer
     end
   ensure
     @heartbeat_thread&.kill
+    @retry_thread&.kill
     @socket.close
   end
 
@@ -58,12 +60,15 @@ class UdpServer
     when "app_sync"          then handle_app_sync(packet, sender_ip)
     when "ping"              then handle_ping(packet, sender_ip)
     when "pong"              then handle_pong(packet, sender_ip)
+    when "ack"               then handle_ack(packet)
     else
       result = ReceiveUdpPacket::Organizer.call(raw_packet: packet, sender_ip: sender_ip)
       unless result.success?
         Rails.logger.warn("UdpServer: failed to process packet from #{sender_ip}: #{result.message}")
       end
     end
+
+    send_ack(packet, sender_ip) if packet["message_id"] && packet["type"] != "ack"
   rescue JSON::ParserError => e
     Rails.logger.warn("UdpServer: received invalid JSON from #{addr[3]}: #{e.message}")
   end
@@ -355,6 +360,49 @@ class UdpServer
     @socket.send(packet, 0, host, port.to_i)
   rescue => e
     Rails.logger.warn("UdpServer: failed to send pong to #{host}:#{port}: #{e.message}")
+  end
+
+  # ACKs and retries
+
+  def handle_ack(packet)
+    msg = OutboundMessage.find_by(message_id: packet["message_id"])
+    return unless msg
+    msg.ack!
+    Rails.logger.info("UdpServer: ack received for message #{packet["message_id"]}")
+  rescue => e
+    Rails.logger.error("UdpServer: handle_ack failed: #{e.message}")
+  end
+
+  def send_ack(packet, sender_ip)
+    reply_port = packet["reply_port"] || DEFAULT_PORT
+    ack = { type: "ack", message_id: packet["message_id"] }.to_json
+    @socket.send(ack, 0, sender_ip, reply_port.to_i)
+  rescue => e
+    Rails.logger.warn("UdpServer: failed to send ack to #{sender_ip}: #{e.message}")
+  end
+
+  def retry_loop
+    sleep(10)
+    Rails.logger.info("UdpServer: retry loop started")
+    while @running
+      retry_pending_messages
+      sleep(10)
+    end
+  rescue => e
+    Rails.logger.error("UdpServer: retry loop crashed: #{e.message}")
+  end
+
+  def retry_pending_messages
+    OutboundMessage.due.each do |msg|
+      @socket.send(msg.packet_json, 0, msg.host, msg.port)
+      Rails.logger.info("UdpServer: retried message #{msg.message_id} (attempt #{msg.retry_count + 1}/#{OutboundMessage::MAX_RETRIES})")
+      msg.schedule_retry!
+    rescue => e
+      Rails.logger.warn("UdpServer: retry failed for #{msg.message_id}: #{e.message}")
+      msg.schedule_retry!
+    end
+  rescue => e
+    Rails.logger.error("UdpServer: retry_pending_messages failed: #{e.message}")
   end
 
   # Heartbeat
