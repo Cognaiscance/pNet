@@ -236,8 +236,36 @@ class UdpServer
     end
 
     Rails.logger.info("UdpServer: app sync from #{sender_device.alias} — #{(packet["apps"] || []).size} apps")
+
+    # Reply with our own apps so the sender gets a full bidirectional sync
+    send_app_sync_to(sender_device) unless packet["reply"] == false
   rescue => e
     Rails.logger.error("UdpServer: failed to handle app sync: #{e.message}")
+  end
+
+  def send_app_sync_to(target_device)
+    node   = Node.instance
+    user   = node&.user
+    device = node&.device
+    return unless user && device
+
+    conn = target_device.active_connection
+    return unless conn
+
+    apps_data = device.apps.accepted.map { |a| { app_uuid: a.app_uuid, app_name: a.app_name } }
+    packet = {
+      type:               "app_sync",
+      sender_user_uuid:   user.uuid,
+      sender_device_uuid: device.uuid,
+      apps:               apps_data,
+      reply:              false
+    }.to_json
+
+    host, port = conn.host_name.split(":")
+    @socket.send(packet, 0, host, port.to_i)
+    Rails.logger.info("UdpServer: app sync reply sent to #{target_device.alias} — #{apps_data.size} apps")
+  rescue => e
+    Rails.logger.warn("UdpServer: failed to send app sync reply to #{target_device.alias}: #{e.message}")
   end
 
   def handle_key_exchange(packet, addr)
