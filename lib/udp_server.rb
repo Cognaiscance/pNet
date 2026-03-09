@@ -3,6 +3,7 @@ require "json"
 
 class UdpServer
   DEFAULT_PORT = 7777
+  HEARTBEAT_INTERVAL = 60  # seconds
 
   def initialize(port: DEFAULT_PORT)
     @port = port
@@ -15,6 +16,8 @@ class UdpServer
     @running = true
     Rails.logger.info("UdpServer: listening on port #{@port}")
 
+    @heartbeat_thread = Thread.new { heartbeat_loop }
+
     while @running
       begin
         data, addr = @socket.recvfrom(65_535)
@@ -26,6 +29,7 @@ class UdpServer
       end
     end
   ensure
+    @heartbeat_thread&.kill
     @socket.close
   end
 
@@ -36,43 +40,28 @@ class UdpServer
   private
 
   def handle_packet(data, addr)
-    packet = JSON.parse(data)
+    packet    = JSON.parse(data)
+    sender_ip = addr[3]
 
-    # Key exchange handshake
-    if packet["type"] == "key_exchange"
-      handle_key_exchange(packet, addr)
-      return
-    end
-
-    if packet["type"] == "peer_introduction"
-      handle_peer_introduction(packet)
-      return
-    end
-
-    if packet["type"] == "contact_sync"
-      handle_contact_sync(packet)
-      return
-    end
-
-    if packet["type"] == "device_pairing"
-      handle_device_pairing(packet)
-      return
-    end
-
-    if packet["type"] == "app_sync"
-      handle_app_sync(packet)
-      return
-    end
-
-    result = ReceiveUdpPacket::Organizer.call(raw_packet: packet)
-    unless result.success?
-      Rails.logger.warn("UdpServer: failed to process packet from #{addr[3]}: #{result.message}")
+    case packet["type"]
+    when "key_exchange"      then handle_key_exchange(packet, addr)
+    when "peer_introduction" then handle_peer_introduction(packet, sender_ip)
+    when "contact_sync"      then handle_contact_sync(packet, sender_ip)
+    when "device_pairing"    then handle_device_pairing(packet, sender_ip)
+    when "app_sync"          then handle_app_sync(packet, sender_ip)
+    when "ping"              then handle_ping(packet, sender_ip)
+    when "pong"              then handle_pong(packet, sender_ip)
+    else
+      result = ReceiveUdpPacket::Organizer.call(raw_packet: packet, sender_ip: sender_ip)
+      unless result.success?
+        Rails.logger.warn("UdpServer: failed to process packet from #{sender_ip}: #{result.message}")
+      end
     end
   rescue JSON::ParserError => e
     Rails.logger.warn("UdpServer: received invalid JSON from #{addr[3]}: #{e.message}")
   end
 
-  def handle_peer_introduction(packet)
+  def handle_peer_introduction(packet, sender_ip)
     local_user = Node.instance&.user
     return unless local_user
 
@@ -85,19 +74,20 @@ class UdpServer
     device.user   = remote_user
     device.save!
 
-    device.connections.create!(
-      host_name:       "#{packet["host"]}:#{packet["port"]}",
-      protocol:        "udp",
+    host = packet["host"].presence || sender_ip
+    Connection.record_address(
+      connectable:     device,
+      host_name:       "#{host}:#{packet["port"]}",
       peer_public_key: packet["public_key"]
     )
 
     Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
-    Rails.logger.info("UdpServer: peer introduction received from #{remote_user.alias} (#{packet["host"]}:#{packet["port"]})")
+    Rails.logger.info("UdpServer: peer introduction received from #{remote_user.alias} (#{host}:#{packet["port"]})")
   rescue => e
     Rails.logger.error("UdpServer: failed to handle peer introduction: #{e.message}")
   end
 
-  def handle_device_pairing(packet)
+  def handle_device_pairing(packet, sender_ip)
     local_user = Node.instance&.user
     return unless local_user
     return unless packet["user_uuid"] == local_user.uuid
@@ -107,13 +97,14 @@ class UdpServer
     device.user  = local_user
     device.save!
 
-    device.connections.create!(
-      host_name:       "#{packet["host"]}:#{packet["port"]}",
-      protocol:        "udp",
+    host = packet["host"].presence || sender_ip
+    Connection.record_address(
+      connectable:     device,
+      host_name:       "#{host}:#{packet["port"]}",
       peer_public_key: packet["public_key"]
     )
 
-    send_contact_sync_to("#{packet["host"]}:#{packet["port"]}")
+    send_contact_sync_to("#{host}:#{packet["port"]}")
     Rails.logger.info("UdpServer: device pairing from #{device.alias} — contact sync sent")
   rescue => e
     Rails.logger.error("UdpServer: failed to handle device pairing: #{e.message}")
@@ -147,13 +138,19 @@ class UdpServer
     Rails.logger.warn("UdpServer: failed to send contact sync to #{host_name}: #{e.message}")
   end
 
-  def handle_contact_sync(packet)
+  def handle_contact_sync(packet, sender_ip)
     local_user = Node.instance&.user
     return unless local_user
     return unless packet["sender_user_uuid"] == local_user.uuid
 
     sender_device = local_user.devices.find_by(uuid: packet["sender_device_uuid"])
     return unless sender_device
+
+    # Passively update sender's stored IP from the actual socket source
+    if (conn = sender_device.active_connection)
+      port = conn.host_name.split(":").last
+      Connection.record_address(connectable: sender_device, host_name: "#{sender_ip}:#{port}")
+    end
 
     addresses_to_introduce = []
 
@@ -172,9 +169,8 @@ class UdpServer
         dev.user  = remote_user
         dev.save!
 
-        # No peer_public_key — Device B will use EKE on first send
         host_name = "#{device_data["host"]}:#{device_data["port"]}"
-        dev.connections.find_or_create_by!(host_name: host_name, protocol: "udp")
+        Connection.record_address(connectable: dev, host_name: host_name)
         addresses_to_introduce << host_name
       end
     end
@@ -219,13 +215,19 @@ class UdpServer
     Rails.logger.warn("UdpServer: failed to send peer introduction to #{host_name}: #{e.message}")
   end
 
-  def handle_app_sync(packet)
+  def handle_app_sync(packet, sender_ip)
     local_user = Node.instance&.user
     return unless local_user
     return unless packet["sender_user_uuid"] == local_user.uuid
 
     sender_device = local_user.devices.find_by(uuid: packet["sender_device_uuid"])
     return unless sender_device
+
+    # Passively update sender's stored IP from the actual socket source
+    if (conn = sender_device.active_connection)
+      port = conn.host_name.split(":").last
+      Connection.record_address(connectable: sender_device, host_name: "#{sender_ip}:#{port}")
+    end
 
     (packet["apps"] || []).each do |app_data|
       app = App.find_or_initialize_by(app_uuid: app_data["app_uuid"])
@@ -269,14 +271,12 @@ class UdpServer
   end
 
   def handle_key_exchange(packet, addr)
-    # Find the connection for the sending device
     device = Device.find_by(uuid: packet["sender_device_uuid"])
     return unless device
 
     connection = device.active_connection
     return unless connection
 
-    # Create or update the ephemeral key exchange with the peer's public key
     eke = connection.active_ephemeral_key_exchange
     initiator = eke && !eke.expired?
 
@@ -294,10 +294,8 @@ class UdpServer
     port = packet["reply_port"] || DEFAULT_PORT
 
     if initiator
-      # We started this exchange — peer just sent their key back, we're done
       Rails.logger.info("UdpServer: key exchange completed with #{host}:#{port}")
     else
-      # We're the responder — send our public key back
       response = {
         type: "key_exchange",
         sender_user_uuid: Node.instance&.user&.uuid,
@@ -307,5 +305,88 @@ class UdpServer
       @socket.send(response.to_json, 0, host, port.to_i)
       Rails.logger.info("UdpServer: key exchange responded to #{host}:#{port}")
     end
+  end
+
+  def handle_ping(packet, sender_ip)
+    sender_device = Device.find_by(uuid: packet["sender_device_uuid"])
+    return unless sender_device
+    listen_port = packet["reply_port"] || DEFAULT_PORT
+    Connection.record_address(connectable: sender_device,
+      host_name: "#{sender_ip}:#{listen_port}")
+    send_pong_to(sender_ip, listen_port)
+  rescue => e
+    Rails.logger.error("UdpServer: handle_ping failed: #{e.message}")
+  end
+
+  def handle_pong(packet, sender_ip)
+    sender_device = Device.find_by(uuid: packet["sender_device_uuid"])
+    return unless sender_device
+    listen_port = packet["reply_port"] || DEFAULT_PORT
+    Connection.record_address(connectable: sender_device,
+      host_name: "#{sender_ip}:#{listen_port}")
+  rescue => e
+    Rails.logger.error("UdpServer: handle_pong failed: #{e.message}")
+  end
+
+  def send_pong_to(host, port)
+    node   = Node.instance
+    user   = node&.user
+    device = node&.device
+    return unless user && device
+
+    packet = {
+      type:               "pong",
+      sender_user_uuid:   user.uuid,
+      sender_device_uuid: device.uuid,
+      reply_port:         @port
+    }.to_json
+    @socket.send(packet, 0, host, port.to_i)
+  rescue => e
+    Rails.logger.warn("UdpServer: failed to send pong to #{host}:#{port}: #{e.message}")
+  end
+
+  # Heartbeat
+
+  def heartbeat_loop
+    sleep(10)  # let Rails warm up first
+    Rails.logger.info("UdpServer: heartbeat started (interval: #{HEARTBEAT_INTERVAL}s)")
+    while @running
+      send_heartbeats
+      sleep(HEARTBEAT_INTERVAL)
+    end
+  rescue => e
+    Rails.logger.error("UdpServer: heartbeat thread crashed: #{e.message}")
+  end
+
+  def send_heartbeats
+    node   = Node.instance
+    user   = node&.user
+    device = node&.device
+    return unless user && device
+
+    # Sibling devices (same user)
+    user.devices.where.not(id: device.id).each { |d| ping_device(d) }
+
+    # Contact devices
+    user.contacts.each { |contact_user| contact_user.devices.each { |d| ping_device(d) } }
+  rescue => e
+    Rails.logger.error("UdpServer: send_heartbeats failed: #{e.message}")
+  end
+
+  def ping_device(target_device)
+    conn = target_device.active_connection
+    return unless conn
+
+    node   = Node.instance
+    packet = {
+      type:               "ping",
+      sender_user_uuid:   node.user.uuid,
+      sender_device_uuid: node.device.uuid,
+      reply_port:         @port
+    }.to_json
+    host, port = conn.host_name.split(":")
+    @socket.send(packet, 0, host, port.to_i)
+  rescue => e
+    Rails.logger.warn("UdpServer: ping to #{target_device.alias} failed: #{e.message}")
   end
 end

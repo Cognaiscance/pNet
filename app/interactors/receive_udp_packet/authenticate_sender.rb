@@ -19,5 +19,12 @@ class ReceiveUdpPacket::AuthenticateSender
     context.sender_user = user
     context.sender_device = device
     context.sender_connection = connection
+
+    if context.sender_ip.present?
+      port = connection.host_name.split(":").last
+      Connection.record_address(connectable: device,
+        host_name: "#{context.sender_ip}:#{port}")
+      context.sender_connection = device.reload.active_connection
+    end
   end
 end
