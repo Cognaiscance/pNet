@@ -9,11 +9,18 @@ class UdpServer
     @port = port
     @socket = UDPSocket.new
     @running = false
+    @external_ip = nil
   end
 
   def start
     @socket.bind("0.0.0.0", @port)
     @running = true
+    @external_ip = StunClient.discover_external_ip
+    if @external_ip
+      Rails.logger.info("UdpServer: external IP discovered: #{@external_ip}")
+    else
+      Rails.logger.warn("UdpServer: could not discover external IP — peer introductions require PNET_HOST")
+    end
     Rails.logger.info("UdpServer: listening on port #{@port}")
 
     @heartbeat_thread = Thread.new { heartbeat_loop }
@@ -83,6 +90,10 @@ class UdpServer
 
     Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
     Rails.logger.info("UdpServer: peer introduction received from #{remote_user.alias} (#{host}:#{packet["port"]})")
+
+    # Reply with our own introduction unless this is already a reply — mutual
+    # exchange ensures both NAT mappings are created (hole punching).
+    send_peer_introduction_to("#{host}:#{packet["port"]}", reply: true) unless packet["reply"]
   rescue => e
     Rails.logger.error("UdpServer: failed to handle peer introduction: #{e.message}")
   end
@@ -190,12 +201,12 @@ class UdpServer
     Rails.logger.error("UdpServer: failed to handle contact sync: #{e.message}")
   end
 
-  def send_peer_introduction_to(host_name)
+  def send_peer_introduction_to(host_name, reply: false)
     return unless host_name.present?
     node   = Node.instance
     user   = node&.user
     device = node&.device
-    host   = ENV.fetch("PNET_HOST", nil)
+    host   = ENV.fetch("PNET_HOST", nil) || @external_ip
     return unless user && device && host
 
     packet = {
@@ -206,7 +217,8 @@ class UdpServer
       device_alias: device.alias,
       host:         host,
       port:         ENV.fetch("PNET_UDP_PORT", 7777).to_i,
-      public_key:   device.active_key_pair&.public_key
+      public_key:   device.active_key_pair&.public_key,
+      reply:        reply
     }.to_json
 
     remote_host, remote_port = host_name.split(":")
