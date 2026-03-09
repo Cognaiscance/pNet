@@ -6,9 +6,7 @@ class AppRegistration::ValidateRegistration
   def call
     context.fail!(message: "app_uuid is required") if context.app_uuid.blank?
     context.fail!(message: "app_name is required") if context.app_name.blank?
-    context.fail!(message: "host is required") if context.host.blank?
-
-    unless context.host.match?(/\A[\w.\-]+:\d+\z/)
+    if context.host.present? && !context.host.match?(/\A[\w.\-]+:\d+\z/)
       context.fail!(message: "host must be in format host:port (e.g. 192.168.1.10:8080)")
     end
 

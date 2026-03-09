@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_03_09_234341) do
+ActiveRecord::Schema[8.1].define(version: 2026_03_09_234740) do
   create_table "apps", force: :cascade do |t|
     t.string "api_key_digest"
     t.string "app_api_key"
@@ -64,6 +64,18 @@ ActiveRecord::Schema[8.1].define(version: 2026_03_09_234341) do
     t.datetime "timeout"
     t.datetime "updated_at", null: false
     t.index ["connection_id"], name: "index_ephemeral_key_exchanges_on_connection_id"
+  end
+
+  create_table "inbound_messages", force: :cascade do |t|
+    t.integer "app_id", null: false
+    t.datetime "created_at", null: false
+    t.string "from_device_uuid", null: false
+    t.string "from_user_uuid", null: false
+    t.text "payload", null: false
+    t.datetime "read_at"
+    t.datetime "updated_at", null: false
+    t.index ["app_id"], name: "index_inbound_messages_on_app_id"
+    t.index ["read_at"], name: "index_inbound_messages_on_read_at"
   end
 
   create_table "key_pairs", force: :cascade do |t|

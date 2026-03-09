@@ -7,26 +7,45 @@ class ReceiveUdpPacket::ForwardToApp
 
   def call
     app = context.target_app
-    connection = app.active_connection
-    context.fail!(message: "No connection for target app") unless connection
 
-    message = {
-      from_user_uuid: context.sender_user.uuid,
+    msg = InboundMessage.create!(
+      app:              app,
+      from_user_uuid:   context.sender_user.uuid,
       from_device_uuid: context.sender_device.uuid,
-      payload: context.decrypted_payload
-    }
+      payload:          context.decrypted_payload
+    )
+
+    push_to_app(app, msg)
+  end
+
+  private
+
+  def push_to_app(app, msg)
+    connection = app.connections.find_by(protocol: "https")
+    return unless connection
+
+    body = {
+      id:               msg.id,
+      from_user_uuid:   msg.from_user_uuid,
+      from_device_uuid: msg.from_device_uuid,
+      payload:          msg.payload,
+      received_at:      msg.created_at
+    }.to_json
 
     uri = URI("http://#{connection.host_name}/receive_message")
     Net::HTTP.start(uri.host, uri.port) do |http|
       request = Net::HTTP::Post.new(uri.path, "Content-Type" => "application/json")
       request["Authorization"] = "Bearer #{app.app_api_key}" if app.app_api_key.present?
-      request.body = message.to_json
+      request.body = body
       response = http.request(request)
-      unless response.is_a?(Net::HTTPSuccess)
-        context.fail!(message: "App rejected message: #{response.code}")
+      if response.is_a?(Net::HTTPSuccess)
+        msg.update!(read_at: Time.current)
+        Rails.logger.info("ForwardToApp: pushed message #{msg.id} to #{app.app_name}")
+      else
+        Rails.logger.warn("ForwardToApp: push to #{app.app_name} returned #{response.code} — message queued for polling")
       end
     end
   rescue => e
-    context.fail!(message: "Failed to forward to app: #{e.message}")
+    Rails.logger.warn("ForwardToApp: push to #{app.app_name} failed (#{e.message}) — message queued for polling")
   end
 end

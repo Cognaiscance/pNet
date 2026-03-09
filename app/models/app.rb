@@ -2,6 +2,7 @@ class App < ApplicationRecord
   belongs_to :device
   has_many :connections, as: :connectable, dependent: :destroy
   has_many :key_pairs, as: :owner, dependent: :destroy
+  has_many :inbound_messages, dependent: :destroy
 
   enum :status, { pending: 0, accepted: 1, rejected: 2 }
 

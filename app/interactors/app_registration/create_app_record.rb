@@ -16,11 +16,9 @@ class AppRegistration::CreateAppRecord
       device: node.device
     )
 
-    Connection.create!(
-      connectable: app,
-      host_name: context.host,
-      protocol: "https"
-    )
+    if context.host.present?
+      Connection.create!(connectable: app, host_name: context.host, protocol: "https")
+    end
 
     context.app = app
   end

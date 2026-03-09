@@ -6,6 +6,7 @@ Rails.application.routes.draw do
     post "register", to: "node#register"
     get  "node",     to: "node#show"
     post "send",     to: "node#send_message"
+    get  "messages", to: "messages#index"
   end
 
   # Localhost UI
