@@ -1,6 +1,17 @@
 <h1>My Devices</h1>
 
-<p><%= link_to "Pair a new device", ui_device_pairing_code_path %></p>
+<p>
+  <%= link_to "Pair a new device", ui_device_pairing_code_path %>
+  &nbsp;|&nbsp;
+  <%= button_to "Sync apps to sibling devices", sync_ui_devices_path, method: :post %>
+</p>
+
+<% if flash[:notice] %>
+  <p style="color:green;"><%= flash[:notice] %></p>
+<% end %>
+<% if flash[:alert] %>
+  <p style="color:red;"><%= flash[:alert] %></p>
+<% end %>
 
 <% if @devices.empty? %>
   <p>No devices configured.</p>
@@ -15,6 +26,18 @@
         <p><strong>Last updated:</strong> <%= conn.created_at.strftime("%Y-%m-%d %H:%M") %></p>
       <% else %>
         <p><em>No active connection.</em></p>
+      <% end %>
+
+      <% accepted_apps = device.apps.select(&:accepted?) %>
+      <% if accepted_apps.any? %>
+        <p><strong>Apps:</strong></p>
+        <ul>
+          <% accepted_apps.each do |app| %>
+            <li><%= app.app_name %> <small>(<code><%= app.app_uuid %></code>)</small></li>
+          <% end %>
+        </ul>
+      <% else %>
+        <p><em>No accepted apps.</em></p>
       <% end %>
     </div>
   <% end %>

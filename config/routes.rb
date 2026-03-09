@@ -22,7 +22,11 @@ Rails.application.routes.draw do
     resources :contacts, only: [ :index, :create, :destroy ]
     resource :connection_code, only: [ :show, :create ]
     resource :device_pairing_code, only: [ :show ]
-    resources :devices, only: [ :index ]
+    resources :devices, only: [ :index ] do
+      collection do
+        post :sync
+      end
+    end
 
     get  "setup", to: "setup#new",    as: :setup
     post "setup", to: "setup#create"
