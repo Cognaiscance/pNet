@@ -5,6 +5,5 @@ class SendUdpPacket::Organizer
            SendUdpPacket::VerifyKeys,
            SendUdpPacket::RequestEphemeralKeys,
            SendUdpPacket::EncryptPayload,
-           SendUdpPacket::SendPacket,
-           SendUdpPacket::NotifyApp
+           SendUdpPacket::SendPacket
 end
