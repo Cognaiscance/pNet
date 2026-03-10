@@ -1,7 +1,9 @@
 class Ui::DevicesController < Ui::BaseController
   def index
     user = Node.instance&.user
-    @devices = user&.devices&.includes(:connections, :apps) || []
+    @own_devices     = user&.devices&.includes(:connections, :apps) || []
+    @contact_devices = user&.contacts&.includes(devices: [ :connections, :apps ])
+                           &.flat_map(&:devices) || []
   end
 
   def sync

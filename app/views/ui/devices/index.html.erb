@@ -13,17 +13,39 @@
   <p style="color:red;"><%= flash[:alert] %></p>
 <% end %>
 
-<% if @devices.empty? %>
+<%
+  def health_badge(conn)
+    return '<span style="color:#999;">&#9679; Unknown</span>'.html_safe unless conn&.last_seen_at
+
+    age = Time.current - conn.last_seen_at
+    if age < 2.minutes
+      '<span style="color:#2a2;">&#9679; Online</span>'.html_safe
+    elsif age < 10.minutes
+      '<span style="color:#aa0;">&#9679; Idle</span>'.html_safe
+    else
+      '<span style="color:#c00;">&#9679; Offline</span>'.html_safe
+    end
+  end
+%>
+
+<% if @own_devices.empty? %>
   <p>No devices configured.</p>
 <% else %>
-  <% @devices.each do |device| %>
+  <% @own_devices.each do |device| %>
     <div style="border:1px solid #ddd;border-radius:6px;padding:1rem;margin-bottom:1rem;">
-      <h3><%= device.alias %></h3>
+      <h3><%= device.alias %> &mdash; <%= health_badge(device.active_connection) %></h3>
       <p><strong>UUID:</strong> <code><%= device.uuid %></code></p>
       <% conn = device.active_connection %>
       <% if conn %>
-        <p><strong>Connection:</strong> <%= conn.host_name %> (<%= conn.protocol %>)</p>
-        <p><strong>Last updated:</strong> <%= conn.created_at.strftime("%Y-%m-%d %H:%M") %></p>
+        <p><strong>Address:</strong> <%= conn.host_name %> (<%= conn.protocol %>)</p>
+        <p><strong>Last seen:</strong>
+          <% if conn.last_seen_at %>
+            <%= conn.last_seen_at.strftime("%Y-%m-%d %H:%M:%S") %>
+            <small>(<%= time_ago_in_words(conn.last_seen_at) %> ago)</small>
+          <% else %>
+            <em>never</em>
+          <% end %>
+        </p>
       <% else %>
         <p><em>No active connection.</em></p>
       <% end %>
@@ -38,6 +60,30 @@
         </ul>
       <% else %>
         <p><em>No accepted apps.</em></p>
+      <% end %>
+    </div>
+  <% end %>
+<% end %>
+
+<% if @contact_devices.any? %>
+  <h2>Contact Devices</h2>
+  <% @contact_devices.each do |device| %>
+    <div style="border:1px solid #ddd;border-radius:6px;padding:1rem;margin-bottom:1rem;">
+      <h3><%= device.alias %> (<%= device.user.alias %>) &mdash; <%= health_badge(device.active_connection) %></h3>
+      <p><strong>UUID:</strong> <code><%= device.uuid %></code></p>
+      <% conn = device.active_connection %>
+      <% if conn %>
+        <p><strong>Address:</strong> <%= conn.host_name %> (<%= conn.protocol %>)</p>
+        <p><strong>Last seen:</strong>
+          <% if conn.last_seen_at %>
+            <%= conn.last_seen_at.strftime("%Y-%m-%d %H:%M:%S") %>
+            <small>(<%= time_ago_in_words(conn.last_seen_at) %> ago)</small>
+          <% else %>
+            <em>never</em>
+          <% end %>
+        </p>
+      <% else %>
+        <p><em>No active connection.</em></p>
       <% end %>
     </div>
   <% end %>
