@@ -5,7 +5,8 @@ class Api::BaseController < ActionController::API
 
   def authenticate_app!
     token = request.headers["Authorization"]&.delete_prefix("Bearer ")
-    app = App.find { |a| a.authenticate_api_key(token.to_s) }
+    digest = token.present? ? Digest::SHA256.hexdigest(token) : nil
+    app = digest ? App.find_by(api_key_digest: digest) : nil
 
     if app.nil?
       render json: { error: "Unauthorized" }, status: :unauthorized

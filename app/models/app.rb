@@ -15,12 +15,12 @@ class App < ApplicationRecord
 
   def authenticate_api_key(token)
     return false unless api_key_digest.present?
-    BCrypt::Password.new(api_key_digest).is_password?(token)
+    Digest::SHA256.hexdigest(token) == api_key_digest
   end
 
   def generate_api_key!
     raw_key = SecureRandom.hex(32)
-    update!(api_key_digest: BCrypt::Password.create(raw_key))
+    update!(api_key_digest: Digest::SHA256.hexdigest(raw_key))
     raw_key
   end
 end
