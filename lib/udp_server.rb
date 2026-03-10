@@ -87,10 +87,12 @@ class UdpServer
     device.save!
 
     host = packet["host"].presence || sender_ip
+    external = packet["host"].presence
     Connection.record_address(
-      connectable:     device,
-      host_name:       "#{host}:#{packet["port"]}",
-      peer_public_key: packet["public_key"]
+      connectable:        device,
+      host_name:          "#{host}:#{packet["port"]}",
+      peer_public_key:    packet["public_key"],
+      external_host_name: external ? "#{external}:#{packet["port"]}" : nil
     )
 
     Contact.find_or_create_by!(owner: local_user, contact_user: remote_user)
@@ -113,11 +115,13 @@ class UdpServer
     device.user  = local_user
     device.save!
 
-    host = packet["host"].presence || sender_ip
+    host     = packet["host"].presence || sender_ip
+    external = packet["host"].presence
     Connection.record_address(
-      connectable:     device,
-      host_name:       "#{host}:#{packet["port"]}",
-      peer_public_key: packet["public_key"]
+      connectable:        device,
+      host_name:          "#{host}:#{packet["port"]}",
+      peer_public_key:    packet["public_key"],
+      external_host_name: external ? "#{external}:#{packet["port"]}" : nil
     )
 
     send_contact_sync_to("#{host}:#{packet["port"]}")
@@ -495,8 +499,20 @@ class UdpServer
       sender_device_uuid: node.device.uuid,
       reply_port:         @port
     }.to_json
+
     host, port = conn.host_name.split(":")
     @socket.send(packet, 0, host, port.to_i)
+
+    # If the connection is stale, also ping the stored external address —
+    # the peer may have moved networks and their LAN IP is now unreachable.
+    # A ping to the external address arrives with our new source IP, letting
+    # the peer record our updated address and reply through the opened NAT hole.
+    stale = conn.last_seen_at.nil? || conn.last_seen_at < (HEARTBEAT_INTERVAL * 3).seconds.ago
+    if stale && conn.external_host_name.present? && conn.external_host_name != conn.host_name
+      ext_host, ext_port = conn.external_host_name.split(":")
+      @socket.send(packet, 0, ext_host, ext_port.to_i)
+      Rails.logger.info("UdpServer: stale connection to #{target_device.alias} — also pinging external address #{conn.external_host_name}")
+    end
   rescue => e
     Rails.logger.warn("UdpServer: ping to #{target_device.alias} failed: #{e.message}")
   end

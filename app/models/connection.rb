@@ -4,16 +4,18 @@ class Connection < ApplicationRecord
 
   validates :host_name, presence: true
 
-  def self.record_address(connectable:, host_name:, peer_public_key: nil)
+  def self.record_address(connectable:, host_name:, peer_public_key: nil, external_host_name: nil)
     conn = connectable.connections.find_by(protocol: "udp")
     if conn
       attrs = { host_name: host_name, last_seen_at: Time.current }
-      attrs[:peer_public_key] = peer_public_key if peer_public_key.present?
+      attrs[:peer_public_key]     = peer_public_key     if peer_public_key.present?
+      attrs[:external_host_name]  = external_host_name  if external_host_name.present?
       conn.update!(attrs)
     else
       connectable.connections.create!(
         host_name: host_name, protocol: "udp",
-        peer_public_key: peer_public_key, last_seen_at: Time.current
+        peer_public_key: peer_public_key, last_seen_at: Time.current,
+        external_host_name: external_host_name
       )
     end
   end

@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_03_09_234740) do
+ActiveRecord::Schema[8.1].define(version: 2026_03_10_011012) do
   create_table "apps", force: :cascade do |t|
     t.string "api_key_digest"
     t.string "app_api_key"
@@ -28,6 +28,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_03_09_234740) do
     t.bigint "connectable_id", null: false
     t.string "connectable_type", null: false
     t.datetime "created_at", null: false
+    t.string "external_host_name"
     t.string "host_name", null: false
     t.datetime "last_seen_at"
     t.text "peer_public_key"
