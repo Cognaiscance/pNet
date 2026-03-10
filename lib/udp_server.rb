@@ -425,12 +425,63 @@ class UdpServer
     return unless user && device
 
     # Sibling devices (same user)
-    user.devices.where.not(id: device.id).each { |d| ping_device(d) }
+    user.devices.where.not(id: device.id).each { |d| ping_device(d); rotate_keys_if_needed(d) }
 
     # Contact devices
-    user.contacts.each { |contact_user| contact_user.devices.each { |d| ping_device(d) } }
+    user.contacts.each { |contact_user| contact_user.devices.each { |d| ping_device(d); rotate_keys_if_needed(d) } }
+
+    cleanup_expired_key_exchanges
   rescue => e
     Rails.logger.error("UdpServer: send_heartbeats failed: #{e.message}")
+  end
+
+  def rotate_keys_if_needed(device)
+    conn = device.active_connection
+    return unless conn
+
+    eke = conn.active_ephemeral_key_exchange
+
+    # Skip if a handshake is already in flight (incomplete and not yet expired)
+    return if eke && !eke.complete? && !eke.expired?
+
+    # Rotate if no EKE exists, expired, or expiring within the next hour
+    needs_rotation = eke.nil? || eke.expired? || eke.timeout < 1.hour.from_now
+    return unless needs_rotation
+
+    initiate_key_exchange(conn, device.alias)
+  rescue => e
+    Rails.logger.warn("UdpServer: key rotation check failed for #{device.alias}: #{e.message}")
+  end
+
+  def initiate_key_exchange(connection, label = nil)
+    eke      = EphemeralKeyExchange.create!(connection: connection, timeout: 24.hours.from_now)
+    key_pair = KeyPair.generate_for(eke)
+
+    message_id  = SecureRandom.uuid
+    packet_hash = {
+      type:               "key_exchange",
+      sender_user_uuid:   Node.instance&.user&.uuid,
+      sender_device_uuid: Node.instance&.device&.uuid,
+      public_key:         key_pair.public_key,
+      reply_port:         @port,
+      message_id:         message_id
+    }
+    packet_json = packet_hash.to_json
+
+    host, port = connection.host_name.split(":")
+    @socket.send(packet_json, 0, host, port.to_i)
+    OutboundMessage.register(message_id: message_id, packet_json: packet_json, host: host, port: port.to_i)
+    Rails.logger.info("UdpServer: key exchange initiated#{label ? " with #{label}" : ""}")
+  rescue => e
+    Rails.logger.warn("UdpServer: initiate_key_exchange failed: #{e.message}")
+  end
+
+  def cleanup_expired_key_exchanges
+    # Keep the most recent EKE per connection; delete older ones past 48h
+    cutoff = 48.hours.ago
+    EphemeralKeyExchange.where("created_at < ?", cutoff).destroy_all
+  rescue => e
+    Rails.logger.warn("UdpServer: cleanup_expired_key_exchanges failed: #{e.message}")
   end
 
   def ping_device(target_device)
