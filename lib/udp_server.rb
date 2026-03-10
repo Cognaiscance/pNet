@@ -3,7 +3,8 @@ require "json"
 
 class UdpServer
   DEFAULT_PORT = 7777
-  HEARTBEAT_INTERVAL = 60  # seconds
+  HEARTBEAT_INTERVAL = 60   # seconds
+  RELAY_STALE_THRESHOLD = 600  # seconds — escalate to relay after 10 min without contact
 
   def initialize(port: DEFAULT_PORT)
     @port = port
@@ -22,6 +23,7 @@ class UdpServer
       Rails.logger.warn("UdpServer: could not discover external IP — peer introductions require PNET_HOST")
     end
     Rails.logger.info("UdpServer: listening on port #{@port}")
+    introduce_to_relay
 
     @heartbeat_thread = Thread.new { heartbeat_loop }
     @retry_thread     = Thread.new { retry_loop }
@@ -61,6 +63,7 @@ class UdpServer
     when "ping"              then handle_ping(packet, sender_ip)
     when "pong"              then handle_pong(packet, sender_ip)
     when "ack"               then handle_ack(packet)
+    when "relay"             then handle_relay(packet)
     else
       result = ReceiveUdpPacket::Organizer.call(raw_packet: packet, sender_ip: sender_ip)
       unless result.success?
@@ -331,10 +334,27 @@ class UdpServer
   def handle_ping(packet, sender_ip)
     sender_device = Device.find_by(uuid: packet["sender_device_uuid"])
     return unless sender_device
-    listen_port = packet["reply_port"] || DEFAULT_PORT
-    Connection.record_address(connectable: sender_device,
-      host_name: "#{sender_ip}:#{listen_port}")
-    send_pong_to(sender_ip, listen_port)
+
+    relayed_from_ip   = packet["relayed_from_ip"]
+    relayed_from_port = packet["relayed_from_port"]
+
+    if relayed_from_ip && relayed_from_port
+      # Packet was forwarded by a relay. Use the sender's true external address,
+      # not the relay's IP.
+      listen_port = relayed_from_port.to_i
+      Connection.record_address(connectable: sender_device,
+        host_name: "#{relayed_from_ip}:#{listen_port}")
+      # Attempt direct reply (hole-punch) and also reply via relay as a guaranteed path.
+      send_pong_to(relayed_from_ip, listen_port)
+      send_via_relay(packet["sender_device_uuid"],
+        { type: "pong", sender_user_uuid: Node.instance&.user&.uuid,
+          sender_device_uuid: Node.instance&.device&.uuid, reply_port: @port }.to_json)
+    else
+      listen_port = packet["reply_port"] || DEFAULT_PORT
+      Connection.record_address(connectable: sender_device,
+        host_name: "#{sender_ip}:#{listen_port}")
+      send_pong_to(sender_ip, listen_port)
+    end
   rescue => e
     Rails.logger.error("UdpServer: handle_ping failed: #{e.message}")
   end
@@ -342,9 +362,20 @@ class UdpServer
   def handle_pong(packet, sender_ip)
     sender_device = Device.find_by(uuid: packet["sender_device_uuid"])
     return unless sender_device
-    listen_port = packet["reply_port"] || DEFAULT_PORT
-    Connection.record_address(connectable: sender_device,
-      host_name: "#{sender_ip}:#{listen_port}")
+
+    relayed_from_ip   = packet["relayed_from_ip"]
+    relayed_from_port = packet["relayed_from_port"]
+
+    if relayed_from_ip && relayed_from_port
+      listen_port = relayed_from_port.to_i
+      Connection.record_address(connectable: sender_device,
+        host_name: "#{relayed_from_ip}:#{listen_port}")
+      Rails.logger.info("UdpServer: relayed pong from #{sender_device.alias} — recorded #{relayed_from_ip}:#{listen_port}")
+    else
+      listen_port = packet["reply_port"] || DEFAULT_PORT
+      Connection.record_address(connectable: sender_device,
+        host_name: "#{sender_ip}:#{listen_port}")
+    end
   rescue => e
     Rails.logger.error("UdpServer: handle_pong failed: #{e.message}")
   end
@@ -364,6 +395,79 @@ class UdpServer
     @socket.send(packet, 0, host, port.to_i)
   rescue => e
     Rails.logger.warn("UdpServer: failed to send pong to #{host}:#{port}: #{e.message}")
+  end
+
+  # Relay
+
+  def introduce_to_relay
+    relay = ENV.fetch("PNET_RELAY_HOST", nil)
+    return unless relay
+
+    Rails.logger.info("UdpServer: introducing to relay #{relay}")
+    send_peer_introduction_to(relay)
+  rescue => e
+    Rails.logger.warn("UdpServer: relay introduction failed: #{e.message}")
+  end
+
+  def send_via_relay(target_device_uuid, inner_packet_json)
+    relay = ENV.fetch("PNET_RELAY_HOST", nil)
+    return unless relay
+
+    node = Node.instance
+    return unless node
+
+    packet = {
+      type:             "relay",
+      to_device_uuid:   target_device_uuid,
+      from_device_uuid: node.device&.uuid,
+      from_ip:          @external_ip || ENV.fetch("PNET_HOST", nil),
+      from_port:        @port,
+      inner:            Base64.strict_encode64(inner_packet_json)
+    }.to_json
+
+    relay_host, relay_port = relay.split(":")
+    @socket.send(packet, 0, relay_host, relay_port.to_i)
+    Rails.logger.info("UdpServer: relayed packet to #{target_device_uuid} via #{relay}")
+  rescue => e
+    Rails.logger.warn("UdpServer: send_via_relay failed for #{target_device_uuid}: #{e.message}")
+  end
+
+  def handle_relay(packet)
+    to_uuid   = packet["to_device_uuid"]
+    from_ip   = packet["from_ip"]
+    from_port = packet["from_port"]
+
+    unless to_uuid && from_ip && from_port && packet["inner"]
+      Rails.logger.warn("UdpServer: malformed relay packet — missing required fields")
+      return
+    end
+
+    target_device = Device.find_by(uuid: to_uuid)
+    unless target_device
+      Rails.logger.warn("UdpServer: relay: unknown device #{to_uuid}")
+      return
+    end
+
+    conn = target_device.active_connection
+    unless conn&.host_name.present?
+      Rails.logger.warn("UdpServer: relay: no known address for device #{to_uuid}")
+      return
+    end
+
+    inner      = JSON.parse(Base64.strict_decode64(packet["inner"]))
+    inner["relayed_from_ip"]   = from_ip
+    inner["relayed_from_port"] = from_port
+    augmented  = inner.to_json
+
+    dest_host, dest_port = conn.host_name.split(":")
+    @socket.send(augmented, 0, dest_host, dest_port.to_i)
+    Rails.logger.info("UdpServer: relayed packet from #{from_ip}:#{from_port} → #{to_uuid} at #{conn.host_name}")
+  rescue ArgumentError => e
+    Rails.logger.warn("UdpServer: relay: bad base64: #{e.message}")
+  rescue JSON::ParserError => e
+    Rails.logger.warn("UdpServer: relay: inner packet not valid JSON: #{e.message}")
+  rescue => e
+    Rails.logger.error("UdpServer: handle_relay failed: #{e.message}")
   end
 
   # ACKs and retries
@@ -512,6 +616,12 @@ class UdpServer
       ext_host, ext_port = conn.external_host_name.split(":")
       @socket.send(packet, 0, ext_host, ext_port.to_i)
       Rails.logger.info("UdpServer: stale connection to #{target_device.alias} — also pinging external address #{conn.external_host_name}")
+    end
+
+    very_stale = conn.last_seen_at.nil? || conn.last_seen_at < RELAY_STALE_THRESHOLD.seconds.ago
+    if very_stale && ENV.key?("PNET_RELAY_HOST")
+      send_via_relay(target_device.uuid, packet)
+      Rails.logger.info("UdpServer: very stale connection to #{target_device.alias} — escalating to relay")
     end
   rescue => e
     Rails.logger.warn("UdpServer: ping to #{target_device.alias} failed: #{e.message}")
