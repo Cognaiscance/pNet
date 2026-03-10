@@ -1,0 +1,57 @@
+<h1>Apps</h1>
+
+<% if flash[:notice] %>
+  <p style="color:green;"><%= flash[:notice] %></p>
+<% end %>
+<% if flash[:alert] %>
+  <p style="color:red;"><%= flash[:alert] %></p>
+<% end %>
+
+<% if @apps.empty? %>
+  <p>No apps registered.</p>
+<% else %>
+  <table style="width:100%;border-collapse:collapse;">
+    <thead>
+      <tr style="background:#f0f0f0;">
+        <th style="padding:0.5rem;text-align:left;">App Name</th>
+        <th style="padding:0.5rem;text-align:left;">UUID</th>
+        <th style="padding:0.5rem;text-align:left;">Host</th>
+        <th style="padding:0.5rem;text-align:left;">Status</th>
+        <th style="padding:0.5rem;text-align:left;">Registered</th>
+        <th style="padding:0.5rem;text-align:left;">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      <% @apps.each do |app| %>
+        <tr style="border-bottom:1px solid #ddd;">
+          <td style="padding:0.5rem;"><strong><%= app.app_name %></strong></td>
+          <td style="padding:0.5rem;"><code><%= app.app_uuid %></code></td>
+          <td style="padding:0.5rem;">
+            <% if app.active_connection %>
+              <%= app.active_connection.host_name %>
+            <% else %>
+              <em>none</em>
+            <% end %>
+          </td>
+          <td style="padding:0.5rem;">
+            <% if app.accepted? %>
+              <span style="color:#2a2;">&#9679; Active</span>
+            <% else %>
+              <span style="color:#c00;">&#9679; Blocked</span>
+            <% end %>
+          </td>
+          <td style="padding:0.5rem;"><%= app.created_at.strftime("%Y-%m-%d %H:%M") %></td>
+          <td style="padding:0.5rem;">
+            <% if app.accepted? %>
+              <%= button_to "Block", block_ui_app_path(app), method: :post,
+                  style: "background:#dc3545;color:#fff;border:none;padding:0.25rem 0.75rem;border-radius:3px;cursor:pointer;" %>
+            <% else %>
+              <%= button_to "Unblock", unblock_ui_app_path(app), method: :post,
+                  style: "background:#28a745;color:#fff;border:none;padding:0.25rem 0.75rem;border-radius:3px;cursor:pointer;" %>
+            <% end %>
+          </td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+<% end %>

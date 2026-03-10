@@ -13,10 +13,10 @@ Rails.application.routes.draw do
   namespace :ui do
     root to: "dashboard#index", as: :dashboard
 
-    resources :pending_apps, only: [ :index ] do
+    resources :apps, only: [ :index ] do
       member do
-        post :accept
-        post :reject
+        post :block
+        post :unblock
       end
     end
 

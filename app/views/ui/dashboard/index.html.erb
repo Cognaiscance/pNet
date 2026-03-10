@@ -31,12 +31,7 @@
     <% end %>
   </section>
 
-  <% if @pending_apps_count > 0 %>
-    <p style="background:#fff3cd;color:#856404;padding:0.75rem;border-radius:4px;">
-      <%= @pending_apps_count %> app(s) awaiting approval.
-      <%= link_to "Review now", ui_pending_apps_path %>
-    </p>
-  <% end %>
+  <p><%= link_to "Manage apps", ui_apps_path %></p>
 
   <% if @pending_key_exchanges.any? %>
     <section style="margin-top:2rem;">

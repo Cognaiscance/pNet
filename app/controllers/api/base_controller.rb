@@ -5,7 +5,14 @@ class Api::BaseController < ActionController::API
 
   def authenticate_app!
     token = request.headers["Authorization"]&.delete_prefix("Bearer ")
-    @current_app = App.accepted.find { |a| a.authenticate_api_key(token.to_s) }
-    render json: { error: "Unauthorized" }, status: :unauthorized unless @current_app
+    app = App.find { |a| a.authenticate_api_key(token.to_s) }
+
+    if app.nil?
+      render json: { error: "Unauthorized" }, status: :unauthorized
+    elsif app.rejected?
+      render json: { error: "Access denied — this app has been blocked" }, status: :forbidden
+    else
+      @current_app = app
+    end
   end
 end

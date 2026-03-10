@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_03_10_011012) do
+ActiveRecord::Schema[8.1].define(version: 2026_03_10_035148) do
   create_table "apps", force: :cascade do |t|
     t.string "api_key_digest"
     t.string "app_api_key"
@@ -18,7 +18,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_03_10_011012) do
     t.string "app_uuid", null: false
     t.datetime "created_at", null: false
     t.integer "device_id", null: false
-    t.integer "status", default: 0, null: false
+    t.integer "status", default: 1, null: false
     t.datetime "updated_at", null: false
     t.index ["app_uuid"], name: "index_apps_on_app_uuid", unique: true
     t.index ["device_id"], name: "index_apps_on_device_id"

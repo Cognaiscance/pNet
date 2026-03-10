@@ -1,8 +1,8 @@
 class AppRegistration::CreateAppRecord
   include Interactor
 
-  # context requires: app_uuid, app_name, host, app_api_key (optional)
-  # context sets: app
+  # context requires: app_uuid, app_name, host (optional), app_api_key (optional)
+  # context sets: app, raw_api_key
 
   def call
     node = Node.instance
@@ -11,10 +11,10 @@ class AppRegistration::CreateAppRecord
     app = App.create!(
       app_uuid: context.app_uuid,
       app_name: context.app_name,
-      status: :pending,
-      app_api_key: context.app_api_key,
-      device: node.device
+      device:   node.device
     )
+
+    context.raw_api_key = app.generate_api_key!
 
     if context.host.present?
       Connection.create!(connectable: app, host_name: context.host, protocol: "https")

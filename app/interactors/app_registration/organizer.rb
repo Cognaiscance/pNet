@@ -3,5 +3,5 @@ class AppRegistration::Organizer
 
   organize AppRegistration::ValidateRegistration,
            AppRegistration::CreateAppRecord,
-           AppRegistration::NotifyPending
+           AppAcceptance::NotifySiblingDevices
 end

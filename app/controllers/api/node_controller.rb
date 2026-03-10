@@ -34,7 +34,7 @@ class Api::NodeController < Api::BaseController
     )
 
     if result.success?
-      render json: { status: "pending", message: "Registration received. Await user approval." }, status: :accepted
+      render json: { status: "accepted", api_key: result.raw_api_key }, status: :created
     else
       render json: { error: result.message }, status: :unprocessable_entity
     end
