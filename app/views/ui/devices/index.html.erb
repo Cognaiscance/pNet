@@ -14,7 +14,8 @@
 <% end %>
 
 <%
-  def health_badge(conn)
+  def health_badge(conn, this_node: false)
+    return '<span style="color:#2a2;">&#9679; Online (this device)</span>'.html_safe if this_node
     return '<span style="color:#999;">&#9679; Unknown</span>'.html_safe unless conn&.last_seen_at
 
     age = Time.current - conn.last_seen_at
@@ -33,7 +34,7 @@
 <% else %>
   <% @own_devices.each do |device| %>
     <div style="border:1px solid #ddd;border-radius:6px;padding:1rem;margin-bottom:1rem;">
-      <h3><%= device.alias %> &mdash; <%= health_badge(device.active_connection) %></h3>
+      <h3><%= device.alias %> &mdash; <%= health_badge(device.active_connection, this_node: device == @node_device) %></h3>
       <p><strong>UUID:</strong> <code><%= device.uuid %></code></p>
       <% conn = device.active_connection %>
       <% if conn %>
