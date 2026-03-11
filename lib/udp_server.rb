@@ -11,6 +11,8 @@ class UdpServer
     @socket = UDPSocket.new
     @running = false
     @external_ip = nil
+    @peer_connections      = {}  # device_uuid => Set<device_uuid> — populated by contact_sync receipts
+    @peer_connections_lock = Mutex.new
   end
 
   def start
@@ -154,7 +156,21 @@ class UdpServer
     end
 
     my_apps = device.apps.accepted.map { |a| { app_uuid: a.app_uuid, app_name: a.app_name } }
-    packet = { type: "contact_sync", sender_user_uuid: user.uuid, sender_device_uuid: device.uuid, contacts: contacts_data, my_apps: my_apps }.to_json
+
+    cutoff = RELAY_STALE_THRESHOLD.seconds.ago
+    live_uuids = []
+    user.devices.where.not(id: device.id).each do |d|
+      conn = d.active_connection
+      live_uuids << d.uuid if conn&.last_seen_at&.> cutoff
+    end
+    user.contacts.each do |contact|
+      contact.devices.each do |d|
+        conn = d.active_connection
+        live_uuids << d.uuid if conn&.last_seen_at&.> cutoff
+      end
+    end
+
+    packet = { type: "contact_sync", sender_user_uuid: user.uuid, sender_device_uuid: device.uuid, contacts: contacts_data, my_apps: my_apps, connected_device_uuids: live_uuids }.to_json
     remote_host, remote_port = host_name.split(":")
     @socket.send(packet, 0, remote_host, remote_port.to_i)
   rescue => e
@@ -173,6 +189,13 @@ class UdpServer
     if (conn = sender_device.active_connection)
       port = conn.host_name.split(":").last
       Connection.record_address(connectable: sender_device, host_name: "#{sender_ip}:#{port}")
+    end
+
+    # Track which devices the sender is currently connected to — used for dynamic relay discovery
+    if (uuids = packet["connected_device_uuids"]).is_a?(Array)
+      @peer_connections_lock.synchronize do
+        @peer_connections[sender_device.uuid] = uuids.to_set
+      end
     end
 
     addresses_to_introduce = []
@@ -346,7 +369,7 @@ class UdpServer
         host_name: "#{relayed_from_ip}:#{listen_port}")
       # Attempt direct reply (hole-punch) and also reply via relay as a guaranteed path.
       send_pong_to(relayed_from_ip, listen_port)
-      send_via_relay(packet["sender_device_uuid"],
+      relay_to(packet["sender_device_uuid"],
         { type: "pong", sender_user_uuid: Node.instance&.user&.uuid,
           sender_device_uuid: Node.instance&.device&.uuid, reply_port: @port }.to_json)
     else
@@ -468,6 +491,65 @@ class UdpServer
     Rails.logger.warn("UdpServer: relay: inner packet not valid JSON: #{e.message}")
   rescue => e
     Rails.logger.error("UdpServer: handle_relay failed: #{e.message}")
+  end
+
+  def relay_to(target_device_uuid, inner_packet_json)
+    candidates = relay_candidates(target_device_uuid)
+    if candidates.any?
+      relay_dev = Device.find_by(uuid: candidates.first)
+      send_via_peer_relay(relay_dev, target_device_uuid, inner_packet_json) if relay_dev
+    elsif ENV.key?("PNET_RELAY_HOST")
+      send_via_relay(target_device_uuid, inner_packet_json)
+    end
+  end
+
+  # Returns UUIDs of devices that (a) I can currently reach and (b) have reported
+  # a live connection to target_device_uuid via contact_sync.
+  def relay_candidates(target_device_uuid)
+    node   = Node.instance
+    user   = node&.user
+    device = node&.device
+    return [] unless user && device
+
+    cutoff = RELAY_STALE_THRESHOLD.seconds.ago
+    reachable = []
+    user.devices.where.not(id: device.id).each do |d|
+      conn = d.active_connection
+      reachable << d.uuid if conn&.last_seen_at&.> cutoff
+    end
+    user.contacts.each do |contact|
+      contact.devices.each do |d|
+        conn = d.active_connection
+        reachable << d.uuid if conn&.last_seen_at&.> cutoff
+      end
+    end
+
+    @peer_connections_lock.synchronize do
+      reachable.select { |uuid| @peer_connections[uuid]&.include?(target_device_uuid) }
+    end
+  end
+
+  def send_via_peer_relay(relay_device, target_device_uuid, inner_packet_json)
+    conn = relay_device.active_connection
+    return unless conn&.host_name.present?
+
+    node = Node.instance
+    return unless node
+
+    packet = {
+      type:             "relay",
+      to_device_uuid:   target_device_uuid,
+      from_device_uuid: node.device&.uuid,
+      from_ip:          @external_ip || ENV.fetch("PNET_HOST", nil),
+      from_port:        @port,
+      inner:            Base64.strict_encode64(inner_packet_json)
+    }.to_json
+
+    relay_host, relay_port = conn.host_name.split(":")
+    @socket.send(packet, 0, relay_host, relay_port.to_i)
+    Rails.logger.info("UdpServer: relayed packet to #{target_device_uuid} via peer #{relay_device.alias}")
+  rescue => e
+    Rails.logger.warn("UdpServer: send_via_peer_relay failed via #{relay_device.alias}: #{e.message}")
   end
 
   # ACKs and retries
@@ -619,8 +701,8 @@ class UdpServer
     end
 
     very_stale = conn.last_seen_at.nil? || conn.last_seen_at < RELAY_STALE_THRESHOLD.seconds.ago
-    if very_stale && ENV.key?("PNET_RELAY_HOST")
-      send_via_relay(target_device.uuid, packet)
+    if very_stale
+      relay_to(target_device.uuid, packet)
       Rails.logger.info("UdpServer: very stale connection to #{target_device.alias} — escalating to relay")
     end
   rescue => e
