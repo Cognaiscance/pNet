@@ -47,16 +47,25 @@ pub struct User {
     pub devices: Vec<Device>,
 }
 
+pub struct Invitation {
+    pub id: Uuid,
+    pub key_pair: KeyPair,
+    pub expires_at: SystemTime,
+}
+
 /// The local owner of this node. Extends User with contacts and a long-term key pair.
 pub struct Owner {
     pub user: User,
     pub contact_users: Vec<Contact>,
     pub key_pair: KeyPair,
+    pub contact_invitations: Vec<Invitation>,
+    pub device_invitations: Vec<Invitation>,
 }
 
 /// A known contact. Extends User with an active ephemeral key exchange.
 pub struct Contact {
     pub user: User,
+    pub public_key: PublicKey,
     pub ephemeral_key_exchange: EphemeralKeyExchange,
 }
 
