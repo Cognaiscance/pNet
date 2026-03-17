@@ -1,0 +1,103 @@
+{
+	"version": 1,
+	"date": "2026-03-17T15:20:14.168Z",
+	"items": {
+		"FILES/.tangent/tags": {
+			"uuid": "1f122125-d420-6700-8958-c3213c7c81f6"
+		},
+		"FILES/.tangent/tangents": {
+			"uuid": "1f122125-d420-6701-8489-e7a08f0427da"
+		},
+		"FILES/.tangent/tangents/sanosuke_0": {
+			"uuid": "1f122125-d473-6720-a10e-743cc33b7acd"
+		},
+		"FILES/.tangent/tangents/sanosuke_0/sessions": {
+			"uuid": "1f122125-d75e-6840-b253-716a1ed56a7e"
+		},
+		"FILES/.tangent/tangents/sanosuke_0/sessions/2026-3-17_9-2-49.tangentsession": {
+			"uuid": "1f122125-d75e-6841-b064-88e19735c05f"
+		},
+		"FILES/.tangent/tangents/sanosuke_0/tangent.json": {
+			"uuid": "1f122125-d473-6721-b776-114c56466e67"
+		},
+		"FILES/Data Models.md": {
+			"uuid": "1f122125-b5cc-6c40-956a-a03b57b8e2a4",
+			"modified": "2026-03-16T20:56:00.835Z",
+			"structure": [
+				{
+					"type": 2,
+					"level": 1,
+					"text": "Node",
+					"start": 0,
+					"end": 6
+				},
+				{
+					"type": 2,
+					"level": 1,
+					"text": "User",
+					"start": 152,
+					"end": 158
+				},
+				{
+					"type": 2,
+					"level": 1,
+					"text": "Owner",
+					"start": 272,
+					"end": 279
+				},
+				{
+					"type": 2,
+					"level": 1,
+					"text": "Contact",
+					"start": 388,
+					"end": 397
+				},
+				{
+					"type": 2,
+					"level": 1,
+					"text": "Device",
+					"start": 456,
+					"end": 464
+				},
+				{
+					"type": 2,
+					"level": 1,
+					"text": "KeyPair",
+					"start": 620,
+					"end": 629
+				},
+				{
+					"type": 2,
+					"level": 1,
+					"text": "EphemeralKeyExchange",
+					"start": 754,
+					"end": 776
+				},
+				{
+					"type": 2,
+					"level": 1,
+					"text": "Application",
+					"start": 886,
+					"end": 899
+				}
+			]
+		},
+		"FILES/Data transport diagram.md": {
+			"uuid": "1f122125-b5b6-6cb0-853c-30608355c700",
+			"modified": "2026-03-16T22:48:13.001Z"
+		},
+		"FILES/communication methods.md": {
+			"uuid": "1f122125-b5d1-6a60-8c29-5c2d8d6a350b",
+			"modified": "2026-03-16T23:10:01.361Z",
+			"structure": [
+				{
+					"type": 2,
+					"level": 1,
+					"text": "Processing of communications",
+					"start": 0,
+					"end": 30
+				}
+			]
+		}
+	}
+}
