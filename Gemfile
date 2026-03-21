@@ -19,7 +19,7 @@ gem "stimulus-rails"
 gem "dotenv-rails"
 
 # Use Active Model has_secure_password
-gem "bcrypt", "~> 3.1.7"
+gem "bcrypt", "~> 3.1.22"
 
 # Interactor pattern for complex multi-step processes
 gem "interactor", "~> 3.0"
