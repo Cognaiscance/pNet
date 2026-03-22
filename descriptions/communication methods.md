@@ -11,7 +11,7 @@ the payload will contain a sequence of values that will be parsed on arrival. Th
   2. generating a new ephemeral key
   3. initializing a contact or device
   4. updating contact or device details
-  5. an application or a contact sending a packet
+  5. an application sending a packet
 
 * the next 16 bytes will be the uuid of the entity making the request
 * the remaining bytes will be the payload of the request.  The contents will vary depending on the type of request.
@@ -47,7 +47,7 @@ the payload will contain a sequence of values that will be parsed on arrival. Th
    ├────────────────┼───────┤
    │ Remaining      │ 447   │
    └────────────────┴───────┘
-   2. 
+   2.
    ┌────────────────┬───────┐
    │     Field      │ Bytes │
    ├────────────────┼───────┤
@@ -63,4 +63,32 @@ the payload will contain a sequence of values that will be parsed on arrival. Th
    ├────────────────┼───────┤
    │ Remaining      │ 399   │
    └────────────────┴───────┘
+   5.
+   Unencrypted header:
+   ┌───────────────────────────┬───────┐
+   │           Field           │ Bytes │
+   ├───────────────────────────┼───────┤
+   │ Operation type            │ 1     │
+   ├───────────────────────────┼───────┤
+   │ Peer active connection ID │ 2     │
+   ├───────────────────────────┼───────┤
+   │ Nonce                     │ 24    │
+   └───────────────────────────┴───────┘
+
+   Encrypted body:
+   ┌─────────────────┬───────┐
+   │      Field      │ Bytes │
+   ├─────────────────┼───────┤
+   │ Sender app ID   │ 2     │
+   ├─────────────────┼───────┤
+   │ Receiver app ID │ 2     │
+   ├─────────────────┼───────┤
+   │ App payload     │ ?     │
+   ├─────────────────┼───────┤
+   │ Auth tag        │ 16    │
+   ├─────────────────┼───────┤
+   │ Used            │ 47    │
+   ├─────────────────┼───────┤
+   │ Remaining       │ 465   │
+   └─────────────────┴───────┘
 

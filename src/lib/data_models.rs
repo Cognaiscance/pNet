@@ -28,7 +28,7 @@ pub enum ApplicationStatus {
 }
 
 pub struct Application {
-    pub uuid: Uuid,
+    pub id: u16,
     pub alias: String,
     pub host: SocketAddrV4,
     pub status: ApplicationStatus,

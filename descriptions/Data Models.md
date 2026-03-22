@@ -47,7 +47,8 @@ description: holds information specific to a device (laptop, server, phone)
 
 # Application
 description: data required to handle communication with apps through the app api
-* uuid
+* id: u16
+	* unique per device; used in packet headers to save space
 * alias
 * host
 	* a SocketAddrV4 (ipv4 address with port number)
