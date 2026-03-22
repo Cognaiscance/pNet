@@ -15,7 +15,9 @@ the payload will contain a sequence of values that will be parsed on arrival. Th
 
 * the next 16 bytes will be the uuid of the entity making the request
 * the remaining bytes will be the payload of the request.  The contents will vary depending on the type of request.
-   0. ┌────────────────┬───────┐                       │     Field      │ Bytes │
+   0. 
+   ┌────────────────┬───────┐
+   │     Field      │ Bytes │
    ├────────────────┼───────┤
    │ Operation type │ 1     │
    ├────────────────┼───────┤

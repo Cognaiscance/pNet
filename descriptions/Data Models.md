@@ -9,11 +9,14 @@ description: the local owner of this node; extends User with contacts and a long
 * user
 * contact_users
 	* a list of Contact structs
-* key_pair
+* keypair
+	* a more secure long term key used by the user when  establishing ephemeral key connections
 * contact_invitations
 	* a list of Invitation structs
 * device_invitations
 	* a list of Invitation structs
+* active_connections
+	* a list of ActiveConnection structs
 
 # User
 description: holds information unique to a user
@@ -27,7 +30,6 @@ description: a known contact; extends User with an active ephemeral key exchange
 * user
 * public_key
 	* the contact's long-term public key
-* ephemeral_key_exchange
 
 # Invitation
 description: an invitation token used to add a contact or device
@@ -51,8 +53,8 @@ description: data required to handle communication with apps through the app api
 	* a SocketAddrV4 (ipv4 address with port number)
 * status
 	* Accepted | Pending
-* api_key
-* ephemeral_key_exchange
+* token
+	* a UUID used to identify the application on subsequent requests
 
 # KeyPair
 description: a pair of Curve25519 encryption keys; Ed25519 for signing, X25519 for key exchange
@@ -61,10 +63,14 @@ description: a pair of Curve25519 encryption keys; Ed25519 for signing, X25519 f
 * private_key
 	* 32-byte Ed25519/X25519 private key
 
-# EphemeralKeyExchange
-description: a short-lived key exchange session with a remote peer
-* id
+# ActiveConnection
+description: represents an active encrypted session with a peer device. Stored in a HashMap<u16, ActiveConnection> on Owner. Incoming packets include the receiver's id in the header, enabling O(1) key lookup for decryption without sending a full UUID.
+* id: u16
+	* local identifier; also the HashMap key
 * timeout
-* key_pair
-* peer_public_key
-	* the remote peer's public key for this exchange
+* key_pair (ephemeral)
+* peer_public_key (ephemeral)
+* peer_active_connection_id: u16
+	* the id the peer uses on their end; included in outbound packet headers
+* device_uuid
+	* identifies which device this connection is with
