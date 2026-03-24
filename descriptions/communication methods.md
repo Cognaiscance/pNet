@@ -7,63 +7,28 @@ I would like messages to be as deliverable as possible, thus I would like the sy
 the payload will contain a sequence of values that will be parsed on arrival. They are described as follows:
 * Byte one is to be interpreted as a number representing what type of operation is to be performed:
   0. application registration
-  1. ephemeral key update
-  2. generating a new ephemeral key
-  3. initializing a contact or device
-  4. updating contact or device details
-  5. an application sending a packet
+    * application sends in its alias and the port number it is listening on.  The pnet sends back a token.
+  1. application update
+    * application sends its token the field or fields it would like to change
+      * allowed fields would be alias or host
+  2. get data
+    * application sends its token
+    * pnet returns the data tree that applications are allowed to see.
+      * for itself: all data in it's Application struct
+      * a tree of data starting at the node level, bacically everything, but without any keys.
+  
+  4. an application sending a packet
+
+  more operations that I need to do more defining on
+  * ephemeral key update
+  * generating a new ephemeral key
+  * initializing a contact or device
+  * updating contact or device details
 
 * the next 16 bytes will be the uuid of the entity making the request
 * the remaining bytes will be the payload of the request.  The contents will vary depending on the type of request.
-   0. 
-   ┌────────────────┬───────┐
-   │     Field      │ Bytes │
-   ├────────────────┼───────┤
-   │ Operation type │ 1     │
-   ├────────────────┼───────┤
-   │ Sender UUID    │ 16    │
-   ├────────────────┼───────┤
-   │ Public key     │ 32    │
-   ├────────────────┼───────┤
-   │ Alias          │ ?     │
-   ├────────────────┼───────┤
-   │ Used           │ 49    │
-   ├────────────────┼───────┤
-   │ Remaining      │ 463   │
-   └────────────────┴───────┘ 
-   1. 
-   ┌────────────────┬───────┐
-   │     Field      │ Bytes │
-   ├────────────────┼───────┤
-   │ Operation type │ 1     │
-   ├────────────────┼───────┤
-   │ Sender UUID    │ 16    │
-   ├────────────────┼───────┤
-   │ EKE ID         │ 16    │
-   ├────────────────┼───────┤
-   │ New public key │ 32    │
-   ├────────────────┼───────┤
-   │ Used           │ 65    │
-   ├────────────────┼───────┤
-   │ Remaining      │ 447   │
-   └────────────────┴───────┘
-   2.
-   ┌────────────────┬───────┐
-   │     Field      │ Bytes │
-   ├────────────────┼───────┤
-   │ Operation type │ 1     │
-   ├────────────────┼───────┤
-   │ Sender UUID    │ 16    │
-   ├────────────────┼───────┤
-   │ New public key │ 32    │
-   ├────────────────┼───────┤
-   │ Signature      │ 64    │
-   ├────────────────┼───────┤
-   │ Used           │ 113   │
-   ├────────────────┼───────┤
-   │ Remaining      │ 399   │
-   └────────────────┴───────┘
-   5.
+   
+   4.
    Unencrypted header:
    ┌───────────────────────────┬───────┐
    │           Field           │ Bytes │

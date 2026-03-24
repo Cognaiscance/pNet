@@ -52,8 +52,8 @@ description: data required to handle communication with apps through the app api
 * alias
 * host
 	* a SocketAddrV4 (ipv4 address with port number)
-* status
-	* Accepted | Pending
+* user_approved
+	* true | false
 * token
 	* a UUID used to identify the application on subsequent requests
 
