@@ -50,9 +50,9 @@ Byte one of every message is to be interpreted as a number representing what typ
   
   
   below are more operations that I need to do more defining on. I want them added to the list above as we work on defining each one. It looks like these are operations that are used to handle pnet administration: making and keeping connections, keeping nodes up to date with changes
+  * initializing a contact or device
   * ephemeral key update
   * generating a new ephemeral key
-  * initializing a contact or device
   * updating contact or device details
   * synchronizing user data across pnet nodes owned by the same user
 
