@@ -22,16 +22,11 @@ pub struct ActiveConnection {
     pub device_uuid: Uuid,
 }
 
-pub enum ApplicationStatus {
-    Accepted,
-    Pending,
-}
-
 pub struct Application {
     pub id: u16,
     pub alias: String,
     pub host: SocketAddrV4,
-    pub status: ApplicationStatus,
+    pub user_approved: bool,
     pub token: Uuid,
 }
 
