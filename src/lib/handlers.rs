@@ -244,6 +244,313 @@ pub fn retry_message(message_id: u64, ctx: &WorkerContext) {
     let _ = (message_id, ctx); // TODO
 }
 
+// ── UI / HTTP handlers ────────────────────────────────────────────────────────
+
+pub fn ui_request(
+    stream:  std::net::TcpStream,
+    method:  String,
+    path:    String,
+    _query:  String,
+    body:    Vec<u8>,
+    ctx:     &WorkerContext,
+) {
+    match (method.as_str(), path.as_str()) {
+        ("GET",  "/")                     => respond_redirect(&stream, "/dashboard"),
+        ("GET",  "/dashboard")            => respond_html(&stream, 200, &render_dashboard(ctx)),
+        ("GET",  "/pending-apps")         => respond_html(&stream, 200, &render_pending_apps(ctx)),
+        ("POST", "/pending-apps/approve") => {
+            approve_app(&body, ctx);
+            respond_redirect(&stream, "/pending-apps");
+        }
+        ("POST", "/pending-apps/reject")  => {
+            reject_app(&body, ctx);
+            respond_redirect(&stream, "/pending-apps");
+        }
+        ("GET",  "/applications")         => respond_html(&stream, 200, &render_applications(ctx)),
+        ("GET",  "/contacts")             => respond_html(&stream, 200, &render_contacts(ctx)),
+        ("GET",  "/devices")              => respond_html(&stream, 200, &render_devices(ctx)),
+        _ => respond_html(&stream, 404, &layout("Not Found", "<h1>404 — Not Found</h1>")),
+    }
+}
+
+// ── Routing helpers ───────────────────────────────────────────────────────────
+
+fn respond_html(stream: &std::net::TcpStream, status: u16, html: &str) {
+    use std::io::Write;
+    let status_text = match status { 200 => "OK", 404 => "Not Found", _ => "OK" };
+    let body = html.as_bytes();
+    let header = format!(
+        "HTTP/1.1 {status} {status_text}\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let mut s = stream;
+    let _ = s.write_all(header.as_bytes());
+    let _ = s.write_all(body);
+}
+
+fn respond_redirect(stream: &std::net::TcpStream, location: &str) {
+    use std::io::Write;
+    let response = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let mut s = stream;
+    let _ = s.write_all(response.as_bytes());
+}
+
+/// Extract a URL-encoded form field value from a POST body (e.g. `id=5`).
+fn form_field<'a>(body: &'a [u8], field: &str) -> Option<&'a str> {
+    let s = std::str::from_utf8(body).ok()?;
+    let prefix = format!("{field}=");
+    for part in s.split('&') {
+        if let Some(val) = part.strip_prefix(prefix.as_str()) {
+            return Some(val);
+        }
+    }
+    None
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+}
+
+// ── Page renders ─────────────────────────────────────────────────────────────
+
+fn render_dashboard(ctx: &WorkerContext) -> String {
+    let node        = ctx.node.read().unwrap();
+    let device_uuid = node.device_uuid;
+    let device      = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
+
+    let owner_alias  = html_escape(&node.owner.user.alias);
+    let device_alias = html_escape(device.map(|d| d.alias.as_str()).unwrap_or("unknown"));
+    let n_contacts   = node.owner.contact_users.len();
+    let n_apps: usize = node.owner.user.devices.iter().map(|d| d.applications.len()).sum();
+    let n_conns      = node.owner.active_connections.len();
+
+    let body = format!(
+        "<h1>Dashboard</h1>\
+         <div class=\"stats\">\
+           <div class=\"stat-card\"><div class=\"stat\">{n_contacts}</div><div class=\"label\">Contacts</div></div>\
+           <div class=\"stat-card\"><div class=\"stat\">{n_apps}</div><div class=\"label\">Applications</div></div>\
+           <div class=\"stat-card\"><div class=\"stat\">{n_conns}</div><div class=\"label\">Active Connections</div></div>\
+         </div>\
+         <div class=\"card\">\
+           <div class=\"label\">Owner</div><div>{owner_alias}</div>\
+           <div class=\"label\" style=\"margin-top:.5rem\">Device</div><div>{device_alias}</div>\
+         </div>"
+    );
+    layout("Dashboard", &body)
+}
+
+fn render_pending_apps(ctx: &WorkerContext) -> String {
+    let node        = ctx.node.read().unwrap();
+    let device_uuid = node.device_uuid;
+    let device      = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
+
+    let rows: String = device
+        .map(|d| {
+            d.applications.iter()
+                .filter(|a| !a.user_approved)
+                .map(|a| format!(
+                    "<tr>\
+                       <td>{}</td>\
+                       <td>{}</td>\
+                       <td>\
+                         <form method='post' action='/pending-apps/approve'>\
+                           <input type='hidden' name='id' value='{}'>\
+                           <button class='approve' type='submit'>Approve</button>\
+                         </form>\
+                         <form method='post' action='/pending-apps/reject'>\
+                           <input type='hidden' name='id' value='{}'>\
+                           <button class='reject' type='submit'>Reject</button>\
+                         </form>\
+                       </td>\
+                     </tr>",
+                    html_escape(&a.alias),
+                    html_escape(&a.host.to_string()),
+                    a.id,
+                    a.id,
+                ))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let body = if rows.is_empty() {
+        "<h1>Pending Apps</h1><p class='empty'>No pending applications.</p>".to_string()
+    } else {
+        format!(
+            "<h1>Pending Apps</h1>\
+             <table>\
+               <tr><th>Alias</th><th>Host</th><th>Actions</th></tr>\
+               {rows}\
+             </table>"
+        )
+    };
+    layout("Pending Apps", &body)
+}
+
+fn render_applications(ctx: &WorkerContext) -> String {
+    let node        = ctx.node.read().unwrap();
+    let device_uuid = node.device_uuid;
+    let device      = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
+
+    let rows: String = device
+        .map(|d| {
+            d.applications.iter()
+                .filter(|a| a.user_approved)
+                .map(|a| format!(
+                    "<tr><td>{}</td><td>{}</td></tr>",
+                    html_escape(&a.alias),
+                    html_escape(&a.host.to_string()),
+                ))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let body = if rows.is_empty() {
+        "<h1>Applications</h1><p class='empty'>No approved applications.</p>".to_string()
+    } else {
+        format!(
+            "<h1>Applications</h1>\
+             <table>\
+               <tr><th>Alias</th><th>Host</th></tr>\
+               {rows}\
+             </table>"
+        )
+    };
+    layout("Applications", &body)
+}
+
+fn render_contacts(ctx: &WorkerContext) -> String {
+    let node     = ctx.node.read().unwrap();
+    let contacts = &node.owner.contact_users;
+
+    let rows: String = contacts.iter()
+        .map(|c| format!(
+            "<tr><td>{}</td><td>{}</td></tr>",
+            html_escape(&c.user.alias),
+            c.user.devices.len(),
+        ))
+        .collect();
+
+    let body = if rows.is_empty() {
+        "<h1>Contacts</h1><p class='empty'>No contacts yet.</p>".to_string()
+    } else {
+        format!(
+            "<h1>Contacts</h1>\
+             <table>\
+               <tr><th>Alias</th><th>Devices</th></tr>\
+               {rows}\
+             </table>"
+        )
+    };
+    layout("Contacts", &body)
+}
+
+fn render_devices(ctx: &WorkerContext) -> String {
+    let node        = ctx.node.read().unwrap();
+    let device_uuid = node.device_uuid;
+
+    let rows: String = node.owner.user.devices.iter()
+        .map(|d| {
+            let suffix = if d.uuid == device_uuid { " <em>(this device)</em>" } else { "" };
+            format!(
+                "<tr><td>{}{suffix}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&d.alias),
+                html_escape(&d.host.to_string()),
+                d.applications.len(),
+            )
+        })
+        .collect();
+
+    let body = if rows.is_empty() {
+        "<h1>Devices</h1><p class='empty'>No devices.</p>".to_string()
+    } else {
+        format!(
+            "<h1>Devices</h1>\
+             <table>\
+               <tr><th>Alias</th><th>Host</th><th>Apps</th></tr>\
+               {rows}\
+             </table>"
+        )
+    };
+    layout("Devices", &body)
+}
+
+// ── App approval / rejection ──────────────────────────────────────────────────
+
+fn approve_app(body: &[u8], ctx: &WorkerContext) {
+    let Some(id_str) = form_field(body, "id") else { return };
+    let Ok(id) = id_str.parse::<u16>() else { return };
+
+    let mut node        = ctx.node.write().unwrap();
+    let device_uuid     = node.device_uuid;
+    let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else { return };
+    if let Some(app) = device.applications.iter_mut().find(|a| a.id == id) {
+        app.user_approved = true;
+    }
+}
+
+fn reject_app(body: &[u8], ctx: &WorkerContext) {
+    let Some(id_str) = form_field(body, "id") else { return };
+    let Ok(id) = id_str.parse::<u16>() else { return };
+
+    let mut node        = ctx.node.write().unwrap();
+    let device_uuid     = node.device_uuid;
+    let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else { return };
+    device.applications.retain(|a| a.id != id);
+}
+
+// ── HTML layout ───────────────────────────────────────────────────────────────
+
+const CSS: &str = "
+body { font-family: sans-serif; margin: 0; background: #f5f5f5; color: #222; }
+nav { background: #1a1a2e; padding: .75rem 1.5rem; display: flex; align-items: center; gap: 1.5rem; }
+nav a { color: #aac; text-decoration: none; font-size: .9rem; }
+nav a:hover { color: #fff; }
+.brand { color: #fff; font-weight: bold; font-size: 1.1rem; margin-right: 1rem; }
+main { padding: 1.5rem 2rem; max-width: 900px; }
+h1 { margin-top: 0; font-size: 1.4rem; }
+table { border-collapse: collapse; width: 100%; background: white; border-radius: 6px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+th { background: #eee; text-align: left; padding: .6rem 1rem; font-size: .85rem; color: #555; }
+td { padding: .6rem 1rem; border-top: 1px solid #eee; font-size: .9rem; }
+.card { background: white; border-radius: 6px; padding: 1.2rem 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,.1); margin-bottom: 1rem; }
+.stats { display: flex; gap: 1rem; margin-bottom: 1.5rem; }
+.stat-card { background: white; border-radius: 6px; padding: 1rem 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,.1); flex: 1; }
+.stat { font-size: 2rem; font-weight: bold; color: #1a1a2e; }
+.label { font-size: .8rem; color: #888; }
+button { padding: .3rem .8rem; border: none; border-radius: 4px; cursor: pointer; font-size: .85rem; }
+.approve { background: #2d7a3b; color: white; }
+.reject { background: #c0392b; color: white; margin-left: .4rem; }
+form { display: inline; }
+.empty { color: #888; font-style: italic; }
+";
+
+fn layout(title: &str, body: &str) -> String {
+    let mut html = String::with_capacity(4096);
+    html.push_str("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>pNet \u{2014} ");
+    html.push_str(title);
+    html.push_str("</title>\n<style>");
+    html.push_str(CSS);
+    html.push_str("</style>\n</head>\n<body>\n");
+    html.push_str("<nav>\n");
+    html.push_str("  <span class=\"brand\">pNet</span>\n");
+    html.push_str("  <a href=\"/dashboard\">Dashboard</a>\n");
+    html.push_str("  <a href=\"/pending-apps\">Pending Apps</a>\n");
+    html.push_str("  <a href=\"/applications\">Applications</a>\n");
+    html.push_str("  <a href=\"/contacts\">Contacts</a>\n");
+    html.push_str("  <a href=\"/devices\">Devices</a>\n");
+    html.push_str("</nav>\n<main>\n");
+    html.push_str(body);
+    html.push_str("\n</main>\n</body>\n</html>");
+    html
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

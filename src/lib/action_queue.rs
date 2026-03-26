@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::Duration;
 
@@ -15,6 +15,9 @@ pub enum Action {
     AppUpdate     { src: SocketAddr, buf: Vec<u8> },
     AppGetData    { src: SocketAddr, buf: Vec<u8> },
     AppSendPacket { src: SocketAddr, buf: Vec<u8> },
+
+    // From HTTP UI
+    UiRequest { stream: TcpStream, method: String, path: String, query: String, body: Vec<u8> },
 
     // Scheduled
     Heartbeat,
@@ -44,6 +47,9 @@ impl Action {
             Action::AppUpdate     { src, buf } => handlers::app_update(src, buf, ctx),
             Action::AppGetData    { src, buf } => handlers::app_get_data(src, buf, ctx),
             Action::AppSendPacket { src, buf } => handlers::app_send_packet(src, buf, ctx),
+            Action::UiRequest { stream, method, path, query, body } => {
+                handlers::ui_request(stream, method, path, query, body, ctx)
+            }
             Action::Heartbeat                  => handlers::heartbeat(ctx),
             Action::KeyRotation                => handlers::key_rotation(ctx),
             Action::RetryMessage { message_id } => handlers::retry_message(message_id, ctx),
