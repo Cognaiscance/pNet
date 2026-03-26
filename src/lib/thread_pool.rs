@@ -78,3 +78,56 @@ impl Worker {
         Worker { id, thread }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::action_queue::{Action, ActionQueue, WorkerContext};
+
+    fn make_queue() -> SharedQueue {
+        Arc::new((Mutex::new(ActionQueue::new()), Condvar::new()))
+    }
+
+    fn make_ctx() -> Arc<WorkerContext> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Arc::new(WorkerContext { scheduler_tx: tx })
+    }
+
+    fn stop_and_wake(stop: &Arc<AtomicBool>, queue: &SharedQueue) {
+        stop.store(true, Ordering::SeqCst);
+        let (_, cvar) = &**queue;
+        cvar.notify_all();
+    }
+
+    #[test]
+    fn workers_drain_queue_before_stopping() {
+        let queue = make_queue();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut pool = ThreadPool::new(2, Arc::clone(&queue), Arc::clone(&stop), make_ctx());
+
+        {
+            let (lock, cvar) = &*queue;
+            let mut guard = lock.lock().unwrap();
+            for _ in 0..20 {
+                guard.push(0, Action::Heartbeat);
+            }
+            cvar.notify_all();
+        }
+
+        stop_and_wake(&stop, &queue);
+        pool.join();
+
+        let (lock, _) = &*queue;
+        assert!(lock.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn workers_exit_on_empty_queue_with_stop_signal() {
+        let queue = make_queue();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut pool = ThreadPool::new(2, Arc::clone(&queue), Arc::clone(&stop), make_ctx());
+
+        stop_and_wake(&stop, &queue);
+        pool.join(); // must return without deadlocking
+    }
+}

@@ -78,3 +78,53 @@ fn write_atomic(path: &PathBuf, content: &str) -> io::Result<()> {
         Ok(())
     })()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pnet_writer_test_{name}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_atomic_creates_file_with_correct_content() {
+        let dir = test_dir("atomic");
+        let path = dir.join("test.toml");
+
+        write_atomic(&path, "hello = true\n").unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "hello = true\n");
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_tmp_file_on_success() {
+        let dir = test_dir("no_tmp");
+        let path = dir.join("test.toml");
+
+        write_atomic(&path, "x = 1\n").unwrap();
+
+        assert!(!dir.join(".pnet_write_tmp").exists());
+    }
+
+    #[test]
+    fn writer_thread_processes_all_requests_before_shutdown() {
+        let dir = test_dir("thread");
+        let mut writer = WriterThread::start(dir.clone());
+        let tx = writer.sender();
+
+        tx.send(WriteRequest::NodeData("node = true\n".into())).unwrap();
+        tx.send(WriteRequest::AppData("app = true\n".into())).unwrap();
+
+        // Drop tx before joining — join() closes the internal sender, but the
+        // channel stays open until all clones are dropped too.
+        drop(tx);
+        writer.join(); // blocks until channel drained
+
+        assert_eq!(fs::read_to_string(dir.join("node.toml")).unwrap(), "node = true\n");
+        assert_eq!(fs::read_to_string(dir.join("apps.toml")).unwrap(), "app = true\n");
+    }
+}

@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use super::action_queue::{Action, ScheduleRequest, PRIORITY_LOW};
 use super::thread_pool::SharedQueue;
 
-const TICK:                  Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL:    Duration = Duration::from_secs(60);
 const KEY_ROTATION_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -18,9 +17,13 @@ pub struct SchedulerThread {
 impl SchedulerThread {
     /// Start the scheduler thread. Returns the thread handle and a sender that
     /// action handlers can use to schedule one-shot future work.
+    ///
+    /// `tick` controls how often the scheduler wakes to check for due jobs.
+    /// Pass `Duration::from_secs(1)` in production and a short duration in tests.
     pub fn start(
         queue: SharedQueue,
         stop: Arc<AtomicBool>,
+        tick: Duration,
     ) -> (SchedulerThread, mpsc::Sender<ScheduleRequest>) {
         let (tx, rx) = mpsc::channel::<ScheduleRequest>();
 
@@ -32,7 +35,7 @@ impl SchedulerThread {
             let mut pending: Vec<(Instant, Action)> = Vec::new();
 
             while !stop.load(Ordering::Acquire) {
-                thread::sleep(TICK);
+                thread::sleep(tick);
 
                 let now = Instant::now();
 
@@ -79,5 +82,58 @@ impl SchedulerThread {
 
     pub fn join(self) {
         self.handle.join().expect("scheduler thread panicked");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Condvar, Mutex};
+    use super::super::action_queue::{Action, ActionQueue, ScheduleRequest};
+
+    fn make_queue() -> SharedQueue {
+        Arc::new((Mutex::new(ActionQueue::new()), Condvar::new()))
+    }
+
+    #[test]
+    fn one_shot_request_fires_after_delay() {
+        let queue = make_queue();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (scheduler, tx) = SchedulerThread::start(
+            Arc::clone(&queue),
+            Arc::clone(&stop),
+            Duration::from_millis(10),
+        );
+
+        tx.send(ScheduleRequest {
+            action: Action::Heartbeat,
+            delay:  Duration::from_millis(20),
+        })
+        .unwrap();
+
+        // Wait long enough for at least one tick after the delay elapses.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let (lock, _) = &*queue;
+        let guard = lock.lock().unwrap();
+        assert!(!guard.is_empty(), "action should have been enqueued by now");
+
+        stop.store(true, Ordering::SeqCst);
+        drop(guard);
+        scheduler.join();
+    }
+
+    #[test]
+    fn stop_signal_exits_cleanly() {
+        let queue = make_queue();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (scheduler, _tx) = SchedulerThread::start(
+            Arc::clone(&queue),
+            Arc::clone(&stop),
+            Duration::from_millis(10),
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        scheduler.join(); // must return without deadlocking
     }
 }

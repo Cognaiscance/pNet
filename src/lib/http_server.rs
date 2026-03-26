@@ -6,17 +6,15 @@ use std::time::Duration;
 
 use super::thread_pool::SharedQueue;
 
-const HTTP_ADDR: &str = "127.0.0.1:8080";
-
 pub struct HttpServer {
     handle: thread::JoinHandle<()>,
 }
 
 impl HttpServer {
-    pub fn start(queue: SharedQueue, stop: Arc<AtomicBool>) -> HttpServer {
+    pub fn start(port: u16, queue: SharedQueue, stop: Arc<AtomicBool>) -> HttpServer {
         let handle = thread::spawn(move || {
-            let listener = TcpListener::bind(HTTP_ADDR)
-                .unwrap_or_else(|e| panic!("HTTP bind on {HTTP_ADDR} failed: {e}"));
+            let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
+                .unwrap_or_else(|e| panic!("HTTP bind on 127.0.0.1:{port} failed: {e}"));
             listener
                 .set_nonblocking(true)
                 .expect("set_nonblocking failed");
