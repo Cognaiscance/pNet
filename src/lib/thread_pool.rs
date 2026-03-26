@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -10,16 +11,22 @@ pub struct ThreadPool {
 }
 
 impl ThreadPool {
-    pub fn new(size: usize, queue: SharedQueue) -> ThreadPool {
+    pub fn new(size: usize, queue: SharedQueue, stop: Arc<AtomicBool>) -> ThreadPool {
         assert!(size > 0);
-
         let mut workers = Vec::with_capacity(size);
-
         for id in 0..size {
-            workers.push(Worker::new(id, Arc::clone(&queue)));
+            workers.push(Worker::new(id, Arc::clone(&queue), Arc::clone(&stop)));
         }
-
         ThreadPool { workers }
+    }
+
+    /// Drain the queue and wait for all workers to exit.
+    /// Caller must have already set the stop flag and called `cvar.notify_all()`
+    /// to wake any workers sleeping on an empty queue.
+    pub fn join(&mut self) {
+        for worker in self.workers.drain(..) {
+            worker.thread.join().expect("worker thread panicked");
+        }
     }
 }
 
@@ -29,20 +36,26 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(id: usize, queue: SharedQueue) -> Worker {
+    fn new(id: usize, queue: SharedQueue, stop: Arc<AtomicBool>) -> Worker {
         let thread = thread::spawn(move || {
             let (lock, cvar) = &*queue;
             let mut guard = lock.lock().unwrap();
 
             loop {
-                while guard.is_empty() {
+                // Sleep while queue is empty and stop hasn't been signalled.
+                while guard.is_empty() && !stop.load(Ordering::Acquire) {
                     guard = cvar.wait(guard).unwrap();
+                }
+
+                // Exit when stopped and nothing left to process.
+                if guard.is_empty() {
+                    return;
                 }
 
                 let action = guard.pop().unwrap();
                 drop(guard);
 
-                (action.handler)();
+                action.dispatch();
 
                 guard = lock.lock().unwrap();
             }

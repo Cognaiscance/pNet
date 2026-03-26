@@ -1,7 +1,34 @@
-pub struct Action {
-    pub name: String,
-    pub id: String,
-    pub handler: Box<dyn FnOnce() + Send + 'static>,
+use std::net::SocketAddr;
+
+pub const PRIORITY_HIGH:   u8 = 0;
+pub const PRIORITY_NORMAL: u8 = 1;
+pub const PRIORITY_LOW:    u8 = 2;
+
+pub enum Action {
+    // From local apps (op byte in first byte of UDP packet)
+    AppRegister   { src: SocketAddr, buf: Vec<u8> },
+    AppUpdate     { src: SocketAddr, buf: Vec<u8> },
+    AppGetData    { src: SocketAddr, buf: Vec<u8> },
+    AppSendPacket { src: SocketAddr, buf: Vec<u8> },
+
+    // Scheduled
+    Heartbeat,
+    KeyRotation,
+    RetryMessage { message_id: u64 },
+}
+
+impl Action {
+    pub fn dispatch(self) {
+        match self {
+            Action::AppRegister   { src, buf } => { let _ = (src, buf); /* TODO */ }
+            Action::AppUpdate     { src, buf } => { let _ = (src, buf); /* TODO */ }
+            Action::AppGetData    { src, buf } => { let _ = (src, buf); /* TODO */ }
+            Action::AppSendPacket { src, buf } => { let _ = (src, buf); /* TODO */ }
+            Action::Heartbeat                  => { /* TODO */ }
+            Action::KeyRotation                => { /* TODO */ }
+            Action::RetryMessage { message_id } => { let _ = message_id; /* TODO */ }
+        }
+    }
 }
 
 pub struct ActionQueue {
@@ -11,7 +38,7 @@ pub struct ActionQueue {
 impl ActionQueue {
     pub fn new() -> Self {
         ActionQueue {
-            buckets: Default::default(),
+            buckets: std::array::from_fn(|_| Vec::new()),
         }
     }
 
@@ -37,10 +64,14 @@ impl ActionQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    fn action(name: &str) -> Action {
-        Action { name: name.to_string(), id: name.to_string(), handler: Box::new(|| {}) }
+    fn addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000)
     }
+
+    fn reg() -> Action { Action::AppRegister { src: addr(), buf: vec![] } }
+    fn upd() -> Action { Action::AppUpdate   { src: addr(), buf: vec![] } }
 
     #[test]
     fn pop_empty_returns_none() {
@@ -51,44 +82,44 @@ mod tests {
     #[test]
     fn push_and_pop_single() {
         let mut q = ActionQueue::new();
-        q.push(0, action("a"));
-        assert_eq!(q.pop().unwrap().name, "a");
+        q.push(0, reg());
+        assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
         assert!(q.pop().is_none());
     }
 
     #[test]
     fn lower_priority_popped_first() {
         let mut q = ActionQueue::new();
-        q.push(3, action("low"));
-        q.push(0, action("high"));
-        assert_eq!(q.pop().unwrap().name, "high");
-        assert_eq!(q.pop().unwrap().name, "low");
+        q.push(3, Action::Heartbeat);
+        q.push(0, reg());
+        assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+        assert!(matches!(q.pop().unwrap(), Action::Heartbeat));
     }
 
     #[test]
     fn fifo_within_same_priority() {
         let mut q = ActionQueue::new();
-        q.push(1, action("first"));
-        q.push(1, action("second"));
-        assert_eq!(q.pop().unwrap().name, "first");
-        assert_eq!(q.pop().unwrap().name, "second");
+        q.push(1, reg());
+        q.push(1, upd());
+        assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+        assert!(matches!(q.pop().unwrap(), Action::AppUpdate   { .. }));
     }
 
     #[test]
     fn drains_bucket_before_next() {
         let mut q = ActionQueue::new();
-        q.push(0, action("a0"));
-        q.push(0, action("b0"));
-        q.push(1, action("a1"));
-        assert_eq!(q.pop().unwrap().name, "a0");
-        assert_eq!(q.pop().unwrap().name, "b0");
-        assert_eq!(q.pop().unwrap().name, "a1");
+        q.push(0, reg());
+        q.push(0, upd());
+        q.push(1, Action::Heartbeat);
+        assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+        assert!(matches!(q.pop().unwrap(), Action::AppUpdate   { .. }));
+        assert!(matches!(q.pop().unwrap(), Action::Heartbeat));
     }
 
     #[test]
     #[should_panic]
     fn push_invalid_priority_panics() {
         let mut q = ActionQueue::new();
-        q.push(8, action("bad"));
+        q.push(8, reg());
     }
 }
