@@ -1,5 +1,6 @@
 pub mod action_queue;
 pub mod data_models;
+pub mod handlers;
 pub mod http_server;
 pub mod scheduler;
 pub mod thread_pool;

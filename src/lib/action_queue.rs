@@ -1,6 +1,9 @@
-use std::net::SocketAddr;
-use std::sync::mpsc;
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::{mpsc, Arc, RwLock};
 use std::time::Duration;
+
+use super::data_models::Node;
+use super::writer::WriteRequest;
 
 pub const PRIORITY_HIGH:   u8 = 0;
 pub const PRIORITY_NORMAL: u8 = 1;
@@ -27,19 +30,23 @@ pub struct ScheduleRequest {
 
 /// Shared context passed to every action handler.
 pub struct WorkerContext {
+    pub node:         Arc<RwLock<Node>>,
+    pub udp_socket:   Arc<UdpSocket>,
+    pub writer_tx:    mpsc::SyncSender<WriteRequest>,
     pub scheduler_tx: mpsc::Sender<ScheduleRequest>,
 }
 
 impl Action {
     pub fn dispatch(self, ctx: &WorkerContext) {
+        use super::handlers;
         match self {
-            Action::AppRegister   { src, buf } => { let _ = (src, buf, ctx); /* TODO */ }
-            Action::AppUpdate     { src, buf } => { let _ = (src, buf, ctx); /* TODO */ }
-            Action::AppGetData    { src, buf } => { let _ = (src, buf, ctx); /* TODO */ }
-            Action::AppSendPacket { src, buf } => { let _ = (src, buf, ctx); /* TODO */ }
-            Action::Heartbeat                  => { /* TODO */ }
-            Action::KeyRotation                => { /* TODO */ }
-            Action::RetryMessage { message_id } => { let _ = message_id; /* TODO */ }
+            Action::AppRegister   { src, buf } => handlers::app_register(src, buf, ctx),
+            Action::AppUpdate     { src, buf } => handlers::app_update(src, buf, ctx),
+            Action::AppGetData    { src, buf } => handlers::app_get_data(src, buf, ctx),
+            Action::AppSendPacket { src, buf } => handlers::app_send_packet(src, buf, ctx),
+            Action::Heartbeat                  => handlers::heartbeat(ctx),
+            Action::KeyRotation                => handlers::key_rotation(ctx),
+            Action::RetryMessage { message_id } => handlers::retry_message(message_id, ctx),
         }
     }
 }

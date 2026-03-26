@@ -89,8 +89,19 @@ mod tests {
     }
 
     fn make_ctx() -> Arc<WorkerContext> {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        Arc::new(WorkerContext { scheduler_tx: tx })
+        use std::net::UdpSocket;
+        use std::sync::RwLock;
+        use super::super::data_models::Node;
+        use super::super::writer::WriteRequest;
+
+        let (scheduler_tx, _sched_rx) = std::sync::mpsc::channel();
+        let (writer_tx, _writer_rx)   = std::sync::mpsc::sync_channel::<WriteRequest>(16);
+        Arc::new(WorkerContext {
+            node:         Arc::new(RwLock::new(Node::new())),
+            udp_socket:   Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            writer_tx,
+            scheduler_tx,
+        })
     }
 
     fn stop_and_wake(stop: &Arc<AtomicBool>, queue: &SharedQueue) {

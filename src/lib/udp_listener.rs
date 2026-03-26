@@ -14,26 +14,31 @@ pub struct UdpListener {
     /// The address the socket is actually bound to. Useful when port 0 was
     /// requested and the OS assigned an ephemeral port.
     pub local_addr: SocketAddr,
+    /// Shared with workers so they can send replies on the same socket.
+    pub socket: Arc<UdpSocket>,
     handle: thread::JoinHandle<()>,
 }
 
 impl UdpListener {
     pub fn start(port: u16, queue: SharedQueue, stop: Arc<AtomicBool>) -> UdpListener {
-        // Bind before spawning so callers can read `local_addr` immediately.
+        // Bind before spawning so `local_addr` and `socket` are available immediately.
         let addr = format!("0.0.0.0:{port}");
-        let socket = UdpSocket::bind(&addr)
-            .unwrap_or_else(|e| panic!("UDP bind on {addr} failed: {e}"));
+        let socket = Arc::new(
+            UdpSocket::bind(&addr)
+                .unwrap_or_else(|e| panic!("UDP bind on {addr} failed: {e}")),
+        );
         socket
             .set_read_timeout(Some(READ_TIMEOUT))
             .expect("set_read_timeout failed");
         let local_addr = socket.local_addr().unwrap();
 
+        let socket_for_thread = Arc::clone(&socket);
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*queue;
             let mut buf = [0u8; 512];
 
             while !stop.load(Ordering::Acquire) {
-                let (len, src) = match socket.recv_from(&mut buf) {
+                let (len, src) = match socket_for_thread.recv_from(&mut buf) {
                     Ok(r) => r,
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
@@ -71,7 +76,7 @@ impl UdpListener {
             }
         });
 
-        UdpListener { local_addr, handle }
+        UdpListener { local_addr, socket, handle }
     }
 
     pub fn join(self) {
@@ -117,7 +122,6 @@ mod tests {
 
             send_packet(udp.local_addr, &[*op, 0xAA, 0xBB]);
 
-            // Poll until the action appears (up to 500 ms).
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
             loop {
                 {
@@ -144,7 +148,7 @@ mod tests {
         let udp = UdpListener::start(0, Arc::clone(&queue), Arc::clone(&stop));
 
         send_packet(udp.local_addr, &[0xFF, 0x01]);
-        std::thread::sleep(Duration::from_millis(150)); // one read-timeout cycle
+        std::thread::sleep(Duration::from_millis(150));
 
         let (lock, _) = &*queue;
         assert!(lock.lock().unwrap().is_empty(), "unknown op should be dropped");
@@ -160,6 +164,6 @@ mod tests {
         let udp = UdpListener::start(0, Arc::clone(&queue), Arc::clone(&stop));
 
         stop.store(true, Ordering::SeqCst);
-        udp.join(); // must return without deadlocking
+        udp.join();
     }
 }
