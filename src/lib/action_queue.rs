@@ -57,14 +57,20 @@ impl Action {
     }
 }
 
+/// After this many consecutive bucket-0 pops, the next pop yields to the
+/// highest-priority non-zero bucket that has work, preventing starvation.
+const STARVATION_THRESHOLD: usize = 20;
+
 pub struct ActionQueue {
-    buckets: [Vec<Action>; 8],
+    buckets:     [Vec<Action>; 8],
+    high_streak: usize,
 }
 
 impl ActionQueue {
     pub fn new() -> Self {
         ActionQueue {
-            buckets: std::array::from_fn(|_| Vec::new()),
+            buckets:     std::array::from_fn(|_| Vec::new()),
+            high_streak: 0,
         }
     }
 
@@ -78,8 +84,25 @@ impl ActionQueue {
     }
 
     pub fn pop(&mut self) -> Option<Action> {
-        for bucket in &mut self.buckets {
+        // Starvation guard: after STARVATION_THRESHOLD consecutive bucket-0
+        // pops, yield to the next non-empty lower-priority bucket.
+        if self.high_streak >= STARVATION_THRESHOLD {
+            for bucket in &mut self.buckets[1..] {
+                if !bucket.is_empty() {
+                    self.high_streak = 0;
+                    return Some(bucket.remove(0));
+                }
+            }
+            // Nothing in lower buckets; fall through to normal priority order.
+        }
+
+        for (i, bucket) in self.buckets.iter_mut().enumerate() {
             if !bucket.is_empty() {
+                if i == 0 {
+                    self.high_streak += 1;
+                } else {
+                    self.high_streak = 0;
+                }
                 return Some(bucket.remove(0));
             }
         }
@@ -147,5 +170,67 @@ mod tests {
     fn push_invalid_priority_panics() {
         let mut q = ActionQueue::new();
         q.push(8, reg());
+    }
+
+    // ── Starvation prevention ─────────────────────────────────────────────────
+
+    #[test]
+    fn starvation_guard_yields_to_lower_priority_after_threshold() {
+        let mut q = ActionQueue::new();
+
+        // Fill bucket 0 beyond the threshold and add one low-priority item.
+        for _ in 0..STARVATION_THRESHOLD {
+            q.push(0, reg());
+        }
+        q.push(1, Action::Heartbeat); // the item that must not starve
+
+        // First STARVATION_THRESHOLD pops should all be bucket-0 items.
+        for _ in 0..STARVATION_THRESHOLD {
+            assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+        }
+
+        // The very next pop must yield the lower-priority item.
+        assert!(matches!(q.pop().unwrap(), Action::Heartbeat));
+    }
+
+    #[test]
+    fn starvation_streak_resets_after_lower_priority_pop() {
+        let mut q = ActionQueue::new();
+
+        // Burn through the threshold.
+        for _ in 0..STARVATION_THRESHOLD {
+            q.push(0, reg());
+        }
+        q.push(1, Action::Heartbeat);
+        for _ in 0..STARVATION_THRESHOLD {
+            q.pop();
+        }
+        q.pop(); // yields Heartbeat, streak resets to 0
+
+        // Queue is empty; add fewer than STARVATION_THRESHOLD high-priority
+        // items — they should all pop normally without triggering the guard.
+        for _ in 0..STARVATION_THRESHOLD - 1 {
+            q.push(0, reg());
+        }
+        q.push(1, Action::KeyRotation);
+        for _ in 0..STARVATION_THRESHOLD - 1 {
+            assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+        }
+        // KeyRotation should still be in the queue (streak hasn't hit threshold yet).
+        assert!(matches!(q.pop().unwrap(), Action::KeyRotation));
+    }
+
+    #[test]
+    fn starvation_guard_falls_through_when_no_lower_priority_work() {
+        let mut q = ActionQueue::new();
+
+        // Only bucket-0 items; guard should not block them even after threshold.
+        for _ in 0..=STARVATION_THRESHOLD {
+            q.push(0, reg());
+        }
+        for _ in 0..=STARVATION_THRESHOLD {
+            assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+        }
+        assert!(q.pop().is_none());
     }
 }
