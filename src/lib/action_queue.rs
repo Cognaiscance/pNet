@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+use std::sync::mpsc;
+use std::time::Duration;
 
 pub const PRIORITY_HIGH:   u8 = 0;
 pub const PRIORITY_NORMAL: u8 = 1;
@@ -17,13 +19,24 @@ pub enum Action {
     RetryMessage { message_id: u64 },
 }
 
+/// Sent by an action handler to schedule future work.
+pub struct ScheduleRequest {
+    pub action: Action,
+    pub delay:  Duration,
+}
+
+/// Shared context passed to every action handler.
+pub struct WorkerContext {
+    pub scheduler_tx: mpsc::Sender<ScheduleRequest>,
+}
+
 impl Action {
-    pub fn dispatch(self) {
+    pub fn dispatch(self, ctx: &WorkerContext) {
         match self {
-            Action::AppRegister   { src, buf } => { let _ = (src, buf); /* TODO */ }
-            Action::AppUpdate     { src, buf } => { let _ = (src, buf); /* TODO */ }
-            Action::AppGetData    { src, buf } => { let _ = (src, buf); /* TODO */ }
-            Action::AppSendPacket { src, buf } => { let _ = (src, buf); /* TODO */ }
+            Action::AppRegister   { src, buf } => { let _ = (src, buf, ctx); /* TODO */ }
+            Action::AppUpdate     { src, buf } => { let _ = (src, buf, ctx); /* TODO */ }
+            Action::AppGetData    { src, buf } => { let _ = (src, buf, ctx); /* TODO */ }
+            Action::AppSendPacket { src, buf } => { let _ = (src, buf, ctx); /* TODO */ }
             Action::Heartbeat                  => { /* TODO */ }
             Action::KeyRotation                => { /* TODO */ }
             Action::RetryMessage { message_id } => { let _ = message_id; /* TODO */ }

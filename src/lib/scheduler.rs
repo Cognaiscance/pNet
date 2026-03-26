@@ -1,9 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::action_queue::{Action, PRIORITY_LOW};
+use super::action_queue::{Action, ScheduleRequest, PRIORITY_LOW};
 use super::thread_pool::SharedQueue;
 
 const TICK:                  Duration = Duration::from_secs(1);
@@ -15,31 +16,57 @@ pub struct SchedulerThread {
 }
 
 impl SchedulerThread {
-    pub fn start(queue: SharedQueue, stop: Arc<AtomicBool>) -> SchedulerThread {
+    /// Start the scheduler thread. Returns the thread handle and a sender that
+    /// action handlers can use to schedule one-shot future work.
+    pub fn start(
+        queue: SharedQueue,
+        stop: Arc<AtomicBool>,
+    ) -> (SchedulerThread, mpsc::Sender<ScheduleRequest>) {
+        let (tx, rx) = mpsc::channel::<ScheduleRequest>();
+
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*queue;
 
             let mut last_heartbeat    = Instant::now();
             let mut last_key_rotation = Instant::now();
+            let mut pending: Vec<(Instant, Action)> = Vec::new();
 
             while !stop.load(Ordering::Acquire) {
                 thread::sleep(TICK);
 
                 let now = Instant::now();
-                let mut due: Vec<Action> = Vec::new();
 
+                // Pick up any new one-shot requests from action handlers.
+                while let Ok(req) = rx.try_recv() {
+                    pending.push((now + req.delay, req.action));
+                }
+
+                let mut to_enqueue: Vec<Action> = Vec::new();
+
+                // Recurring jobs.
                 if now.duration_since(last_heartbeat) >= HEARTBEAT_INTERVAL {
-                    due.push(Action::Heartbeat);
+                    to_enqueue.push(Action::Heartbeat);
                     last_heartbeat = now;
                 }
                 if now.duration_since(last_key_rotation) >= KEY_ROTATION_INTERVAL {
-                    due.push(Action::KeyRotation);
+                    to_enqueue.push(Action::KeyRotation);
                     last_key_rotation = now;
                 }
 
-                if !due.is_empty() {
+                // One-shot pending jobs — drain those that are due.
+                let mut remaining = Vec::new();
+                for (due_at, action) in pending.drain(..) {
+                    if now >= due_at {
+                        to_enqueue.push(action);
+                    } else {
+                        remaining.push((due_at, action));
+                    }
+                }
+                pending = remaining;
+
+                if !to_enqueue.is_empty() {
                     let mut guard = lock.lock().unwrap();
-                    for action in due {
+                    for action in to_enqueue {
                         guard.push(PRIORITY_LOW, action);
                     }
                     cvar.notify_all();
@@ -47,7 +74,7 @@ impl SchedulerThread {
             }
         });
 
-        SchedulerThread { handle }
+        (SchedulerThread { handle }, tx)
     }
 
     pub fn join(self) {
