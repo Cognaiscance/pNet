@@ -1,14 +1,18 @@
 {
 	"directoryView": {
 		"openDirectories": [],
-		"selection": [],
+		"selection": [
+			"FILES/Data transport diagram.md"
+		],
 		"sortMode": "name|ascending",
 		"sortFoldersToTop": true,
 		"sortQueriesToTop": true
 	},
 	"tagTreeView": {
 		"openDirectories": [],
-		"selection": [],
+		"selection": [
+			"FILES/Data transport diagram.md"
+		],
 		"sortMode": "name|ascending",
 		"sortFoldersToTop": true,
 		"sortQueriesToTop": true
@@ -20,17 +24,17 @@
 		"lastFocusedMode": 0,
 		"currentTab": "files"
 	},
-	"targetFocusModeLevel": 2,
+	"targetFocusModeLevel": 1,
 	"system": {
 		"showMenu": false,
 		"section": null
 	},
 	"version": 3,
 	"window_state": {
-		"x": 1599,
-		"y": 549,
-		"width": 1536,
-		"height": 891,
+		"x": 0,
+		"y": 37,
+		"width": 2304,
+		"height": 1259,
 		"fullscreen": false
 	}
 }

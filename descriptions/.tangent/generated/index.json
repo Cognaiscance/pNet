@@ -1,28 +1,16 @@
 {
 	"version": 1,
-	"date": "2026-03-17T15:20:14.168Z",
+	"date": "2026-03-27T19:41:18.284Z",
 	"items": {
-		"FILES/.tangent/tags": {
-			"uuid": "1f122125-d420-6700-8958-c3213c7c81f6"
+		"FILES/.tangent/tangents/sanosuke_0/state": {
+			"uuid": "1f129fba-03df-60a0-9148-34a3a02bd9da"
 		},
-		"FILES/.tangent/tangents": {
-			"uuid": "1f122125-d420-6701-8489-e7a08f0427da"
-		},
-		"FILES/.tangent/tangents/sanosuke_0": {
-			"uuid": "1f122125-d473-6720-a10e-743cc33b7acd"
-		},
-		"FILES/.tangent/tangents/sanosuke_0/sessions": {
-			"uuid": "1f122125-d75e-6840-b253-716a1ed56a7e"
-		},
-		"FILES/.tangent/tangents/sanosuke_0/sessions/2026-3-17_9-2-49.tangentsession": {
-			"uuid": "1f122125-d75e-6841-b064-88e19735c05f"
-		},
-		"FILES/.tangent/tangents/sanosuke_0/tangent.json": {
-			"uuid": "1f122125-d473-6721-b776-114c56466e67"
+		"FILES/.tangent/tangents/sanosuke_0/state/1f122125-b5b6-6cb0-853c-30608355c700.noteview": {
+			"uuid": "1f129fba-03df-60a1-907b-180a4d4b7206"
 		},
 		"FILES/Data Models.md": {
 			"uuid": "1f122125-b5cc-6c40-956a-a03b57b8e2a4",
-			"modified": "2026-03-16T20:56:00.835Z",
+			"modified": "2026-03-23T23:31:56.580Z",
 			"structure": [
 				{
 					"type": 2,
@@ -34,61 +22,151 @@
 				{
 					"type": 2,
 					"level": 1,
-					"text": "User",
+					"text": "Owner",
 					"start": 152,
-					"end": 158
+					"end": 159
 				},
 				{
 					"type": 2,
 					"level": 1,
-					"text": "Owner",
-					"start": 272,
-					"end": 279
+					"text": "User",
+					"start": 577,
+					"end": 583
 				},
 				{
 					"type": 2,
 					"level": 1,
 					"text": "Contact",
-					"start": 388,
-					"end": 397
+					"start": 697,
+					"end": 706
+				},
+				{
+					"type": 2,
+					"level": 1,
+					"text": "Invitation",
+					"start": 847,
+					"end": 859
 				},
 				{
 					"type": 2,
 					"level": 1,
 					"text": "Device",
-					"start": 456,
-					"end": 464
-				},
-				{
-					"type": 2,
-					"level": 1,
-					"text": "KeyPair",
-					"start": 620,
-					"end": 629
-				},
-				{
-					"type": 2,
-					"level": 1,
-					"text": "EphemeralKeyExchange",
-					"start": 754,
-					"end": 776
+					"start": 955,
+					"end": 963
 				},
 				{
 					"type": 2,
 					"level": 1,
 					"text": "Application",
-					"start": 886,
-					"end": 899
+					"start": 1128,
+					"end": 1141
+				},
+				{
+					"type": 2,
+					"level": 1,
+					"text": "KeyPair",
+					"start": 1464,
+					"end": 1473
+				},
+				{
+					"type": 2,
+					"level": 1,
+					"text": "ActiveConnection",
+					"start": 1673,
+					"end": 1691
 				}
 			]
 		},
 		"FILES/Data transport diagram.md": {
 			"uuid": "1f122125-b5b6-6cb0-853c-30608355c700",
-			"modified": "2026-03-16T22:48:13.001Z"
+			"modified": "2026-03-27T16:20:05.353Z"
+		},
+		"FILES/administration UI.md": {
+			"uuid": "1f129fb9-cbb0-6b70-b5c6-29eb4b08787a",
+			"modified": "2026-03-24T22:53:48.838Z",
+			"structure": [
+				{
+					"type": 2,
+					"level": 1,
+					"text": "Administration UI",
+					"start": 0,
+					"end": 19
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Access & Authentication",
+					"start": 158,
+					"end": 184
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Pages",
+					"start": 369,
+					"end": 377
+				},
+				{
+					"type": 2,
+					"level": 3,
+					"text": "Setup first run",
+					"start": 379,
+					"end": 400
+				},
+				{
+					"type": 2,
+					"level": 3,
+					"text": "Dashboard",
+					"start": 516,
+					"end": 529
+				},
+				{
+					"type": 2,
+					"level": 3,
+					"text": "Pending Apps",
+					"start": 766,
+					"end": 782
+				},
+				{
+					"type": 2,
+					"level": 3,
+					"text": "Applications",
+					"start": 928,
+					"end": 944
+				},
+				{
+					"type": 2,
+					"level": 3,
+					"text": "Contacts",
+					"start": 1061,
+					"end": 1073
+				},
+				{
+					"type": 2,
+					"level": 3,
+					"text": "Devices",
+					"start": 1181,
+					"end": 1192
+				},
+				{
+					"type": 2,
+					"level": 3,
+					"text": "Activity Log",
+					"start": 1416,
+					"end": 1432
+				},
+				{
+					"type": 2,
+					"level": 3,
+					"text": "Invitations",
+					"start": 1702,
+					"end": 1717
+				}
+			]
 		},
 		"FILES/communication methods.md": {
 			"uuid": "1f122125-b5d1-6a60-8c29-5c2d8d6a350b",
-			"modified": "2026-03-16T23:10:01.361Z",
+			"modified": "2026-03-24T22:20:06.104Z",
 			"structure": [
 				{
 					"type": 2,
@@ -96,6 +174,143 @@
 					"text": "Processing of communications",
 					"start": 0,
 					"end": 30
+				}
+			]
+		},
+		"FILES/data persistence.md": {
+			"uuid": "1f129fb9-cbb8-60a0-948a-20512f510cef",
+			"modified": "2026-03-25T21:52:58.573Z",
+			"structure": [
+				{
+					"type": 2,
+					"level": 1,
+					"text": "Data Persistence",
+					"start": 0,
+					"end": 18
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "In-memory",
+					"start": 20,
+					"end": 32
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "On-disk format",
+					"start": 196,
+					"end": 213
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "File layout and permissions",
+					"start": 340,
+					"end": 370
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Decisions",
+					"start": 687,
+					"end": 699
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Thread safety and disk writes",
+					"start": 966,
+					"end": 998
+				}
+			]
+		},
+		"FILES/main program loop.md": {
+			"uuid": "1f129fb9-cbbc-6ec0-a4a1-3c5ab877b401",
+			"modified": "2026-03-25T21:56:17.153Z",
+			"structure": [
+				{
+					"type": 2,
+					"level": 1,
+					"text": "Main Program Loop",
+					"start": 0,
+					"end": 19
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Queue",
+					"start": 201,
+					"end": 209
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Producers",
+					"start": 1348,
+					"end": 1360
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Workers",
+					"start": 1958,
+					"end": 1968
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Scheduler",
+					"start": 2180,
+					"end": 2192
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Startup Shutdown",
+					"start": 2375,
+					"end": 2396
+				}
+			]
+		},
+		"FILES/pnet to pnet communication.md": {
+			"uuid": "1f129fb9-cbc1-6ce0-93f5-9ca07a9a96f6",
+			"modified": "2026-03-24T22:51:08.872Z",
+			"structure": [
+				{
+					"type": 2,
+					"level": 1,
+					"text": "pNet to pNet Communication",
+					"start": 0,
+					"end": 28
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Constraints",
+					"start": 176,
+					"end": 190
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Active Connections",
+					"start": 295,
+					"end": 316
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Packet Structure",
+					"start": 847,
+					"end": 866
+				},
+				{
+					"type": 2,
+					"level": 2,
+					"text": "Administration Operations",
+					"start": 1379,
+					"end": 1407
 				}
 			]
 		}

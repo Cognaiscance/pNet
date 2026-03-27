@@ -9,7 +9,7 @@ The queue has priority buckets. When a worker thread is ready, it checks the hig
 Priority levels (high → low):
 - **high** — inbound UDP packets (time-sensitive, peer may be waiting)
 - **normal** — UI/API requests
-- **low** — scheduled/maintenance tasks (retries, heartbeats, key rotation, etc.)
+- **low** — scheduled/maintenance tasks (retries, key rotation, SG polling, etc.)
 
 Each item in the queue is a variant of the `Action` enum — one variant per action type. This keeps all action types centralized and avoids heap allocation per item.
 
@@ -28,8 +28,8 @@ Known action variants:
 - *(to be defined)*
 
 **Scheduled:**
-- `Heartbeat` — ping peers
-- `KeyRotation` — renegotiate expiring ephemeral keys
+- `KeyRotation` — rotate ephemeral keys on a fixed timer (see background systems.md)
+- `PollSG` — ping candidate SGs to measure RTT and detect downtime (see background systems.md)
 - `RetryMessage` — retry an unACKed outbound message
 
 ## Producers
@@ -38,7 +38,7 @@ Things that put items into the queue:
 
 - **UDP listener** — receives a raw packet, reads the op byte to determine the action type, wraps the sender's socket address and raw bytes into the appropriate `Action` variant, and enqueues it. Parsing and processing happen in the worker.
 - **HTTP handlers** (API + UI) — on request, wrap the work as a normal-priority action and enqueue it; the handler waits for the result to send a response
-- **Scheduler** — a lightweight loop that wakes up periodically and enqueues low-priority actions whose time has come (retries, heartbeats, EKE rotation, etc.)
+- **Scheduler** — a lightweight loop that wakes up periodically and enqueues low-priority actions whose time has come (retries, key rotation, SG polling, etc.)
 
 ## Workers
 

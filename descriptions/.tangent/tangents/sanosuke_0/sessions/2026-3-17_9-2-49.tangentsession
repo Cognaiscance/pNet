@@ -1,9 +1,23 @@
 {
-	"threadHistory": [],
-	"threadIndex": -1,
+	"threadHistory": [
+		{
+			"thread": [
+				"FILES/Data transport diagram.md"
+			],
+			"currentNode": "FILES/Data transport diagram.md"
+		}
+	],
+	"threadIndex": 0,
 	"previousSession": "",
 	"map": {
-		"nodes": {},
+		"nodes": {
+			"FILES/Data transport diagram.md": {
+				"node": "FILES/Data transport diagram.md",
+				"isRoot": true,
+				"strength": 2,
+				"dateCreated": "2026-03-27T16:40:12.715Z"
+			}
+		},
 		"connections": []
 	},
 	"version": 1

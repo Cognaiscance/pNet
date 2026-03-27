@@ -36,6 +36,6 @@ The following operations are used to manage the state of the network. They are y
 * **Initializing a contact or device** — establishing a new active connection with a newly added contact or device
 * **Ephemeral key update** — refreshing the ephemeral key in an existing active connection
 * **Generating a new ephemeral key** — initiating a fresh key exchange
-  * Key rotation should be handled automatically by a scheduled background task. The owner should not need to manage this manually.
+  * Key rotation is handled automatically by a time-based background task on a fixed schedule, independent of any network activity. See background systems.md.
 * **Updating contact or device details** — propagating changes such as a new host address
 * **Synchronizing user data** — keeping pNet nodes owned by the same user consistent with each other. This should be handled automatically by a background task. Implementation not yet defined.
