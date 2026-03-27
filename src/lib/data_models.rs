@@ -35,6 +35,7 @@ pub struct ActiveConnection {
 pub struct Application {
     pub id:            u16,
     pub alias:         String,
+    pub protocol:      String,
     pub host:          SocketAddrV4,
     pub user_approved: bool,
     pub token:         Uuid,

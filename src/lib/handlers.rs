@@ -32,6 +32,7 @@ fn ipv4_from(addr: SocketAddr) -> Option<Ipv4Addr> {
 ///
 /// Request body (after op byte):
 ///   [alias_len: u8][alias: alias_len bytes][port: u16 be]
+///   [protocol_len: u8][protocol: protocol_len bytes]
 ///
 /// Reply on success:  [0x00][token: 16 bytes]
 /// Reply on error:    [0x01][error_code: u8]
@@ -52,6 +53,19 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if port == 0 {
         return send_error(ctx, src, ERR_BAD_PACKET);
     }
+    let mut pos = 3 + alias_len;
+    if pos >= buf.len() {
+        return send_error(ctx, src, ERR_BAD_PACKET);
+    }
+    let protocol_len = buf[pos] as usize;
+    pos += 1;
+    if buf.len() < pos + protocol_len {
+        return send_error(ctx, src, ERR_BAD_PACKET);
+    }
+    let protocol = match std::str::from_utf8(&buf[pos..pos + protocol_len]) {
+        Ok(s) if !s.is_empty() => s.to_string(),
+        _ => return send_error(ctx, src, ERR_BAD_PACKET),
+    };
     let ip = match ipv4_from(src) {
         Some(ip) => ip,
         None => return send_error(ctx, src, ERR_BAD_PACKET),
@@ -82,6 +96,7 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         device.applications.push(Application {
             id: next_id,
             alias,
+            protocol,
             host: SocketAddrV4::new(ip, port),
             user_approved: false,
             token,
@@ -360,6 +375,7 @@ fn render_pending_apps(ctx: &WorkerContext) -> String {
                     "<tr>\
                        <td>{}</td>\
                        <td>{}</td>\
+                       <td>{}</td>\
                        <td>\
                          <form method='post' action='/pending-apps/approve'>\
                            <input type='hidden' name='id' value='{}'>\
@@ -372,6 +388,7 @@ fn render_pending_apps(ctx: &WorkerContext) -> String {
                        </td>\
                      </tr>",
                     html_escape(&a.alias),
+                    html_escape(&a.protocol),
                     html_escape(&a.host.to_string()),
                     a.id,
                     a.id,
@@ -386,7 +403,7 @@ fn render_pending_apps(ctx: &WorkerContext) -> String {
         format!(
             "<h1>Pending Apps</h1>\
              <table>\
-               <tr><th>Alias</th><th>Host</th><th>Actions</th></tr>\
+               <tr><th>Alias</th><th>Protocol</th><th>Host</th><th>Actions</th></tr>\
                {rows}\
              </table>"
         )
@@ -404,8 +421,9 @@ fn render_applications(ctx: &WorkerContext) -> String {
             d.applications.iter()
                 .filter(|a| a.user_approved)
                 .map(|a| format!(
-                    "<tr><td>{}</td><td>{}</td></tr>",
+                    "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
                     html_escape(&a.alias),
+                    html_escape(&a.protocol),
                     html_escape(&a.host.to_string()),
                 ))
                 .collect()
@@ -418,7 +436,7 @@ fn render_applications(ctx: &WorkerContext) -> String {
         format!(
             "<h1>Applications</h1>\
              <table>\
-               <tr><th>Alias</th><th>Host</th></tr>\
+               <tr><th>Alias</th><th>Protocol</th><th>Host</th></tr>\
                {rows}\
              </table>"
         )
@@ -604,10 +622,12 @@ mod tests {
 
     // ── AppRegister ───────────────────────────────────────────────────────────
 
-    fn register_packet(alias: &str, port: u16) -> Vec<u8> {
+    fn register_packet(alias: &str, port: u16, protocol: &str) -> Vec<u8> {
         let mut buf = vec![alias.len() as u8];
         buf.extend_from_slice(alias.as_bytes());
         buf.extend_from_slice(&port.to_be_bytes());
+        buf.push(protocol.len() as u8);
+        buf.extend_from_slice(protocol.as_bytes());
         buf
     }
 
