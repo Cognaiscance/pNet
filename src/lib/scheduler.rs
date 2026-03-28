@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use super::action_queue::{Action, ScheduleRequest, PRIORITY_LOW};
 use super::thread_pool::SharedQueue;
 
-const HEARTBEAT_INTERVAL:    Duration = Duration::from_secs(60);
 const KEY_ROTATION_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct SchedulerThread {
@@ -30,7 +29,6 @@ impl SchedulerThread {
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*queue;
 
-            let mut last_heartbeat    = Instant::now();
             let mut last_key_rotation = Instant::now();
             let mut pending: Vec<(Instant, Action)> = Vec::new();
 
@@ -47,10 +45,6 @@ impl SchedulerThread {
                 let mut to_enqueue: Vec<Action> = Vec::new();
 
                 // Recurring jobs.
-                if now.duration_since(last_heartbeat) >= HEARTBEAT_INTERVAL {
-                    to_enqueue.push(Action::Heartbeat);
-                    last_heartbeat = now;
-                }
                 if now.duration_since(last_key_rotation) >= KEY_ROTATION_INTERVAL {
                     to_enqueue.push(Action::KeyRotation);
                     last_key_rotation = now;
@@ -106,7 +100,7 @@ mod tests {
         );
 
         tx.send(ScheduleRequest {
-            action: Action::Heartbeat,
+            action: Action::KeyRotation,
             delay:  Duration::from_millis(20),
         })
         .unwrap();

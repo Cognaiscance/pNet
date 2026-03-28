@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use lib::action_queue::{ActionQueue, WorkerContext};
-use lib::data_models::Node;
+use lib::data_models::{DeviceGrade, Node};
 use lib::http_server::HttpServer;
 use lib::scheduler::SchedulerThread;
 use lib::thread_pool::{SharedQueue, ThreadPool};
@@ -60,9 +60,22 @@ fn main() {
     let mut pool = ThreadPool::new(WORKER_COUNT, Arc::clone(&queue), Arc::clone(&stop), ctx);
 
     // ── 7. Start HTTP server ─────────────────────────────────────────────────
-    let http = HttpServer::start(8080, Arc::clone(&queue), Arc::clone(&stop));
+    // SG devices bind on all interfaces so remote pNet nodes can reach the admin
+    // API. DG devices bind on loopback only.
+    let http_bind = {
+        let n = node.read().unwrap();
+        let device_uuid = n.device_uuid;
+        let local_device = n.owner.user.devices.iter()
+            .find(|d| d.uuid == device_uuid)
+            .expect("local device not found in node");
+        match local_device.grade {
+            DeviceGrade::SG => std::net::Ipv4Addr::UNSPECIFIED,
+            DeviceGrade::DG => std::net::Ipv4Addr::LOCALHOST,
+        }
+    };
+    let http = HttpServer::start(http_bind, 8080, Arc::clone(&queue), Arc::clone(&stop));
 
-    println!("[main] running. HTTP on 127.0.0.1:8080");
+    println!("[main] running. HTTP on {http_bind}:8080");
 
     // ── Wait for SIGINT / SIGTERM ─────────────────────────────────────────────
     ctrlc::set_handler({
@@ -130,7 +143,7 @@ mod tests {
         });
         let mut pool = ThreadPool::new(2, Arc::clone(&queue), Arc::clone(&stop), ctx);
 
-        let http = HttpServer::start(0, Arc::clone(&queue), Arc::clone(&stop));
+        let http = HttpServer::start(std::net::Ipv4Addr::LOCALHOST, 0, Arc::clone(&queue), Arc::clone(&stop));
 
         stop.store(true, Ordering::SeqCst);
         {

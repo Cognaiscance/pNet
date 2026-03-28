@@ -41,9 +41,17 @@ pub struct Application {
     pub token:         Uuid,
 }
 
+pub enum DeviceGrade {
+    /// Server Grade — static IP or domain, acts as relay for the user's DGs.
+    SG,
+    /// Device Grade — laptop, phone, or any device behind arbitrary NAT.
+    DG,
+}
+
 pub struct Device {
     pub alias:        String,
     pub uuid:         Uuid,
+    pub grade:        DeviceGrade,
     pub host:         SocketAddrV4,
     pub applications: Vec<Application>,
 }
@@ -91,6 +99,7 @@ impl Node {
         let device = Device {
             alias:        "This Device".to_string(),
             uuid:         device_uuid,
+            grade:        DeviceGrade::DG,
             host:         "0.0.0.0:0".parse().unwrap(),
             applications: Vec::new(),
         };

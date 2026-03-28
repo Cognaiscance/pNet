@@ -243,11 +243,6 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
 // ── Scheduled action handlers ─────────────────────────────────────────────────
 
-/// Ping all known peers to keep connections alive.
-pub fn heartbeat(ctx: &WorkerContext) {
-    let _ = ctx; // TODO
-}
-
 /// Check for active connections whose ephemeral keys are expiring soon and
 /// initiate a re-exchange.
 pub fn key_rotation(ctx: &WorkerContext) {
@@ -634,7 +629,7 @@ mod tests {
     #[test]
     fn app_register_returns_token() {
         let t = TestCtx::new();
-        app_register(t.app_addr(), register_packet("myapp", 9001), &t.ctx);
+        app_register(t.app_addr(), register_packet("myapp", 9001, "udp"), &t.ctx);
 
         let reply = t.recv_reply();
         assert_eq!(reply[0], OK);
@@ -644,7 +639,7 @@ mod tests {
     #[test]
     fn app_register_adds_application_to_node() {
         let t = TestCtx::new();
-        app_register(t.app_addr(), register_packet("myapp", 9001), &t.ctx);
+        app_register(t.app_addr(), register_packet("myapp", 9001, "udp"), &t.ctx);
 
         let node = t.ctx.node.read().unwrap();
         let device_uuid = node.device_uuid;
@@ -658,9 +653,9 @@ mod tests {
     #[test]
     fn app_register_each_app_gets_unique_id_and_token() {
         let t = TestCtx::new();
-        app_register(t.app_addr(), register_packet("app1", 9001), &t.ctx);
+        app_register(t.app_addr(), register_packet("app1", 9001, "udp"), &t.ctx);
         let reply1 = t.recv_reply();
-        app_register(t.app_addr(), register_packet("app2", 9002), &t.ctx);
+        app_register(t.app_addr(), register_packet("app2", 9002, "udp"), &t.ctx);
         let reply2 = t.recv_reply();
 
         let token1 = &reply1[1..17];
@@ -688,7 +683,7 @@ mod tests {
 
     /// Register an app and return its token.
     fn register_and_get_token(t: &TestCtx, alias: &str, port: u16) -> [u8; 16] {
-        app_register(t.app_addr(), register_packet(alias, port), t.ctx());
+        app_register(t.app_addr(), register_packet(alias, port, "udp"), t.ctx());
         let reply = t.recv_reply();
         assert_eq!(reply[0], OK);
         reply[1..17].try_into().unwrap()

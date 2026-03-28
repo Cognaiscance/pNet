@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Read};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -13,10 +13,10 @@ pub struct HttpServer {
 }
 
 impl HttpServer {
-    pub fn start(port: u16, queue: SharedQueue, stop: Arc<AtomicBool>) -> HttpServer {
+    pub fn start(bind_ip: Ipv4Addr, port: u16, queue: SharedQueue, stop: Arc<AtomicBool>) -> HttpServer {
         let handle = thread::spawn(move || {
-            let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
-                .unwrap_or_else(|e| panic!("HTTP bind on 127.0.0.1:{port} failed: {e}"));
+            let listener = TcpListener::bind((bind_ip, port))
+                .unwrap_or_else(|e| panic!("HTTP bind on {bind_ip}:{port} failed: {e}"));
             listener
                 .set_nonblocking(true)
                 .expect("set_nonblocking failed");

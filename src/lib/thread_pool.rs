@@ -120,7 +120,7 @@ mod tests {
             let (lock, cvar) = &*queue;
             let mut guard = lock.lock().unwrap();
             for _ in 0..20 {
-                guard.push(0, Action::Heartbeat);
+                guard.push(0, Action::KeyRotation);
             }
             cvar.notify_all();
         }

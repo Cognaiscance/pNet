@@ -20,7 +20,6 @@ pub enum Action {
     UiRequest { stream: TcpStream, method: String, path: String, query: String, body: Vec<u8> },
 
     // Scheduled
-    Heartbeat,
     KeyRotation,
     RetryMessage { message_id: u64 },
 }
@@ -50,7 +49,6 @@ impl Action {
             Action::UiRequest { stream, method, path, query, body } => {
                 handlers::ui_request(stream, method, path, query, body, ctx)
             }
-            Action::Heartbeat                  => handlers::heartbeat(ctx),
             Action::KeyRotation                => handlers::key_rotation(ctx),
             Action::RetryMessage { message_id } => handlers::retry_message(message_id, ctx),
         }
@@ -139,10 +137,10 @@ mod tests {
     #[test]
     fn lower_priority_popped_first() {
         let mut q = ActionQueue::new();
-        q.push(3, Action::Heartbeat);
+        q.push(3, Action::KeyRotation);
         q.push(0, reg());
         assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
-        assert!(matches!(q.pop().unwrap(), Action::Heartbeat));
+        assert!(matches!(q.pop().unwrap(), Action::KeyRotation));
     }
 
     #[test]
@@ -159,10 +157,10 @@ mod tests {
         let mut q = ActionQueue::new();
         q.push(0, reg());
         q.push(0, upd());
-        q.push(1, Action::Heartbeat);
+        q.push(1, Action::KeyRotation);
         assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
         assert!(matches!(q.pop().unwrap(), Action::AppUpdate   { .. }));
-        assert!(matches!(q.pop().unwrap(), Action::Heartbeat));
+        assert!(matches!(q.pop().unwrap(), Action::KeyRotation));
     }
 
     #[test]
@@ -182,7 +180,7 @@ mod tests {
         for _ in 0..STARVATION_THRESHOLD {
             q.push(0, reg());
         }
-        q.push(1, Action::Heartbeat); // the item that must not starve
+        q.push(1, Action::KeyRotation); // the item that must not starve
 
         // First STARVATION_THRESHOLD pops should all be bucket-0 items.
         for _ in 0..STARVATION_THRESHOLD {
@@ -190,7 +188,7 @@ mod tests {
         }
 
         // The very next pop must yield the lower-priority item.
-        assert!(matches!(q.pop().unwrap(), Action::Heartbeat));
+        assert!(matches!(q.pop().unwrap(), Action::KeyRotation));
     }
 
     #[test]
@@ -201,7 +199,7 @@ mod tests {
         for _ in 0..STARVATION_THRESHOLD {
             q.push(0, reg());
         }
-        q.push(1, Action::Heartbeat);
+        q.push(1, Action::KeyRotation);
         for _ in 0..STARVATION_THRESHOLD {
             q.pop();
         }
