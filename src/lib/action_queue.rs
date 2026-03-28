@@ -19,7 +19,11 @@ pub enum Action {
     // From HTTP UI
     UiRequest { stream: TcpStream, method: String, path: String, query: String, body: Vec<u8> },
 
+    // From peer pNet nodes
+    SgPing { src: SocketAddr, nonce: [u8; 16] },
+
     // Scheduled
+    PollSG,
     KeyRotation,
     RetryMessage { message_id: u64 },
 }
@@ -49,6 +53,8 @@ impl Action {
             Action::UiRequest { stream, method, path, query, body } => {
                 handlers::ui_request(stream, method, path, query, body, ctx)
             }
+            Action::SgPing { src, nonce }      => handlers::sg_ping(src, nonce, ctx),
+            Action::PollSG                     => handlers::poll_sg(ctx),
             Action::KeyRotation                => handlers::key_rotation(ctx),
             Action::RetryMessage { message_id } => handlers::retry_message(message_id, ctx),
         }

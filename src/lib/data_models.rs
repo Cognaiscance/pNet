@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddrV4;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 // Curve25519 keys (32 bytes), compatible with NaCl/libsodium (rbnacl on the Rails side).
 // Use X25519 for key exchange (EphemeralKeyExchange) and Ed25519 for signing (KeyPair).
@@ -84,9 +84,19 @@ pub struct Contact {
     pub public_key: PublicKey,
 }
 
+/// Runtime SG health telemetry for a single candidate SG device.
+/// Keyed by device UUID in `Node::sg_statuses`.
+pub struct SgStatus {
+    pub last_rtt:    Option<Duration>,
+    pub up:          bool,
+    pub last_polled: Instant,
+}
+
 pub struct Node {
-    pub owner:       Owner,
-    pub device_uuid: Uuid,
+    pub owner:        Owner,
+    pub device_uuid:  Uuid,
+    /// RTT and up/down status for every candidate SG, refreshed by PollSG.
+    pub sg_statuses:  HashMap<Uuid, SgStatus>,
 }
 
 impl Node {
@@ -106,6 +116,7 @@ impl Node {
 
         Node {
             device_uuid,
+            sg_statuses: HashMap::new(),
             owner: Owner {
                 user: User {
                     alias:   "Owner".to_string(),

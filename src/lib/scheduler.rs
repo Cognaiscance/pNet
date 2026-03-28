@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use super::action_queue::{Action, ScheduleRequest, PRIORITY_LOW};
 use super::thread_pool::SharedQueue;
 
+const POLL_SG_INTERVAL:      Duration = Duration::from_secs(30);
 const KEY_ROTATION_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct SchedulerThread {
@@ -29,6 +30,7 @@ impl SchedulerThread {
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*queue;
 
+            let mut last_poll_sg      = Instant::now();
             let mut last_key_rotation = Instant::now();
             let mut pending: Vec<(Instant, Action)> = Vec::new();
 
@@ -45,6 +47,10 @@ impl SchedulerThread {
                 let mut to_enqueue: Vec<Action> = Vec::new();
 
                 // Recurring jobs.
+                if now.duration_since(last_poll_sg) >= POLL_SG_INTERVAL {
+                    to_enqueue.push(Action::PollSG);
+                    last_poll_sg = now;
+                }
                 if now.duration_since(last_key_rotation) >= KEY_ROTATION_INTERVAL {
                     to_enqueue.push(Action::KeyRotation);
                     last_key_rotation = now;

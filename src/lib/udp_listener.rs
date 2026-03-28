@@ -60,10 +60,18 @@ impl UdpListener {
                 let payload = buf[1..len].to_vec();
 
                 let action = match op {
-                    0 => Action::AppRegister   { src, buf: payload },
-                    1 => Action::AppUpdate     { src, buf: payload },
-                    2 => Action::AppGetData    { src, buf: payload },
-                    3 => Action::AppSendPacket { src, buf: payload },
+                    0x00 => Action::AppRegister   { src, buf: payload },
+                    0x01 => Action::AppUpdate     { src, buf: payload },
+                    0x02 => Action::AppGetData    { src, buf: payload },
+                    0x03 => Action::AppSendPacket { src, buf: payload },
+                    0x10 => {
+                        if payload.len() < 16 {
+                            eprintln!("[udp] sg_ping too short from {src}");
+                            continue;
+                        }
+                        let nonce: [u8; 16] = payload[..16].try_into().unwrap();
+                        Action::SgPing { src, nonce }
+                    }
                     _ => {
                         eprintln!("[udp] unknown op byte {op} from {src}");
                         continue;
@@ -109,10 +117,11 @@ mod tests {
     #[test]
     fn op_bytes_map_to_correct_action_variants() {
         let cases: &[(u8, fn(&Action) -> bool)] = &[
-            (0, |a| matches!(a, Action::AppRegister   { .. })),
-            (1, |a| matches!(a, Action::AppUpdate     { .. })),
-            (2, |a| matches!(a, Action::AppGetData    { .. })),
-            (3, |a| matches!(a, Action::AppSendPacket { .. })),
+            (0x00, |a| matches!(a, Action::AppRegister   { .. })),
+            (0x01, |a| matches!(a, Action::AppUpdate     { .. })),
+            (0x02, |a| matches!(a, Action::AppGetData    { .. })),
+            (0x03, |a| matches!(a, Action::AppSendPacket { .. })),
+            (0x10, |a| matches!(a, Action::SgPing        { .. })),
         ];
 
         for (op, check) in cases {
@@ -120,7 +129,15 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let udp = UdpListener::start(0, Arc::clone(&queue), Arc::clone(&stop));
 
-            send_packet(udp.local_addr, &[*op, 0xAA, 0xBB]);
+            // SgPing requires op + 16-byte nonce; other ops are fine with 2 payload bytes.
+            let packet: Vec<u8> = if *op == 0x10 {
+                let mut p = vec![*op];
+                p.extend_from_slice(&[0u8; 16]);
+                p
+            } else {
+                vec![*op, 0xAA, 0xBB]
+            };
+            send_packet(udp.local_addr, &packet);
 
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
             loop {

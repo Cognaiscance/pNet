@@ -1,7 +1,8 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::time::{Duration, Instant};
 
 use super::action_queue::WorkerContext;
-use super::data_models::{Application, generate_uuid};
+use super::data_models::{Application, DeviceGrade, SgStatus, Uuid, generate_uuid};
 
 // ── Reply status bytes ────────────────────────────────────────────────────────
 const OK:                u8 = 0x00;
@@ -241,7 +242,90 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let _ = (src, buf, ctx); // TODO
 }
 
+// ── Peer pNet node handlers ───────────────────────────────────────────────────
+
+const SG_PING_OP: u8 = 0x10;
+const SG_PONG_OP: u8 = 0x11;
+
+/// Respond to an SG ping from another node with the nonce echoed back.
+pub fn sg_ping(src: SocketAddr, nonce: [u8; 16], ctx: &WorkerContext) {
+    let mut reply = [0u8; 17];
+    reply[0] = SG_PONG_OP;
+    reply[1..17].copy_from_slice(&nonce);
+    send(ctx, src, &reply);
+}
+
 // ── Scheduled action handlers ─────────────────────────────────────────────────
+
+const SG_PING_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Ping every candidate SG, record RTT, and mark each one up or down.
+///
+/// Candidate pool: all SG-grade devices owned by the local user (excluding the
+/// local device itself) plus all SG-grade devices of every contact user.
+pub fn poll_sg(ctx: &WorkerContext) {
+    // Collect (device_uuid, host) for every candidate SG.
+    let candidates: Vec<(Uuid, SocketAddrV4)> = {
+        let node = ctx.node.read().unwrap();
+        let local_uuid = node.device_uuid;
+        let mut v: Vec<(Uuid, SocketAddrV4)> = Vec::new();
+        for d in &node.owner.user.devices {
+            if matches!(d.grade, DeviceGrade::SG) && d.uuid != local_uuid {
+                v.push((d.uuid, d.host));
+            }
+        }
+        for contact in &node.owner.contact_users {
+            for d in &contact.user.devices {
+                if matches!(d.grade, DeviceGrade::SG) {
+                    v.push((d.uuid, d.host));
+                }
+            }
+        }
+        v
+    };
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Ephemeral socket so pong responses come back here, not to the main listener.
+    let ping_socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(e) => { eprintln!("[poll_sg] bind failed: {e}"); return; }
+    };
+    ping_socket.set_read_timeout(Some(SG_PING_TIMEOUT)).ok();
+
+    for (uuid, host) in candidates {
+        let nonce = generate_uuid();
+        let mut packet = [0u8; 17];
+        packet[0] = SG_PING_OP;
+        packet[1..17].copy_from_slice(&nonce);
+
+        let start = Instant::now();
+        if ping_socket.send_to(&packet, std::net::SocketAddr::V4(host)).is_err() {
+            record_sg_status(ctx, uuid, None);
+            continue;
+        }
+
+        let mut buf = [0u8; 32];
+        let up = match ping_socket.recv_from(&mut buf) {
+            Ok((len, _)) if len >= 17 && buf[0] == SG_PONG_OP && buf[1..17] == nonce => {
+                Some(start.elapsed())
+            }
+            _ => None,
+        };
+        record_sg_status(ctx, uuid, up);
+    }
+}
+
+fn record_sg_status(ctx: &WorkerContext, uuid: Uuid, rtt: Option<Duration>) {
+    let mut node = ctx.node.write().unwrap();
+    node.sg_statuses.insert(uuid, SgStatus {
+        up:          rtt.is_some(),
+        last_rtt:    rtt,
+        last_polled: Instant::now(),
+    });
+}
 
 /// Check for active connections whose ephemeral keys are expiring soon and
 /// initiate a re-exchange.
@@ -750,6 +834,20 @@ mod tests {
         let reply = t.recv_reply();
         assert_eq!(reply[0], 0x01);
         assert_eq!(reply[1], ERR_TOKEN_UNKNOWN);
+    }
+
+    // ── SgPing ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sg_ping_replies_with_pong_and_echoed_nonce() {
+        let t = TestCtx::new();
+        let nonce: [u8; 16] = *b"test_nonce_12345";
+        sg_ping(t.app_addr(), nonce, &t.ctx);
+
+        let reply = t.recv_reply();
+        assert_eq!(reply.len(), 17);
+        assert_eq!(reply[0], SG_PONG_OP);
+        assert_eq!(reply[1..17], nonce);
     }
 
     // ── AppGetData ────────────────────────────────────────────────────────────
