@@ -251,6 +251,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
 const SG_PING_OP:          u8 = 0x10;
 const SG_PONG_OP:          u8 = 0x11;
+const DG_KEEPALIVE_OP:     u8 = 0x12;
 const CONNECT_REQUEST_OP:  u8 = 0x20;
 const CONNECT_ACK_OP:      u8 = 0x21;
 const BOOTSTRAP_REQUEST_OP:  u8 = 0x30;
@@ -943,6 +944,49 @@ pub fn maintain_connections(ctx: &WorkerContext) {
 /// Retry an unacknowledged outbound message.
 pub fn retry_message(message_id: u64, ctx: &WorkerContext) {
     let _ = (message_id, ctx); // TODO
+}
+
+/// Scheduled every 20 seconds on DG devices.
+///
+/// Sends a 1-byte packet (op `0x12`) to every SG with an active connection,
+/// keeping the DG's NAT mapping alive so the SG can push packets back.
+pub fn keepalive_dg(ctx: &WorkerContext) {
+    let sg_hosts: Vec<SocketAddrV4> = {
+        let node       = ctx.node.read().unwrap();
+        let local_uuid = node.device_uuid;
+
+        // Only DGs need to send keepalives.
+        let is_dg = node.owner.user.devices.iter()
+            .find(|d| d.uuid == local_uuid)
+            .map(|d| matches!(d.grade, DeviceGrade::DG))
+            .unwrap_or(false);
+        if !is_dg { return; }
+
+        // UUIDs of devices we currently have an active connection with.
+        let connected: HashSet<Uuid> = node.owner.active_connections.values()
+            .map(|c| c.device_uuid)
+            .collect();
+
+        // Collect the host address of every connected SG (own + contacts').
+        let mut hosts = Vec::new();
+        for d in &node.owner.user.devices {
+            if matches!(d.grade, DeviceGrade::SG) && connected.contains(&d.uuid) {
+                hosts.push(d.host);
+            }
+        }
+        for contact in &node.owner.contact_users {
+            for d in &contact.user.devices {
+                if matches!(d.grade, DeviceGrade::SG) && connected.contains(&d.uuid) {
+                    hosts.push(d.host);
+                }
+            }
+        }
+        hosts
+    };
+
+    for host in sg_hosts {
+        send(ctx, SocketAddr::V4(host), &[DG_KEEPALIVE_OP]);
+    }
 }
 
 // ── UI / HTTP handlers ────────────────────────────────────────────────────────

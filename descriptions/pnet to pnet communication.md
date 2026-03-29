@@ -29,6 +29,23 @@ The remainder of the packet is encrypted using the ephemeral keys from the activ
 
 Before two nodes can exchange encrypted packets they must establish an `ActiveConnection` via a two-message handshake. This is driven by the `MaintainConnections` background task (see background systems.md).
 
+### DgKeepalive — op `0x12`
+
+Sent by a DG to each SG it has an active connection with, every 20 seconds.
+
+```
+┌──────────────────────────────┬───────┐
+│ Field                        │ Bytes │
+├──────────────────────────────┼───────┤
+│ Operation type (0x12)        │ 1     │
+└──────────────────────────────┴───────┘
+```
+Total: 1 byte.
+
+No response is sent. The packet's only purpose is to refresh the DG's NAT mapping so the SG can continue to push packets back to the DG. See background systems.md — DG Keepalive.
+
+---
+
 ### ConnectRequest — op `0x20`
 
 Sent by the initiator (always a DG when connecting to an SG; lower-UUID node when SG-to-SG).

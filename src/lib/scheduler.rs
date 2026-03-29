@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 use super::action_queue::{Action, ScheduleRequest, PRIORITY_LOW};
 use super::thread_pool::SharedQueue;
 
-const POLL_SG_INTERVAL:               Duration = Duration::from_secs(30);
-const MAINTAIN_CONNECTIONS_INTERVAL:  Duration = Duration::from_secs(5 * 60);
+const POLL_SG_INTERVAL:              Duration = Duration::from_secs(30);
+const MAINTAIN_CONNECTIONS_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Must be safely under the typical 30-second UDP NAT mapping timeout.
+const KEEPALIVE_DG_INTERVAL:         Duration = Duration::from_secs(20);
 
 pub struct SchedulerThread {
     handle: thread::JoinHandle<()>,
@@ -31,7 +33,8 @@ impl SchedulerThread {
             let (lock, cvar) = &*queue;
 
             let mut last_poll_sg    = Instant::now();
-            let mut last_maintain  = Instant::now();
+            let mut last_maintain   = Instant::now();
+            let mut last_keepalive  = Instant::now();
             let mut pending: Vec<(Instant, Action)> = Vec::new();
 
             while !stop.load(Ordering::Acquire) {
@@ -54,6 +57,10 @@ impl SchedulerThread {
                 if now.duration_since(last_maintain) >= MAINTAIN_CONNECTIONS_INTERVAL {
                     to_enqueue.push(Action::MaintainConnections);
                     last_maintain = now;
+                }
+                if now.duration_since(last_keepalive) >= KEEPALIVE_DG_INTERVAL {
+                    to_enqueue.push(Action::KeepAliveDG);
+                    last_keepalive = now;
                 }
 
                 // One-shot pending jobs — drain those that are due.

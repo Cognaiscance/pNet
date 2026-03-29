@@ -30,6 +30,7 @@ pub enum Action {
     // Scheduled
     PollSG,
     MaintainConnections,
+    KeepAliveDG,
     RetryMessage { message_id: u64 },
 }
 
@@ -66,6 +67,7 @@ impl Action {
             Action::DeviceRegistration { src, buf }   => handlers::device_registration(src, buf, ctx),
             Action::PollSG                          => handlers::poll_sg(ctx),
             Action::MaintainConnections             => handlers::maintain_connections(ctx),
+            Action::KeepAliveDG                     => handlers::keepalive_dg(ctx),
             Action::RetryMessage { message_id }     => handlers::retry_message(message_id, ctx),
         }
     }

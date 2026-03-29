@@ -72,6 +72,9 @@ impl UdpListener {
                         let nonce: [u8; 16] = payload[..16].try_into().unwrap();
                         Action::SgPing { src, nonce }
                     }
+                    // DG keepalive — no-op on the SG receive side; the packet's
+                    // only purpose is to refresh the DG's NAT mapping.
+                    0x12 => continue,
                     0x20 => Action::ConnectRequest     { src, buf: payload },
                     0x21 => Action::ConnectAck         { src, buf: payload },
                     0x30 => Action::BootstrapRequest   { src, buf: payload },

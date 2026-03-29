@@ -67,6 +67,21 @@ Each pNet node maintains a ranked list of candidate SGs for routing decisions. T
 
 ---
 
+## DG Keepalive
+
+NAT routers typically expire idle UDP mappings after 30–120 seconds. For an SG to push an incoming application packet to a DG, there must be an active NAT mapping established by a recent outbound packet from that DG. If the DG has been idle, the mapping may have expired and the SG's packet is silently dropped by the DG's router.
+
+`KeepAliveDG` prevents this by sending a minimal 1-byte UDP packet (op `0x12`) from the DG to each SG it holds an `ActiveConnection` with, on an interval safely under the typical 30-second NAT timeout.
+
+- **Runs on**: DG-grade devices only — SGs have stable public addresses and do not need this
+- **Interval**: every 20 seconds
+- **No response expected**: the SG silently discards the packet; the sole purpose is to produce outbound UDP traffic so the DG's router keeps the mapping alive
+- **Sends to**: every SG (own user's and contacts') for which an `ActiveConnection` currently exists
+
+---
+
 ## What was removed: Heartbeat
 
-An earlier design included a `Heartbeat` action to ping peers and keep NAT pinholes open. This has been removed. The SG/DG architecture eliminates the need for NAT hole-punching since DGs always communicate via SGs, which have stable reachable addresses. SG health polling covers the liveness-checking concern that the heartbeat previously served.
+An earlier design included a `Heartbeat` action to ping all peers and keep NAT pinholes open between arbitrary nodes. This was removed when the SG/DG architecture was introduced: DGs no longer communicate directly with other DGs, so the hole-punching concern between arbitrary pairs of nodes no longer applies.
+
+`KeepAliveDG` is the targeted replacement. It addresses the one remaining NAT concern — keeping the DG→SG mapping alive so the SG can push packets back to the DG — without the broader scope of the original Heartbeat.
