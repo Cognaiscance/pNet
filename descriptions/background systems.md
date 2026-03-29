@@ -4,13 +4,48 @@ pNet has two independent background systems that run on a schedule. They have di
 
 ---
 
-## Key Rotation
+## Connection Maintenance
 
-Ephemeral keys used for encrypted communication are rotated on a fixed time-based schedule. The rotation fires regardless of whether any packets are being sent or received — it is driven purely by a timer.
+Every pNet node must hold active encrypted sessions with a set of peer nodes before it can route or receive application packets. The `MaintainConnections` background task keeps this set current and prevents sessions from lapsing unnoticed.
 
-- **Trigger**: scheduler enqueues a `KeyRotation` action at a fixed interval
-- **No dependency on**: network activity, SG availability, or any other system
-- **Purpose**: limit the window of exposure if an ephemeral key is ever compromised
+- **Trigger**: enqueued immediately at startup, then by the scheduler every 5 minutes
+- **Interval rationale**: RENEW_THRESHOLD (2 hours) >> 5-minute interval, so a session is always renewed well before it expires
+- **No dependency on**: network activity, SG health polling, or message retry
+
+### Desired connection set
+
+The set of peers a node should be connected to depends on its device grade:
+
+| Local grade | Connects to |
+|-------------|-------------|
+| DG | All SG-grade devices: own user's SGs + every contact's SGs |
+| SG | All devices: own user's SGs + DGs + every contact's SGs + DGs |
+
+An SG connects to DGs as well as other SGs because it can originate application packets directly, not only relay them.
+
+### What it does each run
+
+1. Reads the current desired peer set from the node's known devices and contacts.
+2. Builds a set of devices that already have a healthy `ActiveConnection` (more than `RENEW_THRESHOLD` remaining) or an in-flight `PendingConnection`.
+3. For every remaining desired peer, generates an ephemeral key pair, stores a `PendingConnection`, and sends a `ConnectRequest` UDP packet.
+
+### Handshake
+
+Connection establishment is a two-message exchange:
+
+1. **ConnectRequest** (op `0x20`) — sent by the initiator. Contains the initiator's ephemeral public key, device UUID, and long-term public key (Ed25519, for identity verification).
+2. **ConnectAck** (op `0x21`) — sent by the responder. Contains the responder's ephemeral public key and echoes the initiator's connection ID so the initiator can correlate it to the pending entry.
+
+After the ack, both sides hold an `ActiveConnection` with the peer's ephemeral public key and a matched pair of connection IDs. The X25519 shared secret is derived from the ephemeral keys on demand during encryption/decryption.
+
+**Initiation rule**: a DG always initiates to an SG (NAT — the DG must punch outward). For SG-to-SG connections, the node whose device UUID sorts lower initiates, preventing simultaneous handshake collisions.
+
+### Key fields involved
+
+- `Owner::active_connections: HashMap<u16, ActiveConnection>` — fully established sessions, keyed by our local connection ID
+- `Owner::pending_connections: HashMap<u16, PendingConnection>` — half-open sessions awaiting ConnectAck, keyed by our local connection ID
+- `ActiveConnection::timeout` / `CONNECTION_LIFETIME` (24 h) — session lifetime
+- `RENEW_THRESHOLD` (2 h) — renew if less than this much time remains
 
 ---
 

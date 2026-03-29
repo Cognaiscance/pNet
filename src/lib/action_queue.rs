@@ -20,11 +20,13 @@ pub enum Action {
     UiRequest { stream: TcpStream, method: String, path: String, query: String, body: Vec<u8> },
 
     // From peer pNet nodes
-    SgPing { src: SocketAddr, nonce: [u8; 16] },
+    SgPing         { src: SocketAddr, nonce: [u8; 16] },
+    ConnectRequest { src: SocketAddr, buf: Vec<u8> },
+    ConnectAck     { src: SocketAddr, buf: Vec<u8> },
 
     // Scheduled
     PollSG,
-    KeyRotation,
+    MaintainConnections,
     RetryMessage { message_id: u64 },
 }
 
@@ -53,10 +55,12 @@ impl Action {
             Action::UiRequest { stream, method, path, query, body } => {
                 handlers::ui_request(stream, method, path, query, body, ctx)
             }
-            Action::SgPing { src, nonce }      => handlers::sg_ping(src, nonce, ctx),
-            Action::PollSG                     => handlers::poll_sg(ctx),
-            Action::KeyRotation                => handlers::key_rotation(ctx),
-            Action::RetryMessage { message_id } => handlers::retry_message(message_id, ctx),
+            Action::SgPing { src, nonce }           => handlers::sg_ping(src, nonce, ctx),
+            Action::ConnectRequest { src, buf }     => handlers::connect_request(src, buf, ctx),
+            Action::ConnectAck     { src, buf }     => handlers::connect_ack(src, buf, ctx),
+            Action::PollSG                          => handlers::poll_sg(ctx),
+            Action::MaintainConnections             => handlers::maintain_connections(ctx),
+            Action::RetryMessage { message_id }     => handlers::retry_message(message_id, ctx),
         }
     }
 }
@@ -143,10 +147,10 @@ mod tests {
     #[test]
     fn lower_priority_popped_first() {
         let mut q = ActionQueue::new();
-        q.push(3, Action::KeyRotation);
+        q.push(3, Action::MaintainConnections);
         q.push(0, reg());
         assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
-        assert!(matches!(q.pop().unwrap(), Action::KeyRotation));
+        assert!(matches!(q.pop().unwrap(), Action::MaintainConnections));
     }
 
     #[test]
@@ -163,10 +167,10 @@ mod tests {
         let mut q = ActionQueue::new();
         q.push(0, reg());
         q.push(0, upd());
-        q.push(1, Action::KeyRotation);
+        q.push(1, Action::MaintainConnections);
         assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
         assert!(matches!(q.pop().unwrap(), Action::AppUpdate   { .. }));
-        assert!(matches!(q.pop().unwrap(), Action::KeyRotation));
+        assert!(matches!(q.pop().unwrap(), Action::MaintainConnections));
     }
 
     #[test]
@@ -186,7 +190,7 @@ mod tests {
         for _ in 0..STARVATION_THRESHOLD {
             q.push(0, reg());
         }
-        q.push(1, Action::KeyRotation); // the item that must not starve
+        q.push(1, Action::MaintainConnections); // the item that must not starve
 
         // First STARVATION_THRESHOLD pops should all be bucket-0 items.
         for _ in 0..STARVATION_THRESHOLD {
@@ -194,7 +198,7 @@ mod tests {
         }
 
         // The very next pop must yield the lower-priority item.
-        assert!(matches!(q.pop().unwrap(), Action::KeyRotation));
+        assert!(matches!(q.pop().unwrap(), Action::MaintainConnections));
     }
 
     #[test]
@@ -205,7 +209,7 @@ mod tests {
         for _ in 0..STARVATION_THRESHOLD {
             q.push(0, reg());
         }
-        q.push(1, Action::KeyRotation);
+        q.push(1, Action::MaintainConnections);
         for _ in 0..STARVATION_THRESHOLD {
             q.pop();
         }
@@ -216,12 +220,12 @@ mod tests {
         for _ in 0..STARVATION_THRESHOLD - 1 {
             q.push(0, reg());
         }
-        q.push(1, Action::KeyRotation);
+        q.push(1, Action::MaintainConnections);
         for _ in 0..STARVATION_THRESHOLD - 1 {
             assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
         }
         // KeyRotation should still be in the queue (streak hasn't hit threshold yet).
-        assert!(matches!(q.pop().unwrap(), Action::KeyRotation));
+        assert!(matches!(q.pop().unwrap(), Action::MaintainConnections));
     }
 
     #[test]

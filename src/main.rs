@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use lib::action_queue::{ActionQueue, WorkerContext};
+use lib::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW};
 use lib::data_models::{DeviceGrade, Node};
 use lib::http_server::HttpServer;
 use lib::scheduler::SchedulerThread;
@@ -59,7 +59,14 @@ fn main() {
     });
     let mut pool = ThreadPool::new(WORKER_COUNT, Arc::clone(&queue), Arc::clone(&stop), ctx);
 
-    // ── 7. Start HTTP server ─────────────────────────────────────────────────
+    // ── 7. Kick off initial connection maintenance ───────────────────────────
+    {
+        let (lock, cvar) = &*queue;
+        lock.lock().unwrap().push(PRIORITY_LOW, Action::MaintainConnections);
+        cvar.notify_one();
+    }
+
+    // ── 8. Start HTTP server ─────────────────────────────────────────────────
     // SG devices bind on all interfaces so remote pNet nodes can reach the admin
     // API. DG devices bind on loopback only.
     let http_bind = {

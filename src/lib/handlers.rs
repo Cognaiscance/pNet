@@ -1,8 +1,12 @@
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::action_queue::WorkerContext;
-use super::data_models::{Application, DeviceGrade, SgStatus, Uuid, generate_uuid};
+use super::data_models::{
+    ActiveConnection, Application, DeviceGrade, KeyPair, PendingConnection, PublicKey,
+    SgStatus, Uuid, CONNECTION_LIFETIME, RENEW_THRESHOLD, generate_key_bytes, generate_uuid,
+};
 
 // ── Reply status bytes ────────────────────────────────────────────────────────
 const OK:                u8 = 0x00;
@@ -244,8 +248,50 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
 // ── Peer pNet node handlers ───────────────────────────────────────────────────
 
-const SG_PING_OP: u8 = 0x10;
-const SG_PONG_OP: u8 = 0x11;
+const SG_PING_OP:        u8 = 0x10;
+const SG_PONG_OP:        u8 = 0x11;
+const CONNECT_REQUEST_OP: u8 = 0x20;
+const CONNECT_ACK_OP:     u8 = 0x21;
+
+/// Find the device UUID for an incoming connection request, given the peer's
+/// long-term public key and claimed device UUID.  Returns `Some(uuid)` if both
+/// the key and the UUID are known (own devices or a contact's devices).
+fn find_device_uuid_for_pk(node: &super::data_models::Node, longterm_pk: &PublicKey, device_uuid: &Uuid) -> Option<Uuid> {
+    // Own devices share the owner's long-term public key.
+    if node.owner.key_pair.public_key == *longterm_pk {
+        if node.owner.user.devices.iter().any(|d| d.uuid == *device_uuid) {
+            return Some(*device_uuid);
+        }
+    }
+    // Contact devices use the contact's public key.
+    for contact in &node.owner.contact_users {
+        if contact.public_key == *longterm_pk {
+            if contact.user.devices.iter().any(|d| d.uuid == *device_uuid) {
+                return Some(*device_uuid);
+            }
+        }
+    }
+    None
+}
+
+/// Allocate a connection ID that is not already in use in either the active or
+/// pending connection maps.  Increments from the current maximum; wraps on overflow.
+fn allocate_conn_id(node: &super::data_models::Node) -> u16 {
+    let max = node.owner.active_connections.keys()
+        .chain(node.owner.pending_connections.keys())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mut candidate = max.wrapping_add(1);
+    loop {
+        if !node.owner.active_connections.contains_key(&candidate)
+            && !node.owner.pending_connections.contains_key(&candidate)
+        {
+            return candidate;
+        }
+        candidate = candidate.wrapping_add(1);
+    }
+}
 
 /// Respond to an SG ping from another node with the nonce echoed back.
 pub fn sg_ping(src: SocketAddr, nonce: [u8; 16], ctx: &WorkerContext) {
@@ -253,6 +299,105 @@ pub fn sg_ping(src: SocketAddr, nonce: [u8; 16], ctx: &WorkerContext) {
     reply[0] = SG_PONG_OP;
     reply[1..17].copy_from_slice(&nonce);
     send(ctx, src, &reply);
+}
+
+/// Op 0x20 — Incoming connection request from a peer node.
+///
+/// Payload layout (after op byte):
+///   [initiator_conn_id: u16 be]
+///   [initiator_device_uuid: 16 bytes]
+///   [initiator_ephemeral_pk: 32 bytes]
+///   [initiator_longterm_pk: 32 bytes]
+///   [signature: 64 bytes]             — TODO: verify with Ed25519
+///
+/// If the initiator is a known device, stores an ActiveConnection and replies
+/// with a ConnectAck containing our ephemeral public key.
+pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    const MIN_LEN: usize = 2 + 16 + 32 + 32 + 64;
+    if buf.len() < MIN_LEN {
+        eprintln!("[connect_request] packet too short ({} bytes) from {src}", buf.len());
+        return;
+    }
+
+    let initiator_conn_id                   = u16::from_be_bytes([buf[0], buf[1]]);
+    let initiator_device_uuid: Uuid         = buf[2..18].try_into().unwrap();
+    let initiator_ephemeral_pk: PublicKey   = buf[18..50].try_into().unwrap();
+    let initiator_longterm_pk: PublicKey    = buf[50..82].try_into().unwrap();
+    // buf[82..146] = signature — TODO: verify with Ed25519
+
+    // Verify the initiator is a known device.
+    let known = {
+        let node = ctx.node.read().unwrap();
+        find_device_uuid_for_pk(&node, &initiator_longterm_pk, &initiator_device_uuid).is_some()
+    };
+    if !known {
+        eprintln!("[connect_request] unknown public key or device UUID from {src}");
+        return;
+    }
+
+    // Allocate our ephemeral key pair and connection ID, then store the active connection.
+    let (our_conn_id, our_ephemeral_pk) = {
+        let mut node = ctx.node.write().unwrap();
+        let conn_id  = allocate_conn_id(&node);
+        let key_pair = KeyPair { public_key: generate_key_bytes(), private_key: generate_key_bytes() };
+        let pk_copy  = key_pair.public_key;
+        node.owner.active_connections.insert(conn_id, ActiveConnection {
+            id:                        conn_id,
+            timeout:                   SystemTime::now() + CONNECTION_LIFETIME,
+            key_pair,
+            peer_public_key:           initiator_ephemeral_pk,
+            peer_active_connection_id: initiator_conn_id,
+            device_uuid:               initiator_device_uuid,
+        });
+        (conn_id, pk_copy)
+    };
+
+    // Reply with ConnectAck:
+    //   [op=0x21][our_conn_id: u16][initiator_conn_id: u16][our_ephemeral_pk: 32][sig: 64]
+    let mut pkt = [0u8; 101];
+    pkt[0]       = CONNECT_ACK_OP;
+    pkt[1..3].copy_from_slice(&our_conn_id.to_be_bytes());
+    pkt[3..5].copy_from_slice(&initiator_conn_id.to_be_bytes());
+    pkt[5..37].copy_from_slice(&our_ephemeral_pk);
+    // pkt[37..101] = signature, zeros (TODO: Ed25519 signing)
+    send(ctx, src, &pkt);
+}
+
+/// Op 0x21 — Acknowledgement from a peer node in response to our ConnectRequest.
+///
+/// Payload layout (after op byte):
+///   [responder_conn_id: u16 be]
+///   [our_conn_id: u16 be]             — echoed back so we correlate to pending entry
+///   [responder_ephemeral_pk: 32 bytes]
+///   [signature: 64 bytes]             — TODO: verify with Ed25519
+///
+/// Promotes the matching PendingConnection to an ActiveConnection.
+pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    const MIN_LEN: usize = 2 + 2 + 32 + 64;
+    if buf.len() < MIN_LEN {
+        eprintln!("[connect_ack] packet too short ({} bytes) from {src}", buf.len());
+        return;
+    }
+
+    let responder_conn_id               = u16::from_be_bytes([buf[0], buf[1]]);
+    let our_conn_id                     = u16::from_be_bytes([buf[2], buf[3]]);
+    let responder_ephemeral_pk: PublicKey = buf[4..36].try_into().unwrap();
+    // buf[36..100] = signature — TODO: verify with Ed25519 using pending.peer_longterm_pk
+
+    let mut node = ctx.node.write().unwrap();
+    let Some(pending) = node.owner.pending_connections.remove(&our_conn_id) else {
+        eprintln!("[connect_ack] no pending connection for id {our_conn_id} from {src}");
+        return;
+    };
+
+    node.owner.active_connections.insert(our_conn_id, ActiveConnection {
+        id:                        our_conn_id,
+        timeout:                   SystemTime::now() + CONNECTION_LIFETIME,
+        key_pair:                  pending.our_key_pair,
+        peer_public_key:           responder_ephemeral_pk,
+        peer_active_connection_id: responder_conn_id,
+        device_uuid:               pending.peer_device_uuid,
+    });
 }
 
 // ── Scheduled action handlers ─────────────────────────────────────────────────
@@ -327,10 +472,110 @@ fn record_sg_status(ctx: &WorkerContext, uuid: Uuid, rtt: Option<Duration>) {
     });
 }
 
-/// Check for active connections whose ephemeral keys are expiring soon and
-/// initiate a re-exchange.
-pub fn key_rotation(ctx: &WorkerContext) {
-    let _ = ctx; // TODO
+/// Ensure active connections exist to all peers that require them.
+///
+/// For each desired peer (own SGs/DGs and contact SGs/DGs, depending on local
+/// device grade) this checks whether a healthy ActiveConnection already exists.
+/// If not — and no ConnectRequest is already pending — it generates an ephemeral
+/// key pair, stores a PendingConnection, and sends a ConnectRequest.
+///
+/// Also handles renewal: connections within RENEW_THRESHOLD of expiry are treated
+/// as missing so the new session is established before the old one lapses.
+///
+/// Triggered at startup and then every MAINTAIN_CONNECTIONS_INTERVAL.
+pub fn maintain_connections(ctx: &WorkerContext) {
+    let now = SystemTime::now();
+
+    // ── Collect desired peers and current state (read lock) ───────────────────
+    let (need_conn, our_longterm_pk, our_device_uuid) = {
+        let node = ctx.node.read().unwrap();
+        let our_device_uuid = node.device_uuid;
+        let our_longterm_pk = node.owner.key_pair.public_key;
+
+        let is_sg = node.owner.user.devices.iter()
+            .find(|d| d.uuid == our_device_uuid)
+            .map(|d| matches!(d.grade, DeviceGrade::SG))
+            .unwrap_or(false);
+
+        // Desired peers: own devices (all if SG, SGs-only if DG) + contact devices (same rule).
+        let mut desired: Vec<(Uuid, SocketAddrV4, PublicKey)> = Vec::new();
+        for d in &node.owner.user.devices {
+            if d.uuid == our_device_uuid { continue; }
+            if is_sg || matches!(d.grade, DeviceGrade::SG) {
+                desired.push((d.uuid, d.host, our_longterm_pk));
+            }
+        }
+        for contact in &node.owner.contact_users {
+            for d in &contact.user.devices {
+                if is_sg || matches!(d.grade, DeviceGrade::SG) {
+                    desired.push((d.uuid, d.host, contact.public_key));
+                }
+            }
+        }
+
+        // Devices with connections healthy enough to not need renewal.
+        let healthy: HashSet<Uuid> = node.owner.active_connections.values()
+            .filter(|c| c.timeout.duration_since(now)
+                .map(|r| r >= RENEW_THRESHOLD)
+                .unwrap_or(false))
+            .map(|c| c.device_uuid)
+            .collect();
+
+        // Devices already waiting for a ConnectAck.
+        let pending: HashSet<Uuid> = node.owner.pending_connections.values()
+            .map(|p| p.peer_device_uuid)
+            .collect();
+
+        let need_conn: Vec<(Uuid, SocketAddrV4, PublicKey)> = desired.into_iter()
+            .filter(|(uuid, _, _)| !healthy.contains(uuid) && !pending.contains(uuid))
+            .collect();
+
+        (need_conn, our_longterm_pk, our_device_uuid)
+    };
+
+    // ── For each peer that needs a connection, allocate state and send ────────
+    for (peer_uuid, peer_host, peer_longterm_pk) in need_conn {
+        let result: Option<(u16, PublicKey)> = {
+            let mut node = ctx.node.write().unwrap();
+
+            // Re-check under write lock to avoid TOCTOU if this action fires twice.
+            let already_covered =
+                node.owner.pending_connections.values().any(|p| p.peer_device_uuid == peer_uuid)
+                || node.owner.active_connections.values().any(|c| c.device_uuid == peer_uuid
+                    && c.timeout.duration_since(now)
+                        .map(|r| r >= RENEW_THRESHOLD)
+                        .unwrap_or(false));
+
+            if already_covered {
+                None
+            } else {
+                let conn_id  = allocate_conn_id(&node);
+                let key_pair = KeyPair { public_key: generate_key_bytes(), private_key: generate_key_bytes() };
+                let pk_copy  = key_pair.public_key;
+                node.owner.pending_connections.insert(conn_id, PendingConnection {
+                    our_conn_id:      conn_id,
+                    our_key_pair:     key_pair,
+                    peer_device_uuid: peer_uuid,
+                    peer_longterm_pk,
+                });
+                Some((conn_id, pk_copy))
+            }
+        };
+
+        let Some((conn_id, our_ephemeral_pk)) = result else { continue; };
+
+        // Build ConnectRequest:
+        //   [op=0x20][conn_id: u16][our_device_uuid: 16][our_ephemeral_pk: 32][our_longterm_pk: 32][sig: 64]
+        let mut pkt = [0u8; 147];
+        pkt[0]        = CONNECT_REQUEST_OP;
+        pkt[1..3].copy_from_slice(&conn_id.to_be_bytes());
+        pkt[3..19].copy_from_slice(&our_device_uuid);
+        pkt[19..51].copy_from_slice(&our_ephemeral_pk);
+        pkt[51..83].copy_from_slice(&our_longterm_pk);
+        // pkt[83..147] = signature, zeros (TODO: Ed25519 signing)
+
+        send(ctx, SocketAddr::V4(peer_host), &pkt);
+    }
 }
 
 /// Retry an unacknowledged outbound message.

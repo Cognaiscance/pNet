@@ -8,6 +8,11 @@ pub type PublicKey  = [u8; 32];
 pub type PrivateKey = [u8; 32];
 pub type Uuid       = [u8; 16];
 
+/// Active connections are renewed when less than this much time remains.
+/// Must exceed MAINTAIN_CONNECTIONS_INTERVAL so a connection never lapses between checks.
+pub const RENEW_THRESHOLD:    Duration = Duration::from_secs(2 * 3600);  // 2 hours
+pub const CONNECTION_LIFETIME: Duration = Duration::from_secs(24 * 3600); // 24 hours
+
 /// Read 16 cryptographically random bytes from the OS.
 pub fn generate_uuid() -> Uuid {
     use std::io::Read;
@@ -18,18 +23,39 @@ pub fn generate_uuid() -> Uuid {
     bytes
 }
 
+/// Read 32 cryptographically random bytes from the OS (for ephemeral key generation).
+pub fn generate_key_bytes() -> [u8; 32] {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .expect("failed to read /dev/urandom");
+    bytes
+}
+
+#[derive(Clone)]
 pub struct KeyPair {
     pub public_key:  PublicKey,
     pub private_key: PrivateKey,
 }
 
 pub struct ActiveConnection {
-    pub id:                       u16,
-    pub timeout:                  SystemTime,
-    pub key_pair:                 KeyPair,
-    pub peer_public_key:          PublicKey,
+    pub id:                        u16,
+    pub timeout:                   SystemTime,
+    pub key_pair:                  KeyPair,
+    pub peer_public_key:           PublicKey,
     pub peer_active_connection_id: u16,
-    pub device_uuid:              Uuid,
+    pub device_uuid:               Uuid,
+}
+
+/// A half-open connection: we sent a ConnectRequest and are waiting for a ConnectAck.
+/// Keyed by our local connection ID in `Owner::pending_connections`.
+pub struct PendingConnection {
+    pub our_conn_id:      u16,
+    pub our_key_pair:     KeyPair,
+    pub peer_device_uuid: Uuid,
+    /// Long-term public key of the peer's user — used to verify the ConnectAck signature.
+    pub peer_longterm_pk: PublicKey,
 }
 
 pub struct Application {
@@ -75,7 +101,10 @@ pub struct Owner {
     pub key_pair:            KeyPair,
     pub contact_invitations: Vec<Invitation>,
     pub device_invitations:  Vec<Invitation>,
+    /// Fully established sessions, keyed by our local connection ID.
     pub active_connections:  HashMap<u16, ActiveConnection>,
+    /// Half-open sessions awaiting ConnectAck, keyed by our local connection ID.
+    pub pending_connections: HashMap<u16, PendingConnection>,
 }
 
 /// A known contact. Extends User with an active ephemeral key exchange.
@@ -128,6 +157,7 @@ impl Node {
                 contact_invitations: Vec::new(),
                 device_invitations:  Vec::new(),
                 active_connections:  HashMap::new(),
+                pending_connections: HashMap::new(),
             },
         }
     }
