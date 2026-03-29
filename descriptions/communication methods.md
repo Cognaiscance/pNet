@@ -56,5 +56,3 @@ Byte one of every message is to be interpreted as a number representing what typ
   * updating contact or device details
   * synchronizing user data across pnet nodes owned by the same user
 
-   
-I would like these administration messages sent from pnet to pnet node to be as deliverable as possible, thus I would like the system to require all udp transmissions fit within the safe internet udp limit. I believe this means that the payload needs to be 512 bytes or less.

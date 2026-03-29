@@ -94,6 +94,28 @@ pub struct Invitation {
     pub expires_at: SystemTime,
 }
 
+/// State held by a new device while waiting for a BootstrapResponse from the SG.
+pub struct PendingBootstrap {
+    /// From the invitation code — needed to include in DeviceRegistration so the SG
+    /// can look up the shared secret.
+    pub invitation_id:      Uuid,
+    /// Our one-time X25519 ephemeral key pair for this exchange.
+    pub our_ephem_key_pair: KeyPair,
+    /// The invitation's public key (from the code) — combined with our ephemeral
+    /// private key to derive the shared secret.
+    pub invitation_pk:      PublicKey,
+    /// Where to send DeviceRegistration once the response is received.
+    pub sg_addr:            SocketAddrV4,
+}
+
+/// State held by an SG after sending a BootstrapResponse, while waiting for
+/// the new device to send a DeviceRegistration.  Keyed by invitation ID.
+pub struct PendingDeviceAcceptance {
+    /// X25519 shared secret derived during the bootstrap exchange.
+    pub shared_secret: [u8; 32],
+    pub expires_at:    SystemTime,
+}
+
 /// The local owner of this node. Extends User with contacts and a long-term key pair.
 pub struct Owner {
     pub user:                User,
@@ -105,6 +127,11 @@ pub struct Owner {
     pub active_connections:  HashMap<u16, ActiveConnection>,
     /// Half-open sessions awaiting ConnectAck, keyed by our local connection ID.
     pub pending_connections: HashMap<u16, PendingConnection>,
+    /// Set when this device has sent a BootstrapRequest and is awaiting the response.
+    pub pending_bootstrap:   Option<PendingBootstrap>,
+    /// Keyed by invitation ID. Set when this SG has sent a BootstrapResponse and is
+    /// awaiting the new device's DeviceRegistration.
+    pub pending_device_acceptances: HashMap<Uuid, PendingDeviceAcceptance>,
 }
 
 /// A known contact. Extends User with an active ephemeral key exchange.
@@ -154,10 +181,12 @@ impl Node {
                 },
                 contact_users:       Vec::new(),
                 key_pair:            KeyPair { public_key: [0; 32], private_key: [0; 32] }, // TODO: generate real Curve25519 keys
-                contact_invitations: Vec::new(),
-                device_invitations:  Vec::new(),
-                active_connections:  HashMap::new(),
-                pending_connections: HashMap::new(),
+                contact_invitations:        Vec::new(),
+                device_invitations:         Vec::new(),
+                active_connections:         HashMap::new(),
+                pending_connections:        HashMap::new(),
+                pending_bootstrap:          None,
+                pending_device_acceptances: HashMap::new(),
             },
         }
     }

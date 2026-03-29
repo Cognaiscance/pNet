@@ -35,7 +35,7 @@ impl UdpListener {
         let socket_for_thread = Arc::clone(&socket);
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*queue;
-            let mut buf = [0u8; 512];
+            let mut buf = [0u8; 65535];
 
             while !stop.load(Ordering::Acquire) {
                 let (len, src) = match socket_for_thread.recv_from(&mut buf) {
@@ -72,8 +72,11 @@ impl UdpListener {
                         let nonce: [u8; 16] = payload[..16].try_into().unwrap();
                         Action::SgPing { src, nonce }
                     }
-                    0x20 => Action::ConnectRequest { src, buf: payload },
-                    0x21 => Action::ConnectAck     { src, buf: payload },
+                    0x20 => Action::ConnectRequest     { src, buf: payload },
+                    0x21 => Action::ConnectAck         { src, buf: payload },
+                    0x30 => Action::BootstrapRequest   { src, buf: payload },
+                    0x31 => Action::BootstrapResponse  { src, buf: payload },
+                    0x32 => Action::DeviceRegistration { src, buf: payload },
                     _ => {
                         eprintln!("[udp] unknown op byte {op} from {src}");
                         continue;
@@ -119,13 +122,16 @@ mod tests {
     #[test]
     fn op_bytes_map_to_correct_action_variants() {
         let cases: &[(u8, fn(&Action) -> bool)] = &[
-            (0x00, |a| matches!(a, Action::AppRegister    { .. })),
-            (0x01, |a| matches!(a, Action::AppUpdate      { .. })),
-            (0x02, |a| matches!(a, Action::AppGetData     { .. })),
-            (0x03, |a| matches!(a, Action::AppSendPacket  { .. })),
-            (0x10, |a| matches!(a, Action::SgPing         { .. })),
-            (0x20, |a| matches!(a, Action::ConnectRequest { .. })),
-            (0x21, |a| matches!(a, Action::ConnectAck     { .. })),
+            (0x00, |a| matches!(a, Action::AppRegister      { .. })),
+            (0x01, |a| matches!(a, Action::AppUpdate        { .. })),
+            (0x02, |a| matches!(a, Action::AppGetData       { .. })),
+            (0x03, |a| matches!(a, Action::AppSendPacket    { .. })),
+            (0x10, |a| matches!(a, Action::SgPing           { .. })),
+            (0x20, |a| matches!(a, Action::ConnectRequest   { .. })),
+            (0x21, |a| matches!(a, Action::ConnectAck       { .. })),
+            (0x30, |a| matches!(a, Action::BootstrapRequest   { .. })),
+            (0x31, |a| matches!(a, Action::BootstrapResponse  { .. })),
+            (0x32, |a| matches!(a, Action::DeviceRegistration { .. })),
         ];
 
         for (op, check) in cases {

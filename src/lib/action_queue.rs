@@ -20,9 +20,12 @@ pub enum Action {
     UiRequest { stream: TcpStream, method: String, path: String, query: String, body: Vec<u8> },
 
     // From peer pNet nodes
-    SgPing         { src: SocketAddr, nonce: [u8; 16] },
-    ConnectRequest { src: SocketAddr, buf: Vec<u8> },
-    ConnectAck     { src: SocketAddr, buf: Vec<u8> },
+    SgPing             { src: SocketAddr, nonce: [u8; 16] },
+    ConnectRequest     { src: SocketAddr, buf: Vec<u8> },
+    ConnectAck         { src: SocketAddr, buf: Vec<u8> },
+    BootstrapRequest   { src: SocketAddr, buf: Vec<u8> },
+    BootstrapResponse  { src: SocketAddr, buf: Vec<u8> },
+    DeviceRegistration { src: SocketAddr, buf: Vec<u8> },
 
     // Scheduled
     PollSG,
@@ -55,9 +58,12 @@ impl Action {
             Action::UiRequest { stream, method, path, query, body } => {
                 handlers::ui_request(stream, method, path, query, body, ctx)
             }
-            Action::SgPing { src, nonce }           => handlers::sg_ping(src, nonce, ctx),
-            Action::ConnectRequest { src, buf }     => handlers::connect_request(src, buf, ctx),
-            Action::ConnectAck     { src, buf }     => handlers::connect_ack(src, buf, ctx),
+            Action::SgPing             { src, nonce } => handlers::sg_ping(src, nonce, ctx),
+            Action::ConnectRequest     { src, buf }   => handlers::connect_request(src, buf, ctx),
+            Action::ConnectAck         { src, buf }   => handlers::connect_ack(src, buf, ctx),
+            Action::BootstrapRequest   { src, buf }   => handlers::bootstrap_request(src, buf, ctx),
+            Action::BootstrapResponse  { src, buf }   => handlers::bootstrap_response(src, buf, ctx),
+            Action::DeviceRegistration { src, buf }   => handlers::device_registration(src, buf, ctx),
             Action::PollSG                          => handlers::poll_sg(ctx),
             Action::MaintainConnections             => handlers::maintain_connections(ctx),
             Action::RetryMessage { message_id }     => handlers::retry_message(message_id, ctx),

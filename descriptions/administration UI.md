@@ -58,3 +58,13 @@ Manage invitation tokens used to add new contacts or devices.
 * Generate a new device invitation
 * View pending invitations with expiry times
 * Revoke an invitation
+
+#### Device invitation detail
+
+When the owner generates a device invitation, the node:
+1. Selects the target SG — itself if this device is an SG, otherwise the lowest-RTT up SG from `sg_statuses`.
+2. Creates an `Invitation` with a fresh ephemeral key pair and an expiry time.
+3. Stores it in `owner.device_invitations`. If this device is a DG, the invitation will be synced to the target SG by the future device-sync system before the new device tries to use it.
+4. Displays a shareable code: base64 of `invitation_id (16) || invitation_public_key (32) || sg_host (6)` — 72 characters, suitable for copy-paste or QR code.
+
+On the new, unconfigured device, the owner enters the invitation code. The node parses out the invitation ID, public key, and SG host, then begins the bootstrap exchange (see pnet to pnet communication.md — Device Bootstrap). After the exchange completes, the owner is prompted to set an alias and grade for the new device before it registers with the SG.
