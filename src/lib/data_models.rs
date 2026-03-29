@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant, SystemTime};
 
+use serde::{Deserialize, Serialize};
+
 // Curve25519 keys (32 bytes), compatible with NaCl/libsodium (rbnacl on the Rails side).
 // Use X25519 for key exchange (EphemeralKeyExchange) and Ed25519 for signing (KeyPair).
 pub type PublicKey  = [u8; 32];
@@ -33,9 +35,122 @@ pub fn generate_key_bytes() -> [u8; 32] {
     bytes
 }
 
-#[derive(Clone)]
+// ── Serde helpers ─────────────────────────────────────────────────────────────
+
+/// Serialize/deserialize a [u8; 32] as a 64-character lowercase hex string.
+pub mod serde_bytes_32 {
+    use serde::{de::Error, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex(v))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s: String = serde::Deserialize::deserialize(d)?;
+        unhex_32(&s).map_err(D::Error::custom)
+    }
+
+    pub fn hex(bytes: &[u8]) -> String {
+        const H: &[u8] = b"0123456789abcdef";
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            s.push(H[(b >> 4) as usize] as char);
+            s.push(H[(b & 0xf) as usize] as char);
+        }
+        s
+    }
+
+    fn unhex_32(s: &str) -> Result<[u8; 32], &'static str> {
+        if s.len() != 64 { return Err("expected 64 hex chars for 32-byte field"); }
+        let mut out = [0u8; 32];
+        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+            out[i] = nibble(chunk[0])? << 4 | nibble(chunk[1])?;
+        }
+        Ok(out)
+    }
+
+    fn nibble(b: u8) -> Result<u8, &'static str> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err("invalid hex character"),
+        }
+    }
+}
+
+/// Serialize/deserialize a [u8; 16] as a 32-character lowercase hex string.
+mod serde_bytes_16 {
+    use serde::{de::Error, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8; 16], s: S) -> Result<S::Ok, S::Error> {
+        let hex: String = v.iter().flat_map(|&b| {
+            const H: &[u8] = b"0123456789abcdef";
+            [H[(b >> 4) as usize] as char, H[(b & 0xf) as usize] as char]
+        }).collect();
+        s.serialize_str(&hex)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 16], D::Error> {
+        let s: String = serde::Deserialize::deserialize(d)?;
+        if s.len() != 32 { return Err(D::Error::custom("expected 32 hex chars for 16-byte field")); }
+        let mut out = [0u8; 16];
+        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+            out[i] = nibble(chunk[0]).map_err(D::Error::custom)? << 4
+                   | nibble(chunk[1]).map_err(D::Error::custom)?;
+        }
+        Ok(out)
+    }
+
+    fn nibble(b: u8) -> Result<u8, &'static str> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err("invalid hex character"),
+        }
+    }
+}
+
+/// Serialize/deserialize a SocketAddrV4 as an "ip:port" string.
+mod serde_socket_addr_v4 {
+    use serde::{de::Error as _, Deserializer, Serializer};
+    use std::net::SocketAddrV4;
+    use std::str::FromStr;
+
+    pub fn serialize<S: Serializer>(v: &SocketAddrV4, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SocketAddrV4, D::Error> {
+        let s: String = serde::Deserialize::deserialize(d)?;
+        SocketAddrV4::from_str(&s).map_err(D::Error::custom)
+    }
+}
+
+/// Serialize/deserialize a SystemTime as seconds since UNIX_EPOCH (i64).
+mod serde_system_time {
+    use serde::{Deserializer, Serializer};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    pub fn serialize<S: Serializer>(v: &SystemTime, s: S) -> Result<S::Ok, S::Error> {
+        let secs = v.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() as i64;
+        s.serialize_i64(secs)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SystemTime, D::Error> {
+        let secs: i64 = serde::Deserialize::deserialize(d)?;
+        Ok(UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64))
+    }
+}
+
+// ── Data model structs ────────────────────────────────────────────────────────
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KeyPair {
+    #[serde(with = "serde_bytes_32")]
     pub public_key:  PublicKey,
+    #[serde(with = "serde_bytes_32")]
     pub private_key: PrivateKey,
 }
 
@@ -58,15 +173,19 @@ pub struct PendingConnection {
     pub peer_longterm_pk: PublicKey,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Application {
     pub id:            u16,
     pub alias:         String,
     pub protocol:      String,
+    #[serde(with = "serde_socket_addr_v4")]
     pub host:          SocketAddrV4,
     pub user_approved: bool,
+    #[serde(with = "serde_bytes_16")]
     pub token:         Uuid,
 }
 
+#[derive(Serialize, Deserialize)]
 pub enum DeviceGrade {
     /// Server Grade — static IP or domain, acts as relay for the user's DGs.
     SG,
@@ -74,23 +193,31 @@ pub enum DeviceGrade {
     DG,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Device {
     pub alias:        String,
+    #[serde(with = "serde_bytes_16")]
     pub uuid:         Uuid,
     pub grade:        DeviceGrade,
+    #[serde(with = "serde_socket_addr_v4")]
     pub host:         SocketAddrV4,
     pub applications: Vec<Application>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct User {
     pub alias:   String,
+    #[serde(with = "serde_bytes_16")]
     pub uuid:    Uuid,
     pub devices: Vec<Device>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Invitation {
+    #[serde(with = "serde_bytes_16")]
     pub id:         Uuid,
     pub key_pair:   KeyPair,
+    #[serde(with = "serde_system_time")]
     pub expires_at: SystemTime,
 }
 
@@ -117,26 +244,32 @@ pub struct PendingDeviceAcceptance {
 }
 
 /// The local owner of this node. Extends User with contacts and a long-term key pair.
+#[derive(Serialize, Deserialize)]
 pub struct Owner {
     pub user:                User,
     pub contact_users:       Vec<Contact>,
     pub key_pair:            KeyPair,
     pub contact_invitations: Vec<Invitation>,
     pub device_invitations:  Vec<Invitation>,
-    /// Fully established sessions, keyed by our local connection ID.
+    /// Ephemeral — not persisted; rebuilt as connections are established.
+    #[serde(skip)]
     pub active_connections:  HashMap<u16, ActiveConnection>,
-    /// Half-open sessions awaiting ConnectAck, keyed by our local connection ID.
+    /// Ephemeral — not persisted; cleared when ConnectAck arrives.
+    #[serde(skip)]
     pub pending_connections: HashMap<u16, PendingConnection>,
-    /// Set when this device has sent a BootstrapRequest and is awaiting the response.
+    /// Ephemeral — not persisted; set while waiting for BootstrapResponse.
+    #[serde(skip)]
     pub pending_bootstrap:   Option<PendingBootstrap>,
-    /// Keyed by invitation ID. Set when this SG has sent a BootstrapResponse and is
-    /// awaiting the new device's DeviceRegistration.
+    /// Ephemeral — not persisted; set when this SG is awaiting DeviceRegistration.
+    #[serde(skip)]
     pub pending_device_acceptances: HashMap<Uuid, PendingDeviceAcceptance>,
 }
 
 /// A known contact. Extends User with an active ephemeral key exchange.
+#[derive(Serialize, Deserialize)]
 pub struct Contact {
     pub user:       User,
+    #[serde(with = "serde_bytes_32")]
     pub public_key: PublicKey,
 }
 
@@ -148,11 +281,14 @@ pub struct SgStatus {
     pub last_polled: Instant,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Node {
-    pub owner:        Owner,
-    pub device_uuid:  Uuid,
-    /// RTT and up/down status for every candidate SG, refreshed by PollSG.
-    pub sg_statuses:  HashMap<Uuid, SgStatus>,
+    pub owner:       Owner,
+    #[serde(with = "serde_bytes_16")]
+    pub device_uuid: Uuid,
+    /// Ephemeral — not persisted; refreshed by PollSG on each run.
+    #[serde(skip)]
+    pub sg_statuses: HashMap<Uuid, SgStatus>,
 }
 
 impl Node {

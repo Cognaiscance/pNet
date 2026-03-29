@@ -48,6 +48,15 @@ pub struct WorkerContext {
     pub scheduler_tx: mpsc::Sender<ScheduleRequest>,
 }
 
+impl WorkerContext {
+    /// Serialize the current node state and queue it for writing to disk.
+    /// Call this after any mutation that affects persistent data.
+    pub fn save_node(&self) {
+        let toml_str = super::persistence::save(&*self.node.read().unwrap());
+        let _ = self.writer_tx.send(WriteRequest::NodeData(toml_str));
+    }
+}
+
 impl Action {
     pub fn dispatch(self, ctx: &WorkerContext) {
         use super::handlers;

@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use lib::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW};
-use lib::data_models::{DeviceGrade, Node};
+use lib::data_models::DeviceGrade;
 use lib::http_server::HttpServer;
+use lib::persistence;
 use lib::scheduler::SchedulerThread;
 use lib::thread_pool::{SharedQueue, ThreadPool};
 use lib::udp_listener::{udp_port, UdpListener};
@@ -21,10 +22,9 @@ fn data_dir() -> PathBuf {
 
 fn main() {
     // ── 1. Load data from disk ───────────────────────────────────────────────
-    // TODO: deserialize TOML files from data_dir() into Node; use Node::new()
-    //       only when no saved state exists (first run).
-    println!("[main] loading data...");
-    let node = Arc::new(RwLock::new(Node::new()));
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir).expect("could not create data directory");
+    let node = Arc::new(RwLock::new(persistence::load(&dir)));
 
     // ── 2. Start the shared queue ────────────────────────────────────────────
     let queue: SharedQueue = Arc::new((Mutex::new(ActionQueue::new()), Condvar::new()));
@@ -33,8 +33,6 @@ fn main() {
     let stop = Arc::new(AtomicBool::new(false));
 
     // ── 3. Start writer thread ───────────────────────────────────────────────
-    let dir = data_dir();
-    std::fs::create_dir_all(&dir).expect("could not create data directory");
     let mut writer = WriterThread::start(dir);
 
     // ── 4. Start scheduler ───────────────────────────────────────────────────
@@ -122,6 +120,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lib::data_models::Node;
     use std::time::Duration;
 
     #[test]

@@ -111,7 +111,7 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         // write lock released here
     };
 
-    // TODO: persist — ctx.writer_tx.send(WriteRequest::AppData(serialize_apps(&node))).ok();
+    ctx.save_node();
 
     // Reply: [OK][token: 16 bytes]
     let mut reply = [0u8; 17];
@@ -192,9 +192,8 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         // write lock released here
     };
 
-    // TODO: persist
-
     if found {
+        ctx.save_node();
         send(ctx, src, &[OK]);
     } else {
         send_error(ctx, src, ERR_TOKEN_UNKNOWN);
@@ -617,6 +616,8 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         // write lock released here
     };
 
+    ctx.save_node(); // consumed the device invitation
+
     // Encrypt and send outside the lock.
     let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
     let mut pkt = Vec::with_capacity(1 + 24 + ciphertext.len());
@@ -690,6 +691,8 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         // write lock released here
     };
 
+    ctx.save_node(); // applied user data from bootstrap
+
     if device_reg_payload.is_empty() {
         eprintln!("[bootstrap_response] local device not found, cannot register");
         return;
@@ -758,9 +761,9 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         if !node.owner.user.devices.iter().any(|d| d.uuid == device.uuid) {
             eprintln!("[device_registration] new device '{}' registered from {src}", device.alias);
             node.owner.user.devices.push(device);
-            // TODO: persist; trigger sync to other user devices
         }
     }
+    ctx.save_node();
 }
 
 // ── Scheduled action handlers ─────────────────────────────────────────────────
@@ -1244,23 +1247,27 @@ fn render_devices(ctx: &WorkerContext) -> String {
 fn approve_app(body: &[u8], ctx: &WorkerContext) {
     let Some(id_str) = form_field(body, "id") else { return };
     let Ok(id) = id_str.parse::<u16>() else { return };
-
-    let mut node        = ctx.node.write().unwrap();
-    let device_uuid     = node.device_uuid;
-    let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else { return };
-    if let Some(app) = device.applications.iter_mut().find(|a| a.id == id) {
-        app.user_approved = true;
+    {
+        let mut node    = ctx.node.write().unwrap();
+        let device_uuid = node.device_uuid;
+        let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else { return };
+        if let Some(app) = device.applications.iter_mut().find(|a| a.id == id) {
+            app.user_approved = true;
+        }
     }
+    ctx.save_node();
 }
 
 fn reject_app(body: &[u8], ctx: &WorkerContext) {
     let Some(id_str) = form_field(body, "id") else { return };
     let Ok(id) = id_str.parse::<u16>() else { return };
-
-    let mut node        = ctx.node.write().unwrap();
-    let device_uuid     = node.device_uuid;
-    let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else { return };
-    device.applications.retain(|a| a.id != id);
+    {
+        let mut node    = ctx.node.write().unwrap();
+        let device_uuid = node.device_uuid;
+        let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else { return };
+        device.applications.retain(|a| a.id != id);
+    }
+    ctx.save_node();
 }
 
 // ── Invitation generation and bootstrap initiation ───────────────────────────
@@ -1307,6 +1314,8 @@ fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
         });
         (id, pk)
     };
+
+    ctx.save_node();
 
     // Encode: invitation_id (16) || invitation_pk (32) || sg_host ip (4) || port (2) = 54 bytes
     let mut raw = [0u8; 54];
