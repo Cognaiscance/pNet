@@ -294,6 +294,11 @@ pub struct Node {
 impl Node {
     /// Create a brand-new node with no contacts, no apps, and placeholder keys.
     /// Used on first run before the user has completed setup.
+    /// Returns true once the node has completed first-run setup (keys are non-zero).
+    pub fn is_initialized(&self) -> bool {
+        self.owner.key_pair.public_key != [0u8; 32]
+    }
+
     pub fn new() -> Self {
         let owner_uuid  = generate_uuid();
         let device_uuid = generate_uuid();

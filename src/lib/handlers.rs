@@ -1002,7 +1002,30 @@ pub fn ui_request(
     body:   Vec<u8>,
     ctx:    &WorkerContext,
 ) {
+    // Setup guard — redirect to /setup when not yet initialized, and redirect
+    // away from /setup once initialization is complete.
+    let is_setup_route = matches!(path.as_str(), "/setup" | "/setup/create" | "/setup/join");
+    if is_setup_route {
+        if ctx.node.read().unwrap().is_initialized() {
+            return respond_redirect(&stream, "/dashboard");
+        }
+    } else if !ctx.node.read().unwrap().is_initialized() {
+        return respond_redirect(&stream, "/setup");
+    }
+
     match (method.as_str(), path.as_str()) {
+        ("GET",  "/setup") => respond_html(&stream, 200, &render_setup(&query)),
+        ("POST", "/setup/create") => {
+            if complete_setup(&body, ctx) {
+                respond_redirect(&stream, "/dashboard")
+            } else {
+                respond_redirect(&stream, "/setup?grade=sg&role=new&error=1")
+            }
+        }
+        ("POST", "/setup/join") => {
+            initiate_bootstrap(&body, ctx);
+            respond_redirect(&stream, "/setup?waiting=1")
+        }
         ("GET",  "/")                     => respond_redirect(&stream, "/dashboard"),
         ("GET",  "/dashboard")            => respond_html(&stream, 200, &render_dashboard(ctx)),
         ("GET",  "/pending-apps")         => respond_html(&stream, 200, &render_pending_apps(ctx)),
@@ -1074,6 +1097,46 @@ fn html_escape(s: &str) -> String {
      .replace('<', "&lt;")
      .replace('>', "&gt;")
      .replace('"', "&quot;")
+}
+
+/// Decode a percent-encoded URL form value (e.g. `hello+world` → `hello world`).
+fn url_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => { out.push(' '); i += 1; }
+            b'%' if i + 2 < b.len() => {
+                match (hex_nibble(b[i + 1]), hex_nibble(b[i + 2])) {
+                    (Some(hi), Some(lo)) => { out.push(char::from(hi << 4 | lo)); i += 3; }
+                    _ => { out.push('%'); i += 1; }
+                }
+            }
+            c => { out.push(char::from(c)); i += 1; }
+        }
+    }
+    out
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Extract a value from a query string (e.g. `grade=sg&role=new`).
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    for part in query.split('&') {
+        if let Some(val) = part.strip_prefix(prefix.as_str()) {
+            return Some(val);
+        }
+    }
+    None
 }
 
 // ── Page renders ─────────────────────────────────────────────────────────────
@@ -1429,6 +1492,143 @@ fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
     layout("Invitations", &body)
 }
 
+// ── Setup wizard ─────────────────────────────────────────────────────────────
+
+/// Apply first-run setup from the new-user form.  Returns false if required
+/// fields are missing (caller should redirect back with an error indicator).
+fn complete_setup(body: &[u8], ctx: &WorkerContext) -> bool {
+    let alias        = form_field(body, "alias").map(url_decode).unwrap_or_default();
+    let device_alias = form_field(body, "device_alias").map(url_decode).unwrap_or_default();
+    let grade_str    = form_field(body, "grade").unwrap_or("sg");
+
+    let alias        = alias.trim().to_string();
+    let device_alias = device_alias.trim().to_string();
+
+    if alias.is_empty() || device_alias.is_empty() {
+        return false;
+    }
+
+    let grade    = if grade_str == "sg" { DeviceGrade::SG } else { DeviceGrade::DG };
+    let key_pair = generate_x25519_keypair();
+
+    {
+        let mut node    = ctx.node.write().unwrap();
+        node.owner.user.alias = alias;
+        node.owner.key_pair   = key_pair;
+
+        let device_uuid = node.device_uuid;
+        if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) {
+            dev.alias = device_alias;
+            dev.grade = grade;
+        }
+    }
+    ctx.save_node();
+    true
+}
+
+fn render_setup(query: &str) -> String {
+    let grade   = query_param(query, "grade").unwrap_or("");
+    let role    = query_param(query, "role").unwrap_or("");
+    let waiting = query_param(query, "waiting").is_some();
+    let error   = query_param(query, "error").is_some();
+
+    let body: String = if waiting {
+        "<meta http-equiv=\"refresh\" content=\"3; url=/setup\">\
+         <h1>Connecting\u{2026}</h1>\
+         <p class=\"swiz-sub\">Waiting for a response from the server.<br>\
+         This page will refresh automatically.</p>\
+         <p style=\"color:#888;font-size:.8rem\">Make sure the invitation code was valid \
+         and that the server is reachable.</p>"
+            .to_string()
+    } else {
+        match (grade, role) {
+            ("", _) => render_setup_grade_step(),
+            ("sg", "") => render_setup_role_step(),
+            ("sg", "new") => render_setup_new_user_form(error),
+            ("sg", "join") | ("dg", _) => render_setup_code_entry(grade),
+            _ => render_setup_grade_step(),
+        }
+    };
+    setup_layout(&body)
+}
+
+fn render_setup_grade_step() -> String {
+    "<h1>Welcome to pNet</h1>\
+     <p class=\"swiz-sub\">Let\u{2019}s get your node configured. \
+     First, what type of device is this?</p>\
+     <a class=\"choice-btn\" href=\"/setup?grade=sg\">\
+       <span class=\"choice-title\">Server Grade (SG)</span>\
+       <span class=\"choice-desc\">A server with a static IP or domain. \
+       Acts as a relay for your other devices.</span>\
+     </a>\
+     <a class=\"choice-btn\" href=\"/setup?grade=dg\">\
+       <span class=\"choice-title\">Device Grade (DG)</span>\
+       <span class=\"choice-desc\">A laptop, phone, or any device behind a home router. \
+       Requires a server to relay connections.</span>\
+     </a>"
+        .to_string()
+}
+
+fn render_setup_role_step() -> String {
+    "<h1>Server Grade Setup</h1>\
+     <p class=\"swiz-sub\">Is this the first device for a new user, \
+     or are you adding it to an existing account?</p>\
+     <a class=\"choice-btn\" href=\"/setup?grade=sg&role=new\">\
+       <span class=\"choice-title\">New User</span>\
+       <span class=\"choice-desc\">Create a new pNet identity on this server.</span>\
+     </a>\
+     <a class=\"choice-btn\" href=\"/setup?grade=sg&role=join\">\
+       <span class=\"choice-title\">Join Existing</span>\
+       <span class=\"choice-desc\">Add this server to an existing user\u{2019}s pNet \
+       using an invitation code.</span>\
+     </a>\
+     <a class=\"swiz-back\" href=\"/setup\">\u{2190} Back</a>"
+        .to_string()
+}
+
+fn render_setup_new_user_form(error: bool) -> String {
+    let error_msg = if error {
+        "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+         Both fields are required.</p>"
+    } else {
+        ""
+    };
+    format!(
+        "<h1>Create Your Identity</h1>\
+         <p class=\"swiz-sub\">Set your name and give this server a label.</p>\
+         {error_msg}\
+         <form method=\"post\" action=\"/setup/create\" style=\"display:block\">\
+           <input type=\"hidden\" name=\"grade\" value=\"sg\">\
+           <label class=\"swiz-label\">Your name or alias</label>\
+           <input class=\"swiz-input\" type=\"text\" name=\"alias\" \
+                  placeholder=\"e.g. Alice\" required autocomplete=\"off\">\
+           <label class=\"swiz-label\">Device name</label>\
+           <input class=\"swiz-input\" type=\"text\" name=\"device_alias\" \
+                  placeholder=\"e.g. Home Server\" required autocomplete=\"off\">\
+           <button class=\"swiz-btn\" type=\"submit\">Create Identity</button>\
+         </form>\
+         <a class=\"swiz-back\" href=\"/setup?grade=sg\">\u{2190} Back</a>"
+    )
+}
+
+fn render_setup_code_entry(grade: &str) -> String {
+    let back = if grade == "sg" { "/setup?grade=sg" } else { "/setup" };
+    format!(
+        "<h1>Enter Invitation Code</h1>\
+         <p class=\"swiz-sub\">Paste the invitation code generated on your existing device.</p>\
+         <form method=\"post\" action=\"/setup/join\" style=\"display:block\">\
+           <label class=\"swiz-label\">Invitation code</label>\
+           <textarea name=\"code\" rows=\"4\" \
+             style=\"width:100%;box-sizing:border-box;font-family:monospace;\
+                    font-size:.8rem;padding:.5rem;border:1px solid #ccc;\
+                    border-radius:4px;margin-bottom:.75rem;resize:vertical\" \
+             placeholder=\"Paste code here\u{2026}\" required></textarea>\
+           <button class=\"swiz-btn\" type=\"submit\">Connect</button>\
+         </form>\
+         <a class=\"swiz-back\" href=\"{back}\">\u{2190} Back</a>"
+    )
+}
+
 // ── HTML layout ───────────────────────────────────────────────────────────────
 
 const CSS: &str = "
@@ -1473,6 +1673,42 @@ fn layout(title: &str, body: &str) -> String {
     html.push_str(body);
     html.push_str("\n</main>\n</body>\n</html>");
     html
+}
+
+const SETUP_CSS: &str = "
+.swiz-wrap { max-width: 460px; margin: 5rem auto; padding: 0 1.5rem; }
+.swiz-brand { color: #1a1a2e; font-weight: bold; font-size: 1.3rem; margin-bottom: 2.5rem; }
+.swiz-wrap h1 { font-size: 1.5rem; margin: 0 0 .4rem; }
+.swiz-sub { color: #666; font-size: .9rem; margin: 0 0 1.5rem; line-height: 1.5; }
+.choice-btn { display: block; background: white; border: 1px solid #ddd; border-radius: 8px;
+              padding: 1rem 1.2rem; margin-bottom: .75rem; text-decoration: none; color: #222;
+              box-shadow: 0 1px 3px rgba(0,0,0,.07); transition: border-color .15s; }
+.choice-btn:hover { border-color: #1a1a2e; }
+.choice-title { display: block; font-weight: bold; font-size: .95rem; }
+.choice-desc { display: block; font-size: .8rem; color: #666; margin-top: .25rem; line-height: 1.4; }
+.swiz-label { display: block; font-size: .85rem; color: #555; margin-bottom: .3rem; }
+.swiz-input { display: block; width: 100%; box-sizing: border-box; padding: .55rem .7rem;
+              border: 1px solid #ccc; border-radius: 5px; font-size: .95rem; margin-bottom: 1rem; }
+.swiz-btn { background: #1a1a2e; color: white; border: none; border-radius: 5px;
+            padding: .55rem 1.4rem; font-size: .95rem; cursor: pointer; }
+.swiz-btn:hover { background: #2a2a4e; }
+.swiz-back { display: inline-block; margin-top: 1.25rem; font-size: .8rem; color: #888;
+             text-decoration: none; }
+.swiz-back:hover { color: #444; }
+";
+
+fn setup_layout(body: &str) -> String {
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n\
+         <meta charset=\"utf-8\">\n\
+         <title>pNet \u{2014} Setup</title>\n\
+         <style>{SETUP_CSS}</style>\n\
+         </head>\n<body>\n\
+         <div class=\"swiz-wrap\">\
+           <div class=\"swiz-brand\">pNet</div>\
+           {body}\
+         </div>\n</body>\n</html>"
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
