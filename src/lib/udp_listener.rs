@@ -80,6 +80,8 @@ impl UdpListener {
                     0x30 => Action::BootstrapRequest   { src, buf: payload },
                     0x31 => Action::BootstrapResponse  { src, buf: payload },
                     0x32 => Action::DeviceRegistration { src, buf: payload },
+                    0x40 => Action::RelayPacket        { src, buf: payload },
+                    0x41 => Action::AppPacket          { src, buf: payload },
                     _ => {
                         eprintln!("[udp] unknown op byte {op} from {src}");
                         continue;

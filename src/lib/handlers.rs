@@ -13,6 +13,7 @@ use super::data_models::{
 const OK:                u8 = 0x00;
 const ERR_BAD_PACKET:    u8 = 0x01;
 const ERR_TOKEN_UNKNOWN: u8 = 0x02;
+const ERR_NO_ROUTE:      u8 = 0x03;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -242,8 +243,69 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// Looks up the active connection for the target device, encrypts the payload,
 /// and forwards the packet to the peer pnet node.
 /// Not yet implemented — requires ephemeral key exchange to be established first.
+/// Op 3 — Application send packet.
+///
+/// Request body (after op byte):
+///   [token: 16][dest_device_uuid: 16][dest_app_id: u16][payload: rest]
+///
+/// Builds a RelayPacket (op 0x40) and sends it to the lowest-RTT reachable SG
+/// from the combined pool of the local user's SGs and the destination user's SGs.
 pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let _ = (src, buf, ctx); // TODO
+    const MIN_LEN: usize = 16 + 16 + 2;
+    if buf.len() < MIN_LEN {
+        return send_error(ctx, src, ERR_BAD_PACKET);
+    }
+
+    let token: Uuid            = buf[0..16].try_into().unwrap();
+    let dest_device_uuid: Uuid = buf[16..32].try_into().unwrap();
+    let dest_app_id            = u16::from_be_bytes([buf[32], buf[33]]);
+    let payload                = &buf[34..];
+
+    // Build packet and look up the SG address under a single read lock.
+    let out: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+
+        // Find the sending app by token.
+        let device_uuid = node.device_uuid;
+        let Some(sender_app_id) = node.owner.user.devices.iter()
+            .find(|d| d.uuid == device_uuid)
+            .and_then(|d| d.applications.iter()
+                .find(|a| a.token == token && a.user_approved))
+            .map(|a| a.id)
+        else {
+            return send_error(ctx, src, ERR_TOKEN_UNKNOWN);
+        };
+
+        // Build SG candidate pool and pick the best one.
+        let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
+        let Some(sg_conn) = best_sg_connection(&node, &candidates) else {
+            eprintln!("[app_send_packet] no reachable SG for dest {:?}", dest_device_uuid);
+            return send_error(ctx, src, ERR_NO_ROUTE);
+        };
+
+        let sg_uuid = sg_conn.device_uuid;
+
+        // RelayPacket body: [dest_device_uuid: 16][dest_app_id: u16][sender_app_id: u16][payload]
+        let mut plaintext = Vec::with_capacity(20 + payload.len());
+        plaintext.extend_from_slice(&dest_device_uuid);
+        plaintext.extend_from_slice(&dest_app_id.to_be_bytes());
+        plaintext.extend_from_slice(&sender_app_id.to_be_bytes());
+        plaintext.extend_from_slice(payload);
+
+        let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
+
+        // Find the SG's host address.
+        let sg_host = node.owner.user.devices.iter()
+            .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
+            .find(|d| d.uuid == sg_uuid)
+            .map(|d| d.host);
+
+        sg_host.map(|h| (pkt, SocketAddr::V4(h)))
+    };
+
+    if let Some((pkt, dest)) = out {
+        send(ctx, dest, &pkt);
+    }
 }
 
 // ── Peer pNet node handlers ───────────────────────────────────────────────────
@@ -256,6 +318,9 @@ const CONNECT_ACK_OP:      u8 = 0x21;
 const BOOTSTRAP_REQUEST_OP:  u8 = 0x30;
 const BOOTSTRAP_RESPONSE_OP: u8 = 0x31;
 const DEVICE_REGISTER_OP:    u8 = 0x32;
+const RELAY_PACKET_OP:       u8 = 0x40;
+const APP_PACKET_OP:         u8 = 0x41;
+const APP_PUSH_OP:           u8 = 0x04;
 
 /// How long the SG keeps a PendingDeviceAcceptance waiting for DeviceRegistration.
 const PENDING_ACCEPTANCE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -330,7 +395,16 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let initiator_device_uuid: Uuid         = buf[2..18].try_into().unwrap();
     let initiator_ephemeral_pk: PublicKey   = buf[18..50].try_into().unwrap();
     let initiator_longterm_pk: PublicKey    = buf[50..82].try_into().unwrap();
-    // buf[82..146] = signature — TODO: verify with Ed25519
+    let signature: [u8; 64]                 = buf[82..146].try_into().unwrap();
+
+    // Verify Ed25519 signature over [op=0x20] || buf[0..82].
+    let mut signed_msg = [0u8; 83];
+    signed_msg[0] = CONNECT_REQUEST_OP;
+    signed_msg[1..83].copy_from_slice(&buf[0..82]);
+    if !ed25519_verify(&initiator_longterm_pk, &signed_msg, &signature) {
+        eprintln!("[connect_request] invalid signature from {src}");
+        return;
+    }
 
     // Verify the initiator is a known device.
     let known = {
@@ -343,11 +417,12 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
 
     // Allocate our ephemeral key pair and connection ID, then store the active connection.
-    let (our_conn_id, our_ephemeral_pk) = {
+    let (our_conn_id, our_ephemeral_pk, our_longterm_sk) = {
         let mut node = ctx.node.write().unwrap();
         let conn_id  = allocate_conn_id(&node);
-        let key_pair = KeyPair { public_key: generate_key_bytes(), private_key: generate_key_bytes() };
+        let key_pair = generate_x25519_keypair();
         let pk_copy  = key_pair.public_key;
+        let sk_copy  = node.owner.key_pair.private_key;
         node.owner.active_connections.insert(conn_id, ActiveConnection {
             id:                        conn_id,
             timeout:                   SystemTime::now() + CONNECTION_LIFETIME,
@@ -356,7 +431,7 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             peer_active_connection_id: initiator_conn_id,
             device_uuid:               initiator_device_uuid,
         });
-        (conn_id, pk_copy)
+        (conn_id, pk_copy, sk_copy)
     };
 
     // Reply with ConnectAck:
@@ -366,7 +441,8 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     pkt[1..3].copy_from_slice(&our_conn_id.to_be_bytes());
     pkt[3..5].copy_from_slice(&initiator_conn_id.to_be_bytes());
     pkt[5..37].copy_from_slice(&our_ephemeral_pk);
-    // pkt[37..101] = signature, zeros (TODO: Ed25519 signing)
+    let sig = ed25519_sign(&our_longterm_sk, &pkt[0..37]);
+    pkt[37..101].copy_from_slice(&sig);
     send(ctx, src, &pkt);
 }
 
@@ -389,13 +465,24 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let responder_conn_id               = u16::from_be_bytes([buf[0], buf[1]]);
     let our_conn_id                     = u16::from_be_bytes([buf[2], buf[3]]);
     let responder_ephemeral_pk: PublicKey = buf[4..36].try_into().unwrap();
-    // buf[36..100] = signature — TODO: verify with Ed25519 using pending.peer_longterm_pk
+    let signature: [u8; 64]             = buf[36..100].try_into().unwrap();
 
     let mut node = ctx.node.write().unwrap();
     let Some(pending) = node.owner.pending_connections.remove(&our_conn_id) else {
         eprintln!("[connect_ack] no pending connection for id {our_conn_id} from {src}");
         return;
     };
+
+    // Verify Ed25519 signature over [op=0x21] || buf[0..36].
+    let mut signed_msg = [0u8; 37];
+    signed_msg[0] = CONNECT_ACK_OP;
+    signed_msg[1..37].copy_from_slice(&buf[0..36]);
+    if !ed25519_verify(&pending.peer_longterm_pk, &signed_msg, &signature) {
+        eprintln!("[connect_ack] invalid signature from {src}");
+        // Put the pending connection back so we don't lose the slot.
+        node.owner.pending_connections.insert(our_conn_id, pending);
+        return;
+    }
 
     node.owner.active_connections.insert(our_conn_id, ActiveConnection {
         id:                        our_conn_id,
@@ -427,6 +514,31 @@ fn generate_x25519_keypair() -> KeyPair {
     }
 }
 
+/// Generate a proper Ed25519 key pair for long-term identity signing.
+fn generate_ed25519_keypair() -> KeyPair {
+    use ed25519_dalek::SigningKey;
+    let seed = generate_key_bytes();
+    let signing_key = SigningKey::from_bytes(&seed);
+    KeyPair {
+        private_key: seed,
+        public_key:  *signing_key.verifying_key().as_bytes(),
+    }
+}
+
+/// Ed25519 sign: returns a 64-byte signature over `message` using a 32-byte seed.
+fn ed25519_sign(private_key: &[u8; 32], message: &[u8]) -> [u8; 64] {
+    use ed25519_dalek::{SigningKey, Signer};
+    SigningKey::from_bytes(private_key).sign(message).to_bytes()
+}
+
+/// Ed25519 verify: returns true if the 64-byte signature is valid over `message`.
+fn ed25519_verify(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+    let Ok(vk)  = VerifyingKey::from_bytes(public_key) else { return false };
+    let sig     = Signature::from_bytes(signature);
+    vk.verify(message, &sig).is_ok()
+}
+
 /// XChaCha20-Poly1305 authenticated encryption.  Returns (ciphertext, 24-byte nonce).
 fn xchacha20_encrypt(key: &[u8; 32], plaintext: &[u8]) -> (Vec<u8>, [u8; 24]) {
     use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::{Aead, KeyInit}};
@@ -448,6 +560,94 @@ fn xchacha20_decrypt(key: &[u8; 32], nonce: &[u8; 24], ciphertext: &[u8]) -> Opt
     let cipher = XChaCha20Poly1305::new_from_slice(key).ok()?;
     let nonce  = XNonce::from_slice(nonce);
     cipher.decrypt(nonce, ciphertext).ok()
+}
+
+// ── Packet routing helpers ────────────────────────────────────────────────────
+
+/// Build a complete relay or app packet: unencrypted header + encrypted body.
+///
+/// Header: [op: 1][peer_active_conn_id: u16][nonce: 24]
+/// Body:   XChaCha20-Poly1305 encrypted plaintext using the X25519 shared secret.
+fn build_encrypted_packet(op: u8, conn: &ActiveConnection, plaintext: &[u8]) -> Vec<u8> {
+    let shared  = x25519_shared(&conn.key_pair.private_key, &conn.peer_public_key);
+    let (ct, nonce) = xchacha20_encrypt(&shared, plaintext);
+    let mut pkt = Vec::with_capacity(1 + 2 + 24 + ct.len());
+    pkt.push(op);
+    pkt.extend_from_slice(&conn.peer_active_connection_id.to_be_bytes());
+    pkt.extend_from_slice(&nonce);
+    pkt.extend_from_slice(&ct);
+    pkt
+}
+
+/// Decrypt the body of a relay or app packet (buf starts after the op byte).
+///
+/// buf layout: [receiver_active_conn_id: u16][nonce: 24][ciphertext]
+///
+/// Looks up the named active connection in the node's map and decrypts using
+/// the X25519 shared secret derived from that connection's key pair.
+fn decrypt_packet_body(node: &super::data_models::Node, buf: &[u8]) -> Option<Vec<u8>> {
+    if buf.len() < 26 { return None; }
+    let conn_id           = u16::from_be_bytes([buf[0], buf[1]]);
+    let nonce: [u8; 24]   = buf[2..26].try_into().unwrap();
+    let ciphertext        = &buf[26..];
+    let conn              = node.owner.active_connections.get(&conn_id)?;
+    let shared            = x25519_shared(&conn.key_pair.private_key, &conn.peer_public_key);
+    xchacha20_decrypt(&shared, &nonce, ciphertext)
+}
+
+/// Build the pool of candidate SG UUIDs for routing a packet to `dest_device_uuid`.
+/// Pool = all SGs owned by the local user + all SGs owned by the contact who holds that device.
+fn sg_candidates_for_dest(node: &super::data_models::Node, dest_device_uuid: &Uuid) -> Vec<Uuid> {
+    let mut uuids = Vec::new();
+    for d in &node.owner.user.devices {
+        if matches!(d.grade, DeviceGrade::SG) {
+            uuids.push(d.uuid);
+        }
+    }
+    for contact in &node.owner.contact_users {
+        if contact.user.devices.iter().any(|d| d.uuid == *dest_device_uuid) {
+            for d in &contact.user.devices {
+                if matches!(d.grade, DeviceGrade::SG) {
+                    uuids.push(d.uuid);
+                }
+            }
+            break; // a device belongs to exactly one contact
+        }
+    }
+    uuids
+}
+
+/// Select the best SG from a list of candidate device UUIDs.
+///
+/// Prefers the lowest-RTT SG that is marked up in `sg_statuses` and has an
+/// active connection.  Falls back to any candidate with an active connection
+/// when PollSG has not yet run.
+fn best_sg_connection<'a>(
+    node: &'a super::data_models::Node,
+    candidates: &[Uuid],
+) -> Option<&'a ActiveConnection> {
+    // Primary: lowest RTT, must be up and have an active connection.
+    let polled = candidates.iter()
+        .filter_map(|uuid| {
+            let status = node.sg_statuses.get(uuid)?;
+            if !status.up { return None; }
+            let rtt = status.last_rtt?;
+            node.owner.active_connections.values()
+                .find(|c| c.device_uuid == *uuid)
+                .map(|c| (rtt, c))
+        })
+        .min_by_key(|(rtt, _)| *rtt)
+        .map(|(_, c)| c);
+
+    if polled.is_some() {
+        return polled;
+    }
+
+    // Fallback: any candidate with an active connection (PollSG not yet run).
+    candidates.iter().find_map(|uuid| {
+        node.owner.active_connections.values()
+            .find(|c| c.device_uuid == *uuid)
+    })
 }
 
 // ── Bootstrap payload serialization ──────────────────────────────────────────
@@ -770,6 +970,110 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
 const SG_PING_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Op 0x40 — Relay packet (DG → SG).
+///
+/// The SG decrypts the body, reads the destination device UUID, re-encrypts
+/// the inner payload for the destination, and forwards it as an AppPacket (0x41).
+///
+/// Encrypted body: [dest_device_uuid: 16][dest_app_id: u16][sender_app_id: u16][payload]
+pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let node = ctx.node.read().unwrap();
+
+    let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
+        eprintln!("[relay_packet] decryption failed from {src}");
+        return;
+    };
+
+    // Parse body.
+    if plaintext.len() < 20 {
+        eprintln!("[relay_packet] plaintext too short from {src}");
+        return;
+    }
+    let dest_device_uuid: Uuid = plaintext[0..16].try_into().unwrap();
+    let dest_app_id            = u16::from_be_bytes([plaintext[16], plaintext[17]]);
+    let sender_app_id          = u16::from_be_bytes([plaintext[18], plaintext[19]]);
+    let payload                = &plaintext[20..];
+
+    // Find active connection to destination.
+    let Some(dest_conn) = node.owner.active_connections.values()
+        .find(|c| c.device_uuid == dest_device_uuid)
+    else {
+        eprintln!("[relay_packet] no active connection to dest {:?}", dest_device_uuid);
+        return;
+    };
+
+    // Find destination device host.
+    let dest_host = node.owner.user.devices.iter()
+        .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
+        .find(|d| d.uuid == dest_device_uuid)
+        .map(|d| d.host);
+
+    let Some(dest_host) = dest_host else {
+        eprintln!("[relay_packet] dest device host not found for {:?}", dest_device_uuid);
+        return;
+    };
+
+    // AppPacket body: [dest_app_id: u16][sender_app_id: u16][payload]
+    let mut app_body = Vec::with_capacity(4 + payload.len());
+    app_body.extend_from_slice(&dest_app_id.to_be_bytes());
+    app_body.extend_from_slice(&sender_app_id.to_be_bytes());
+    app_body.extend_from_slice(payload);
+
+    let pkt  = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
+    let dest = SocketAddr::V4(dest_host);
+    drop(node);
+
+    send(ctx, dest, &pkt);
+}
+
+/// Op 0x41 — App packet (SG → destination node).
+///
+/// The destination node decrypts the body, finds the local app by dest_app_id,
+/// and pushes the payload to the app via UDP.
+///
+/// Encrypted body: [dest_app_id: u16][sender_app_id: u16][payload]
+/// Push to app:    [0x04][sender_app_id: u16][payload]
+pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let (push_pkt, app_host) = {
+        let node = ctx.node.read().unwrap();
+
+        let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
+            eprintln!("[app_packet] decryption failed from {src}");
+            return;
+        };
+
+        if plaintext.len() < 4 {
+            eprintln!("[app_packet] plaintext too short from {src}");
+            return;
+        }
+        let dest_app_id   = u16::from_be_bytes([plaintext[0], plaintext[1]]);
+        let sender_app_id = u16::from_be_bytes([plaintext[2], plaintext[3]]);
+        let payload       = &plaintext[4..];
+
+        // Find the destination app on this node.
+        let device_uuid = node.device_uuid;
+        let Some(app_host) = node.owner.user.devices.iter()
+            .find(|d| d.uuid == device_uuid)
+            .and_then(|d| d.applications.iter()
+                .find(|a| a.id == dest_app_id && a.user_approved))
+            .map(|a| a.host)
+        else {
+            eprintln!("[app_packet] no approved app with id {dest_app_id}");
+            return;
+        };
+
+        // Build push packet: [0x04][sender_app_id: u16][payload]
+        let mut push = Vec::with_capacity(3 + payload.len());
+        push.push(APP_PUSH_OP);
+        push.extend_from_slice(&sender_app_id.to_be_bytes());
+        push.extend_from_slice(payload);
+
+        (push, app_host)
+    };
+
+    send(ctx, SocketAddr::V4(app_host), &push_pkt);
+}
+
 /// Ping every candidate SG, record RTT, and mark each one up or down.
 ///
 /// Candidate pool: all SG-grade devices owned by the local user (excluding the
@@ -853,10 +1157,11 @@ pub fn maintain_connections(ctx: &WorkerContext) {
     let now = SystemTime::now();
 
     // ── Collect desired peers and current state (read lock) ───────────────────
-    let (need_conn, our_longterm_pk, our_device_uuid) = {
+    let (need_conn, our_longterm_pk, our_longterm_sk, our_device_uuid) = {
         let node = ctx.node.read().unwrap();
         let our_device_uuid = node.device_uuid;
         let our_longterm_pk = node.owner.key_pair.public_key;
+        let our_longterm_sk = node.owner.key_pair.private_key;
 
         let is_sg = node.owner.user.devices.iter()
             .find(|d| d.uuid == our_device_uuid)
@@ -896,7 +1201,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
             .filter(|(uuid, _, _)| !healthy.contains(uuid) && !pending.contains(uuid))
             .collect();
 
-        (need_conn, our_longterm_pk, our_device_uuid)
+        (need_conn, our_longterm_pk, our_longterm_sk, our_device_uuid)
     };
 
     // ── For each peer that needs a connection, allocate state and send ────────
@@ -916,7 +1221,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
                 None
             } else {
                 let conn_id  = allocate_conn_id(&node);
-                let key_pair = KeyPair { public_key: generate_key_bytes(), private_key: generate_key_bytes() };
+                let key_pair = generate_x25519_keypair();
                 let pk_copy  = key_pair.public_key;
                 node.owner.pending_connections.insert(conn_id, PendingConnection {
                     our_conn_id:      conn_id,
@@ -938,7 +1243,8 @@ pub fn maintain_connections(ctx: &WorkerContext) {
         pkt[3..19].copy_from_slice(&our_device_uuid);
         pkt[19..51].copy_from_slice(&our_ephemeral_pk);
         pkt[51..83].copy_from_slice(&our_longterm_pk);
-        // pkt[83..147] = signature, zeros (TODO: Ed25519 signing)
+        let sig = ed25519_sign(&our_longterm_sk, &pkt[0..83]);
+        pkt[83..147].copy_from_slice(&sig);
 
         send(ctx, SocketAddr::V4(peer_host), &pkt);
     }
@@ -1509,7 +1815,7 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> bool {
     }
 
     let grade    = if grade_str == "sg" { DeviceGrade::SG } else { DeviceGrade::DG };
-    let key_pair = generate_x25519_keypair();
+    let key_pair = generate_ed25519_keypair();
 
     {
         let mut node    = ctx.node.write().unwrap();
@@ -1933,5 +2239,561 @@ mod tests {
         let reply = t.recv_reply();
         assert_eq!(reply[0], 0x01);
         assert_eq!(reply[1], ERR_TOKEN_UNKNOWN);
+    }
+
+    // ── Ed25519 helpers ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ed25519_roundtrip_valid_signature() {
+        let kp  = generate_ed25519_keypair();
+        let msg = b"hello pnet";
+        let sig = ed25519_sign(&kp.private_key, msg);
+        assert!(ed25519_verify(&kp.public_key, msg, &sig));
+    }
+
+    #[test]
+    fn ed25519_verify_rejects_wrong_key() {
+        let kp1 = generate_ed25519_keypair();
+        let kp2 = generate_ed25519_keypair();
+        let sig  = ed25519_sign(&kp1.private_key, b"msg");
+        assert!(!ed25519_verify(&kp2.public_key, b"msg", &sig));
+    }
+
+    #[test]
+    fn ed25519_verify_rejects_tampered_signature() {
+        let kp  = generate_ed25519_keypair();
+        let mut sig = ed25519_sign(&kp.private_key, b"msg");
+        sig[0] ^= 0xFF;
+        assert!(!ed25519_verify(&kp.public_key, b"msg", &sig));
+    }
+
+    // ── ConnectRequest ────────────────────────────────────────────────────────
+
+    /// Add a contact with its own Ed25519 key pair to the node.
+    /// Returns the contact's device UUID and key pair.
+    fn add_contact_with_device(node: &mut Node) -> (Uuid, KeyPair) {
+        let kp          = generate_ed25519_keypair();
+        let device_uuid = generate_uuid();
+        node.owner.contact_users.push(Contact {
+            public_key: kp.public_key,
+            user: User {
+                alias:   "peer".to_string(),
+                uuid:    generate_uuid(),
+                devices: vec![Device {
+                    alias:        "peer-device".to_string(),
+                    uuid:         device_uuid,
+                    grade:        DeviceGrade::SG,
+                    host:         "127.0.0.1:9999".parse().unwrap(),
+                    applications: Vec::new(),
+                }],
+            },
+        });
+        (device_uuid, kp)
+    }
+
+    /// Build the buf for connect_request (op byte already stripped).
+    fn connect_request_buf(
+        conn_id:      u16,
+        device_uuid:  &Uuid,
+        ephemeral_pk: &PublicKey,
+        longterm_pk:  &PublicKey,
+        longterm_sk:  &[u8; 32],
+        tamper_sig:   bool,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; 146];
+        buf[0..2].copy_from_slice(&conn_id.to_be_bytes());
+        buf[2..18].copy_from_slice(device_uuid);
+        buf[18..50].copy_from_slice(ephemeral_pk);
+        buf[50..82].copy_from_slice(longterm_pk);
+
+        let mut signed_msg = [0u8; 83];
+        signed_msg[0] = CONNECT_REQUEST_OP;
+        signed_msg[1..83].copy_from_slice(&buf[0..82]);
+        let mut sig = ed25519_sign(longterm_sk, &signed_msg);
+        if tamper_sig { sig[0] ^= 0xFF; }
+        buf[82..146].copy_from_slice(&sig);
+        buf
+    }
+
+    #[test]
+    fn connect_request_valid_signature_accepted() {
+        let t = TestCtx::new();
+        let (device_uuid, peer_kp) = {
+            let mut node = t.ctx.node.write().unwrap();
+            add_contact_with_device(&mut node)
+        };
+        let eph_kp = generate_x25519_keypair();
+
+        connect_request(
+            t.app_addr(),
+            connect_request_buf(1, &device_uuid, &eph_kp.public_key,
+                                 &peer_kp.public_key, &peer_kp.private_key, false),
+            &t.ctx,
+        );
+
+        // Node must have stored an active connection for the peer device.
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(node.owner.active_connections.len(), 1);
+        let conn = node.owner.active_connections.values().next().unwrap();
+        assert_eq!(conn.device_uuid, device_uuid);
+
+        // Reply must be a ConnectAck (op 0x21).
+        // recv_reply uses a 64-byte buffer which truncates the 101-byte packet; check op only.
+        let reply = t.recv_reply();
+        assert_eq!(reply[0], CONNECT_ACK_OP);
+    }
+
+    #[test]
+    fn connect_request_invalid_signature_rejected() {
+        let t = TestCtx::new();
+        let (device_uuid, peer_kp) = {
+            let mut node = t.ctx.node.write().unwrap();
+            add_contact_with_device(&mut node)
+        };
+        let eph_kp = generate_x25519_keypair();
+
+        connect_request(
+            t.app_addr(),
+            connect_request_buf(1, &device_uuid, &eph_kp.public_key,
+                                 &peer_kp.public_key, &peer_kp.private_key, true),
+            &t.ctx,
+        );
+
+        let node = t.ctx.node.read().unwrap();
+        assert!(node.owner.active_connections.is_empty());
+    }
+
+    // ── ConnectAck ────────────────────────────────────────────────────────────
+
+    /// Build the buf for connect_ack (op byte already stripped).
+    fn connect_ack_buf(
+        responder_conn_id: u16,
+        our_conn_id:       u16,
+        eph_pk:            &PublicKey,
+        responder_sk:      &[u8; 32],
+        tamper_sig:        bool,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; 100];
+        buf[0..2].copy_from_slice(&responder_conn_id.to_be_bytes());
+        buf[2..4].copy_from_slice(&our_conn_id.to_be_bytes());
+        buf[4..36].copy_from_slice(eph_pk);
+
+        let mut signed_msg = [0u8; 37];
+        signed_msg[0] = CONNECT_ACK_OP;
+        signed_msg[1..37].copy_from_slice(&buf[0..36]);
+        let mut sig = ed25519_sign(responder_sk, &signed_msg);
+        if tamper_sig { sig[0] ^= 0xFF; }
+        buf[36..100].copy_from_slice(&sig);
+        buf
+    }
+
+    #[test]
+    fn connect_ack_valid_signature_promotes_pending() {
+        let t = TestCtx::new();
+        let peer_kp     = generate_ed25519_keypair();
+        let peer_uuid   = generate_uuid();
+        let our_conn_id = 42u16;
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.pending_connections.insert(our_conn_id, PendingConnection {
+                our_conn_id,
+                our_key_pair:     generate_x25519_keypair(),
+                peer_device_uuid: peer_uuid,
+                peer_longterm_pk: peer_kp.public_key,
+            });
+        }
+
+        let eph_kp = generate_x25519_keypair();
+        connect_ack(
+            t.app_addr(),
+            connect_ack_buf(7, our_conn_id, &eph_kp.public_key,
+                            &peer_kp.private_key, false),
+            &t.ctx,
+        );
+
+        let node = t.ctx.node.read().unwrap();
+        assert!(node.owner.pending_connections.is_empty());
+        assert_eq!(node.owner.active_connections.len(), 1);
+        let conn = node.owner.active_connections.values().next().unwrap();
+        assert_eq!(conn.device_uuid, peer_uuid);
+        assert_eq!(conn.peer_active_connection_id, 7);
+    }
+
+    #[test]
+    fn connect_ack_invalid_signature_preserves_pending() {
+        let t = TestCtx::new();
+        let peer_kp     = generate_ed25519_keypair();
+        let peer_uuid   = generate_uuid();
+        let our_conn_id = 42u16;
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.pending_connections.insert(our_conn_id, PendingConnection {
+                our_conn_id,
+                our_key_pair:     generate_x25519_keypair(),
+                peer_device_uuid: peer_uuid,
+                peer_longterm_pk: peer_kp.public_key,
+            });
+        }
+
+        let eph_kp = generate_x25519_keypair();
+        connect_ack(
+            t.app_addr(),
+            connect_ack_buf(7, our_conn_id, &eph_kp.public_key,
+                            &peer_kp.private_key, true),
+            &t.ctx,
+        );
+
+        let node = t.ctx.node.read().unwrap();
+        assert!(node.owner.active_connections.is_empty());
+        assert!(node.owner.pending_connections.contains_key(&our_conn_id));
+    }
+
+    // ── Routing helpers ───────────────────────────────────────────────────────
+
+    fn make_sg_device(uuid: Uuid) -> Device {
+        Device {
+            alias: "sg".to_string(),
+            uuid,
+            grade: DeviceGrade::SG,
+            host: "127.0.0.1:9000".parse().unwrap(),
+            applications: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sg_candidates_for_dest_includes_own_and_contact_sgs() {
+        let t = TestCtx::new();
+        let own_sg_uuid     = generate_uuid();
+        let contact_sg_uuid = generate_uuid();
+        let dest_uuid       = generate_uuid();
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(make_sg_device(own_sg_uuid));
+            node.owner.contact_users.push(Contact {
+                public_key: generate_key_bytes(),
+                user: User {
+                    alias:   "contact".to_string(),
+                    uuid:    generate_uuid(),
+                    devices: vec![
+                        make_sg_device(contact_sg_uuid),
+                        Device {
+                            alias: "dest".to_string(),
+                            uuid:  dest_uuid,
+                            grade: DeviceGrade::DG,
+                            host:  "127.0.0.1:9001".parse().unwrap(),
+                            applications: Vec::new(),
+                        },
+                    ],
+                },
+            });
+        }
+
+        let node       = t.ctx.node.read().unwrap();
+        let candidates = sg_candidates_for_dest(&node, &dest_uuid);
+        assert!(candidates.contains(&own_sg_uuid));
+        assert!(candidates.contains(&contact_sg_uuid));
+        assert!(!candidates.contains(&dest_uuid));
+    }
+
+    #[test]
+    fn best_sg_connection_picks_lowest_rtt() {
+        use std::time::Instant;
+        let t = TestCtx::new();
+        let slow_uuid = generate_uuid();
+        let fast_uuid = generate_uuid();
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.active_connections.insert(1, ActiveConnection {
+                id: 1,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: generate_x25519_keypair(),
+                peer_public_key: generate_key_bytes(),
+                peer_active_connection_id: 10,
+                device_uuid: slow_uuid,
+            });
+            node.owner.active_connections.insert(2, ActiveConnection {
+                id: 2,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: generate_x25519_keypair(),
+                peer_public_key: generate_key_bytes(),
+                peer_active_connection_id: 20,
+                device_uuid: fast_uuid,
+            });
+            node.sg_statuses.insert(slow_uuid, super::super::data_models::SgStatus {
+                up: true,
+                last_rtt: Some(Duration::from_millis(80)),
+                last_polled: Instant::now(),
+            });
+            node.sg_statuses.insert(fast_uuid, super::super::data_models::SgStatus {
+                up: true,
+                last_rtt: Some(Duration::from_millis(20)),
+                last_polled: Instant::now(),
+            });
+        }
+
+        let node = t.ctx.node.read().unwrap();
+        let candidates = vec![slow_uuid, fast_uuid];
+        let best = best_sg_connection(&node, &candidates).unwrap();
+        assert_eq!(best.device_uuid, fast_uuid);
+    }
+
+    #[test]
+    fn best_sg_connection_falls_back_when_unpolled() {
+        let t = TestCtx::new();
+        let sg_uuid = generate_uuid();
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.active_connections.insert(1, ActiveConnection {
+                id: 1,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: generate_x25519_keypair(),
+                peer_public_key: generate_key_bytes(),
+                peer_active_connection_id: 10,
+                device_uuid: sg_uuid,
+            });
+            // No sg_statuses entry — PollSG hasn't run.
+        }
+
+        let node = t.ctx.node.read().unwrap();
+        let best = best_sg_connection(&node, &[sg_uuid]);
+        assert!(best.is_some());
+        assert_eq!(best.unwrap().device_uuid, sg_uuid);
+    }
+
+    // ── Packet encrypt/decrypt round-trip ─────────────────────────────────────
+
+    #[test]
+    fn build_and_decrypt_packet_roundtrip() {
+        // Simulate two sides of a connection with known key pairs.
+        let sender_kp   = generate_x25519_keypair();
+        let receiver_kp = generate_x25519_keypair();
+
+        // sender builds a packet addressed to receiver's conn ID 7.
+        let conn = ActiveConnection {
+            id:                        1,
+            timeout:                   SystemTime::now() + Duration::from_secs(3600),
+            key_pair:                  sender_kp.clone(),
+            peer_public_key:           receiver_kp.public_key,
+            peer_active_connection_id: 7,
+            device_uuid:               generate_uuid(),
+        };
+        let plaintext = b"hello relay";
+        let pkt = build_encrypted_packet(RELAY_PACKET_OP, &conn, plaintext);
+
+        assert_eq!(pkt[0], RELAY_PACKET_OP);
+        assert_eq!(u16::from_be_bytes([pkt[1], pkt[2]]), 7);
+
+        // Receiver decrypts: its active connection uses receiver_kp, peer pk = sender_kp.public_key.
+        // Receiver stored this connection under its own local ID, which was placed in pkt[1..3] (=7).
+        let t = TestCtx::new();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.active_connections.insert(7, ActiveConnection {
+                id:                        7,
+                timeout:                   SystemTime::now() + Duration::from_secs(3600),
+                key_pair:                  receiver_kp,
+                peer_public_key:           sender_kp.public_key,
+                peer_active_connection_id: 1,
+                device_uuid:               generate_uuid(),
+            });
+        }
+
+        let node      = t.ctx.node.read().unwrap();
+        let decrypted = decrypt_packet_body(&node, &pkt[1..]).unwrap(); // strip op byte
+        assert_eq!(decrypted, plaintext);
+    }
+
+    // ── relay_packet forwards AppPacket to destination ────────────────────────
+
+    #[test]
+    fn relay_packet_forwards_app_packet_to_dest() {
+        // The "SG" node is the TestCtx node.
+        // dg_sender_kp  — sender DG's side of its connection with the SG
+        // sg_from_dg_kp — SG's side of the same connection
+        // sg_to_dest_kp — SG's side of its connection with the dest DG
+        // dest_kp        — dest DG's side of its connection with the SG
+        let dg_sender_kp  = generate_x25519_keypair();
+        let sg_from_dg_kp = generate_x25519_keypair();
+        let sg_to_dest_kp = generate_x25519_keypair();
+        let dest_kp        = generate_x25519_keypair();
+
+        let dest_device_uuid = generate_uuid();
+        let dest_app_id: u16 = 5;
+        let sender_app_id: u16 = 3;
+
+        // The "destination" app socket — we'll receive the AppPacket here.
+        let dest_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        dest_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let dest_addr: std::net::SocketAddrV4 = dest_socket.local_addr().unwrap()
+            .to_string().parse().unwrap();
+
+        let t = TestCtx::new();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+
+            // SG active connection #1: toward sender DG (SG's view).
+            node.owner.active_connections.insert(1, ActiveConnection {
+                id:                        1,
+                timeout:                   SystemTime::now() + Duration::from_secs(3600),
+                key_pair:                  sg_from_dg_kp.clone(),
+                peer_public_key:           dg_sender_kp.public_key,
+                peer_active_connection_id: 10, // sender DG's local conn id
+                device_uuid:               generate_uuid(),
+            });
+
+            // SG active connection #2: toward dest DG.
+            node.owner.active_connections.insert(2, ActiveConnection {
+                id:                        2,
+                timeout:                   SystemTime::now() + Duration::from_secs(3600),
+                key_pair:                  sg_to_dest_kp.clone(),
+                peer_public_key:           dest_kp.public_key,
+                peer_active_connection_id: 20, // dest DG's local conn id
+                device_uuid:               dest_device_uuid,
+            });
+
+            // Dest device must be in the node's known devices/contacts.
+            node.owner.contact_users.push(Contact {
+                public_key: generate_key_bytes(),
+                user: User {
+                    alias:   "contact".to_string(),
+                    uuid:    generate_uuid(),
+                    devices: vec![Device {
+                        alias:        "dest-dg".to_string(),
+                        uuid:         dest_device_uuid,
+                        grade:        DeviceGrade::DG,
+                        host:         dest_addr,
+                        applications: Vec::new(),
+                    }],
+                },
+            });
+        }
+
+        // Build a RelayPacket as if sent by the sender DG.
+        // Shared secret for SG conn #1 = x25519_shared(dg_sender_sk, sg_from_dg_pk)
+        //                               = x25519_shared(sg_from_dg_sk, dg_sender_pk) — same
+        let mut relay_body = Vec::new();
+        relay_body.extend_from_slice(&dest_device_uuid);
+        relay_body.extend_from_slice(&dest_app_id.to_be_bytes());
+        relay_body.extend_from_slice(&sender_app_id.to_be_bytes());
+        relay_body.extend_from_slice(b"payload");
+
+        // Use dg_sender_kp to encrypt for SG's conn #1 (peer_active_conn_id = 1 on SG side).
+        let sender_side_conn = ActiveConnection {
+            id:                        10,
+            timeout:                   SystemTime::now() + Duration::from_secs(3600),
+            key_pair:                  dg_sender_kp,
+            peer_public_key:           sg_from_dg_kp.public_key,
+            peer_active_connection_id: 1, // SG's local conn ID
+            device_uuid:               generate_uuid(),
+        };
+        let relay_pkt = build_encrypted_packet(RELAY_PACKET_OP, &sender_side_conn, &relay_body);
+
+        // Feed the relay packet (buf = everything after op byte) to the SG handler.
+        relay_packet(t.app_addr(), relay_pkt[1..].to_vec(), &t.ctx);
+
+        // Dest socket should have received an AppPacket (op 0x41).
+        let mut buf = [0u8; 512];
+        let (len, _) = dest_socket.recv_from(&mut buf).expect("no AppPacket received");
+        assert_eq!(buf[0], APP_PACKET_OP);
+
+        // Decrypt the AppPacket using dest DG's view of its connection with the SG.
+        let dest_side_conn = ActiveConnection {
+            id:                        20,
+            timeout:                   SystemTime::now() + Duration::from_secs(3600),
+            key_pair:                  dest_kp,
+            peer_public_key:           sg_to_dest_kp.public_key,
+            peer_active_connection_id: 2,
+            device_uuid:               generate_uuid(),
+        };
+        let t2 = TestCtx::new();
+        {
+            let mut node = t2.ctx.node.write().unwrap();
+            node.owner.active_connections.insert(20, ActiveConnection {
+                id:                        dest_side_conn.id,
+                timeout:                   dest_side_conn.timeout,
+                key_pair:                  dest_side_conn.key_pair,
+                peer_public_key:           dest_side_conn.peer_public_key,
+                peer_active_connection_id: dest_side_conn.peer_active_connection_id,
+                device_uuid:               dest_side_conn.device_uuid,
+            });
+        }
+        let node     = t2.ctx.node.read().unwrap();
+        let decrypted = decrypt_packet_body(&node, &buf[1..len]).unwrap();
+
+        // Decrypted body: [dest_app_id: u16][sender_app_id: u16][payload]
+        assert_eq!(u16::from_be_bytes([decrypted[0], decrypted[1]]), dest_app_id);
+        assert_eq!(u16::from_be_bytes([decrypted[2], decrypted[3]]), sender_app_id);
+        assert_eq!(&decrypted[4..], b"payload");
+    }
+
+    // ── app_packet delivers to local app ──────────────────────────────────────
+
+    #[test]
+    fn app_packet_delivers_to_local_app() {
+        let t = TestCtx::new();
+
+        // Set up: an approved app on the local device.
+        let app_id: u16     = 9;
+        let sender_app_id   = 3u16;
+        let sg_kp           = generate_x25519_keypair();
+        let local_kp        = generate_x25519_keypair();
+
+        // Register the app first so we have an approved app with a known port.
+        let app_addr = t.app_addr(); // we'll use app_socket as the "app"
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let device_uuid = node.device_uuid;
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == device_uuid).unwrap();
+            dev.applications.push(super::super::data_models::Application {
+                id:            app_id,
+                alias:         "myapp".to_string(),
+                protocol:      "udp".to_string(),
+                host:          app_addr.to_string().parse().unwrap(),
+                user_approved: true,
+                token:         generate_uuid(),
+            });
+
+            // Active connection #5: from SG (our peer is the SG).
+            node.owner.active_connections.insert(5, ActiveConnection {
+                id:                        5,
+                timeout:                   SystemTime::now() + Duration::from_secs(3600),
+                key_pair:                  local_kp.clone(),
+                peer_public_key:           sg_kp.public_key,
+                peer_active_connection_id: 99,
+                device_uuid:               generate_uuid(),
+            });
+        }
+
+        // Build AppPacket body: [dest_app_id: u16][sender_app_id: u16][payload]
+        let mut body = Vec::new();
+        body.extend_from_slice(&app_id.to_be_bytes());
+        body.extend_from_slice(&sender_app_id.to_be_bytes());
+        body.extend_from_slice(b"hello app");
+
+        // SG encrypts using its side of conn #5.
+        let sg_side = ActiveConnection {
+            id:                        99,
+            timeout:                   SystemTime::now() + Duration::from_secs(3600),
+            key_pair:                  sg_kp,
+            peer_public_key:           local_kp.public_key,
+            peer_active_connection_id: 5,
+            device_uuid:               generate_uuid(),
+        };
+        let pkt = build_encrypted_packet(APP_PACKET_OP, &sg_side, &body);
+
+        // Feed the AppPacket (buf after op byte) to the handler.
+        app_packet(t.app_addr(), pkt[1..].to_vec(), &t.ctx);
+
+        // app_socket should receive the push.
+        let push = t.recv_reply();
+        assert_eq!(push[0], APP_PUSH_OP);
+        assert_eq!(u16::from_be_bytes([push[1], push[2]]), sender_app_id);
+        assert_eq!(&push[3..], b"hello app");
     }
 }
