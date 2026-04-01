@@ -4,9 +4,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::action_queue::WorkerContext;
 use super::data_models::{
-    ActiveConnection, Application, Contact, Device, DeviceGrade, Invitation, KeyPair,
-    PendingBootstrap, PendingConnection, PendingDeviceAcceptance, PublicKey,
-    SgStatus, User, Uuid, CONNECTION_LIFETIME, RENEW_THRESHOLD, generate_key_bytes, generate_uuid,
+    ActiveConnection, ActiveTunnel, Application, Contact, Device, DeviceGrade, Invitation,
+    KeyPair, PendingBootstrap, PendingConnection, PendingDeviceAcceptance, PendingTunnel,
+    PendingTunnelConnection, PublicKey, SgStatus, TunnelCounter, User, Uuid,
+    CONNECTION_LIFETIME, RENEW_THRESHOLD, TUNNEL_COUNTER_WINDOW, TUNNEL_THRESHOLD,
+    generate_key_bytes, generate_uuid,
 };
 
 // ── Reply status bytes ────────────────────────────────────────────────────────
@@ -276,31 +278,94 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return send_error(ctx, src, ERR_TOKEN_UNKNOWN);
         };
 
-        // Build SG candidate pool and pick the best one.
-        let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
-        let Some(sg_conn) = best_sg_connection(&node, &candidates) else {
-            eprintln!("[app_send_packet] no reachable SG for dest {:?}", dest_device_uuid);
-            return send_error(ctx, src, ERR_NO_ROUTE);
-        };
+        // ── Tunnel path (if a DG-to-DG tunnel is active for this destination) ──
+        // Only use if the tunnel's ActiveConnection still exists.
+        let tunnel_info: Option<(u16, u16)> = node.owner.dg_tunnel_map.iter()
+            .find(|(tid, conn_id)| {
+                let _ = *tid;
+                node.owner.active_connections.get(*conn_id)
+                    .map(|c| c.device_uuid == dest_device_uuid)
+                    .unwrap_or(false)
+            })
+            .map(|(tid, cid)| (*tid, *cid))
+            .filter(|(_, cid)| node.owner.active_connections.contains_key(cid));
 
-        let sg_uuid = sg_conn.device_uuid;
+        if let Some((tunnel_id, dg_dg_conn_id)) = tunnel_info {
+            // Encrypt with the DG-to-DG shared secret.
+            let Some(dg_dg_conn) = node.owner.active_connections.get(&dg_dg_conn_id) else {
+                unreachable!("filtered above");
+            };
+            let shared = x25519_shared(&dg_dg_conn.key_pair.private_key, &dg_dg_conn.peer_public_key);
 
-        // RelayPacket body: [dest_device_uuid: 16][dest_app_id: u16][sender_app_id: u16][payload]
-        let mut plaintext = Vec::with_capacity(20 + payload.len());
-        plaintext.extend_from_slice(&dest_device_uuid);
-        plaintext.extend_from_slice(&dest_app_id.to_be_bytes());
-        plaintext.extend_from_slice(&sender_app_id.to_be_bytes());
-        plaintext.extend_from_slice(payload);
+            // Plaintext format: [dest_app_id: u16][sender_app_id: u16][payload]
+            let mut plaintext = Vec::with_capacity(4 + payload.len());
+            plaintext.extend_from_slice(&dest_app_id.to_be_bytes());
+            plaintext.extend_from_slice(&sender_app_id.to_be_bytes());
+            plaintext.extend_from_slice(payload);
 
-        let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
+            let (ciphertext, nonce) = xchacha20_encrypt(&shared, &plaintext);
 
-        // Find the SG's host address.
-        let sg_host = node.owner.user.devices.iter()
-            .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
-            .find(|d| d.uuid == sg_uuid)
-            .map(|d| d.host);
+            // Route the tunnel forward packet via the relay SG.
+            let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid)
+                .or_else(|| {
+                    let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
+                    best_sg_connection(&node, &candidates)
+                });
+            let Some(sg_conn) = sg_conn else {
+                eprintln!("[app_send_packet] no reachable SG for tunnel dest {:?}", dest_device_uuid);
+                return send_error(ctx, src, ERR_NO_ROUTE);
+            };
 
-        sg_host.map(|h| (pkt, SocketAddr::V4(h)))
+            // `peer_active_connection_id` is the SG's local conn_id for this DG's connection.
+            let sender_sg_conn_id = sg_conn.peer_active_connection_id;
+            let sg_uuid = sg_conn.device_uuid;
+
+            // TUNNEL_FORWARD: [op=0x51][sender_sg_conn_id: u16][tunnel_id: u16][nonce: 24][ciphertext]
+            let mut pkt = Vec::with_capacity(4 + 24 + ciphertext.len());
+            pkt.push(TUNNEL_FORWARD_OP);
+            pkt.extend_from_slice(&sender_sg_conn_id.to_be_bytes());
+            pkt.extend_from_slice(&tunnel_id.to_be_bytes());
+            pkt.extend_from_slice(&nonce);
+            pkt.extend_from_slice(&ciphertext);
+
+            let sg_host = node.owner.user.devices.iter()
+                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
+                .find(|d| d.uuid == sg_uuid)
+                .map(|d| d.host);
+
+            sg_host.map(|h| (pkt, SocketAddr::V4(h)))
+        } else {
+            // ── Standard relay path ───────────────────────────────────────────
+            // Prefer the recipient's top-ranked SG (only one with a keep-alive
+            // tunnel to the destination DG). Fall back to lowest-RTT SG.
+            let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid)
+                .or_else(|| {
+                    let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
+                    best_sg_connection(&node, &candidates)
+                });
+            let Some(sg_conn) = sg_conn else {
+                eprintln!("[app_send_packet] no reachable SG for dest {:?}", dest_device_uuid);
+                return send_error(ctx, src, ERR_NO_ROUTE);
+            };
+
+            let sg_uuid = sg_conn.device_uuid;
+
+            // RelayPacket body: [dest_device_uuid: 16][dest_app_id: u16][sender_app_id: u16][payload]
+            let mut plaintext = Vec::with_capacity(20 + payload.len());
+            plaintext.extend_from_slice(&dest_device_uuid);
+            plaintext.extend_from_slice(&dest_app_id.to_be_bytes());
+            plaintext.extend_from_slice(&sender_app_id.to_be_bytes());
+            plaintext.extend_from_slice(payload);
+
+            let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
+
+            let sg_host = node.owner.user.devices.iter()
+                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
+                .find(|d| d.uuid == sg_uuid)
+                .map(|d| d.host);
+
+            sg_host.map(|h| (pkt, SocketAddr::V4(h)))
+        }
     };
 
     if let Some((pkt, dest)) = out {
@@ -318,9 +383,14 @@ const CONNECT_ACK_OP:      u8 = 0x21;
 const BOOTSTRAP_REQUEST_OP:  u8 = 0x30;
 const BOOTSTRAP_RESPONSE_OP: u8 = 0x31;
 const DEVICE_REGISTER_OP:    u8 = 0x32;
-const RELAY_PACKET_OP:       u8 = 0x40;
-const APP_PACKET_OP:         u8 = 0x41;
-const APP_PUSH_OP:           u8 = 0x04;
+const RELAY_PACKET_OP:            u8 = 0x40;
+const APP_PACKET_OP:              u8 = 0x41;
+const APP_PUSH_OP:                u8 = 0x04;
+const TUNNEL_INIT_OP:             u8 = 0x50;
+const TUNNEL_FORWARD_OP:          u8 = 0x51;
+const TUNNEL_CONNECT_REQUEST_OP:  u8 = 0x52;
+const TUNNEL_CONNECT_ACK_OP:      u8 = 0x53;
+const TUNNEL_DELIVERY_OP:         u8 = 0x54;
 
 /// How long the SG keeps a PendingDeviceAcceptance waiting for DeviceRegistration.
 const PENDING_ACCEPTANCE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -617,6 +687,38 @@ fn sg_candidates_for_dest(node: &super::data_models::Node, dest_device_uuid: &Uu
     uuids
 }
 
+/// Return the UUID of the highest-ranked SG that owns `dest_device_uuid` and
+/// currently has an active connection on this node.  Returns `None` if no
+/// ranked SG with an active connection is found.
+fn top_ranked_sg_for_device<'a>(
+    node: &'a super::data_models::Node,
+    dest_device_uuid: &Uuid,
+) -> Option<&'a ActiveConnection> {
+    // Find the user (own or contact) who owns dest_device_uuid.
+    let dest_user_devices: Option<&Vec<super::data_models::Device>> =
+        if node.owner.user.devices.iter().any(|d| d.uuid == *dest_device_uuid) {
+            Some(&node.owner.user.devices)
+        } else {
+            node.owner.contact_users.iter()
+                .find(|c| c.user.devices.iter().any(|d| d.uuid == *dest_device_uuid))
+                .map(|c| &c.user.devices)
+        };
+
+    let devices = dest_user_devices?;
+
+    // Collect SGs with active connections, sorted by rank ascending (None last).
+    let mut sgs: Vec<&super::data_models::Device> = devices.iter()
+        .filter(|d| matches!(d.grade, DeviceGrade::SG))
+        .filter(|d| node.owner.active_connections.values().any(|c| c.device_uuid == d.uuid))
+        .collect();
+    sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
+
+    // Return the active connection to the highest-ranked SG that is up.
+    sgs.iter()
+        .find(|d| node.sg_statuses.get(&d.uuid).map(|s| s.up).unwrap_or(true))
+        .and_then(|d| node.owner.active_connections.values().find(|c| c.device_uuid == d.uuid))
+}
+
 /// Select the best SG from a list of candidate device UUIDs.
 ///
 /// Prefers the lowest-RTT SG that is marked up in `sg_statuses` and has an
@@ -689,6 +791,8 @@ fn push_device(buf: &mut Vec<u8>, d: &Device) {
     buf.extend_from_slice(&d.uuid);
     push_str(buf, &d.alias);
     buf.push(if matches!(d.grade, DeviceGrade::SG) { 1 } else { 0 });
+    // sg_rank: 0 = None/DG, 1–255 = rank value (clamped to u8).
+    buf.push(d.sg_rank.map(|r| r.min(255) as u8).unwrap_or(0));
     buf.extend_from_slice(&d.host.ip().octets());
     buf.extend_from_slice(&d.host.port().to_be_bytes());
 }
@@ -698,6 +802,8 @@ fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
     let alias        = read_str(data, pos)?;
     let grade_byte   = *data.get(*pos)?; *pos += 1;
     let grade        = if grade_byte == 1 { DeviceGrade::SG } else { DeviceGrade::DG };
+    let rank_byte    = *data.get(*pos)?; *pos += 1;
+    let sg_rank      = if rank_byte == 0 { None } else { Some(rank_byte as u32) };
     let ip: [u8; 4]  = read_arr(data, pos)?;
     let port_bytes: [u8; 2] = read_arr(data, pos)?;
     let port         = u16::from_be_bytes(port_bytes);
@@ -705,6 +811,7 @@ fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
         uuid,
         alias,
         grade,
+        sg_rank,
         host:         SocketAddrV4::new(Ipv4Addr::from(ip), port),
         applications: Vec::new(),
     })
@@ -974,56 +1081,123 @@ const SG_PING_TIMEOUT: Duration = Duration::from_secs(1);
 ///
 /// The SG decrypts the body, reads the destination device UUID, re-encrypts
 /// the inner payload for the destination, and forwards it as an AppPacket (0x41).
+/// Also maintains a rolling per-pair packet count; once the threshold is reached
+/// a `SetupTunnel` action is scheduled so subsequent traffic can bypass the
+/// decrypt/re-encrypt step.
 ///
 /// Encrypted body: [dest_device_uuid: 16][dest_app_id: u16][sender_app_id: u16][payload]
 pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let node = ctx.node.read().unwrap();
-
-    let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
-        eprintln!("[relay_packet] decryption failed from {src}");
-        return;
+    // Extract the sender device UUID from the connection ID in the packet header
+    // before taking the read lock, so we can update the tunnel counter later.
+    let sender_uuid = if buf.len() >= 2 {
+        let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+        ctx.node.read().unwrap()
+            .owner.active_connections.get(&conn_id)
+            .map(|c| c.device_uuid)
+    } else {
+        None
     };
 
-    // Parse body.
-    if plaintext.len() < 20 {
-        eprintln!("[relay_packet] plaintext too short from {src}");
-        return;
-    }
-    let dest_device_uuid: Uuid = plaintext[0..16].try_into().unwrap();
-    let dest_app_id            = u16::from_be_bytes([plaintext[16], plaintext[17]]);
-    let sender_app_id          = u16::from_be_bytes([plaintext[18], plaintext[19]]);
-    let payload                = &plaintext[20..];
+    let (pkt, dest, dest_uuid) = {
+        let node = ctx.node.read().unwrap();
 
-    // Find active connection to destination.
-    let Some(dest_conn) = node.owner.active_connections.values()
-        .find(|c| c.device_uuid == dest_device_uuid)
-    else {
-        eprintln!("[relay_packet] no active connection to dest {:?}", dest_device_uuid);
-        return;
+        let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
+            eprintln!("[relay_packet] decryption failed from {src}");
+            return;
+        };
+
+        // Parse body.
+        if plaintext.len() < 20 {
+            eprintln!("[relay_packet] plaintext too short from {src}");
+            return;
+        }
+        let dest_device_uuid: Uuid = plaintext[0..16].try_into().unwrap();
+        let dest_app_id            = u16::from_be_bytes([plaintext[16], plaintext[17]]);
+        let sender_app_id          = u16::from_be_bytes([plaintext[18], plaintext[19]]);
+        let payload                = &plaintext[20..];
+
+        // Find active connection to destination.
+        let Some(dest_conn) = node.owner.active_connections.values()
+            .find(|c| c.device_uuid == dest_device_uuid)
+        else {
+            eprintln!("[relay_packet] no active connection to dest {:?}", dest_device_uuid);
+            return;
+        };
+
+        // Find destination device host.
+        let Some(dest_host) = node.owner.user.devices.iter()
+            .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
+            .find(|d| d.uuid == dest_device_uuid)
+            .map(|d| d.host)
+        else {
+            eprintln!("[relay_packet] dest device host not found for {:?}", dest_device_uuid);
+            return;
+        };
+
+        // AppPacket body: [dest_app_id: u16][sender_app_id: u16][payload]
+        let mut app_body = Vec::with_capacity(4 + payload.len());
+        app_body.extend_from_slice(&dest_app_id.to_be_bytes());
+        app_body.extend_from_slice(&sender_app_id.to_be_bytes());
+        app_body.extend_from_slice(payload);
+
+        let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
+        (pkt, SocketAddr::V4(dest_host), dest_device_uuid)
     };
-
-    // Find destination device host.
-    let dest_host = node.owner.user.devices.iter()
-        .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
-        .find(|d| d.uuid == dest_device_uuid)
-        .map(|d| d.host);
-
-    let Some(dest_host) = dest_host else {
-        eprintln!("[relay_packet] dest device host not found for {:?}", dest_device_uuid);
-        return;
-    };
-
-    // AppPacket body: [dest_app_id: u16][sender_app_id: u16][payload]
-    let mut app_body = Vec::with_capacity(4 + payload.len());
-    app_body.extend_from_slice(&dest_app_id.to_be_bytes());
-    app_body.extend_from_slice(&sender_app_id.to_be_bytes());
-    app_body.extend_from_slice(payload);
-
-    let pkt  = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
-    let dest = SocketAddr::V4(dest_host);
-    drop(node);
 
     send(ctx, dest, &pkt);
+
+    // Tunnel threshold: count relay packets per (sender, dest) pair on this SG.
+    // Once the threshold is reached within the window, schedule tunnel setup.
+    let Some(sender_uuid) = sender_uuid else { return; };
+    let pair = (sender_uuid, dest_uuid);
+    let now  = Instant::now();
+
+    let schedule_setup = {
+        let mut node = ctx.node.write().unwrap();
+
+        // Skip if a tunnel already exists for this pair.
+        let tunnel_exists = node.owner.active_tunnels.values()
+            .any(|t| {
+                let a = node.owner.active_connections.get(&t.connection_a_id)
+                    .map(|c| c.device_uuid);
+                let b = node.owner.active_connections.get(&t.connection_b_id)
+                    .map(|c| c.device_uuid);
+                (a == Some(sender_uuid) && b == Some(dest_uuid))
+                || (a == Some(dest_uuid)   && b == Some(sender_uuid))
+            });
+        let pending_exists = node.owner.pending_tunnels.values()
+            .any(|p| p.sender_device_uuid == sender_uuid && p.dest_device_uuid == dest_uuid);
+
+        if tunnel_exists || pending_exists {
+            false
+        } else {
+            let counter = node.owner.tunnel_counters.entry(pair).or_insert(TunnelCounter {
+                count:        0,
+                window_start: now,
+            });
+            if now.duration_since(counter.window_start) >= TUNNEL_COUNTER_WINDOW {
+                // Window expired — reset.
+                counter.count        = 1;
+                counter.window_start = now;
+                false
+            } else {
+                counter.count += 1;
+                if counter.count >= TUNNEL_THRESHOLD {
+                    node.owner.tunnel_counters.remove(&pair);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    };
+
+    if schedule_setup {
+        ctx.scheduler_tx.send(super::action_queue::ScheduleRequest {
+            action: super::action_queue::Action::SetupTunnel { sender_uuid, dest_uuid },
+            delay:  std::time::Duration::ZERO,
+        }).ok();
+    }
 }
 
 /// Op 0x41 — App packet (SG → destination node).
@@ -1255,12 +1429,426 @@ pub fn retry_message(message_id: u64, ctx: &WorkerContext) {
     let _ = (message_id, ctx); // TODO
 }
 
+// ── Tunnel handlers ───────────────────────────────────────────────────────────
+
+/// Allocate a tunnel ID not already used in active or pending tunnel maps.
+fn allocate_tunnel_id(node: &super::data_models::Node) -> u16 {
+    let max = node.owner.active_tunnels.keys()
+        .chain(node.owner.pending_tunnels.keys())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    max.wrapping_add(1)
+}
+
+/// Scheduled by `relay_packet` once the per-pair threshold is reached.
+///
+/// Allocates a tunnel ID, stores a `PendingTunnel`, and sends `TUNNEL_INIT`
+/// (op 0x50) to the sender DG to kick off the DG-to-DG key exchange.
+pub fn setup_tunnel(sender_uuid: Uuid, dest_uuid: Uuid, ctx: &WorkerContext) {
+    let (tunnel_id, sender_host) = {
+        let mut node = ctx.node.write().unwrap();
+
+        // Abort if connections to either DG are gone.
+        let has_sender = node.owner.active_connections.values()
+            .any(|c| c.device_uuid == sender_uuid);
+        let has_dest   = node.owner.active_connections.values()
+            .any(|c| c.device_uuid == dest_uuid);
+        if !has_sender || !has_dest { return; }
+
+        let tunnel_id = allocate_tunnel_id(&node);
+        node.owner.pending_tunnels.insert(tunnel_id, PendingTunnel {
+            tunnel_id,
+            sender_device_uuid: sender_uuid,
+            dest_device_uuid:   dest_uuid,
+            sender_ephem_pk:    None,
+        });
+
+        let sender_host = node.owner.user.devices.iter()
+            .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
+            .find(|d| d.uuid == sender_uuid)
+            .map(|d| d.host);
+
+        (tunnel_id, sender_host)
+    };
+
+    if let Some(host) = sender_host {
+        // TUNNEL_INIT: [op=0x50][tunnel_id: u16][dest_device_uuid: 16]
+        let mut pkt = [0u8; 19];
+        pkt[0]     = TUNNEL_INIT_OP;
+        pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
+        pkt[3..19].copy_from_slice(&dest_uuid);
+        send(ctx, SocketAddr::V4(host), &pkt);
+    }
+}
+
+/// Op 0x50 — Tunnel init (SG → DG_sender).
+///
+/// DG_sender generates an ephemeral X25519 key pair, stores it as a
+/// `PendingTunnelConnection`, and sends `TUNNEL_CONNECT_REQUEST` (0x52) back
+/// to the SG so the key exchange can be relayed to DG_dest.
+///
+/// Payload: [tunnel_id: u16][dest_device_uuid: 16]
+pub fn tunnel_init(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 18 {
+        eprintln!("[tunnel_init] packet too short from {src}");
+        return;
+    }
+    let tunnel_id        = u16::from_be_bytes([buf[0], buf[1]]);
+    let dest_device_uuid: Uuid = buf[2..18].try_into().unwrap();
+
+    let (our_conn_id, our_ephem_pk) = {
+        let mut node = ctx.node.write().unwrap();
+        let conn_id  = allocate_conn_id(&node);
+        let key_pair = generate_x25519_keypair();
+        let pk_copy  = key_pair.public_key;
+        node.owner.pending_tunnel_connections.insert(tunnel_id, PendingTunnelConnection {
+            tunnel_id,
+            our_conn_id: conn_id,
+            our_key_pair: key_pair,
+            dest_device_uuid,
+        });
+        (conn_id, pk_copy)
+    };
+
+    let _ = our_conn_id; // conn_id is stored in the pending struct; not sent in this packet.
+
+    // Send TUNNEL_CONNECT_REQUEST back to the SG that sent TUNNEL_INIT.
+    // Format: [op=0x52][tunnel_id: u16][our_ephem_pk: 32]
+    let mut pkt = [0u8; 35];
+    pkt[0]     = TUNNEL_CONNECT_REQUEST_OP;
+    pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
+    pkt[3..35].copy_from_slice(&our_ephem_pk);
+    send(ctx, src, &pkt);
+}
+
+/// Op 0x52 — Tunnel connect request.
+///
+/// Two roles, distinguished by packet length:
+///
+/// **SG relay** (buf len == 34): received from DG_sender `[tunnel_id: u16][sender_ephem_pk: 32]`.
+/// Stores the sender's ephemeral PK in the pending tunnel and forwards the
+/// request to DG_dest with the extended format (+ sender_device_uuid).
+///
+/// **DG_dest** (buf len >= 50): received from SG `[tunnel_id: u16][sender_ephem_pk: 32][sender_device_uuid: 16]`.
+/// Generates own ephemeral key pair, derives shared secret, stores an
+/// `ActiveConnection` to DG_sender, updates `dg_tunnel_map`, and replies with
+/// `TUNNEL_CONNECT_ACK` (0x53) to the SG.
+pub fn tunnel_connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 34 {
+        eprintln!("[tunnel_connect_request] packet too short from {src}");
+        return;
+    }
+    let tunnel_id       = u16::from_be_bytes([buf[0], buf[1]]);
+    let sender_ephem_pk: PublicKey = buf[2..34].try_into().unwrap();
+
+    // Determine role by checking which pending map has this tunnel_id.
+    let is_sg_relay = ctx.node.read().unwrap()
+        .owner.pending_tunnels.contains_key(&tunnel_id);
+
+    if is_sg_relay {
+        // ── SG relay path ─────────────────────────────────────────────────────
+        let dest_host = {
+            let mut node = ctx.node.write().unwrap();
+            let Some(pending) = node.owner.pending_tunnels.get_mut(&tunnel_id) else {
+                eprintln!("[tunnel_connect_request] no pending tunnel {tunnel_id} from {src}");
+                return;
+            };
+            pending.sender_ephem_pk = Some(sender_ephem_pk);
+            let dest_uuid   = pending.dest_device_uuid;
+            let sender_uuid = pending.sender_device_uuid;
+
+            let host = node.owner.user.devices.iter()
+                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
+                .find(|d| d.uuid == dest_uuid)
+                .map(|d| d.host);
+            (host, sender_uuid)
+        };
+
+        if let (Some(host), sender_uuid) = dest_host {
+            // Forward to DG_dest: [op=0x52][tunnel_id: u16][sender_ephem_pk: 32][sender_device_uuid: 16]
+            let mut pkt = [0u8; 51];
+            pkt[0]      = TUNNEL_CONNECT_REQUEST_OP;
+            pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
+            pkt[3..35].copy_from_slice(&sender_ephem_pk);
+            pkt[35..51].copy_from_slice(&sender_uuid);
+            send(ctx, SocketAddr::V4(host), &pkt);
+        }
+    } else if buf.len() >= 50 {
+        // ── DG_dest path ──────────────────────────────────────────────────────
+        let sender_device_uuid: Uuid = buf[34..50].try_into().unwrap();
+
+        let (conn_id, our_ephem_pk) = {
+            let mut node    = ctx.node.write().unwrap();
+            let conn_id     = allocate_conn_id(&node);
+            let key_pair    = generate_x25519_keypair();
+            let pk_copy     = key_pair.public_key;
+
+            node.owner.active_connections.insert(conn_id, ActiveConnection {
+                id:                        conn_id,
+                timeout:                   SystemTime::now() + CONNECTION_LIFETIME,
+                key_pair,
+                peer_public_key:           sender_ephem_pk,
+                peer_active_connection_id: 0, // not used for tunnel decryption
+                device_uuid:               sender_device_uuid,
+            });
+            node.owner.dg_tunnel_map.insert(tunnel_id, conn_id);
+            (conn_id, pk_copy)
+        };
+
+        let _ = conn_id;
+
+        // Reply TUNNEL_CONNECT_ACK to the SG that forwarded this request.
+        // Format: [op=0x53][tunnel_id: u16][our_ephem_pk: 32]
+        let mut pkt = [0u8; 35];
+        pkt[0]     = TUNNEL_CONNECT_ACK_OP;
+        pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
+        pkt[3..35].copy_from_slice(&our_ephem_pk);
+        send(ctx, src, &pkt);
+    } else {
+        eprintln!("[tunnel_connect_request] unexpected packet length {} from {src}", buf.len());
+    }
+}
+
+/// Op 0x53 — Tunnel connect ack.
+///
+/// Two roles, distinguished by which pending map holds the tunnel_id:
+///
+/// **SG relay** (`pending_tunnels` has tunnel_id): received from DG_dest.
+/// Promotes the `PendingTunnel` to an `ActiveTunnel`, then forwards the ack
+/// to DG_sender.
+///
+/// **DG_sender** (`pending_tunnel_connections` has tunnel_id): received from SG.
+/// Completes the key exchange: stores an `ActiveConnection` to DG_dest and
+/// updates `dg_tunnel_map`.
+///
+/// Payload: [tunnel_id: u16][ephem_pk: 32]
+pub fn tunnel_connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 34 {
+        eprintln!("[tunnel_connect_ack] packet too short from {src}");
+        return;
+    }
+    let tunnel_id    = u16::from_be_bytes([buf[0], buf[1]]);
+    let dest_ephem_pk: PublicKey = buf[2..34].try_into().unwrap();
+
+    let is_sg_relay = ctx.node.read().unwrap()
+        .owner.pending_tunnels.contains_key(&tunnel_id);
+    let is_dg_sender = ctx.node.read().unwrap()
+        .owner.pending_tunnel_connections.contains_key(&tunnel_id);
+
+    if is_sg_relay {
+        // ── SG relay path ─────────────────────────────────────────────────────
+        let sender_host = {
+            let mut node = ctx.node.write().unwrap();
+            let Some(pending) = node.owner.pending_tunnels.remove(&tunnel_id) else { return; };
+
+            // Link the two active connections as an ActiveTunnel.
+            let conn_a = node.owner.active_connections.values()
+                .find(|c| c.device_uuid == pending.sender_device_uuid)
+                .map(|c| c.id);
+            let conn_b = node.owner.active_connections.values()
+                .find(|c| c.device_uuid == pending.dest_device_uuid)
+                .map(|c| c.id);
+
+            if let (Some(a), Some(b)) = (conn_a, conn_b) {
+                node.owner.active_tunnels.insert(tunnel_id, ActiveTunnel {
+                    id:              tunnel_id,
+                    connection_a_id: a,
+                    connection_b_id: b,
+                    last_used_at:    Instant::now(),
+                });
+            }
+
+            node.owner.user.devices.iter()
+                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
+                .find(|d| d.uuid == pending.sender_device_uuid)
+                .map(|d| d.host)
+        };
+
+        if let Some(host) = sender_host {
+            // Forward ack to DG_sender: [op=0x53][tunnel_id: u16][dest_ephem_pk: 32]
+            let mut pkt = [0u8; 35];
+            pkt[0]     = TUNNEL_CONNECT_ACK_OP;
+            pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
+            pkt[3..35].copy_from_slice(&dest_ephem_pk);
+            send(ctx, SocketAddr::V4(host), &pkt);
+        }
+    } else if is_dg_sender {
+        // ── DG_sender path ────────────────────────────────────────────────────
+        let mut node = ctx.node.write().unwrap();
+        let Some(ptc) = node.owner.pending_tunnel_connections.remove(&tunnel_id) else { return; };
+
+        node.owner.active_connections.insert(ptc.our_conn_id, ActiveConnection {
+            id:                        ptc.our_conn_id,
+            timeout:                   SystemTime::now() + CONNECTION_LIFETIME,
+            key_pair:                  ptc.our_key_pair,
+            peer_public_key:           dest_ephem_pk,
+            peer_active_connection_id: 0, // not used for tunnel packets
+            device_uuid:               ptc.dest_device_uuid,
+        });
+        node.owner.dg_tunnel_map.insert(tunnel_id, ptc.our_conn_id);
+    } else {
+        eprintln!("[tunnel_connect_ack] unknown tunnel_id {tunnel_id} from {src}");
+    }
+}
+
+/// Op 0x51 — Tunnel forward (DG → SG).
+///
+/// The SG looks up the tunnel by ID, identifies the outbound leg, and forwards
+/// the nonce+ciphertext payload as-is without decryption (op 0x54).
+///
+/// Payload: [sender_sg_conn_id: u16][tunnel_id: u16][nonce: 24][ciphertext...]
+pub fn tunnel_forward(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 28 {
+        eprintln!("[tunnel_forward] packet too short from {src}");
+        return;
+    }
+    let sender_sg_conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+    let tunnel_id         = u16::from_be_bytes([buf[2], buf[3]]);
+    let payload           = &buf[4..]; // nonce + ciphertext, forwarded as-is
+
+    let dest_host = {
+        let mut node = ctx.node.write().unwrap();
+        let Some(tunnel) = node.owner.active_tunnels.get_mut(&tunnel_id) else {
+            eprintln!("[tunnel_forward] unknown tunnel_id {tunnel_id} from {src}");
+            return;
+        };
+
+        let out_conn_id = if tunnel.connection_a_id == sender_sg_conn_id {
+            tunnel.connection_b_id
+        } else if tunnel.connection_b_id == sender_sg_conn_id {
+            tunnel.connection_a_id
+        } else {
+            eprintln!("[tunnel_forward] conn_id {sender_sg_conn_id} not in tunnel {tunnel_id}");
+            return;
+        };
+
+        tunnel.last_used_at = Instant::now();
+
+        let dest_uuid = node.owner.active_connections.get(&out_conn_id)
+            .map(|c| c.device_uuid);
+
+        dest_uuid.and_then(|uuid| {
+            node.owner.user.devices.iter()
+                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
+                .find(|d| d.uuid == uuid)
+                .map(|d| d.host)
+        })
+    };
+
+    if let Some(host) = dest_host {
+        // Forward as TUNNEL_DELIVERY (0x54): [op][tunnel_id: u16][nonce+ciphertext]
+        let mut pkt = Vec::with_capacity(3 + payload.len());
+        pkt.push(TUNNEL_DELIVERY_OP);
+        pkt.extend_from_slice(&tunnel_id.to_be_bytes());
+        pkt.extend_from_slice(payload);
+        send(ctx, SocketAddr::V4(host), &pkt);
+    }
+}
+
+/// Op 0x54 — Tunnel delivery (SG → DG).
+///
+/// DG_dest decrypts the payload with the DG-to-DG shared secret (looked up via
+/// `dg_tunnel_map`) and pushes it to the target local app.
+///
+/// Payload: [tunnel_id: u16][nonce: 24][ciphertext...]
+pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 26 {
+        eprintln!("[tunnel_delivery] packet too short from {src}");
+        return;
+    }
+    let tunnel_id       = u16::from_be_bytes([buf[0], buf[1]]);
+    let nonce: [u8; 24] = buf[2..26].try_into().unwrap();
+    let ciphertext      = &buf[26..];
+
+    let (push_pkt, app_host) = {
+        let node = ctx.node.read().unwrap();
+
+        let Some(&conn_id) = node.owner.dg_tunnel_map.get(&tunnel_id) else {
+            eprintln!("[tunnel_delivery] unknown tunnel_id {tunnel_id} from {src}");
+            return;
+        };
+        let Some(conn) = node.owner.active_connections.get(&conn_id) else {
+            eprintln!("[tunnel_delivery] no active connection for tunnel {tunnel_id}");
+            return;
+        };
+
+        let shared = x25519_shared(&conn.key_pair.private_key, &conn.peer_public_key);
+        let Some(plaintext) = xchacha20_decrypt(&shared, &nonce, ciphertext) else {
+            eprintln!("[tunnel_delivery] decryption failed for tunnel {tunnel_id} from {src}");
+            return;
+        };
+        if plaintext.len() < 4 {
+            eprintln!("[tunnel_delivery] plaintext too short for tunnel {tunnel_id}");
+            return;
+        }
+
+        let dest_app_id   = u16::from_be_bytes([plaintext[0], plaintext[1]]);
+        let sender_app_id = u16::from_be_bytes([plaintext[2], plaintext[3]]);
+        let payload       = &plaintext[4..];
+
+        let device_uuid = node.device_uuid;
+        let Some(app_host) = node.owner.user.devices.iter()
+            .find(|d| d.uuid == device_uuid)
+            .and_then(|d| d.applications.iter().find(|a| a.id == dest_app_id))
+            .map(|a| a.host)
+        else {
+            eprintln!("[tunnel_delivery] no app {dest_app_id} for tunnel {tunnel_id}");
+            return;
+        };
+
+        let mut push = Vec::with_capacity(3 + payload.len());
+        push.push(APP_PUSH_OP);
+        push.extend_from_slice(&sender_app_id.to_be_bytes());
+        push.extend_from_slice(payload);
+
+        (push, app_host)
+    };
+
+    send(ctx, SocketAddr::V4(app_host), &push_pkt);
+}
+
+/// Recurring cleanup: remove idle tunnels and stale counters.
+pub fn cleanup_tunnels(ctx: &WorkerContext) {
+    const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+    let now     = Instant::now();
+    let now_sys = SystemTime::now();
+
+    let mut node = ctx.node.write().unwrap();
+
+    // SG: remove idle ActiveTunnels.
+    node.owner.active_tunnels.retain(|_, t| {
+        now.duration_since(t.last_used_at) < TUNNEL_IDLE_TIMEOUT
+    });
+
+    // SG: clear stale tunnel counters (window expired).
+    node.owner.tunnel_counters.retain(|_, c| {
+        now.duration_since(c.window_start) < TUNNEL_COUNTER_WINDOW
+    });
+
+    // DG: remove dg_tunnel_map entries whose ActiveConnection has expired.
+    let expired_tunnels: Vec<u16> = node.owner.dg_tunnel_map.iter()
+        .filter(|(_, conn_id)| {
+            !node.owner.active_connections.get(*conn_id)
+                .map(|c| c.timeout > now_sys)
+                .unwrap_or(false)
+        })
+        .map(|(&tid, _)| tid)
+        .collect();
+    for tid in expired_tunnels {
+        node.owner.dg_tunnel_map.remove(&tid);
+    }
+}
+
 /// Scheduled every 20 seconds on DG devices.
 ///
-/// Sends a 1-byte packet (op `0x12`) to every SG with an active connection,
-/// keeping the DG's NAT mapping alive so the SG can push packets back.
+/// Sends a 1-byte packet (op `0x12`) to the highest-ranked reachable SG owned
+/// by this device's user, keeping the NAT mapping alive so that SG can push
+/// packets back. Only one SG receives the keep-alive at a time: the top-ranked
+/// SG that is currently marked up by `poll_sg`. If the top-ranked SG is down,
+/// falls through to the next rank.
 pub fn keepalive_dg(ctx: &WorkerContext) {
-    let sg_hosts: Vec<SocketAddrV4> = {
+    let target: Option<SocketAddrV4> = {
         let node       = ctx.node.read().unwrap();
         let local_uuid = node.device_uuid;
 
@@ -1271,29 +1859,24 @@ pub fn keepalive_dg(ctx: &WorkerContext) {
             .unwrap_or(false);
         if !is_dg { return; }
 
-        // UUIDs of devices we currently have an active connection with.
+        // UUIDs of own SGs that have an active connection, sorted by rank ascending.
+        // None-rank SGs sort last (treat as u32::MAX).
         let connected: HashSet<Uuid> = node.owner.active_connections.values()
             .map(|c| c.device_uuid)
             .collect();
 
-        // Collect the host address of every connected SG (own + contacts').
-        let mut hosts = Vec::new();
-        for d in &node.owner.user.devices {
-            if matches!(d.grade, DeviceGrade::SG) && connected.contains(&d.uuid) {
-                hosts.push(d.host);
-            }
-        }
-        for contact in &node.owner.contact_users {
-            for d in &contact.user.devices {
-                if matches!(d.grade, DeviceGrade::SG) && connected.contains(&d.uuid) {
-                    hosts.push(d.host);
-                }
-            }
-        }
-        hosts
+        let mut own_sgs: Vec<&super::data_models::Device> = node.owner.user.devices.iter()
+            .filter(|d| matches!(d.grade, DeviceGrade::SG) && connected.contains(&d.uuid))
+            .collect();
+        own_sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
+
+        // Pick the highest-ranked SG that poll_sg considers up (treat unpolled as up).
+        own_sgs.iter()
+            .find(|d| node.sg_statuses.get(&d.uuid).map(|s| s.up).unwrap_or(true))
+            .map(|d| d.host)
     };
 
-    for host in sg_hosts {
+    if let Some(host) = target {
         send(ctx, SocketAddr::V4(host), &[DG_KEEPALIVE_OP]);
     }
 }
@@ -1814,7 +2397,16 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> bool {
         return false;
     }
 
-    let grade    = if grade_str == "sg" { DeviceGrade::SG } else { DeviceGrade::DG };
+    let grade   = if grade_str == "sg" { DeviceGrade::SG } else { DeviceGrade::DG };
+    let sg_rank = if matches!(grade, DeviceGrade::SG) {
+        let rank = form_field(body, "sg_rank")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1)
+            .max(1);
+        Some(rank)
+    } else {
+        None
+    };
     let key_pair = generate_ed25519_keypair();
 
     {
@@ -1824,8 +2416,9 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> bool {
 
         let device_uuid = node.device_uuid;
         if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) {
-            dev.alias = device_alias;
-            dev.grade = grade;
+            dev.alias   = device_alias;
+            dev.grade   = grade;
+            dev.sg_rank = sg_rank;
         }
     }
     ctx.save_node();
@@ -1911,6 +2504,9 @@ fn render_setup_new_user_form(error: bool) -> String {
            <label class=\"swiz-label\">Device name</label>\
            <input class=\"swiz-input\" type=\"text\" name=\"device_alias\" \
                   placeholder=\"e.g. Home Server\" required autocomplete=\"off\">\
+           <label class=\"swiz-label\">SG rank (1 = highest priority relay)</label>\
+           <input class=\"swiz-input\" type=\"number\" name=\"sg_rank\" \
+                  value=\"1\" min=\"1\" max=\"255\" autocomplete=\"off\">\
            <button class=\"swiz-btn\" type=\"submit\">Create Identity</button>\
          </form>\
          <a class=\"swiz-back\" href=\"/setup?grade=sg\">\u{2190} Back</a>"

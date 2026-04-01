@@ -29,11 +29,20 @@ pub enum Action {
     RelayPacket        { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
+    // Tunnel
+    TunnelInit           { src: SocketAddr, buf: Vec<u8> },
+    TunnelForward        { src: SocketAddr, buf: Vec<u8> },
+    TunnelDelivery       { src: SocketAddr, buf: Vec<u8> },
+    TunnelConnectRequest { src: SocketAddr, buf: Vec<u8> },
+    TunnelConnectAck     { src: SocketAddr, buf: Vec<u8> },
+
     // Scheduled
     PollSG,
     MaintainConnections,
     KeepAliveDG,
-    RetryMessage { message_id: u64 },
+    CleanupTunnels,
+    RetryMessage  { message_id: u64 },
+    SetupTunnel   { sender_uuid: super::data_models::Uuid, dest_uuid: super::data_models::Uuid },
 }
 
 /// Sent by an action handler to schedule future work.
@@ -78,10 +87,17 @@ impl Action {
             Action::DeviceRegistration { src, buf }   => handlers::device_registration(src, buf, ctx),
             Action::RelayPacket        { src, buf }   => handlers::relay_packet(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
-            Action::PollSG                          => handlers::poll_sg(ctx),
-            Action::MaintainConnections             => handlers::maintain_connections(ctx),
-            Action::KeepAliveDG                     => handlers::keepalive_dg(ctx),
-            Action::RetryMessage { message_id }     => handlers::retry_message(message_id, ctx),
+            Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),
+            Action::TunnelForward        { src, buf } => handlers::tunnel_forward(src, buf, ctx),
+            Action::TunnelDelivery       { src, buf } => handlers::tunnel_delivery(src, buf, ctx),
+            Action::TunnelConnectRequest { src, buf } => handlers::tunnel_connect_request(src, buf, ctx),
+            Action::TunnelConnectAck     { src, buf } => handlers::tunnel_connect_ack(src, buf, ctx),
+            Action::PollSG                           => handlers::poll_sg(ctx),
+            Action::MaintainConnections              => handlers::maintain_connections(ctx),
+            Action::KeepAliveDG                      => handlers::keepalive_dg(ctx),
+            Action::CleanupTunnels                   => handlers::cleanup_tunnels(ctx),
+            Action::RetryMessage { message_id }      => handlers::retry_message(message_id, ctx),
+            Action::SetupTunnel { sender_uuid, dest_uuid } => handlers::setup_tunnel(sender_uuid, dest_uuid, ctx),
         }
     }
 }

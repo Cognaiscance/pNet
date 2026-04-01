@@ -11,6 +11,7 @@ const POLL_SG_INTERVAL:              Duration = Duration::from_secs(30);
 const MAINTAIN_CONNECTIONS_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Must be safely under the typical 30-second UDP NAT mapping timeout.
 const KEEPALIVE_DG_INTERVAL:         Duration = Duration::from_secs(20);
+const CLEANUP_TUNNELS_INTERVAL:      Duration = Duration::from_secs(5 * 60);
 
 pub struct SchedulerThread {
     handle: thread::JoinHandle<()>,
@@ -32,9 +33,10 @@ impl SchedulerThread {
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*queue;
 
-            let mut last_poll_sg    = Instant::now();
-            let mut last_maintain   = Instant::now();
-            let mut last_keepalive  = Instant::now();
+            let mut last_poll_sg       = Instant::now();
+            let mut last_maintain      = Instant::now();
+            let mut last_keepalive     = Instant::now();
+            let mut last_cleanup_tunnels = Instant::now();
             let mut pending: Vec<(Instant, Action)> = Vec::new();
 
             while !stop.load(Ordering::Acquire) {
@@ -61,6 +63,10 @@ impl SchedulerThread {
                 if now.duration_since(last_keepalive) >= KEEPALIVE_DG_INTERVAL {
                     to_enqueue.push(Action::KeepAliveDG);
                     last_keepalive = now;
+                }
+                if now.duration_since(last_cleanup_tunnels) >= CLEANUP_TUNNELS_INTERVAL {
+                    to_enqueue.push(Action::CleanupTunnels);
+                    last_cleanup_tunnels = now;
                 }
 
                 // One-shot pending jobs — drain those that are due.

@@ -3,9 +3,17 @@ pNet devices come in two grades:
 - **SG (Server Grade)**: runs on a machine with a static IP or domain name, free from NAT/firewall restrictions. If on a home network, appropriate ports are forwarded and a stable IP or DDNS is in place.
 - **DG (Device Grade)**: runs on a laptop, phone, or any device that accepts whatever internet access is available. May be behind double NAT or restrictive ISP routing.
 
-Every user on the pNet system must have at least one SG. A user's DGs do not communicate directly with other users' devices — instead they relay all outbound packets through their own SG, which forwards them to the recipient's SG, which then delivers to the appropriate DG.
+Every user on the pNet system must have at least one SG.  This is required because of how connections must be kept alive between an SG and DG to make the 2 way communication reliable.
 
-Packet path: `DG_sender → SG_sender → SG_recipient → DG_recipient`
+### SG server Responsibilities and Priorities
+
+The SG has a job to be the only device to which the DG devices owned by the user do their keep-alive communications. If a user has more than one SG device they will be ranked, so that the top-ranking SG is the one used for keep-alive. If that machine goes down (meaning it doesn't respond to keep-alive signals), the DG devices start sending their keep-alive signals to the next SG in the list.
+
+Because only the top-ranked SG is able to send packets to the DG of that user, the rank number needs to be included in the device data of an SG.
+
+Packet path: `DG_sender → [relay SG] → SG_recipient_top → DG_recipient`
+
+The final hop to a recipient's DG must always go through that user's **top-ranked SG**, since it is the only SG holding an active keep-alive tunnel with the DG. The relay SG used for the first hop may be any SG from either user's pool.
 
 ```mermaid
 flowchart LR
@@ -15,13 +23,13 @@ flowchart LR
         DG1[pNet: user1: DG1]
         D[file sync app: DG2]
         DG2[pNet: user1: DG2]
-        SG1[pNet: user1: SG]
+        SG1["pNet: user1: SG (rank 1)"]
     end
 
     subgraph user2
         C[messenger app: DG3]
         DG3[pNet: user2: DG3]
-        SG2[pNet: user2: SG]
+        SG2["pNet: user2: SG (rank 1)"]
     end
 
     A <-->|encrypted udp|DG1
@@ -29,99 +37,84 @@ flowchart LR
     D <-->|encrypted udp|DG2
     C <-->|encrypted udp|DG3
 
-    DG1 <-->|encrypted udp|SG1
-    DG2 <-->|encrypted udp|SG1
+    DG1 <-->|keep-alive + data|SG1
+    DG2 <-->|keep-alive + data|SG1
     SG1 <-->|encrypted udp|SG2
     SG2 <-->|encrypted udp|DG3
 ```
 
-The diagram above shows how a message from the messenger app on user1's DG1 travels to user2's DG3: the DG1 pNet node forwards it to user1's SG, which relays it to user2's SG, which delivers it to DG3's pNet node, which hands it to the messenger app. It also shows how a file from the file sync app on DG1 can reach the file sync app on DG2 — both owned by user1 — via user1's SG as the relay.
+The diagram shows the simple case where each user has one SG (automatically rank 1). DG1 and DG2 (both belonging to user1) maintain their keep-alive tunnels exclusively with user1's top-ranked SG. A message from the messenger app on user1's DG1 travels to user2's DG3: DG1 → SG1 → SG2 → DG3. Only SG2 can deliver to DG3 because it is user2's top-ranked SG and the only one holding an active tunnel to DG3. File data from DG1 to DG2 (same user) also routes through SG1 as the shared relay.
 
-pNet is responsible for maintaining network location information and encryption keys to connect and send packets to other pNet nodes, which then forward that data to the appropriate app on the device. The SG/DG split ensures reliable delivery even in difficult network environments (double NAT, advanced ISP routing) by guaranteeing that at least one reachable relay exists per user.
+pNet is responsible for maintaining network location information, SG rank data, and encryption keys to connect and send packets to other pNet nodes, which then forward that data to the appropriate app on the device. The SG/DG split ensures reliable delivery even in difficult network environments (double NAT, advanced ISP routing) by guaranteeing that at least one reachable, top-ranked relay exists per user at all times.
 
 ---
 
-## Complete routing model — proximity-based SG selection
+## SG selection for routing
 
-The simplified model always routes through the sender's own SG first. The complete model allows a DG to use any SG that belongs to either party in the conversation, choosing the geographically closest one to minimize network hops. Each device stores a latitude and longitude so distances can be computed.
+When a DG sends a packet to a remote DG, it must route through a relay SG. The selection rule is:
 
-**Routing algorithm (4 steps):**
-1. Build the candidate SG list: all SGs owned by the sender's user **or** the recipient's user.
-2. Select the closest SG from that list using device lat/long coordinates.
-3. Send the packet to that SG.
-4. The SG receives the packet and delivers it to the destination DG.
+1. Prefer a direct connection to the **recipient's top-ranked SG** — this is the SG that holds the active keep-alive tunnel to the recipient's DG and is the only one that can deliver to it. If a connection to that SG exists, use it (2-hop path).
+2. If no direct connection to the recipient's top-ranked SG is available, fall back to the best available SG by lowest measured RTT (from `poll_sg` results), which will relay onward to the recipient's top-ranked SG.
 
-This means the relay hop is always as short as possible regardless of where the DG currently is, and may skip the sender's own SG entirely when the recipient's SG is closer.
-
-### Example: William (Utah, SG in Utah) visits Chad (England, SG in England)
-
-**William sends a message to Chad:**
-
-Simple model path — William's DG is in England but still routes through Utah:
-```
-William's DG (England) → William's SG (Utah) → Chad's SG (England) → Chad's DG (England)
-```
-
-Complete model path — William's DG checks both SGs and picks Chad's SG (same continent):
-```
-William's DG (England) → Chad's SG (England) → Chad's DG (England)
-```
-
-```mermaid
-flowchart LR
-    WDG["William's DG\n(England)"]
-    WSG["William's SG\n(Utah)"]
-    CSG["Chad's SG\n(England)"]
-    CDG["Chad's DG\n(England)"]
-
-    WDG -->|"simple model\n(long path)"| WSG
-    WSG -->|"simple model"| CSG
-    WDG -->|"complete model\n(short path)"| CSG
-    CSG --> CDG
-```
-
-**Chad sends a reply to William:**
-
-Chad's DG checks both SGs. His own SG is in England, same as William's DG — it is the closest option, so the packet goes to Chad's SG and then directly to William's DG. In this direction the simple and complete models agree.
-
-```
-Chad's DG (England) → Chad's SG (England) → William's DG (England)
-```
-
-```mermaid
-flowchart LR
-    CDG["Chad's DG\n(England)"]
-    CSG["Chad's SG\n(England)"]
-    WDG["William's DG\n(England)"]
-
-    CDG -->|"closest SG"| CSG
-    CSG --> WDG
-```
-
-The complete model generalises cleanly: a DG always picks the single best relay from the full pool of SGs shared between the two users, keeping traffic local when the users are physically near each other.
+RTT-based selection naturally favours well-connected, low-latency relays without requiring any geographic metadata.
 
 ### Intra-user routing (DG to DG, same user)
 
-The algorithm is identical when both the sender and recipient belong to the same user. The candidate SG pool is simply that user's own SGs. If the user has only one SG the path is straightforward; if they have multiple SGs in different locations the proximity logic still applies and picks the best relay naturally.
+The same rule applies. All of a user's DGs keep their keep-alive with the user's rank 1 SG. That SG is always `SG_dest` for any intra-user delivery, regardless of which DG is sending or receiving. The rank 1 SG is effectively the hub for all of that user's DG traffic until a failover event promotes rank 2 to rank 1.
 
-**Example: Will has an SG in Utah and an SG in England. His DG in England sends a file to his DG in Utah.**
+---
 
-The candidate pool is `{Will's SG Utah, Will's SG England}`. The Utah SG is closest to the destination (Will's Utah DG), so it is selected as the relay.
+## Lazy DG-to-DG tunnels
 
-```
-Will's DG (England) → Will's SG (Utah) → Will's DG (Utah)
-```
+### Motivation
+
+In the standard routing model, every packet that passes through a relay SG is fully decrypted and then re-encrypted for the next leg of the journey. For a high-throughput use case — such as a file sync app streaming many packets between two DGs — this per-packet decrypt/re-encrypt cost at the SG adds up. A **lazy tunnel** allows the relay SG to forward packets without touching the encrypted payload, using a direct DG-to-DG shared secret negotiated automatically once traffic between a pair crosses a threshold.
+
+### Threshold and trigger
+
+The relay SG maintains a rolling packet count per `(sender_uuid, dest_uuid)` pair. The counter resets if the threshold is not reached within a 5-minute window. Once a pair crosses **10 packets** in a single window, the SG automatically initiates a DG-to-DG key exchange — no action is required from the apps.
+
+### Key exchange
+
+The exchange reuses the same X25519 ephemeral key exchange mechanism used for standard DG-to-SG connections, relayed through the SG.
 
 ```mermaid
-flowchart LR
-    WDG_EN["Will's DG\n(England)"]
-    WSG_EN["Will's SG\n(England)"]
-    WSG_UT["Will's SG\n(Utah)"]
-    WDG_UT["Will's DG\n(Utah)"]
+sequenceDiagram
+    participant DG_s  as DG_sender
+    participant SG    as Relay SG
+    participant DG_d  as DG_dest
 
-    WDG_EN -->|"closest to destination"| WSG_UT
-    WSG_EN -.->|"further — not chosen"| WSG_UT
-    WSG_UT --> WDG_UT
+    Note over SG: packet count reaches threshold
+    SG->>DG_s: TUNNEL_INIT (0x50) [tunnel_id, dest_device_uuid]
+    DG_s->>SG: TUNNEL_CONNECT_REQUEST (0x52) [tunnel_id, sender_ephem_pk]
+    SG->>DG_d: TUNNEL_CONNECT_REQUEST (0x52) [tunnel_id, sender_ephem_pk, sender_device_uuid]
+    DG_d->>SG: TUNNEL_CONNECT_ACK (0x53) [tunnel_id, dest_ephem_pk]
+    Note over DG_d: derives shared secret, records tunnel
+    SG->>DG_s: TUNNEL_CONNECT_ACK (0x53) [tunnel_id, dest_ephem_pk]
+    Note over DG_s: derives shared secret, records tunnel
+    Note over SG: promotes to ActiveTunnel
 ```
 
-The same logic works in reverse: Will's Utah DG sending to his England DG would pick the England SG as the relay.
+### Tunnel packet forwarding
+
+Once the tunnel is established, the sender DG encrypts directly for the destination DG using the negotiated shared secret and sends a tunnel forward packet to the relay SG. The SG forwards it without decryption.
+
+```
+DG_sender → SG:  [0x51 TUNNEL_FORWARD][sender_conn_id: u16][tunnel_id: u16][nonce: 24][ciphertext]
+SG → DG_dest:    [0x54 TUNNEL_DELIVERY][tunnel_id: u16][nonce: 24][ciphertext]
+```
+
+The relay SG reads only `tunnel_id` to identify the outbound leg — the encrypted payload is forwarded as-is.
+
+### Why this is more efficient
+
+| | Standard packet | Tunnel packet |
+|---|---|---|
+| Relay SG work | decrypt → inspect → re-encrypt | read tunnel_id → forward |
+| Encryption hops | DG→SG (leg 1), SG→DG (leg 2) | DG→DG (end-to-end, one key) |
+| Latency benefit | baseline | lower per-packet CPU at SG |
+| Best for | low-volume, ad-hoc messages | high-throughput streams (file sync, video) |
+
+### Tunnel lifetime
+
+The `last_used_at` timestamp on `ActiveTunnel` allows idle tunnels to be cleaned up. If no tunnel packet has been forwarded within 5 minutes, the SG removes the tunnel record and traffic falls back to the standard relay path. The DG-to-DG `ActiveConnection` expires naturally after 24 hours.

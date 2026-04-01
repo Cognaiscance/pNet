@@ -82,6 +82,11 @@ impl UdpListener {
                     0x32 => Action::DeviceRegistration { src, buf: payload },
                     0x40 => Action::RelayPacket        { src, buf: payload },
                     0x41 => Action::AppPacket          { src, buf: payload },
+                    0x50 => Action::TunnelInit           { src, buf: payload },
+                    0x51 => Action::TunnelForward        { src, buf: payload },
+                    0x52 => Action::TunnelConnectRequest { src, buf: payload },
+                    0x53 => Action::TunnelConnectAck     { src, buf: payload },
+                    0x54 => Action::TunnelDelivery       { src, buf: payload },
                     _ => {
                         eprintln!("[udp] unknown op byte {op} from {src}");
                         continue;
