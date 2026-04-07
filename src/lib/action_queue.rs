@@ -41,7 +41,6 @@ pub enum Action {
     MaintainConnections,
     KeepAliveDG,
     CleanupTunnels,
-    RetryMessage  { message_id: u64 },
     SetupTunnel   { sender_uuid: super::data_models::Uuid, dest_uuid: super::data_models::Uuid },
 }
 
@@ -96,7 +95,6 @@ impl Action {
             Action::MaintainConnections              => handlers::maintain_connections(ctx),
             Action::KeepAliveDG                      => handlers::keepalive_dg(ctx),
             Action::CleanupTunnels                   => handlers::cleanup_tunnels(ctx),
-            Action::RetryMessage { message_id }      => handlers::retry_message(message_id, ctx),
             Action::SetupTunnel { sender_uuid, dest_uuid } => handlers::setup_tunnel(sender_uuid, dest_uuid, ctx),
         }
     }

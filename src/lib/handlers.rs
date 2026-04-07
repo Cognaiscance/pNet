@@ -1424,11 +1424,6 @@ pub fn maintain_connections(ctx: &WorkerContext) {
     }
 }
 
-/// Retry an unacknowledged outbound message.
-pub fn retry_message(message_id: u64, ctx: &WorkerContext) {
-    let _ = (message_id, ctx); // TODO
-}
-
 // ── Tunnel handlers ───────────────────────────────────────────────────────────
 
 /// Allocate a tunnel ID not already used in active or pending tunnel maps.
