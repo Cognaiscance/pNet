@@ -3956,6 +3956,287 @@ mod tests {
         assert_eq!(&push[3..], b"hello app");
     }
 
+    // ── Contact exchange (0x33 / 0x34) ───────────────────────────────────────
+
+    /// Build a ContactRequest buf (after op byte) from the requester's node and
+    /// the invitation stored on the target.
+    fn contact_request_buf(requester_node: &Node, inv: &Invitation) -> Vec<u8> {
+        let ephem_kp      = generate_x25519_keypair();
+        let shared_secret = x25519_shared(&ephem_kp.private_key, &inv.key_pair.public_key);
+        let payload       = serialize_contact_payload(requester_node);
+        let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&inv.id);
+        buf.extend_from_slice(&ephem_kp.public_key);
+        buf.extend_from_slice(&nonce);
+        buf.extend_from_slice(&ciphertext);
+        buf
+    }
+
+    /// Add a fresh contact invitation to a node and return a clone for use in tests.
+    fn add_contact_invitation(node: &mut Node) -> Invitation {
+        let kp = generate_x25519_keypair();
+        let inv = Invitation {
+            id:         generate_uuid(),
+            key_pair:   kp,
+            expires_at: SystemTime::now() + Duration::from_secs(3600),
+        };
+        node.owner.contact_invitations.push(inv.clone());
+        inv
+    }
+
+    impl Clone for Invitation {
+        fn clone(&self) -> Self {
+            Invitation {
+                id:         self.id,
+                key_pair:   KeyPair {
+                    public_key:  self.key_pair.public_key,
+                    private_key: self.key_pair.private_key,
+                },
+                expires_at: self.expires_at,
+            }
+        }
+    }
+
+    #[test]
+    fn contact_request_valid_adds_contact_and_replies() {
+        let target    = TestCtx::new();
+        let requester = TestCtx::new();
+
+        // Complete setup so key_pair is non-zero.
+        {
+            let mut node = requester.ctx.node.write().unwrap();
+            node.owner.key_pair = generate_ed25519_keypair();
+            node.owner.user.alias = "chad".to_string();
+        }
+
+        let inv = {
+            let mut node = target.ctx.node.write().unwrap();
+            add_contact_invitation(&mut node)
+        };
+
+        let buf = {
+            let node = requester.ctx.node.read().unwrap();
+            contact_request_buf(&node, &inv)
+        };
+
+        contact_request(target.app_addr(), buf, &target.ctx);
+
+        // Requester should have been added as a contact.
+        let node = target.ctx.node.read().unwrap();
+        assert_eq!(node.owner.contact_users.len(), 1);
+        assert_eq!(node.owner.contact_users[0].user.alias, "chad");
+
+        // Invitation must be consumed.
+        assert!(node.owner.contact_invitations.is_empty());
+        drop(node);
+
+        // A ContactResponse (op 0x34) must have been sent back.
+        let reply = target.recv_reply();
+        assert_eq!(reply[0], CONTACT_RESPONSE_OP);
+    }
+
+    #[test]
+    fn contact_request_unknown_invitation_is_rejected() {
+        let target = TestCtx::new();
+
+        // No invitations stored — use a random invitation ID.
+        let fake_inv = Invitation {
+            id:         generate_uuid(),
+            key_pair:   generate_x25519_keypair(),
+            expires_at: SystemTime::now() + Duration::from_secs(3600),
+        };
+
+        let requester_node = {
+            let mut n = Node::new();
+            n.owner.key_pair = generate_ed25519_keypair();
+            n
+        };
+        let buf = contact_request_buf(&requester_node, &fake_inv);
+
+        contact_request(target.app_addr(), buf, &target.ctx);
+
+        let node = target.ctx.node.read().unwrap();
+        assert!(node.owner.contact_users.is_empty());
+    }
+
+    #[test]
+    fn contact_request_expired_invitation_is_rejected() {
+        let target = TestCtx::new();
+
+        let inv = {
+            let mut node = target.ctx.node.write().unwrap();
+            let kp = generate_x25519_keypair();
+            let inv = Invitation {
+                id:         generate_uuid(),
+                key_pair:   kp,
+                expires_at: SystemTime::now() - Duration::from_secs(1), // already expired
+            };
+            node.owner.contact_invitations.push(inv.clone());
+            inv
+        };
+
+        let requester_node = {
+            let mut n = Node::new();
+            n.owner.key_pair = generate_ed25519_keypair();
+            n
+        };
+        let buf = contact_request_buf(&requester_node, &inv);
+
+        contact_request(target.app_addr(), buf, &target.ctx);
+
+        let node = target.ctx.node.read().unwrap();
+        assert!(node.owner.contact_users.is_empty());
+        // Expired invitation must be removed.
+        assert!(node.owner.contact_invitations.is_empty());
+    }
+
+    #[test]
+    fn contact_request_duplicate_not_added_twice() {
+        let target    = TestCtx::new();
+        let requester = TestCtx::new();
+
+        {
+            let mut node = requester.ctx.node.write().unwrap();
+            node.owner.key_pair       = generate_ed25519_keypair();
+            node.owner.user.alias     = "chad".to_string();
+        }
+
+        // First request.
+        let inv1 = {
+            let mut node = target.ctx.node.write().unwrap();
+            add_contact_invitation(&mut node)
+        };
+        let buf1 = {
+            let node = requester.ctx.node.read().unwrap();
+            contact_request_buf(&node, &inv1)
+        };
+        contact_request(target.app_addr(), buf1, &target.ctx);
+        let _ = target.recv_reply();
+
+        // Second request with a fresh invitation but same requester UUID.
+        let inv2 = {
+            let mut node = target.ctx.node.write().unwrap();
+            add_contact_invitation(&mut node)
+        };
+        let buf2 = {
+            let node = requester.ctx.node.read().unwrap();
+            contact_request_buf(&node, &inv2)
+        };
+        contact_request(target.app_addr(), buf2, &target.ctx);
+        let _ = target.recv_reply();
+
+        let node = target.ctx.node.read().unwrap();
+        assert_eq!(node.owner.contact_users.len(), 1, "duplicate contact must not be added");
+    }
+
+    #[test]
+    fn contact_response_valid_adds_contact_and_clears_pending() {
+        let requester = TestCtx::new();
+
+        // Set up the requester's side of a pending exchange.
+        let inv_kp    = generate_x25519_keypair();
+        let ephem_kp  = generate_x25519_keypair();
+        let sg_addr: std::net::SocketAddrV4 = "127.0.0.1:19000".parse().unwrap();
+
+        {
+            let mut node = requester.ctx.node.write().unwrap();
+            node.owner.pending_contact_exchange = Some(PendingContactExchange {
+                our_ephem_key_pair: ephem_kp.clone(),
+                invitation_pk:      inv_kp.public_key,
+                sg_addr,
+            });
+        }
+
+        // Shared secret from requester's perspective.
+        let shared_secret = x25519_shared(&ephem_kp.private_key, &inv_kp.public_key);
+
+        // Build the target's contact payload.
+        let target_uuid = generate_uuid();
+        let target_pk   = generate_ed25519_keypair().public_key;
+        let mut payload = Vec::new();
+        push_str(&mut payload, "will");
+        payload.extend_from_slice(&target_uuid);
+        payload.extend_from_slice(&target_pk);
+        payload.push(0u8); // 0 devices
+
+        let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&nonce);
+        buf.extend_from_slice(&ciphertext);
+
+        contact_response(SocketAddr::V4(sg_addr), buf, &requester.ctx);
+
+        let node = requester.ctx.node.read().unwrap();
+        assert_eq!(node.owner.contact_users.len(), 1);
+        assert_eq!(node.owner.contact_users[0].user.alias, "will");
+        assert_eq!(node.owner.contact_users[0].user.uuid, target_uuid);
+        // Pending exchange must be cleared.
+        assert!(node.owner.pending_contact_exchange.is_none());
+    }
+
+    #[test]
+    fn contact_response_wrong_source_is_rejected() {
+        let requester = TestCtx::new();
+
+        let inv_kp   = generate_x25519_keypair();
+        let ephem_kp = generate_x25519_keypair();
+        let sg_addr: std::net::SocketAddrV4 = "127.0.0.1:19001".parse().unwrap();
+
+        {
+            let mut node = requester.ctx.node.write().unwrap();
+            node.owner.pending_contact_exchange = Some(PendingContactExchange {
+                our_ephem_key_pair: ephem_kp.clone(),
+                invitation_pk:      inv_kp.public_key,
+                sg_addr,
+            });
+        }
+
+        let shared_secret = x25519_shared(&ephem_kp.private_key, &inv_kp.public_key);
+        let mut payload = Vec::new();
+        push_str(&mut payload, "will");
+        payload.extend_from_slice(&generate_uuid());
+        payload.extend_from_slice(&generate_key_bytes());
+        payload.push(0u8);
+        let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&nonce);
+        buf.extend_from_slice(&ciphertext);
+
+        // Deliver from a different address.
+        let wrong_addr: SocketAddr = "127.0.0.1:19002".parse().unwrap();
+        contact_response(wrong_addr, buf, &requester.ctx);
+
+        let node = requester.ctx.node.read().unwrap();
+        assert!(node.owner.contact_users.is_empty());
+        // Pending exchange must still be intact.
+        assert!(node.owner.pending_contact_exchange.is_some());
+    }
+
+    #[test]
+    fn contact_response_no_pending_exchange_is_rejected() {
+        let requester = TestCtx::new();
+        // No pending_contact_exchange set — handler should be a no-op.
+
+        let shared_secret = generate_key_bytes();
+        let mut payload   = Vec::new();
+        push_str(&mut payload, "will");
+        payload.extend_from_slice(&generate_uuid());
+        payload.extend_from_slice(&generate_key_bytes());
+        payload.push(0u8);
+        let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&nonce);
+        buf.extend_from_slice(&ciphertext);
+
+        let src: SocketAddr = "127.0.0.1:19003".parse().unwrap();
+        contact_response(src, buf, &requester.ctx);
+
+        let node = requester.ctx.node.read().unwrap();
+        assert!(node.owner.contact_users.is_empty());
+    }
+
     // ── Contact data sync ─────────────────────────────────────────────────────
 
     /// Set up the test node as an SG and return the active connection ID and
