@@ -383,8 +383,10 @@ const CONNECT_ACK_OP:      u8 = 0x21;
 const BOOTSTRAP_REQUEST_OP:  u8 = 0x30;
 const BOOTSTRAP_RESPONSE_OP: u8 = 0x31;
 const DEVICE_REGISTER_OP:    u8 = 0x32;
-const CONTACT_REQUEST_OP:    u8 = 0x33;
-const CONTACT_RESPONSE_OP:   u8 = 0x34;
+const CONTACT_REQUEST_OP:         u8 = 0x33;
+const CONTACT_RESPONSE_OP:        u8 = 0x34;
+const CONTACT_DATA_PUSH_OP:       u8 = 0x60;
+const CONTACT_DATA_PULL_REQ_OP:   u8 = 0x61;
 const RELAY_PACKET_OP:            u8 = 0x40;
 const APP_PACKET_OP:              u8 = 0x41;
 const APP_PUSH_OP:                u8 = 0x04;
@@ -1073,6 +1075,7 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
     }
     ctx.save_node();
+    push_data_to_contacts(ctx);
 }
 
 // ── Contact exchange payload serialization ────────────────────────────────────
@@ -1179,6 +1182,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     };
 
     ctx.save_node();
+    push_data_to_contacts(ctx);
 
     // Encrypt and send ContactResponse.
     let (ciphertext, resp_nonce) = xchacha20_encrypt(&shared_secret, &response_payload);
@@ -1246,12 +1250,224 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
 
     ctx.save_node();
+    push_data_to_contacts(ctx);
 
     // Trigger connection maintenance — we have a new contact.
     ctx.scheduler_tx.send(super::action_queue::ScheduleRequest {
         action: super::action_queue::Action::MaintainConnections,
         delay:  Duration::ZERO,
     }).ok();
+}
+
+// ── Contact data sync ─────────────────────────────────────────────────────────
+//
+// Keeps each user's device and app list up-to-date on all contacts' nodes.
+//
+// Push payload format (encrypted body of ContactDataPush, op 0x60):
+//   [user_uuid: 16]
+//   [device_count: u8]
+//     each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8][ip:4][port:2 BE]
+//       [app_count: u8]
+//         each approved app: [id: u16 BE][alias: u8+bytes]
+//
+// Pull request payload (encrypted body of ContactDataPullRequest, op 0x61):
+//   [user_uuid: 16]   — identifies the requesting user; connection provides auth
+
+fn serialize_contact_data(node: &super::data_models::Node) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let user = &node.owner.user;
+    buf.extend_from_slice(&user.uuid);
+    buf.push(user.devices.len() as u8);
+    for d in &user.devices {
+        push_device(&mut buf, d);
+        let approved: Vec<&Application> = d.applications.iter()
+            .filter(|a| a.user_approved)
+            .collect();
+        buf.push(approved.len() as u8);
+        for a in approved {
+            buf.extend_from_slice(&a.id.to_be_bytes());
+            push_str(&mut buf, &a.alias);
+        }
+    }
+    buf
+}
+
+struct ContactData {
+    user_uuid: Uuid,
+    devices:   Vec<(Device, Vec<(u16, String)>)>, // (device, vec of (app_id, app_alias))
+}
+
+fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
+    let mut pos = 0usize;
+    let user_uuid: Uuid    = read_arr(data, &mut pos)?;
+    let device_count = *data.get(pos)? as usize; pos += 1;
+    let mut devices = Vec::new();
+    for _ in 0..device_count {
+        let device = read_device(data, &mut pos)?;
+        let app_count = *data.get(pos)? as usize; pos += 1;
+        let mut apps = Vec::new();
+        for _ in 0..app_count {
+            let id_bytes: [u8; 2] = read_arr(data, &mut pos)?;
+            let id    = u16::from_be_bytes(id_bytes);
+            let alias = read_str(data, &mut pos)?;
+            apps.push((id, alias));
+        }
+        devices.push((device, apps));
+    }
+    Some(ContactData { user_uuid, devices })
+}
+
+/// Send a ContactDataPush to the top-ranked reachable SG of every contact.
+/// Silently skips contacts with no active connection — the daily pull will catch them.
+fn push_data_to_contacts(ctx: &WorkerContext) {
+    let node = ctx.node.read().unwrap();
+    // Only SGs originate pushes — DGs don't have direct connections to contact SGs.
+    let local_uuid = node.device_uuid;
+    let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid);
+    if !local_device.map(|d| matches!(d.grade, DeviceGrade::SG)).unwrap_or(false) {
+        return;
+    }
+
+    let payload = serialize_contact_data(&node);
+
+    let mut packets: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
+    for contact in &node.owner.contact_users {
+        // Find the contact's top-ranked SG that we have an active connection to.
+        let mut sgs: Vec<&Device> = contact.user.devices.iter()
+            .filter(|d| matches!(d.grade, DeviceGrade::SG))
+            .filter(|d| node.owner.active_connections.values().any(|c| c.device_uuid == d.uuid))
+            .collect();
+        sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
+
+        let Some(sg) = sgs.first() else { continue };
+        let Some(conn) = node.owner.active_connections.values()
+            .find(|c| c.device_uuid == sg.uuid)
+        else { continue };
+
+        let pkt = build_encrypted_packet(CONTACT_DATA_PUSH_OP, conn, &payload);
+        packets.push((pkt, SocketAddr::V4(sg.host)));
+    }
+    drop(node);
+
+    for (pkt, dest) in packets {
+        send(ctx, dest, &pkt);
+    }
+}
+
+/// Apply received contact data, updating the matching contact's device and app lists.
+fn apply_contact_data(data: ContactData, ctx: &WorkerContext) {
+    let mut node = ctx.node.write().unwrap();
+    let Some(contact) = node.owner.contact_users.iter_mut()
+        .find(|c| c.user.uuid == data.user_uuid)
+    else {
+        eprintln!("[contact_data] received data for unknown contact {:?}", data.user_uuid);
+        return;
+    };
+
+    contact.user.devices = data.devices.into_iter().map(|(mut dev, apps)| {
+        dev.applications = apps.into_iter().map(|(id, alias)| Application {
+            id,
+            alias,
+            protocol:      String::new(),
+            host:          "0.0.0.0:0".parse().unwrap(),
+            user_approved: true,
+            token:         [0u8; 16],
+        }).collect();
+        dev
+    }).collect();
+}
+
+/// Op 0x60 — Contact data push (SG → contact's SG).
+///
+/// Encrypted body: [user_uuid:16][device_count:u8][ ...devices+apps... ]
+///
+/// Updates the sender's entry in the receiver's contact list.
+pub fn contact_data_push(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let node = ctx.node.read().unwrap();
+    let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
+        eprintln!("[contact_data_push] decryption failed from {src}");
+        return;
+    };
+    drop(node);
+
+    let Some(data) = deserialize_contact_data(&plaintext) else {
+        eprintln!("[contact_data_push] deserialization failed from {src}");
+        return;
+    };
+
+    apply_contact_data(data, ctx);
+    ctx.save_node();
+}
+
+/// Op 0x61 — Contact data pull request (SG → contact's SG).
+///
+/// Encrypted body: [user_uuid: 16]
+///
+/// The receiver replies with a ContactDataPush containing its current data.
+pub fn contact_data_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let (plaintext, payload) = {
+        let node = ctx.node.read().unwrap();
+        let Some(pt) = decrypt_packet_body(&node, &buf) else {
+            eprintln!("[contact_data_pull_request] decryption failed from {src}");
+            return;
+        };
+        let payload = serialize_contact_data(&node);
+        (pt, payload)
+    };
+
+    if plaintext.len() < 16 {
+        eprintln!("[contact_data_pull_request] body too short from {src}");
+        return;
+    }
+
+    // Look up the connection the request arrived on so we can reply.
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+    let reply_pkt = {
+        let node = ctx.node.read().unwrap();
+        let Some(conn) = node.owner.active_connections.get(&conn_id) else {
+            eprintln!("[contact_data_pull_request] no active connection for id {conn_id}");
+            return;
+        };
+        build_encrypted_packet(CONTACT_DATA_PUSH_OP, conn, &payload)
+    };
+
+    send(ctx, src, &reply_pkt);
+}
+
+/// Scheduled daily: send a ContactDataPullRequest to the top SG of every contact.
+pub fn sync_contacts(ctx: &WorkerContext) {
+    let node = ctx.node.read().unwrap();
+
+    // Only SGs run this — DGs don't have direct connections to contact SGs.
+    let local_uuid = node.device_uuid;
+    let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid);
+    if !local_device.map(|d| matches!(d.grade, DeviceGrade::SG)).unwrap_or(false) {
+        return;
+    }
+
+    let our_uuid = node.owner.user.uuid;
+    let mut packets: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
+
+    for contact in &node.owner.contact_users {
+        let mut sgs: Vec<&Device> = contact.user.devices.iter()
+            .filter(|d| matches!(d.grade, DeviceGrade::SG))
+            .filter(|d| node.owner.active_connections.values().any(|c| c.device_uuid == d.uuid))
+            .collect();
+        sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
+
+        let Some(sg) = sgs.first() else { continue };
+        let Some(conn) = node.owner.active_connections.values()
+            .find(|c| c.device_uuid == sg.uuid)
+        else { continue };
+
+        let pkt = build_encrypted_packet(CONTACT_DATA_PULL_REQ_OP, conn, &our_uuid);
+        packets.push((pkt, SocketAddr::V4(sg.host)));
+    }
+    drop(node);
+
+    for (pkt, dest) in packets {
+        send(ctx, dest, &pkt);
+    }
 }
 
 // ── Scheduled action handlers ─────────────────────────────────────────────────
@@ -2409,6 +2625,7 @@ fn approve_app(body: &[u8], ctx: &WorkerContext) {
         }
     }
     ctx.save_node();
+    push_data_to_contacts(ctx);
 }
 
 fn reject_app(body: &[u8], ctx: &WorkerContext) {
@@ -2421,6 +2638,7 @@ fn reject_app(body: &[u8], ctx: &WorkerContext) {
         device.applications.retain(|a| a.id != id);
     }
     ctx.save_node();
+    push_data_to_contacts(ctx);
 }
 
 // ── Invitation generation and bootstrap initiation ───────────────────────────

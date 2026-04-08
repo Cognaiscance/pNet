@@ -26,8 +26,10 @@ pub enum Action {
     BootstrapRequest   { src: SocketAddr, buf: Vec<u8> },
     BootstrapResponse  { src: SocketAddr, buf: Vec<u8> },
     DeviceRegistration { src: SocketAddr, buf: Vec<u8> },
-    ContactRequest     { src: SocketAddr, buf: Vec<u8> },
-    ContactResponse    { src: SocketAddr, buf: Vec<u8> },
+    ContactRequest        { src: SocketAddr, buf: Vec<u8> },
+    ContactResponse       { src: SocketAddr, buf: Vec<u8> },
+    ContactDataPush       { src: SocketAddr, buf: Vec<u8> },
+    ContactDataPullRequest { src: SocketAddr, buf: Vec<u8> },
     RelayPacket        { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
@@ -43,6 +45,7 @@ pub enum Action {
     MaintainConnections,
     KeepAliveDG,
     CleanupTunnels,
+    SyncContacts,
     SetupTunnel   { sender_uuid: super::data_models::Uuid, dest_uuid: super::data_models::Uuid },
 }
 
@@ -86,8 +89,10 @@ impl Action {
             Action::BootstrapRequest   { src, buf }   => handlers::bootstrap_request(src, buf, ctx),
             Action::BootstrapResponse  { src, buf }   => handlers::bootstrap_response(src, buf, ctx),
             Action::DeviceRegistration { src, buf }   => handlers::device_registration(src, buf, ctx),
-            Action::ContactRequest     { src, buf }   => handlers::contact_request(src, buf, ctx),
-            Action::ContactResponse    { src, buf }   => handlers::contact_response(src, buf, ctx),
+            Action::ContactRequest         { src, buf } => handlers::contact_request(src, buf, ctx),
+            Action::ContactResponse        { src, buf } => handlers::contact_response(src, buf, ctx),
+            Action::ContactDataPush        { src, buf } => handlers::contact_data_push(src, buf, ctx),
+            Action::ContactDataPullRequest { src, buf } => handlers::contact_data_pull_request(src, buf, ctx),
             Action::RelayPacket        { src, buf }   => handlers::relay_packet(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
             Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),
@@ -99,6 +104,7 @@ impl Action {
             Action::MaintainConnections              => handlers::maintain_connections(ctx),
             Action::KeepAliveDG                      => handlers::keepalive_dg(ctx),
             Action::CleanupTunnels                   => handlers::cleanup_tunnels(ctx),
+            Action::SyncContacts                     => handlers::sync_contacts(ctx),
             Action::SetupTunnel { sender_uuid, dest_uuid } => handlers::setup_tunnel(sender_uuid, dest_uuid, ctx),
         }
     }
