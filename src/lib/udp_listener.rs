@@ -84,6 +84,8 @@ impl UdpListener {
                     0x34 => Action::ContactResponse        { src, buf: payload },
                     0x60 => Action::ContactDataPush        { src, buf: payload },
                     0x61 => Action::ContactDataPullRequest { src, buf: payload },
+                    0x62 => Action::DeviceDataPush         { src, buf: payload },
+                    0x63 => Action::DeviceDataPullRequest  { src, buf: payload },
                     0x40 => Action::RelayPacket        { src, buf: payload },
                     0x41 => Action::AppPacket          { src, buf: payload },
                     0x50 => Action::TunnelInit           { src, buf: payload },

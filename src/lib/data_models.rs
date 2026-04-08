@@ -176,7 +176,7 @@ pub struct PendingConnection {
     pub peer_longterm_pk: PublicKey,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Application {
     pub id:            u16,
     pub alias:         String,

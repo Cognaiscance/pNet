@@ -13,6 +13,7 @@ const MAINTAIN_CONNECTIONS_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const KEEPALIVE_DG_INTERVAL:         Duration = Duration::from_secs(20);
 const CLEANUP_TUNNELS_INTERVAL:      Duration = Duration::from_secs(5 * 60);
 const SYNC_CONTACTS_INTERVAL:        Duration = Duration::from_secs(24 * 3600);
+const SYNC_DEVICES_INTERVAL:         Duration = Duration::from_secs(24 * 3600);
 
 pub struct SchedulerThread {
     handle: thread::JoinHandle<()>,
@@ -39,6 +40,7 @@ impl SchedulerThread {
             let mut last_keepalive       = Instant::now();
             let mut last_cleanup_tunnels = Instant::now();
             let mut last_sync_contacts   = Instant::now();
+            let mut last_sync_devices    = Instant::now();
             let mut pending: Vec<(Instant, Action)> = Vec::new();
 
             while !stop.load(Ordering::Acquire) {
@@ -73,6 +75,10 @@ impl SchedulerThread {
                 if now.duration_since(last_sync_contacts) >= SYNC_CONTACTS_INTERVAL {
                     to_enqueue.push(Action::SyncContacts);
                     last_sync_contacts = now;
+                }
+                if now.duration_since(last_sync_devices) >= SYNC_DEVICES_INTERVAL {
+                    to_enqueue.push(Action::SyncDevices);
+                    last_sync_devices = now;
                 }
 
                 // One-shot pending jobs — drain those that are due.

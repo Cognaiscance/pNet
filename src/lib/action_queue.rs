@@ -30,6 +30,8 @@ pub enum Action {
     ContactResponse       { src: SocketAddr, buf: Vec<u8> },
     ContactDataPush       { src: SocketAddr, buf: Vec<u8> },
     ContactDataPullRequest { src: SocketAddr, buf: Vec<u8> },
+    DeviceDataPush        { src: SocketAddr, buf: Vec<u8> },
+    DeviceDataPullRequest { src: SocketAddr, buf: Vec<u8> },
     RelayPacket        { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
@@ -46,6 +48,7 @@ pub enum Action {
     KeepAliveDG,
     CleanupTunnels,
     SyncContacts,
+    SyncDevices,
     SetupTunnel   { sender_uuid: super::data_models::Uuid, dest_uuid: super::data_models::Uuid },
 }
 
@@ -93,6 +96,8 @@ impl Action {
             Action::ContactResponse        { src, buf } => handlers::contact_response(src, buf, ctx),
             Action::ContactDataPush        { src, buf } => handlers::contact_data_push(src, buf, ctx),
             Action::ContactDataPullRequest { src, buf } => handlers::contact_data_pull_request(src, buf, ctx),
+            Action::DeviceDataPush         { src, buf } => handlers::device_data_push(src, buf, ctx),
+            Action::DeviceDataPullRequest  { src, buf } => handlers::device_data_pull_request(src, buf, ctx),
             Action::RelayPacket        { src, buf }   => handlers::relay_packet(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
             Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),
@@ -105,6 +110,7 @@ impl Action {
             Action::KeepAliveDG                      => handlers::keepalive_dg(ctx),
             Action::CleanupTunnels                   => handlers::cleanup_tunnels(ctx),
             Action::SyncContacts                     => handlers::sync_contacts(ctx),
+            Action::SyncDevices                      => handlers::sync_devices(ctx),
             Action::SetupTunnel { sender_uuid, dest_uuid } => handlers::setup_tunnel(sender_uuid, dest_uuid, ctx),
         }
     }

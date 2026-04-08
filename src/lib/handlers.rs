@@ -208,8 +208,28 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// Request body (after op byte):
 ///   [token: 16 bytes]
 ///
-/// Authenticates the app and returns its view of the node data tree.
-/// Serialization format TBD — returns a stub OK for now.
+/// Authenticates the app via its token and returns its view of the node data tree.
+///
+/// Response format:
+///   [OK: 1]
+///   -- Requesting app's own data (full Application struct) --
+///   [app_id: u16 BE][app_alias: u8+bytes][app_host_ip: 4][app_host_port: 2 BE]
+///   [app_user_approved: u8][app_token: 16]
+///   -- Owner data tree (no crypto keys) --
+///   [owner_alias: u8+bytes][owner_uuid: 16]
+///   [device_count: u8]
+///     each device:
+///       [uuid: 16][alias: u8+bytes][grade: u8][sg_rank: u8][ip: 4][port: 2 BE]
+///       [app_count: u8]
+///         each app: [id: u16 BE][alias: u8+bytes][ip: 4][port: 2 BE][user_approved: u8]
+///   [contact_count: u8]
+///     each contact:
+///       [alias: u8+bytes][uuid: 16]
+///       [device_count: u8]
+///         each device:
+///           [uuid: 16][alias: u8+bytes][grade: u8][sg_rank: u8][ip: 4][port: 2 BE]
+///           [app_count: u8]
+///             each app: [id: u16 BE][alias: u8+bytes]
 pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 16 {
         return send_error(ctx, src, ERR_BAD_PACKET);
@@ -226,15 +246,64 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         .find(|d| d.uuid == device_uuid)
         .expect("local device not found in node");
 
-    let app_exists = device.applications.iter().any(|a| a.token == token);
+    let app = device.applications.iter().find(|a| a.token == token).cloned();
     drop(node);
 
-    if app_exists {
-        // TODO: serialize and send the data tree
-        send(ctx, src, &[OK]);
-    } else {
-        send_error(ctx, src, ERR_TOKEN_UNKNOWN);
+    let app = match app {
+        Some(a) => a,
+        None    => return send_error(ctx, src, ERR_TOKEN_UNKNOWN),
+    };
+
+    let node = ctx.node.read().unwrap();
+    let mut reply = vec![OK];
+
+    // Requesting app's own data.
+    reply.extend_from_slice(&app.id.to_be_bytes());
+    push_str(&mut reply, &app.alias);
+    reply.extend_from_slice(&app.host.ip().octets());
+    reply.extend_from_slice(&app.host.port().to_be_bytes());
+    reply.push(app.user_approved as u8);
+    reply.extend_from_slice(&app.token);
+
+    // Owner alias and UUID.
+    push_str(&mut reply, &node.owner.user.alias);
+    reply.extend_from_slice(&node.owner.user.uuid);
+
+    // Own devices with apps.
+    reply.push(node.owner.user.devices.len() as u8);
+    for d in &node.owner.user.devices {
+        push_device(&mut reply, d);
+        reply.push(d.applications.len() as u8);
+        for a in &d.applications {
+            reply.extend_from_slice(&a.id.to_be_bytes());
+            push_str(&mut reply, &a.alias);
+            reply.extend_from_slice(&a.host.ip().octets());
+            reply.extend_from_slice(&a.host.port().to_be_bytes());
+            reply.push(a.user_approved as u8);
+        }
     }
+
+    // Contacts with devices and apps.
+    reply.push(node.owner.contact_users.len() as u8);
+    for contact in &node.owner.contact_users {
+        push_str(&mut reply, &contact.user.alias);
+        reply.extend_from_slice(&contact.user.uuid);
+        reply.push(contact.user.devices.len() as u8);
+        for d in &contact.user.devices {
+            push_device(&mut reply, d);
+            let approved: Vec<&Application> = d.applications.iter()
+                .filter(|a| a.user_approved)
+                .collect();
+            reply.push(approved.len() as u8);
+            for a in approved {
+                reply.extend_from_slice(&a.id.to_be_bytes());
+                push_str(&mut reply, &a.alias);
+            }
+        }
+    }
+
+    drop(node);
+    send(ctx, src, &reply);
 }
 
 /// Op 3 — Application send packet.
@@ -387,6 +456,8 @@ const CONTACT_REQUEST_OP:         u8 = 0x33;
 const CONTACT_RESPONSE_OP:        u8 = 0x34;
 const CONTACT_DATA_PUSH_OP:       u8 = 0x60;
 const CONTACT_DATA_PULL_REQ_OP:   u8 = 0x61;
+const DEVICE_DATA_PUSH_OP:        u8 = 0x62;
+const DEVICE_DATA_PULL_REQ_OP:    u8 = 0x63;
 const RELAY_PACKET_OP:            u8 = 0x40;
 const APP_PACKET_OP:              u8 = 0x41;
 const APP_PUSH_OP:                u8 = 0x04;
@@ -1076,6 +1147,7 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
     ctx.save_node();
     push_data_to_contacts(ctx);
+    push_data_to_devices(ctx);
 }
 
 // ── Contact exchange payload serialization ────────────────────────────────────
@@ -1397,6 +1469,7 @@ pub fn contact_data_push(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     apply_contact_data(data, ctx);
     ctx.save_node();
+    push_data_to_devices(ctx);
 }
 
 /// Op 0x61 — Contact data pull request (SG → contact's SG).
@@ -1468,6 +1541,253 @@ pub fn sync_contacts(ctx: &WorkerContext) {
     for (pkt, dest) in packets {
         send(ctx, dest, &pkt);
     }
+}
+
+// ── Device data sync (ops 0x62 / 0x63) ───────────────────────────────────────
+//
+// Keeps all of a user's own devices current with the latest device list and
+// contact list.  The SG is authoritative; DGs pull from it and receive pushes.
+//
+// Push payload format (encrypted body of DeviceDataPush, op 0x62):
+//   [device_count: u8]
+//     each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8][ip:4][port:2 BE]
+//   [contact_count: u8]
+//     each contact:
+//       [user_alias: u8+bytes][user_uuid: 16][contact_pk: 32]
+//       [device_count: u8]
+//         each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8][ip:4][port:2 BE]
+//           [app_count: u8]
+//             each app: [id: u16 BE][alias: u8+bytes]
+//
+// Pull request payload (encrypted body of DeviceDataPullRequest, op 0x63):
+//   (empty — active connection provides authentication)
+
+fn serialize_device_sync_payload(node: &super::data_models::Node) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let user = &node.owner.user;
+
+    // Own device list (no apps — each device manages its own apps locally).
+    buf.push(user.devices.len() as u8);
+    for d in &user.devices {
+        push_device(&mut buf, d);
+    }
+
+    // Contact list with devices and apps.
+    buf.push(node.owner.contact_users.len() as u8);
+    for contact in &node.owner.contact_users {
+        push_str(&mut buf, &contact.user.alias);
+        buf.extend_from_slice(&contact.user.uuid);
+        buf.extend_from_slice(&contact.public_key);
+        buf.push(contact.user.devices.len() as u8);
+        for d in &contact.user.devices {
+            push_device(&mut buf, d);
+            let approved: Vec<&Application> = d.applications.iter()
+                .filter(|a| a.user_approved)
+                .collect();
+            buf.push(approved.len() as u8);
+            for a in approved {
+                buf.extend_from_slice(&a.id.to_be_bytes());
+                push_str(&mut buf, &a.alias);
+            }
+        }
+    }
+    buf
+}
+
+struct DeviceSyncData {
+    devices:  Vec<Device>,
+    contacts: Vec<Contact>,
+}
+
+fn deserialize_device_sync_payload(data: &[u8]) -> Option<DeviceSyncData> {
+    let mut pos = 0usize;
+
+    let device_count = *data.get(pos)? as usize; pos += 1;
+    let mut devices = Vec::new();
+    for _ in 0..device_count {
+        devices.push(read_device(data, &mut pos)?);
+    }
+
+    let contact_count = *data.get(pos)? as usize; pos += 1;
+    let mut contacts = Vec::new();
+    for _ in 0..contact_count {
+        let user_alias  = read_str(data, &mut pos)?;
+        let user_uuid: Uuid      = read_arr(data, &mut pos)?;
+        let public_key: PublicKey = read_arr(data, &mut pos)?;
+        let dev_count   = *data.get(pos)? as usize; pos += 1;
+        let mut contact_devices = Vec::new();
+        for _ in 0..dev_count {
+            let mut dev = read_device(data, &mut pos)?;
+            let app_count = *data.get(pos)? as usize; pos += 1;
+            for _ in 0..app_count {
+                let id_bytes: [u8; 2] = read_arr(data, &mut pos)?;
+                let id    = u16::from_be_bytes(id_bytes);
+                let alias = read_str(data, &mut pos)?;
+                dev.applications.push(Application {
+                    id,
+                    alias,
+                    protocol:      String::new(),
+                    host:          "0.0.0.0:0".parse().unwrap(),
+                    user_approved: true,
+                    token:         [0u8; 16],
+                });
+            }
+            contact_devices.push(dev);
+        }
+        contacts.push(Contact {
+            public_key,
+            user: User { alias: user_alias, uuid: user_uuid, devices: contact_devices },
+        });
+    }
+    Some(DeviceSyncData { devices, contacts })
+}
+
+/// Apply received device sync data to the node.
+/// Replaces all device and contact entries from the SG, but preserves the
+/// local device's own application list (managed locally, not pushed by the SG).
+fn apply_device_sync_data(data: DeviceSyncData, ctx: &WorkerContext) {
+    let mut node = ctx.node.write().unwrap();
+    let local_uuid = node.device_uuid;
+
+    // Preserve own apps before replacing the device list.
+    let local_apps = node.owner.user.devices.iter()
+        .find(|d| d.uuid == local_uuid)
+        .map(|d| d.applications.clone())
+        .unwrap_or_default();
+
+    node.owner.user.devices  = data.devices;
+    node.owner.contact_users = data.contacts;
+
+    // Restore own app list — the SG doesn't track DG-local apps.
+    if let Some(d) = node.owner.user.devices.iter_mut().find(|d| d.uuid == local_uuid) {
+        d.applications = local_apps;
+    }
+}
+
+/// Send a DeviceDataPush (0x62) to every own-user device (excluding self) that
+/// has an active connection.  Only called on SGs — DGs don't have connections
+/// to other own-user devices.
+fn push_data_to_devices(ctx: &WorkerContext) {
+    let node = ctx.node.read().unwrap();
+
+    // Guard: only SGs push.
+    let local_uuid = node.device_uuid;
+    let is_sg = node.owner.user.devices.iter()
+        .find(|d| d.uuid == local_uuid)
+        .map(|d| matches!(d.grade, DeviceGrade::SG))
+        .unwrap_or(false);
+    if !is_sg { return; }
+
+    let payload = serialize_device_sync_payload(&node);
+
+    // Build packets for every own-user device (except self) that has an active connection.
+    let own_device_uuids: Vec<Uuid> = node.owner.user.devices.iter()
+        .filter(|d| d.uuid != local_uuid)
+        .map(|d| d.uuid)
+        .collect();
+
+    let mut packets: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
+    for uuid in &own_device_uuids {
+        let Some(conn) = node.owner.active_connections.values()
+            .find(|c| c.device_uuid == *uuid)
+        else { continue };
+        let Some(dev) = node.owner.user.devices.iter().find(|d| d.uuid == *uuid)
+        else { continue };
+        let pkt = build_encrypted_packet(DEVICE_DATA_PUSH_OP, conn, &payload);
+        packets.push((pkt, SocketAddr::V4(dev.host)));
+    }
+    drop(node);
+
+    for (pkt, dest) in packets {
+        send(ctx, dest, &pkt);
+    }
+}
+
+/// Op 0x62 — Device data push (SG → own device).
+///
+/// Encrypted body: device list + full contact list.
+///
+/// Updates the receiver's own device list and contact list.
+pub fn device_data_push(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let node = ctx.node.read().unwrap();
+    let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
+        eprintln!("[device_data_push] decryption failed from {src}");
+        return;
+    };
+    drop(node);
+
+    let Some(data) = deserialize_device_sync_payload(&plaintext) else {
+        eprintln!("[device_data_push] deserialization failed from {src}");
+        return;
+    };
+
+    apply_device_sync_data(data, ctx);
+    ctx.save_node();
+}
+
+/// Op 0x63 — Device data pull request (device → own SG).
+///
+/// Encrypted body: empty — active connection provides authentication.
+///
+/// The SG replies with a DeviceDataPush containing the current device and
+/// contact lists.
+pub fn device_data_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let payload = {
+        let node = ctx.node.read().unwrap();
+        if decrypt_packet_body(&node, &buf).is_none() {
+            eprintln!("[device_data_pull_request] decryption failed from {src}");
+            return;
+        };
+        serialize_device_sync_payload(&node)
+    };
+
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+    let reply_pkt = {
+        let node = ctx.node.read().unwrap();
+        let Some(conn) = node.owner.active_connections.get(&conn_id) else {
+            eprintln!("[device_data_pull_request] no active connection for id {conn_id}");
+            return;
+        };
+        build_encrypted_packet(DEVICE_DATA_PUSH_OP, conn, &payload)
+    };
+
+    send(ctx, src, &reply_pkt);
+}
+
+/// Scheduled daily: push device and contact data to all own devices (SG),
+/// or pull from own SG (DG).
+pub fn sync_devices(ctx: &WorkerContext) {
+    let node = ctx.node.read().unwrap();
+    let local_uuid = node.device_uuid;
+    let is_sg = node.owner.user.devices.iter()
+        .find(|d| d.uuid == local_uuid)
+        .map(|d| matches!(d.grade, DeviceGrade::SG))
+        .unwrap_or(false);
+
+    if is_sg {
+        drop(node);
+        push_data_to_devices(ctx);
+        return;
+    }
+
+    // DG: send a pull request to the top-ranked own SG with an active connection.
+    let mut own_sgs: Vec<&Device> = node.owner.user.devices.iter()
+        .filter(|d| matches!(d.grade, DeviceGrade::SG))
+        .filter(|d| node.owner.active_connections.values().any(|c| c.device_uuid == d.uuid))
+        .collect();
+    own_sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
+
+    let Some(sg) = own_sgs.first() else { return };
+    let Some(conn) = node.owner.active_connections.values()
+        .find(|c| c.device_uuid == sg.uuid)
+    else { return };
+
+    // Pull request body is empty; connection provides identity.
+    let pkt  = build_encrypted_packet(DEVICE_DATA_PULL_REQ_OP, conn, &[]);
+    let dest = SocketAddr::V4(sg.host);
+    drop(node);
+
+    send(ctx, dest, &pkt);
 }
 
 // ── Scheduled action handlers ─────────────────────────────────────────────────
@@ -3216,7 +3536,7 @@ mod tests {
 
         /// Block until a reply arrives at the app socket.
         fn recv_reply(&self) -> Vec<u8> {
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; 4096];
             let (len, _) = self.app_socket.recv_from(&mut buf)
                 .expect("no reply received within timeout");
             buf[..len].to_vec()
@@ -3377,13 +3697,44 @@ mod tests {
     // ── AppGetData ────────────────────────────────────────────────────────────
 
     #[test]
-    fn app_get_data_valid_token_returns_ok() {
+    fn app_get_data_returns_app_and_node_tree() {
         let t = TestCtx::new();
         let token = register_and_get_token(&t, "myapp", 9001);
 
         app_get_data(t.app_addr(), token.to_vec(), &t.ctx);
         let reply = t.recv_reply();
         assert_eq!(reply[0], OK);
+
+        let mut pos = 1usize;
+
+        // App's own data.
+        let app_id = u16::from_be_bytes([reply[pos], reply[pos + 1]]); pos += 2;
+        assert!(app_id > 0);
+        let alias = read_str(&reply, &mut pos).unwrap();
+        assert_eq!(alias, "myapp");
+        pos += 4 + 2; // host ip + port
+        let user_approved = reply[pos]; pos += 1;
+        assert_eq!(user_approved, 0); // not yet approved
+        let token_back: [u8; 16] = reply[pos..pos + 16].try_into().unwrap(); pos += 16;
+        assert_eq!(token_back, token.as_slice());
+
+        // Owner alias + uuid.
+        let owner_alias = read_str(&reply, &mut pos).unwrap();
+        assert!(!owner_alias.is_empty());
+        pos += 16; // owner uuid
+
+        // Own devices.
+        let device_count = reply[pos] as usize; pos += 1;
+        assert_eq!(device_count, 1);
+        pos += 16; // device uuid
+        let _dev_alias = read_str(&reply, &mut pos).unwrap();
+        pos += 1 + 1 + 4 + 2; // grade + sg_rank + ip + port
+        let app_count = reply[pos] as usize; pos += 1;
+        assert_eq!(app_count, 1); // the app we just registered
+
+        // Contact count (none registered).
+        let contact_count = reply[pos] as usize;
+        assert_eq!(contact_count, 0);
     }
 
     #[test]
@@ -4538,5 +4889,330 @@ mod tests {
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].0, 7);
         assert_eq!(apps[0].1, "test-app");
+    }
+
+    // ── Device data sync ──────────────────────────────────────────────────────
+
+    /// Set up the test node as an SG with a second own device (DG) that has an
+    /// active connection.  Returns the DG's UUID and the connection.
+    fn setup_sg_with_own_dg_conn(t: &TestCtx) -> (Uuid, std::net::SocketAddrV4, ActiveConnection) {
+        let sg_kp  = generate_x25519_keypair();
+        let dg_kp  = generate_x25519_keypair();
+        let conn_id = 5u16;
+
+        let dg_uuid: Uuid = generate_uuid();
+        let dg_addr: std::net::SocketAddrV4 = "127.0.0.1:0".parse().unwrap();
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let local_uuid = node.device_uuid;
+
+            // Upgrade local device to SG.
+            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == local_uuid) {
+                dev.grade   = DeviceGrade::SG;
+                dev.sg_rank = Some(1);
+            }
+
+            // Add the DG to the owner's device list.
+            node.owner.user.devices.push(Device {
+                alias:        "my-dg".to_string(),
+                uuid:         dg_uuid,
+                grade:        DeviceGrade::DG,
+                sg_rank:      None,
+                host:         dg_addr,
+                applications: Vec::new(),
+            });
+
+            // Active connection to the DG.
+            node.owner.active_connections.insert(conn_id, ActiveConnection {
+                id:                        conn_id,
+                timeout:                   SystemTime::now() + Duration::from_secs(3600),
+                key_pair:                  sg_kp.clone(),
+                peer_public_key:           dg_kp.public_key,
+                peer_active_connection_id: 99,
+                device_uuid:               dg_uuid,
+            });
+        }
+
+        // Connection from DG's perspective (for encrypting packets to the SG).
+        let dg_conn = ActiveConnection {
+            id:                        99,
+            timeout:                   SystemTime::now() + Duration::from_secs(3600),
+            key_pair:                  dg_kp,
+            peer_public_key:           sg_kp.public_key,
+            peer_active_connection_id: conn_id,
+            device_uuid:               dg_uuid,
+        };
+
+        (dg_uuid, dg_addr, dg_conn)
+    }
+
+    #[test]
+    fn device_data_push_updates_device_and_contact_lists() {
+        let t = TestCtx::new();
+        let contact_uuid    = generate_uuid();
+        let contact_sg_uuid = generate_uuid();
+        let contact_sg_host: std::net::SocketAddrV4 = "127.0.0.1:19910".parse().unwrap();
+
+        let (_, sender_conn) = setup_sg_node_with_contact_conn(
+            &t, contact_uuid, contact_sg_uuid, contact_sg_host,
+        );
+
+        // Add a second own device to the sender_conn's node so the push payload
+        // carries both devices and the contact.
+        let new_device_uuid = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:        "my-phone".to_string(),
+                uuid:         new_device_uuid,
+                grade:        DeviceGrade::DG,
+                sg_rank:      None,
+                host:         "127.0.0.1:0".parse().unwrap(),
+                applications: Vec::new(),
+            });
+        }
+
+        // Build and send a DeviceDataPush packet.
+        let payload = serialize_device_sync_payload(&t.ctx.node.read().unwrap());
+        let pkt = build_encrypted_packet(DEVICE_DATA_PUSH_OP, &sender_conn, &payload);
+
+        // Create a fresh node to receive the push (simulates the DG).
+        let receiver = TestCtx::new();
+        {
+            // Give the receiver an active connection that can decrypt the push.
+            let mut node = receiver.ctx.node.write().unwrap();
+            let recv_conn_id = u16::from_be_bytes([pkt[1], pkt[2]]);
+            node.owner.active_connections.insert(recv_conn_id, ActiveConnection {
+                id:                        recv_conn_id,
+                timeout:                   SystemTime::now() + Duration::from_secs(3600),
+                key_pair:                  sender_conn.key_pair.clone(),
+                peer_public_key:           sender_conn.peer_public_key,
+                peer_active_connection_id: sender_conn.peer_active_connection_id,
+                device_uuid:               sender_conn.device_uuid,
+            });
+        }
+
+        device_data_push(t.app_addr(), pkt[1..].to_vec(), &receiver.ctx);
+
+        let node = receiver.ctx.node.read().unwrap();
+        // Device list should now include the new device.
+        assert!(node.owner.user.devices.iter().any(|d| d.uuid == new_device_uuid));
+        // Contact list should be populated.
+        assert_eq!(node.owner.contact_users.len(), 1);
+        assert_eq!(node.owner.contact_users[0].user.uuid, contact_uuid);
+    }
+
+    #[test]
+    fn device_data_push_preserves_own_apps() {
+        // When a DG receives a DeviceDataPush, its locally registered apps must
+        // not be wiped even though the SG doesn't include them in the payload.
+        let t = TestCtx::new();
+        let (_, _, sender_conn) = setup_sg_with_own_dg_conn(&t);
+
+        // The receiver is the DG — give it a local app.
+        let receiver = TestCtx::new();
+        let receiver_uuid = receiver.ctx.node.read().unwrap().device_uuid;
+        {
+            let mut node = receiver.ctx.node.write().unwrap();
+            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == receiver_uuid) {
+                dev.applications.push(Application {
+                    id:            55,
+                    alias:         "local-app".to_string(),
+                    protocol:      "udp".to_string(),
+                    host:          "127.0.0.1:9000".parse().unwrap(),
+                    user_approved: true,
+                    token:         generate_uuid(),
+                });
+            }
+            // Add the receiver's own device to the sender's device list so it
+            // appears in the payload (SG knows about this device).
+            let dg_device = Device {
+                alias:        "my-dg".to_string(),
+                uuid:         receiver_uuid,
+                grade:        DeviceGrade::DG,
+                sg_rank:      None,
+                host:         "127.0.0.1:0".parse().unwrap(),
+                applications: Vec::new(), // SG has no apps for this device
+            };
+            // Insert into the sender's node as well.
+            drop(node);
+            t.ctx.node.write().unwrap().owner.user.devices.push(dg_device);
+        }
+
+        let payload = serialize_device_sync_payload(&t.ctx.node.read().unwrap());
+        let pkt = build_encrypted_packet(DEVICE_DATA_PUSH_OP, &sender_conn, &payload);
+
+        {
+            let mut node = receiver.ctx.node.write().unwrap();
+            let recv_conn_id = u16::from_be_bytes([pkt[1], pkt[2]]);
+            node.owner.active_connections.insert(recv_conn_id, ActiveConnection {
+                id:                        recv_conn_id,
+                timeout:                   SystemTime::now() + Duration::from_secs(3600),
+                key_pair:                  sender_conn.key_pair.clone(),
+                peer_public_key:           sender_conn.peer_public_key,
+                peer_active_connection_id: sender_conn.peer_active_connection_id,
+                device_uuid:               sender_conn.device_uuid,
+            });
+        }
+
+        device_data_push(t.app_addr(), pkt[1..].to_vec(), &receiver.ctx);
+
+        let node = receiver.ctx.node.read().unwrap();
+        let own_dev = node.owner.user.devices.iter()
+            .find(|d| d.uuid == receiver_uuid)
+            .expect("own device missing after push");
+        assert_eq!(own_dev.applications.len(), 1, "local app was wiped by device sync");
+        assert_eq!(own_dev.applications[0].id, 55);
+    }
+
+    #[test]
+    fn device_data_pull_request_replies_with_push() {
+        let dg_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        dg_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let dg_addr: std::net::SocketAddrV4 =
+            dg_socket.local_addr().unwrap().to_string().parse().unwrap();
+
+        let t = TestCtx::new();
+        let (dg_uuid, _, dg_conn) = setup_sg_with_own_dg_conn(&t);
+        // Fix up the DG host so replies go to our listening socket.
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == dg_uuid) {
+                dev.host = dg_addr;
+            }
+        }
+
+        // DG sends an empty pull request.
+        let pkt = build_encrypted_packet(DEVICE_DATA_PULL_REQ_OP, &dg_conn, &[]);
+        device_data_pull_request(SocketAddr::V4(dg_addr), pkt[1..].to_vec(), &t.ctx);
+
+        // DG socket should receive a DeviceDataPush.
+        let mut buf = [0u8; 4096];
+        let (len, _) = dg_socket.recv_from(&mut buf)
+            .expect("no DeviceDataPush reply received");
+        assert_eq!(buf[0], DEVICE_DATA_PUSH_OP);
+
+        // Reply must decrypt correctly from the DG's perspective.
+        let mut reply_node = Node::new();
+        let reply_conn_id = u16::from_be_bytes([buf[1], buf[2]]);
+        reply_node.owner.active_connections.insert(reply_conn_id, ActiveConnection {
+            id:                        reply_conn_id,
+            timeout:                   SystemTime::now() + Duration::from_secs(3600),
+            key_pair:                  dg_conn.key_pair,
+            peer_public_key:           dg_conn.peer_public_key,
+            peer_active_connection_id: dg_conn.peer_active_connection_id,
+            device_uuid:               dg_conn.device_uuid,
+        });
+        let plaintext = decrypt_packet_body(&reply_node, &buf[1..len])
+            .expect("reply decryption failed");
+
+        let data = deserialize_device_sync_payload(&plaintext)
+            .expect("deserialization of pull reply failed");
+        assert!(!data.devices.is_empty());
+    }
+
+    #[test]
+    fn push_data_to_devices_sends_to_own_dg_connections() {
+        let dg_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        dg_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let dg_addr: std::net::SocketAddrV4 =
+            dg_socket.local_addr().unwrap().to_string().parse().unwrap();
+
+        let t = TestCtx::new();
+        let (dg_uuid, _, _) = setup_sg_with_own_dg_conn(&t);
+        // Point the DG host to our listening socket.
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == dg_uuid) {
+                dev.host = dg_addr;
+            }
+        }
+
+        push_data_to_devices(&t.ctx);
+
+        let mut buf = [0u8; 512];
+        let (len, _) = dg_socket.recv_from(&mut buf)
+            .expect("no DeviceDataPush received");
+        assert_eq!(buf[0], DEVICE_DATA_PUSH_OP);
+        assert!(len > 1);
+    }
+
+    #[test]
+    fn push_data_to_devices_skips_dg_nodes() {
+        // A DG should never push device data.
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let peer_addr: std::net::SocketAddrV4 =
+            peer_socket.local_addr().unwrap().to_string().parse().unwrap();
+
+        let t = TestCtx::new();
+        // Node starts as DG; add a peer device with a connection but don't upgrade to SG.
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let peer_uuid = generate_uuid();
+            node.owner.user.devices.push(Device {
+                alias:        "peer".to_string(),
+                uuid:         peer_uuid,
+                grade:        DeviceGrade::SG,
+                sg_rank:      Some(1),
+                host:         peer_addr,
+                applications: Vec::new(),
+            });
+            node.owner.active_connections.insert(1, ActiveConnection {
+                id:                        1,
+                timeout:                   SystemTime::now() + Duration::from_secs(3600),
+                key_pair:                  generate_x25519_keypair(),
+                peer_public_key:           generate_key_bytes(),
+                peer_active_connection_id: 10,
+                device_uuid:               peer_uuid,
+            });
+        }
+
+        push_data_to_devices(&t.ctx);
+
+        let mut buf = [0u8; 64];
+        assert!(
+            peer_socket.recv_from(&mut buf).is_err(),
+            "DG should not push device data"
+        );
+    }
+
+    #[test]
+    fn device_sync_roundtrip_serialization() {
+        let t = TestCtx::new();
+        let contact_uuid    = generate_uuid();
+        let contact_sg_uuid = generate_uuid();
+        let contact_sg_host: std::net::SocketAddrV4 = "127.0.0.1:19920".parse().unwrap();
+
+        setup_sg_node_with_contact_conn(&t, contact_uuid, contact_sg_uuid, contact_sg_host);
+
+        // Add an app to the contact's device so it appears in the serialized payload.
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            if let Some(contact) = node.owner.contact_users.iter_mut().find(|c| c.user.uuid == contact_uuid) {
+                if let Some(dev) = contact.user.devices.first_mut() {
+                    dev.applications.push(Application {
+                        id:            11,
+                        alias:         "contact-app".to_string(),
+                        protocol:      "udp".to_string(),
+                        host:          "127.0.0.1:0".parse().unwrap(),
+                        user_approved: true,
+                        token:         generate_uuid(),
+                    });
+                }
+            }
+        }
+
+        let payload = serialize_device_sync_payload(&t.ctx.node.read().unwrap());
+        let data = deserialize_device_sync_payload(&payload).expect("deserialization failed");
+
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(data.devices.len(), node.owner.user.devices.len());
+        assert_eq!(data.contacts.len(), 1);
+        assert_eq!(data.contacts[0].user.uuid, contact_uuid);
+        assert_eq!(data.contacts[0].user.devices.len(), 1);
+        assert_eq!(data.contacts[0].user.devices[0].applications.len(), 1);
+        assert_eq!(data.contacts[0].user.devices[0].applications[0].id, 11);
     }
 }
