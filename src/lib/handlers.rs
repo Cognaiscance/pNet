@@ -3955,4 +3955,307 @@ mod tests {
         assert_eq!(u16::from_be_bytes([push[1], push[2]]), sender_app_id);
         assert_eq!(&push[3..], b"hello app");
     }
+
+    // ── Contact data sync ─────────────────────────────────────────────────────
+
+    /// Set up the test node as an SG and return the active connection ID and
+    /// a matching "sender-side" connection that can encrypt packets for this node.
+    fn setup_sg_node_with_contact_conn(
+        t: &TestCtx,
+        contact_user_uuid: Uuid,
+        contact_sg_uuid:   Uuid,
+        contact_sg_host:   std::net::SocketAddrV4,
+    ) -> (u16, ActiveConnection) {
+        let sg_kp     = generate_x25519_keypair();
+        let sender_kp = generate_x25519_keypair();
+        let conn_id   = 7u16;
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+
+            // Make this node an SG.
+            let device_uuid = node.device_uuid;
+            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) {
+                dev.grade   = DeviceGrade::SG;
+                dev.sg_rank = Some(1);
+            }
+
+            // Add the contact.
+            node.owner.contact_users.push(Contact {
+                public_key: generate_key_bytes(),
+                user: User {
+                    alias:   "chad".to_string(),
+                    uuid:    contact_user_uuid,
+                    devices: vec![Device {
+                        alias:        "chad-sg".to_string(),
+                        uuid:         contact_sg_uuid,
+                        grade:        DeviceGrade::SG,
+                        sg_rank:      Some(1),
+                        host:         contact_sg_host,
+                        applications: Vec::new(),
+                    }],
+                },
+            });
+
+            // Active connection to the contact's SG.
+            node.owner.active_connections.insert(conn_id, ActiveConnection {
+                id:                        conn_id,
+                timeout:                   SystemTime::now() + Duration::from_secs(3600),
+                key_pair:                  sg_kp.clone(),
+                peer_public_key:           sender_kp.public_key,
+                peer_active_connection_id: 42,
+                device_uuid:               contact_sg_uuid,
+            });
+        }
+
+        // Sender-side connection that can encrypt packets this node will decrypt.
+        let sender_conn = ActiveConnection {
+            id:                        42,
+            timeout:                   SystemTime::now() + Duration::from_secs(3600),
+            key_pair:                  sender_kp,
+            peer_public_key:           sg_kp.public_key,
+            peer_active_connection_id: conn_id,
+            device_uuid:               contact_sg_uuid,
+        };
+
+        (conn_id, sender_conn)
+    }
+
+    #[test]
+    fn contact_data_push_updates_contact_devices() {
+        let t = TestCtx::new();
+        let contact_uuid    = generate_uuid();
+        let contact_sg_uuid = generate_uuid();
+        // contact_sg_host doesn't need to be reachable; we just check state changes.
+        let contact_sg_host: std::net::SocketAddrV4 = "127.0.0.1:19900".parse().unwrap();
+
+        let (_, sender_conn) = setup_sg_node_with_contact_conn(
+            &t, contact_uuid, contact_sg_uuid, contact_sg_host,
+        );
+
+        // Build a ContactDataPush payload: contact user has 1 device + 1 approved app.
+        let new_device_uuid = generate_uuid();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&contact_uuid); // user_uuid
+        payload.push(1u8);                        // device_count
+        // device: uuid + alias + grade(SG=1) + sg_rank(1) + ip + port
+        push_device(&mut payload, &Device {
+            alias:        "chad-laptop".to_string(),
+            uuid:         new_device_uuid,
+            grade:        DeviceGrade::SG,
+            sg_rank:      Some(1),
+            host:         "127.0.0.1:8888".parse().unwrap(),
+            applications: Vec::new(),
+        });
+        payload.push(1u8);              // app_count
+        payload.extend_from_slice(&42u16.to_be_bytes()); // app id
+        push_str(&mut payload, "chad-app");
+
+        let pkt = build_encrypted_packet(CONTACT_DATA_PUSH_OP, &sender_conn, &payload);
+        contact_data_push(t.app_addr(), pkt[1..].to_vec(), &t.ctx);
+
+        // Contact's device list should now reflect the pushed data.
+        let node = t.ctx.node.read().unwrap();
+        let contact = node.owner.contact_users.iter()
+            .find(|c| c.user.uuid == contact_uuid)
+            .expect("contact not found");
+        assert_eq!(contact.user.devices.len(), 1);
+        assert_eq!(contact.user.devices[0].alias, "chad-laptop");
+        assert_eq!(contact.user.devices[0].applications.len(), 1);
+        assert_eq!(contact.user.devices[0].applications[0].id, 42);
+        assert_eq!(contact.user.devices[0].applications[0].alias, "chad-app");
+    }
+
+    #[test]
+    fn contact_data_push_ignores_unknown_user() {
+        let t = TestCtx::new();
+        let contact_uuid    = generate_uuid();
+        let contact_sg_uuid = generate_uuid();
+        let contact_sg_host: std::net::SocketAddrV4 = "127.0.0.1:19901".parse().unwrap();
+
+        let (_, sender_conn) = setup_sg_node_with_contact_conn(
+            &t, contact_uuid, contact_sg_uuid, contact_sg_host,
+        );
+
+        // Push data for a UUID that is not in our contacts.
+        let unknown_uuid = generate_uuid();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&unknown_uuid);
+        payload.push(0u8); // 0 devices
+        let pkt = build_encrypted_packet(CONTACT_DATA_PUSH_OP, &sender_conn, &payload);
+        contact_data_push(t.app_addr(), pkt[1..].to_vec(), &t.ctx);
+
+        // Contact list should be unchanged.
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(node.owner.contact_users.len(), 1);
+        assert_eq!(node.owner.contact_users[0].user.uuid, contact_uuid);
+    }
+
+    #[test]
+    fn contact_data_pull_request_replies_with_push() {
+        let contact_sg_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        contact_sg_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let contact_sg_addr: std::net::SocketAddrV4 =
+            contact_sg_socket.local_addr().unwrap().to_string().parse().unwrap();
+
+        let t = TestCtx::new();
+        let contact_uuid    = generate_uuid();
+        let contact_sg_uuid = generate_uuid();
+
+        let (conn_id, sender_conn) = setup_sg_node_with_contact_conn(
+            &t, contact_uuid, contact_sg_uuid, contact_sg_addr,
+        );
+
+        // Encrypt a pull request: body is just our user_uuid.
+        let our_uuid = t.ctx.node.read().unwrap().owner.user.uuid;
+        let pkt = build_encrypted_packet(CONTACT_DATA_PULL_REQ_OP, &sender_conn, &our_uuid);
+
+        // Handler receives from contact_sg_addr so the reply goes there.
+        contact_data_pull_request(
+            SocketAddr::V4(contact_sg_addr),
+            pkt[1..].to_vec(),
+            &t.ctx,
+        );
+
+        // Contact's SG socket should have received a ContactDataPush.
+        let mut buf = [0u8; 1024];
+        let (len, _) = contact_sg_socket.recv_from(&mut buf)
+            .expect("no ContactDataPush reply received");
+        assert_eq!(buf[0], CONTACT_DATA_PUSH_OP);
+
+        // The reply must decrypt correctly from the contact SG's perspective.
+        // The reply header carries sender_conn.id (42) as the connection ID,
+        // so decrypt_packet_body will look up that key in active_connections.
+        let sender_conn_id = sender_conn.id;
+        let mut reply_node = Node::new();
+        reply_node.owner.active_connections.insert(sender_conn_id, ActiveConnection {
+            id:                        sender_conn_id,
+            timeout:                   SystemTime::now() + Duration::from_secs(3600),
+            key_pair:                  sender_conn.key_pair,
+            peer_public_key:           sender_conn.peer_public_key,
+            peer_active_connection_id: sender_conn.peer_active_connection_id,
+            device_uuid:               sender_conn.device_uuid,
+        });
+        let plaintext = decrypt_packet_body(&reply_node, &buf[1..len])
+            .expect("reply decryption failed");
+
+        // Payload starts with this node's user UUID.
+        let reply_uuid: Uuid = plaintext[0..16].try_into().unwrap();
+        assert_eq!(reply_uuid, our_uuid);
+    }
+
+    #[test]
+    fn push_data_to_contacts_sends_to_active_sg_connections() {
+        let contact_sg_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        contact_sg_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let contact_sg_addr: std::net::SocketAddrV4 =
+            contact_sg_socket.local_addr().unwrap().to_string().parse().unwrap();
+
+        let t = TestCtx::new();
+        let contact_uuid    = generate_uuid();
+        let contact_sg_uuid = generate_uuid();
+
+        setup_sg_node_with_contact_conn(&t, contact_uuid, contact_sg_uuid, contact_sg_addr);
+
+        push_data_to_contacts(&t.ctx);
+
+        let mut buf = [0u8; 512];
+        let (len, _) = contact_sg_socket.recv_from(&mut buf)
+            .expect("no ContactDataPush received");
+        assert_eq!(buf[0], CONTACT_DATA_PUSH_OP);
+        assert!(len > 1);
+    }
+
+    #[test]
+    fn push_data_to_contacts_skips_dg_nodes() {
+        // If this node is a DG, push_data_to_contacts should be a no-op.
+        let contact_sg_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        contact_sg_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let contact_sg_addr: std::net::SocketAddrV4 =
+            contact_sg_socket.local_addr().unwrap().to_string().parse().unwrap();
+
+        let t = TestCtx::new();
+        // Node defaults to DG — do NOT call setup_sg_node_with_contact_conn
+        // (which upgrades to SG).  Add a contact manually.
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let contact_sg_uuid = generate_uuid();
+            node.owner.contact_users.push(Contact {
+                public_key: generate_key_bytes(),
+                user: User {
+                    alias:   "chad".to_string(),
+                    uuid:    generate_uuid(),
+                    devices: vec![Device {
+                        alias:        "chad-sg".to_string(),
+                        uuid:         contact_sg_uuid,
+                        grade:        DeviceGrade::SG,
+                        sg_rank:      Some(1),
+                        host:         contact_sg_addr,
+                        applications: Vec::new(),
+                    }],
+                },
+            });
+            node.owner.active_connections.insert(1, ActiveConnection {
+                id:                        1,
+                timeout:                   SystemTime::now() + Duration::from_secs(3600),
+                key_pair:                  generate_x25519_keypair(),
+                peer_public_key:           generate_key_bytes(),
+                peer_active_connection_id: 10,
+                device_uuid:               contact_sg_uuid,
+            });
+        }
+
+        push_data_to_contacts(&t.ctx);
+
+        // No packet should arrive.
+        let mut buf = [0u8; 64];
+        assert!(
+            contact_sg_socket.recv_from(&mut buf).is_err(),
+            "DG should not push contact data"
+        );
+    }
+
+    #[test]
+    fn contact_data_roundtrip_serialization() {
+        // Verify serialize → deserialize preserves all fields.
+        let t = TestCtx::new();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let device_uuid = node.device_uuid;
+            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) {
+                dev.applications.push(Application {
+                    id:            7,
+                    alias:         "test-app".to_string(),
+                    protocol:      "udp".to_string(),
+                    host:          "127.0.0.1:5000".parse().unwrap(),
+                    user_approved: true,
+                    token:         generate_uuid(),
+                });
+                dev.applications.push(Application {
+                    id:            8,
+                    alias:         "pending-app".to_string(),
+                    protocol:      "udp".to_string(),
+                    host:          "127.0.0.1:5001".parse().unwrap(),
+                    user_approved: false, // should be excluded from sync
+                    token:         generate_uuid(),
+                });
+            }
+        }
+
+        let payload = {
+            let node = t.ctx.node.read().unwrap();
+            serialize_contact_data(&node)
+        };
+
+        let data = deserialize_contact_data(&payload).expect("deserialization failed");
+
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(data.user_uuid, node.owner.user.uuid);
+        assert_eq!(data.devices.len(), 1);
+        let (_, apps) = &data.devices[0];
+        // Only the approved app should be present.
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].0, 7);
+        assert_eq!(apps[0].1, "test-app");
+    }
 }
