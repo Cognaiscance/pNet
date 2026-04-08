@@ -2617,10 +2617,9 @@ pub fn ui_request(
     match (method.as_str(), path.as_str()) {
         ("GET",  "/setup") => respond_html(&stream, 200, &render_setup(&query)),
         ("POST", "/setup/create") => {
-            if complete_setup(&body, ctx) {
-                respond_redirect(&stream, "/dashboard")
-            } else {
-                respond_redirect(&stream, "/setup?grade=sg&role=new&error=1")
+            match complete_setup(&body, ctx) {
+                None      => respond_redirect(&stream, "/dashboard"),
+                Some(err) => respond_redirect(&stream, &format!("/setup?grade=sg&role=new&error={err}")),
             }
         }
         ("POST", "/setup/join") => {
@@ -3263,8 +3262,8 @@ fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
 // ── Setup wizard ─────────────────────────────────────────────────────────────
 
 /// Apply first-run setup from the new-user form.  Returns false if required
-/// fields are missing (caller should redirect back with an error indicator).
-fn complete_setup(body: &[u8], ctx: &WorkerContext) -> bool {
+/// Returns `None` on success, or `Some(error_code)` if a field is invalid.
+fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     let alias        = form_field(body, "alias").map(url_decode).unwrap_or_default();
     let device_alias = form_field(body, "device_alias").map(url_decode).unwrap_or_default();
     let grade_str    = form_field(body, "grade").unwrap_or("sg");
@@ -3273,7 +3272,7 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> bool {
     let device_alias = device_alias.trim().to_string();
 
     if alias.is_empty() || device_alias.is_empty() {
-        return false;
+        return Some("fields");
     }
 
     let grade   = if grade_str == "sg" { DeviceGrade::SG } else { DeviceGrade::DG };
@@ -3286,6 +3285,23 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> bool {
     } else {
         None
     };
+
+    // Resolve the public SG host if provided.
+    let sg_host: Option<SocketAddrV4> = if matches!(grade, DeviceGrade::SG) {
+        let raw = form_field(body, "sg_host").map(url_decode).unwrap_or_default();
+        let raw = raw.trim();
+        if raw.is_empty() {
+            None
+        } else {
+            match resolve_sg_host(raw) {
+                Some(addr) => Some(addr),
+                None       => return Some("host"),
+            }
+        }
+    } else {
+        None
+    };
+
     let key_pair = generate_ed25519_keypair();
 
     {
@@ -3298,17 +3314,47 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> bool {
             dev.alias   = device_alias;
             dev.grade   = grade;
             dev.sg_rank = sg_rank;
+            if let Some(host) = sg_host {
+                dev.host = host;
+            }
         }
     }
     ctx.save_node();
-    true
+    None
+}
+
+/// Parse a user-supplied SG address (IP or domain, optional :port) into a
+/// `SocketAddrV4`. Port defaults to 7777 if omitted. Returns `None` if the
+/// address cannot be resolved to an IPv4 address.
+fn resolve_sg_host(input: &str) -> Option<SocketAddrV4> {
+    use std::net::ToSocketAddrs;
+
+    // Try a direct parse first — handles "1.2.3.4:port".
+    if let Ok(addr) = input.parse::<SocketAddrV4>() {
+        return Some(addr);
+    }
+
+    // Split off a trailing :port if present, otherwise default to 7777.
+    let (host_part, port) = match input.rfind(':') {
+        Some(pos) => {
+            let port: u16 = input[pos + 1..].parse().ok()?;
+            (&input[..pos], port)
+        }
+        None => (input, 7777u16),
+    };
+
+    // Resolve via DNS (works for both bare IPs and domain names).
+    let addr_str = format!("{host_part}:{port}");
+    addr_str.to_socket_addrs().ok()?.find_map(|a| match a {
+        std::net::SocketAddr::V4(v4) => Some(v4),
+        _ => None,
+    })
 }
 
 fn render_setup(query: &str) -> String {
     let grade   = query_param(query, "grade").unwrap_or("");
     let role    = query_param(query, "role").unwrap_or("");
     let waiting = query_param(query, "waiting").is_some();
-    let error   = query_param(query, "error").is_some();
 
     let body: String = if waiting {
         "<meta http-equiv=\"refresh\" content=\"3; url=/setup\">\
@@ -3322,7 +3368,7 @@ fn render_setup(query: &str) -> String {
         match (grade, role) {
             ("", _) => render_setup_grade_step(),
             ("sg", "") => render_setup_role_step(),
-            ("sg", "new") => render_setup_new_user_form(error),
+            ("sg", "new") => render_setup_new_user_form(&query_param(query, "error").unwrap_or("")),
             ("sg", "join") | ("dg", _) => render_setup_code_entry(grade),
             _ => render_setup_grade_step(),
         }
@@ -3364,12 +3410,13 @@ fn render_setup_role_step() -> String {
         .to_string()
 }
 
-fn render_setup_new_user_form(error: bool) -> String {
-    let error_msg = if error {
-        "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
-         Both fields are required.</p>"
-    } else {
-        ""
+fn render_setup_new_user_form(error: &str) -> String {
+    let error_msg = match error {
+        "fields" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     Name and device name are required.</p>",
+        "host"   => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     Could not resolve the public address. Check the IP or domain and try again.</p>",
+        _        => "",
     };
     format!(
         "<h1>Create Your Identity</h1>\
@@ -3383,6 +3430,13 @@ fn render_setup_new_user_form(error: bool) -> String {
            <label class=\"swiz-label\">Device name</label>\
            <input class=\"swiz-input\" type=\"text\" name=\"device_alias\" \
                   placeholder=\"e.g. Home Server\" required autocomplete=\"off\">\
+           <label class=\"swiz-label\">Public address</label>\
+           <input class=\"swiz-input\" type=\"text\" name=\"sg_host\" \
+                  placeholder=\"e.g. 203.0.113.10 or sg.example.com\" autocomplete=\"off\">\
+           <p style=\"color:#888;font-size:.78rem;margin-top:-.5rem;margin-bottom:.75rem\">\
+             IP or domain name where this server can be reached. Port defaults to 7777. \
+             Used in invitation codes so other devices can connect.\
+           </p>\
            <label class=\"swiz-label\">SG rank (1 = highest priority relay)</label>\
            <input class=\"swiz-input\" type=\"number\" name=\"sg_rank\" \
                   value=\"1\" min=\"1\" max=\"255\" autocomplete=\"off\">\
