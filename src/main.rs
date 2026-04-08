@@ -78,9 +78,9 @@ fn main() {
             DeviceGrade::DG => std::net::Ipv4Addr::LOCALHOST,
         }
     };
-    let http = HttpServer::start(http_bind, 8080, Arc::clone(&queue), Arc::clone(&stop));
+    let http = HttpServer::start(http_bind, 8777, Arc::clone(&queue), Arc::clone(&stop));
 
-    println!("[main] running. HTTP on {http_bind}:8080");
+    println!("[main] running. HTTP on {http_bind}:8777");
 
     // ── Wait for SIGINT / SIGTERM ─────────────────────────────────────────────
     ctrlc::set_handler({
