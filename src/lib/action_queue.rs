@@ -26,6 +26,8 @@ pub enum Action {
     BootstrapRequest   { src: SocketAddr, buf: Vec<u8> },
     BootstrapResponse  { src: SocketAddr, buf: Vec<u8> },
     DeviceRegistration { src: SocketAddr, buf: Vec<u8> },
+    ContactRequest     { src: SocketAddr, buf: Vec<u8> },
+    ContactResponse    { src: SocketAddr, buf: Vec<u8> },
     RelayPacket        { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
@@ -84,6 +86,8 @@ impl Action {
             Action::BootstrapRequest   { src, buf }   => handlers::bootstrap_request(src, buf, ctx),
             Action::BootstrapResponse  { src, buf }   => handlers::bootstrap_response(src, buf, ctx),
             Action::DeviceRegistration { src, buf }   => handlers::device_registration(src, buf, ctx),
+            Action::ContactRequest     { src, buf }   => handlers::contact_request(src, buf, ctx),
+            Action::ContactResponse    { src, buf }   => handlers::contact_response(src, buf, ctx),
             Action::RelayPacket        { src, buf }   => handlers::relay_packet(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
             Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),

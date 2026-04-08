@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime};
 use super::action_queue::WorkerContext;
 use super::data_models::{
     ActiveConnection, ActiveTunnel, Application, Contact, Device, DeviceGrade, Invitation,
-    KeyPair, PendingBootstrap, PendingConnection, PendingDeviceAcceptance, PendingTunnel,
-    PendingTunnelConnection, PublicKey, SgStatus, TunnelCounter, User, Uuid,
+    KeyPair, PendingBootstrap, PendingConnection, PendingContactExchange, PendingDeviceAcceptance,
+    PendingTunnel, PendingTunnelConnection, PublicKey, SgStatus, TunnelCounter, User, Uuid,
     CONNECTION_LIFETIME, RENEW_THRESHOLD, TUNNEL_COUNTER_WINDOW, TUNNEL_THRESHOLD,
     generate_key_bytes, generate_uuid,
 };
@@ -383,6 +383,8 @@ const CONNECT_ACK_OP:      u8 = 0x21;
 const BOOTSTRAP_REQUEST_OP:  u8 = 0x30;
 const BOOTSTRAP_RESPONSE_OP: u8 = 0x31;
 const DEVICE_REGISTER_OP:    u8 = 0x32;
+const CONTACT_REQUEST_OP:    u8 = 0x33;
+const CONTACT_RESPONSE_OP:   u8 = 0x34;
 const RELAY_PACKET_OP:            u8 = 0x40;
 const APP_PACKET_OP:              u8 = 0x41;
 const APP_PUSH_OP:                u8 = 0x04;
@@ -1071,6 +1073,185 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
     }
     ctx.save_node();
+}
+
+// ── Contact exchange payload serialization ────────────────────────────────────
+//
+// Format (used in both ContactRequest and ContactResponse):
+//   [alias: u8 len + bytes]
+//   [uuid: 16]
+//   [long_term_pk: 32]
+//   [device_count: u8]
+//     each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8][ip:4][port:2 BE]
+
+fn serialize_contact_payload(node: &super::data_models::Node) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let user = &node.owner.user;
+    push_str(&mut buf, &user.alias);
+    buf.extend_from_slice(&user.uuid);
+    buf.extend_from_slice(&node.owner.key_pair.public_key);
+    buf.push(user.devices.len() as u8);
+    for d in &user.devices { push_device(&mut buf, d); }
+    buf
+}
+
+struct ContactPayload {
+    alias:      String,
+    uuid:       Uuid,
+    public_key: PublicKey,
+    devices:    Vec<Device>,
+}
+
+fn deserialize_contact_payload(data: &[u8]) -> Option<ContactPayload> {
+    let mut pos = 0usize;
+    let alias       = read_str(data, &mut pos)?;
+    let uuid: Uuid  = read_arr(data, &mut pos)?;
+    let pk: PublicKey = read_arr(data, &mut pos)?;
+    let device_count = *data.get(pos)? as usize; pos += 1;
+    let mut devices = Vec::new();
+    for _ in 0..device_count { devices.push(read_device(data, &mut pos)?); }
+    Some(ContactPayload { alias, uuid, public_key: pk, devices })
+}
+
+// ── Contact exchange handlers ─────────────────────────────────────────────────
+
+/// Op 0x33 — Contact request (requester → target's SG).
+///
+/// Payload (after op byte):
+///   [invitation_id: 16][requester_ephem_pk: 32][nonce: 24][encrypted contact card]
+///
+/// The SG validates the invitation, derives the shared secret, decrypts the
+/// requester's contact card, adds them as a contact, and replies with a
+/// ContactResponse containing this user's contact card encrypted with the same
+/// shared secret.  The invitation is consumed (single-use).
+pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    const MIN_LEN: usize = 16 + 32 + 24;
+    if buf.len() < MIN_LEN {
+        eprintln!("[contact_request] packet too short ({}) from {src}", buf.len());
+        return;
+    }
+
+    let invitation_id:   Uuid      = buf[0..16].try_into().unwrap();
+    let requester_ephem_pk: PublicKey = buf[16..48].try_into().unwrap();
+    let nonce:           [u8; 24]  = buf[48..72].try_into().unwrap();
+    let ciphertext:      &[u8]     = &buf[72..];
+
+    let (shared_secret, response_payload) = {
+        let mut node = ctx.node.write().unwrap();
+        let now = SystemTime::now();
+
+        let pos = match node.owner.contact_invitations.iter().position(|inv| inv.id == invitation_id) {
+            Some(p) => p,
+            None => {
+                eprintln!("[contact_request] unknown invitation from {src}");
+                return;
+            }
+        };
+        if node.owner.contact_invitations[pos].expires_at <= now {
+            eprintln!("[contact_request] expired invitation from {src}");
+            node.owner.contact_invitations.remove(pos);
+            return;
+        }
+
+        let inv = node.owner.contact_invitations.remove(pos);
+        let shared_secret: [u8; 32] = x25519_shared(&inv.key_pair.private_key, &requester_ephem_pk);
+
+        let Some(plaintext) = xchacha20_decrypt(&shared_secret, &nonce, ciphertext) else {
+            eprintln!("[contact_request] decryption failed from {src}");
+            return;
+        };
+        let Some(data) = deserialize_contact_payload(&plaintext) else {
+            eprintln!("[contact_request] deserialization failed from {src}");
+            return;
+        };
+
+        // Add requester as a contact if not already present.
+        if !node.owner.contact_users.iter().any(|c| c.user.uuid == data.uuid) {
+            eprintln!("[contact_request] adding contact '{}' from {src}", data.alias);
+            node.owner.contact_users.push(Contact {
+                user:       User { alias: data.alias, uuid: data.uuid, devices: data.devices },
+                public_key: data.public_key,
+            });
+        }
+
+        let response_payload = serialize_contact_payload(&node);
+        (shared_secret, response_payload)
+    };
+
+    ctx.save_node();
+
+    // Encrypt and send ContactResponse.
+    let (ciphertext, resp_nonce) = xchacha20_encrypt(&shared_secret, &response_payload);
+    let mut pkt = Vec::with_capacity(1 + 24 + ciphertext.len());
+    pkt.push(CONTACT_RESPONSE_OP);
+    pkt.extend_from_slice(&resp_nonce);
+    pkt.extend_from_slice(&ciphertext);
+    send(ctx, src, &pkt);
+
+    // Trigger connection maintenance — we have a new contact.
+    ctx.scheduler_tx.send(super::action_queue::ScheduleRequest {
+        action: super::action_queue::Action::MaintainConnections,
+        delay:  Duration::ZERO,
+    }).ok();
+}
+
+/// Op 0x34 — Contact response (target's SG → requester).
+///
+/// Payload (after op byte):
+///   [nonce: 24][encrypted contact card]
+///
+/// Decrypts using the pending contact exchange's shared secret and adds the
+/// target as a contact.
+pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 24 {
+        eprintln!("[contact_response] packet too short ({}) from {src}", buf.len());
+        return;
+    }
+
+    let nonce:      [u8; 24] = buf[0..24].try_into().unwrap();
+    let ciphertext: &[u8]    = &buf[24..];
+
+    let shared_secret = {
+        let node = ctx.node.read().unwrap();
+        let Some(pce) = &node.owner.pending_contact_exchange else {
+            eprintln!("[contact_response] no pending contact exchange, ignoring from {src}");
+            return;
+        };
+        if SocketAddr::V4(pce.sg_addr) != src {
+            eprintln!("[contact_response] unexpected source {src}, ignoring");
+            return;
+        }
+        x25519_shared(&pce.our_ephem_key_pair.private_key, &pce.invitation_pk)
+    };
+
+    let Some(plaintext) = xchacha20_decrypt(&shared_secret, &nonce, ciphertext) else {
+        eprintln!("[contact_response] decryption failed from {src}");
+        return;
+    };
+    let Some(data) = deserialize_contact_payload(&plaintext) else {
+        eprintln!("[contact_response] deserialization failed from {src}");
+        return;
+    };
+
+    {
+        let mut node = ctx.node.write().unwrap();
+        if !node.owner.contact_users.iter().any(|c| c.user.uuid == data.uuid) {
+            eprintln!("[contact_response] adding contact '{}' from {src}", data.alias);
+            node.owner.contact_users.push(Contact {
+                user:       User { alias: data.alias, uuid: data.uuid, devices: data.devices },
+                public_key: data.public_key,
+            });
+        }
+        node.owner.pending_contact_exchange = None;
+    }
+
+    ctx.save_node();
+
+    // Trigger connection maintenance — we have a new contact.
+    ctx.scheduler_tx.send(super::action_queue::ScheduleRequest {
+        action: super::action_queue::Action::MaintainConnections,
+        delay:  Duration::ZERO,
+    }).ok();
 }
 
 // ── Scheduled action handlers ─────────────────────────────────────────────────
@@ -1929,9 +2110,17 @@ pub fn ui_request(
             let code = generate_device_invitation(ctx).unwrap_or_default();
             respond_redirect(&stream, &format!("/invitations?code={code}"));
         }
+        ("POST", "/invitations/contact") => {
+            let code = generate_contact_invitation(ctx).unwrap_or_default();
+            respond_redirect(&stream, &format!("/invitations?contact_code={code}"));
+        }
         ("POST", "/invitations/enter") => {
             initiate_bootstrap(&body, ctx);
             respond_redirect(&stream, "/invitations");
+        }
+        ("POST", "/contacts/enter") => {
+            initiate_contact_exchange(&body, ctx);
+            respond_redirect(&stream, "/contacts");
         }
         _ => respond_html(&stream, 404, &layout("Not Found", "<h1>404 — Not Found</h1>")),
     }
@@ -2145,17 +2334,34 @@ fn render_contacts(ctx: &WorkerContext) -> String {
         ))
         .collect();
 
-    let body = if rows.is_empty() {
-        "<h1>Contacts</h1><p class='empty'>No contacts yet.</p>".to_string()
+    let table = if rows.is_empty() {
+        "<p class='empty'>No contacts yet.</p>".to_string()
     } else {
         format!(
-            "<h1>Contacts</h1>\
-             <table>\
+            "<table>\
                <tr><th>Alias</th><th>Devices</th></tr>\
                {rows}\
              </table>"
         )
     };
+
+    drop(node);
+
+    let body = format!(
+        "<h1>Contacts</h1>\
+         {table}\
+         <div class='card' style='margin-top:1.5rem'>\
+           <h2 style='margin-top:0;font-size:1rem'>Add a Contact</h2>\
+           <p style='color:#666;font-size:.9rem;margin-top:0'>Paste an invitation code from another pNet user.</p>\
+           <form method='post' action='/contacts/enter'>\
+             <textarea name='code' rows='3' \
+               style='width:100%;font-family:monospace;font-size:.85rem;\
+                      box-sizing:border-box;padding:.4rem;border:1px solid #ccc;border-radius:4px' \
+               placeholder='Paste contact invitation code here...'></textarea><br>\
+             <button type='submit' style='margin-top:.5rem'>Add Contact</button>\
+           </form>\
+         </div>"
+    );
     layout("Contacts", &body)
 }
 
@@ -2314,12 +2520,117 @@ fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
     send(ctx, SocketAddr::V4(sg_addr), &pkt);
 }
 
+/// Generate a contact invitation code: stores the invitation in
+/// `contact_invitations` and returns the base64-encoded shareable code.
+fn generate_contact_invitation(ctx: &WorkerContext) -> Option<String> {
+    use base64::Engine;
+
+    let sg_host: SocketAddrV4 = {
+        let node = ctx.node.read().unwrap();
+        let local_uuid   = node.device_uuid;
+        let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid)?;
+
+        if matches!(local_device.grade, DeviceGrade::SG) {
+            local_device.host
+        } else {
+            let mut best: Option<(Duration, SocketAddrV4)> = None;
+            for d in &node.owner.user.devices {
+                if !matches!(d.grade, DeviceGrade::SG) { continue; }
+                if let Some(s) = node.sg_statuses.get(&d.uuid) {
+                    if s.up {
+                        let rtt = s.last_rtt.unwrap_or(Duration::MAX);
+                        if best.map_or(true, |(br, _)| rtt < br) {
+                            best = Some((rtt, d.host));
+                        }
+                    }
+                }
+            }
+            best.map(|(_, h)| h)?
+        }
+    };
+
+    let (inv_id, inv_pk) = {
+        let mut node = ctx.node.write().unwrap();
+        let kp = generate_x25519_keypair();
+        let pk = kp.public_key;
+        let id = generate_uuid();
+        node.owner.contact_invitations.push(Invitation {
+            id,
+            key_pair:   kp,
+            expires_at: SystemTime::now() + Duration::from_secs(24 * 3600),
+        });
+        (id, pk)
+    };
+
+    ctx.save_node();
+
+    let mut raw = [0u8; 54];
+    raw[0..16].copy_from_slice(&inv_id);
+    raw[16..48].copy_from_slice(&inv_pk);
+    raw[48..52].copy_from_slice(&sg_host.ip().octets());
+    raw[52..54].copy_from_slice(&sg_host.port().to_be_bytes());
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw))
+}
+
+/// Parse a contact invitation code and send a ContactRequest to the target's SG.
+fn initiate_contact_exchange(body: &[u8], ctx: &WorkerContext) {
+    use base64::Engine;
+
+    let Some(code_str) = form_field(body, "code") else { return };
+    let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(code_str.trim()) else {
+        eprintln!("[initiate_contact_exchange] invalid base64");
+        return;
+    };
+    if raw.len() != 54 {
+        eprintln!("[initiate_contact_exchange] wrong code length ({})", raw.len());
+        return;
+    }
+
+    let invitation_id: Uuid      = raw[0..16].try_into().unwrap();
+    let invitation_pk: PublicKey = raw[16..48].try_into().unwrap();
+    let ip_bytes: [u8; 4]        = raw[48..52].try_into().unwrap();
+    let port = u16::from_be_bytes([raw[52], raw[53]]);
+    let sg_addr = SocketAddrV4::new(Ipv4Addr::from(ip_bytes), port);
+
+    let ephem_kp = generate_x25519_keypair();
+    let ephem_pk = ephem_kp.public_key;
+    let shared_secret = x25519_shared(&ephem_kp.private_key, &invitation_pk);
+
+    // Serialize and encrypt our contact card.
+    let payload = {
+        let node = ctx.node.read().unwrap();
+        serialize_contact_payload(&node)
+    };
+    let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
+
+    {
+        let mut node = ctx.node.write().unwrap();
+        node.owner.pending_contact_exchange = Some(PendingContactExchange {
+            our_ephem_key_pair: ephem_kp,
+            invitation_pk,
+            sg_addr,
+        });
+    }
+
+    // Send ContactRequest: [op=0x33][invitation_id:16][ephem_pk:32][nonce:24][ciphertext]
+    let mut pkt = Vec::with_capacity(1 + 16 + 32 + 24 + ciphertext.len());
+    pkt.push(CONTACT_REQUEST_OP);
+    pkt.extend_from_slice(&invitation_id);
+    pkt.extend_from_slice(&ephem_pk);
+    pkt.extend_from_slice(&nonce);
+    pkt.extend_from_slice(&ciphertext);
+    send(ctx, SocketAddr::V4(sg_addr), &pkt);
+}
+
 fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
     let node = ctx.node.read().unwrap();
 
     // Show a generated code if one was passed back via the redirect query string.
     let code_param = query.split('&')
         .find_map(|p| p.strip_prefix("code="))
+        .unwrap_or("");
+    let contact_code_param = query.split('&')
+        .find_map(|p| p.strip_prefix("contact_code="))
         .unwrap_or("");
 
     let code_section = if !code_param.is_empty() {
@@ -2335,17 +2646,43 @@ fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
         String::new()
     };
 
-    let inv_rows: String = node.owner.device_invitations.iter()
+    let contact_code_section = if !contact_code_param.is_empty() {
+        format!(
+            "<div class='card'>\
+               <div class='label'>Share this code with your new contact (expires in 24 h):</div>\
+               <pre style='word-break:break-all;background:#f0f0f0;padding:.75rem;\
+                           border-radius:4px;font-size:.85rem;margin:.5rem 0 0'>{}</pre>\
+             </div>",
+            html_escape(contact_code_param)
+        )
+    } else {
+        String::new()
+    };
+
+    let dev_inv_rows: String = node.owner.device_invitations.iter()
         .map(|inv| {
             let id_hex: String = inv.id.iter().map(|b| format!("{b:02x}")).collect();
             format!("<tr><td style='font-family:monospace'>{}</td></tr>", &id_hex[..16])
         })
         .collect();
 
-    let inv_table = if inv_rows.is_empty() {
+    let dev_inv_table = if dev_inv_rows.is_empty() {
         "<p class='empty'>No pending device invitations.</p>".to_string()
     } else {
-        format!("<table><tr><th>Invitation ID (first 8 bytes)</th></tr>{inv_rows}</table>")
+        format!("<table><tr><th>Invitation ID (first 8 bytes)</th></tr>{dev_inv_rows}</table>")
+    };
+
+    let contact_inv_rows: String = node.owner.contact_invitations.iter()
+        .map(|inv| {
+            let id_hex: String = inv.id.iter().map(|b| format!("{b:02x}")).collect();
+            format!("<tr><td style='font-family:monospace'>{}</td></tr>", &id_hex[..16])
+        })
+        .collect();
+
+    let contact_inv_table = if contact_inv_rows.is_empty() {
+        "<p class='empty'>No pending contact invitations.</p>".to_string()
+    } else {
+        format!("<table><tr><th>Invitation ID (first 8 bytes)</th></tr>{contact_inv_rows}</table>")
     };
 
     drop(node);
@@ -2353,12 +2690,21 @@ fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
     let body = format!(
         "<h1>Invitations</h1>\
          {code_section}\
+         {contact_code_section}\
          <div class='card'>\
            <h2 style='margin-top:0;font-size:1rem'>Add a Device</h2>\
            <p style='color:#666;font-size:.9rem;margin-top:0'>Generate a one-time code, then enter it on the new device.</p>\
-           {inv_table}\
+           {dev_inv_table}\
            <form method='post' action='/invitations/device' style='margin-top:1rem'>\
              <button type='submit'>Generate Device Invitation</button>\
+           </form>\
+         </div>\
+         <div class='card'>\
+           <h2 style='margin-top:0;font-size:1rem'>Add a Contact</h2>\
+           <p style='color:#666;font-size:.9rem;margin-top:0'>Generate a one-time code and share it with the person you want to add.</p>\
+           {contact_inv_table}\
+           <form method='post' action='/invitations/contact' style='margin-top:1rem'>\
+             <button type='submit'>Generate Contact Invitation</button>\
            </form>\
          </div>\
          <div class='card'>\
@@ -2874,6 +3220,7 @@ mod tests {
                     alias:        "peer-device".to_string(),
                     uuid:         device_uuid,
                     grade:        DeviceGrade::SG,
+                    sg_rank:      Some(1),
                     host:         "127.0.0.1:9999".parse().unwrap(),
                     applications: Vec::new(),
                 }],
@@ -3048,6 +3395,7 @@ mod tests {
             alias: "sg".to_string(),
             uuid,
             grade: DeviceGrade::SG,
+            sg_rank: Some(1),
             host: "127.0.0.1:9000".parse().unwrap(),
             applications: Vec::new(),
         }
@@ -3071,10 +3419,11 @@ mod tests {
                     devices: vec![
                         make_sg_device(contact_sg_uuid),
                         Device {
-                            alias: "dest".to_string(),
-                            uuid:  dest_uuid,
-                            grade: DeviceGrade::DG,
-                            host:  "127.0.0.1:9001".parse().unwrap(),
+                            alias:   "dest".to_string(),
+                            uuid:    dest_uuid,
+                            grade:   DeviceGrade::DG,
+                            sg_rank: None,
+                            host:    "127.0.0.1:9001".parse().unwrap(),
                             applications: Vec::new(),
                         },
                     ],
@@ -3257,6 +3606,7 @@ mod tests {
                         alias:        "dest-dg".to_string(),
                         uuid:         dest_device_uuid,
                         grade:        DeviceGrade::DG,
+                        sg_rank:      None,
                         host:         dest_addr,
                         applications: Vec::new(),
                     }],

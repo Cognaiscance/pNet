@@ -227,6 +227,17 @@ pub struct Invitation {
     pub expires_at: SystemTime,
 }
 
+/// State held by a node while waiting for a ContactResponse from the target's SG.
+pub struct PendingContactExchange {
+    /// Our one-time X25519 ephemeral key pair for this exchange.
+    pub our_ephem_key_pair: KeyPair,
+    /// The invitation's public key (from the code) — combined with our ephemeral
+    /// private key to derive the shared secret.
+    pub invitation_pk:      PublicKey,
+    /// Where the ContactResponse will come from.
+    pub sg_addr:            SocketAddrV4,
+}
+
 /// State held by a new device while waiting for a BootstrapResponse from the SG.
 pub struct PendingBootstrap {
     /// From the invitation code — needed to include in DeviceRegistration so the SG
@@ -263,6 +274,9 @@ pub struct Owner {
     /// Ephemeral — not persisted; cleared when ConnectAck arrives.
     #[serde(skip)]
     pub pending_connections: HashMap<u16, PendingConnection>,
+    /// Ephemeral — not persisted; set while waiting for ContactResponse.
+    #[serde(skip)]
+    pub pending_contact_exchange: Option<PendingContactExchange>,
     /// Ephemeral — not persisted; set while waiting for BootstrapResponse.
     #[serde(skip)]
     pub pending_bootstrap:   Option<PendingBootstrap>,
@@ -385,6 +399,7 @@ impl Node {
                 device_invitations:         Vec::new(),
                 active_connections:         HashMap::new(),
                 pending_connections:        HashMap::new(),
+                pending_contact_exchange:   None,
                 pending_bootstrap:          None,
                 pending_device_acceptances: HashMap::new(),
                 active_tunnels:             HashMap::new(),
