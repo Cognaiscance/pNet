@@ -888,8 +888,9 @@ fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
         alias,
         grade,
         sg_rank,
-        host:         SocketAddrV4::new(Ipv4Addr::from(ip), port),
-        applications: Vec::new(),
+        host:            SocketAddrV4::new(Ipv4Addr::from(ip), port),
+        public_hostname: None,
+        applications:    Vec::new(),
     })
 }
 
@@ -2980,28 +2981,28 @@ fn reject_app(body: &[u8], ctx: &WorkerContext) {
 fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
     use base64::Engine;
 
-    let sg_host: SocketAddrV4 = {
+    let (sg_host, sg_hostname): (SocketAddrV4, Option<String>) = {
         let node = ctx.node.read().unwrap();
         let local_uuid   = node.device_uuid;
         let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid)?;
 
         if matches!(local_device.grade, DeviceGrade::SG) {
-            local_device.host
+            (local_device.host, local_device.public_hostname.clone())
         } else {
             // Find the lowest-RTT up SG among own devices.
-            let mut best: Option<(Duration, SocketAddrV4)> = None;
+            let mut best: Option<(Duration, SocketAddrV4, Option<String>)> = None;
             for d in &node.owner.user.devices {
                 if !matches!(d.grade, DeviceGrade::SG) { continue; }
                 if let Some(s) = node.sg_statuses.get(&d.uuid) {
                     if s.up {
                         let rtt = s.last_rtt.unwrap_or(Duration::MAX);
-                        if best.map_or(true, |(br, _)| rtt < br) {
-                            best = Some((rtt, d.host));
+                        if best.as_ref().map_or(true, |(br, _, _)| rtt < *br) {
+                            best = Some((rtt, d.host, d.public_hostname.clone()));
                         }
                     }
                 }
             }
-            best.map(|(_, h)| h)?
+            best.map(|(_, h, hn)| (h, hn))?
         }
     };
 
@@ -3020,13 +3021,18 @@ fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
 
     ctx.save_node();
 
-    // Encode: invitation_id (16) || invitation_pk (32) || sg_host ip (4) || port (2) = 54 bytes
-    let mut raw = [0u8; 54];
-    raw[0..16].copy_from_slice(&inv_id);
-    raw[16..48].copy_from_slice(&inv_pk);
-    raw[48..52].copy_from_slice(&sg_host.ip().octets());
-    raw[52..54].copy_from_slice(&sg_host.port().to_be_bytes());
-    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw))
+    // Encode: [inv_id:16][inv_pk:32][host_len:1][host:host_len][port:2]
+    // host is either the domain name (if one was configured) or the dotted-decimal IP string.
+    let host_str = sg_hostname.unwrap_or_else(|| sg_host.ip().to_string());
+    let host_bytes = host_str.as_bytes();
+    let host_len = host_bytes.len().min(255) as u8;
+    let mut raw = Vec::with_capacity(16 + 32 + 1 + host_len as usize + 2);
+    raw.extend_from_slice(&inv_id);
+    raw.extend_from_slice(&inv_pk);
+    raw.push(host_len);
+    raw.extend_from_slice(&host_bytes[..host_len as usize]);
+    raw.extend_from_slice(&sg_host.port().to_be_bytes());
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw))
 }
 
 /// Parse an invitation code entered via the UI and send a BootstrapRequest to the SG.
@@ -3038,16 +3044,28 @@ fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
         eprintln!("[initiate_bootstrap] invalid base64");
         return;
     };
-    if raw.len() != 54 {
-        eprintln!("[initiate_bootstrap] wrong code length ({})", raw.len());
+    // Minimum: 16 (inv_id) + 32 (inv_pk) + 1 (host_len) + 1 (host min) + 2 (port) = 52
+    if raw.len() < 52 {
+        eprintln!("[initiate_bootstrap] code too short ({} bytes)", raw.len());
         return;
     }
 
     let invitation_id: Uuid      = raw[0..16].try_into().unwrap();
     let invitation_pk: PublicKey = raw[16..48].try_into().unwrap();
-    let ip_bytes: [u8; 4]        = raw[48..52].try_into().unwrap();
-    let port = u16::from_be_bytes([raw[52], raw[53]]);
-    let sg_addr = SocketAddrV4::new(Ipv4Addr::from(ip_bytes), port);
+    let host_len = raw[48] as usize;
+    if raw.len() < 49 + host_len + 2 {
+        eprintln!("[initiate_bootstrap] code truncated");
+        return;
+    }
+    let host_str = match std::str::from_utf8(&raw[49..49 + host_len]) {
+        Ok(s) => s,
+        Err(_) => { eprintln!("[initiate_bootstrap] invalid host string"); return; }
+    };
+    let port = u16::from_be_bytes([raw[49 + host_len], raw[50 + host_len]]);
+    let Some(sg_addr) = resolve_sg_host(&format!("{host_str}:{port}")) else {
+        eprintln!("[initiate_bootstrap] could not resolve host '{host_str}'");
+        return;
+    };
 
     // Generate our ephemeral key pair and store PendingBootstrap.
     let ephem_kp = generate_x25519_keypair();
@@ -3301,19 +3319,32 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     };
 
     // Resolve the public SG host if provided.
-    let sg_host: Option<SocketAddrV4> = if matches!(grade, DeviceGrade::SG) {
+    let (sg_host, sg_hostname): (Option<SocketAddrV4>, Option<String>) = if matches!(grade, DeviceGrade::SG) {
         let raw = form_field(body, "sg_host").map(url_decode).unwrap_or_default();
         let raw = raw.trim();
         if raw.is_empty() {
-            None
+            (None, None)
         } else {
             match resolve_sg_host(raw) {
-                Some(addr) => Some(addr),
-                None       => return Some("host"),
+                Some(addr) => {
+                    // Preserve hostname only if it isn't already a bare IP.
+                    let hostname = if raw.parse::<std::net::IpAddr>().is_err() {
+                        // Strip trailing :port if present so we store just the name.
+                        let name = match raw.rfind(':') {
+                            Some(pos) if raw[pos+1..].parse::<u16>().is_ok() => &raw[..pos],
+                            _ => raw,
+                        };
+                        Some(name.to_string())
+                    } else {
+                        None
+                    };
+                    (Some(addr), hostname)
+                }
+                None => return Some("host"),
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     let key_pair = generate_ed25519_keypair();
@@ -3325,9 +3356,10 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
 
         let device_uuid = node.device_uuid;
         if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) {
-            dev.alias   = device_alias;
-            dev.grade   = grade;
-            dev.sg_rank = sg_rank;
+            dev.alias           = device_alias;
+            dev.grade           = grade;
+            dev.sg_rank         = sg_rank;
+            dev.public_hostname = sg_hostname;
             if let Some(host) = sg_host {
                 dev.host = host;
             }

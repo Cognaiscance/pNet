@@ -204,10 +204,14 @@ pub struct Device {
     pub grade:        DeviceGrade,
     /// Relay priority for SG-grade devices. Lower value = higher priority (1 = top).
     /// `None` for DG-grade devices (they do not act as relays).
-    pub sg_rank:      Option<u32>,
+    pub sg_rank:          Option<u32>,
     #[serde(with = "serde_socket_addr_v4")]
-    pub host:         SocketAddrV4,
-    pub applications: Vec<Application>,
+    pub host:             SocketAddrV4,
+    /// Original hostname entered during setup (e.g. "pnet.example.com").
+    /// Stored so invitation codes can embed the name instead of a raw IP.
+    #[serde(default)]
+    pub public_hostname:  Option<String>,
+    pub applications:     Vec<Application>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -376,12 +380,13 @@ impl Node {
         let device_uuid = generate_uuid();
 
         let device = Device {
-            alias:        "This Device".to_string(),
-            uuid:         device_uuid,
-            grade:        DeviceGrade::DG,
-            sg_rank:      None,
-            host:         "0.0.0.0:0".parse().unwrap(),
-            applications: Vec::new(),
+            alias:           "This Device".to_string(),
+            uuid:            device_uuid,
+            grade:           DeviceGrade::DG,
+            sg_rank:         None,
+            host:            "0.0.0.0:0".parse().unwrap(),
+            public_hostname: None,
+            applications:    Vec::new(),
         };
 
         Node {
