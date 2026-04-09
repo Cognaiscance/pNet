@@ -629,6 +629,7 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
 
+    println!("[connect_ack] connection established with {src} (peer {:02x?})", &pending.peer_device_uuid[..4]);
     node.owner.active_connections.insert(our_conn_id, ActiveConnection {
         id:                        our_conn_id,
         timeout:                   SystemTime::now() + CONNECTION_LIFETIME,
@@ -2139,6 +2140,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
         let sig = ed25519_sign(&our_longterm_sk, &pkt[0..83]);
         pkt[83..147].copy_from_slice(&sig);
 
+        println!("[poll_connections] sending connect request to {peer_host} (peer {:02x?})", &peer_uuid[..4]);
         send(ctx, SocketAddr::V4(peer_host), &pkt);
     }
 }
