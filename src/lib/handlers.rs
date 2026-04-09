@@ -1028,7 +1028,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let ciphertext: &[u8]    = &buf[24..];
 
     // Retrieve pending bootstrap state — we need it before taking the write lock.
-    let (shared_secret, invitation_id, sg_addr) = {
+    let (shared_secret, invitation_id, sg_addr, device_alias) = {
         let node = ctx.node.read().unwrap();
         let Some(pb) = &node.owner.pending_bootstrap else {
             eprintln!("[bootstrap_response] no pending bootstrap, ignoring from {src}");
@@ -1039,7 +1039,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         }
         let ss = x25519_shared(&pb.our_ephem_key_pair.private_key, &pb.invitation_pk);
-        (ss, pb.invitation_id, pb.sg_addr)
+        (ss, pb.invitation_id, pb.sg_addr, pb.device_alias.clone())
     };
 
     let Some(plaintext) = xchacha20_decrypt(&shared_secret, &nonce, ciphertext) else {
@@ -1066,6 +1066,13 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
         node.owner.contact_users  = data.contacts;
         node.owner.pending_bootstrap = None;
+
+        // Apply the user-chosen alias to the local device.
+        if !device_alias.is_empty() {
+            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == local_uuid) {
+                dev.alias = device_alias;
+            }
+        }
 
         // Serialize our own device entry to send as DeviceRegistration.
         let mut buf = Vec::new();
@@ -3039,6 +3046,11 @@ fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
 fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
     use base64::Engine;
 
+    let device_alias = form_field(body, "device_alias")
+        .map(url_decode)
+        .unwrap_or_default();
+    let device_alias = device_alias.trim().to_string();
+
     let Some(code_str) = form_field(body, "code") else { return };
     let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(code_str.trim()) else {
         eprintln!("[initiate_bootstrap] invalid base64");
@@ -3077,6 +3089,7 @@ fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
             our_ephem_key_pair: ephem_kp,
             invitation_pk,
             sg_addr,
+            device_alias,
         });
     }
 
@@ -3498,6 +3511,11 @@ fn render_setup_code_entry(grade: &str) -> String {
         "<h1>Enter Invitation Code</h1>\
          <p class=\"swiz-sub\">Paste the invitation code generated on your existing device.</p>\
          <form method=\"post\" action=\"/setup/join\" style=\"display:block\">\
+           <label class=\"swiz-label\">Device name</label>\
+           <input name=\"device_alias\" type=\"text\" \
+             style=\"width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #ccc;\
+                    border-radius:4px;margin-bottom:.75rem;font-size:1rem\" \
+             placeholder=\"e.g. My Laptop\" required><br>\
            <label class=\"swiz-label\">Invitation code</label>\
            <textarea name=\"code\" rows=\"4\" \
              style=\"width:100%;box-sizing:border-box;font-family:monospace;\

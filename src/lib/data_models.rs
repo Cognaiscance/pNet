@@ -254,6 +254,8 @@ pub struct PendingBootstrap {
     pub invitation_pk:      PublicKey,
     /// Where to send DeviceRegistration once the response is received.
     pub sg_addr:            SocketAddrV4,
+    /// Device alias entered by the user during setup — applied once bootstrap completes.
+    pub device_alias:       String,
 }
 
 /// State held by an SG after sending a BootstrapResponse, while waiting for
