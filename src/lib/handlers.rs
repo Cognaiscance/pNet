@@ -2638,6 +2638,10 @@ pub fn ui_request(
             respond_redirect(&stream, "/pending-apps");
         }
         ("GET",  "/applications")  => respond_html(&stream, 200, &render_applications(ctx)),
+        ("POST", "/applications/delete") => {
+            reject_app(&body, ctx);
+            respond_redirect(&stream, "/applications");
+        }
         ("GET",  "/contacts")      => respond_html(&stream, 200, &render_contacts(ctx)),
         ("GET",  "/devices")       => respond_html(&stream, 200, &render_devices(ctx)),
         ("GET",  "/invitations")   => respond_html(&stream, 200, &render_invitations(ctx, &query)),
@@ -2834,10 +2838,15 @@ fn render_applications(ctx: &WorkerContext) -> String {
             d.applications.iter()
                 .filter(|a| a.user_approved)
                 .map(|a| format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    "<tr><td>{}</td><td>{}</td><td>{}</td>\
+                     <td><form method='post' action='/applications/delete' style='margin:0'>\
+                       <input type='hidden' name='id' value='{}'>\
+                       <button type='submit'>Delete</button>\
+                     </form></td></tr>",
                     html_escape(&a.alias),
                     html_escape(&a.protocol),
                     html_escape(&a.host.to_string()),
+                    a.id,
                 ))
                 .collect()
         })
@@ -2849,7 +2858,7 @@ fn render_applications(ctx: &WorkerContext) -> String {
         format!(
             "<h1>Applications</h1>\
              <table>\
-               <tr><th>Alias</th><th>Protocol</th><th>Host</th></tr>\
+               <tr><th>Alias</th><th>Protocol</th><th>Host</th><th></th></tr>\
                {rows}\
              </table>"
         )
