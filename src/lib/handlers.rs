@@ -3067,6 +3067,7 @@ fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
     pkt[0]      = BOOTSTRAP_REQUEST_OP;
     pkt[1..17].copy_from_slice(&invitation_id);
     pkt[17..49].copy_from_slice(&ephem_pk);
+    println!("[initiate_bootstrap] sending bootstrap request to {sg_addr}");
     send(ctx, SocketAddr::V4(sg_addr), &pkt);
 }
 
