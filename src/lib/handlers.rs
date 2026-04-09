@@ -1006,6 +1006,7 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     pkt.push(BOOTSTRAP_RESPONSE_OP);
     pkt.extend_from_slice(&nonce);
     pkt.extend_from_slice(&ciphertext);
+    println!("[bootstrap_request] sending bootstrap response to {src}");
     send(ctx, src, &pkt);
 }
 
@@ -1080,6 +1081,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
 
+    println!("[bootstrap_response] bootstrap complete, sending device registration to {sg_addr}");
     // Send DeviceRegistration: [op=0x32][invitation_id:16][nonce:24][encrypted device info]
     let (ciphertext, reg_nonce) = xchacha20_encrypt(&shared_secret, &device_reg_payload);
     let mut pkt = Vec::with_capacity(1 + 16 + 24 + ciphertext.len());
@@ -1141,7 +1143,7 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     {
         let mut node = ctx.node.write().unwrap();
         if !node.owner.user.devices.iter().any(|d| d.uuid == device.uuid) {
-            eprintln!("[device_registration] new device '{}' registered from {src}", device.alias);
+            println!("[device_registration] new device '{}' registered from {src}", device.alias);
             node.owner.user.devices.push(device);
         }
     }
