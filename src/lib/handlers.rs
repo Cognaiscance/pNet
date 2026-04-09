@@ -3886,12 +3886,13 @@ mod tests {
                 alias:   "peer".to_string(),
                 uuid:    generate_uuid(),
                 devices: vec![Device {
-                    alias:        "peer-device".to_string(),
-                    uuid:         device_uuid,
-                    grade:        DeviceGrade::SG,
-                    sg_rank:      Some(1),
-                    host:         "127.0.0.1:9999".parse().unwrap(),
-                    applications: Vec::new(),
+                    alias:           "peer-device".to_string(),
+                    uuid:            device_uuid,
+                    grade:           DeviceGrade::SG,
+                    sg_rank:         Some(1),
+                    host:            "127.0.0.1:9999".parse().unwrap(),
+                    public_hostname: None,
+                    applications:    Vec::new(),
                 }],
             },
         });
@@ -4061,12 +4062,13 @@ mod tests {
 
     fn make_sg_device(uuid: Uuid) -> Device {
         Device {
-            alias: "sg".to_string(),
+            alias:           "sg".to_string(),
             uuid,
-            grade: DeviceGrade::SG,
-            sg_rank: Some(1),
-            host: "127.0.0.1:9000".parse().unwrap(),
-            applications: Vec::new(),
+            grade:           DeviceGrade::SG,
+            sg_rank:         Some(1),
+            host:            "127.0.0.1:9000".parse().unwrap(),
+            public_hostname: None,
+            applications:    Vec::new(),
         }
     }
 
@@ -4088,12 +4090,13 @@ mod tests {
                     devices: vec![
                         make_sg_device(contact_sg_uuid),
                         Device {
-                            alias:   "dest".to_string(),
-                            uuid:    dest_uuid,
-                            grade:   DeviceGrade::DG,
-                            sg_rank: None,
-                            host:    "127.0.0.1:9001".parse().unwrap(),
-                            applications: Vec::new(),
+                            alias:           "dest".to_string(),
+                            uuid:            dest_uuid,
+                            grade:           DeviceGrade::DG,
+                            sg_rank:         None,
+                            host:            "127.0.0.1:9001".parse().unwrap(),
+                            public_hostname: None,
+                            applications:    Vec::new(),
                         },
                     ],
                 },
@@ -4272,12 +4275,13 @@ mod tests {
                     alias:   "contact".to_string(),
                     uuid:    generate_uuid(),
                     devices: vec![Device {
-                        alias:        "dest-dg".to_string(),
-                        uuid:         dest_device_uuid,
-                        grade:        DeviceGrade::DG,
-                        sg_rank:      None,
-                        host:         dest_addr,
-                        applications: Vec::new(),
+                        alias:           "dest-dg".to_string(),
+                        uuid:            dest_device_uuid,
+                        grade:           DeviceGrade::DG,
+                        sg_rank:         None,
+                        host:            dest_addr,
+                        public_hostname: None,
+                        applications:    Vec::new(),
                     }],
                 },
             });
@@ -4719,12 +4723,13 @@ mod tests {
                     alias:   "chad".to_string(),
                     uuid:    contact_user_uuid,
                     devices: vec![Device {
-                        alias:        "chad-sg".to_string(),
-                        uuid:         contact_sg_uuid,
-                        grade:        DeviceGrade::SG,
-                        sg_rank:      Some(1),
-                        host:         contact_sg_host,
-                        applications: Vec::new(),
+                        alias:           "chad-sg".to_string(),
+                        uuid:            contact_sg_uuid,
+                        grade:           DeviceGrade::SG,
+                        sg_rank:         Some(1),
+                        host:            contact_sg_host,
+                        public_hostname: None,
+                        applications:    Vec::new(),
                     }],
                 },
             });
@@ -4772,12 +4777,13 @@ mod tests {
         payload.push(1u8);                        // device_count
         // device: uuid + alias + grade(SG=1) + sg_rank(1) + ip + port
         push_device(&mut payload, &Device {
-            alias:        "chad-laptop".to_string(),
-            uuid:         new_device_uuid,
-            grade:        DeviceGrade::SG,
-            sg_rank:      Some(1),
-            host:         "127.0.0.1:8888".parse().unwrap(),
-            applications: Vec::new(),
+            alias:           "chad-laptop".to_string(),
+            uuid:            new_device_uuid,
+            grade:           DeviceGrade::SG,
+            sg_rank:         Some(1),
+            host:            "127.0.0.1:8888".parse().unwrap(),
+            public_hostname: None,
+            applications:    Vec::new(),
         });
         payload.push(1u8);              // app_count
         payload.extend_from_slice(&42u16.to_be_bytes()); // app id
@@ -4918,12 +4924,13 @@ mod tests {
                     alias:   "chad".to_string(),
                     uuid:    generate_uuid(),
                     devices: vec![Device {
-                        alias:        "chad-sg".to_string(),
-                        uuid:         contact_sg_uuid,
-                        grade:        DeviceGrade::SG,
-                        sg_rank:      Some(1),
-                        host:         contact_sg_addr,
-                        applications: Vec::new(),
+                        alias:           "chad-sg".to_string(),
+                        uuid:            contact_sg_uuid,
+                        grade:           DeviceGrade::SG,
+                        sg_rank:         Some(1),
+                        host:            contact_sg_addr,
+                        public_hostname: None,
+                        applications:    Vec::new(),
                     }],
                 },
             });
@@ -5015,12 +5022,13 @@ mod tests {
 
             // Add the DG to the owner's device list.
             node.owner.user.devices.push(Device {
-                alias:        "my-dg".to_string(),
-                uuid:         dg_uuid,
-                grade:        DeviceGrade::DG,
-                sg_rank:      None,
-                host:         dg_addr,
-                applications: Vec::new(),
+                alias:           "my-dg".to_string(),
+                uuid:            dg_uuid,
+                grade:           DeviceGrade::DG,
+                sg_rank:         None,
+                host:            dg_addr,
+                public_hostname: None,
+                applications:    Vec::new(),
             });
 
             // Active connection to the DG.
@@ -5064,12 +5072,13 @@ mod tests {
         {
             let mut node = t.ctx.node.write().unwrap();
             node.owner.user.devices.push(Device {
-                alias:        "my-phone".to_string(),
-                uuid:         new_device_uuid,
-                grade:        DeviceGrade::DG,
-                sg_rank:      None,
-                host:         "127.0.0.1:0".parse().unwrap(),
-                applications: Vec::new(),
+                alias:           "my-phone".to_string(),
+                uuid:            new_device_uuid,
+                grade:           DeviceGrade::DG,
+                sg_rank:         None,
+                host:            "127.0.0.1:0".parse().unwrap(),
+                public_hostname: None,
+                applications:    Vec::new(),
             });
         }
 
@@ -5128,12 +5137,13 @@ mod tests {
             // Add the receiver's own device to the sender's device list so it
             // appears in the payload (SG knows about this device).
             let dg_device = Device {
-                alias:        "my-dg".to_string(),
-                uuid:         receiver_uuid,
-                grade:        DeviceGrade::DG,
-                sg_rank:      None,
-                host:         "127.0.0.1:0".parse().unwrap(),
-                applications: Vec::new(), // SG has no apps for this device
+                alias:           "my-dg".to_string(),
+                uuid:            receiver_uuid,
+                grade:           DeviceGrade::DG,
+                sg_rank:         None,
+                host:            "127.0.0.1:0".parse().unwrap(),
+                public_hostname: None,
+                applications:    Vec::new(), // SG has no apps for this device
             };
             // Insert into the sender's node as well.
             drop(node);
@@ -5252,12 +5262,13 @@ mod tests {
             let mut node = t.ctx.node.write().unwrap();
             let peer_uuid = generate_uuid();
             node.owner.user.devices.push(Device {
-                alias:        "peer".to_string(),
-                uuid:         peer_uuid,
-                grade:        DeviceGrade::SG,
-                sg_rank:      Some(1),
-                host:         peer_addr,
-                applications: Vec::new(),
+                alias:           "peer".to_string(),
+                uuid:            peer_uuid,
+                grade:           DeviceGrade::SG,
+                sg_rank:         Some(1),
+                host:            peer_addr,
+                public_hostname: None,
+                applications:    Vec::new(),
             });
             node.owner.active_connections.insert(1, ActiveConnection {
                 id:                        1,
