@@ -115,6 +115,7 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     };
 
     ctx.save_node();
+    sync_devices(ctx);
 
     // Reply: [OK][token: 16 bytes]
     let mut reply = [0u8; 17];
@@ -197,6 +198,7 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     if found {
         ctx.save_node();
+        sync_devices(ctx);
         send(ctx, src, &[OK]);
     } else {
         send_error(ctx, src, ERR_TOKEN_UNKNOWN);
@@ -1577,10 +1579,15 @@ fn serialize_device_sync_payload(node: &super::data_models::Node) -> Vec<u8> {
     let mut buf = Vec::new();
     let user = &node.owner.user;
 
-    // Own device list (no apps — each device manages its own apps locally).
+    // Own device list with apps.
     buf.push(user.devices.len() as u8);
     for d in &user.devices {
         push_device(&mut buf, d);
+        buf.push(d.applications.len() as u8);
+        for a in &d.applications {
+            buf.extend_from_slice(&a.id.to_be_bytes());
+            push_str(&mut buf, &a.alias);
+        }
     }
 
     // Contact list with devices and apps.
@@ -1616,7 +1623,22 @@ fn deserialize_device_sync_payload(data: &[u8]) -> Option<DeviceSyncData> {
     let device_count = *data.get(pos)? as usize; pos += 1;
     let mut devices = Vec::new();
     for _ in 0..device_count {
-        devices.push(read_device(data, &mut pos)?);
+        let mut dev = read_device(data, &mut pos)?;
+        let app_count = *data.get(pos)? as usize; pos += 1;
+        for _ in 0..app_count {
+            let id_bytes: [u8; 2] = read_arr(data, &mut pos)?;
+            let id    = u16::from_be_bytes(id_bytes);
+            let alias = read_str(data, &mut pos)?;
+            dev.applications.push(Application {
+                id,
+                alias,
+                protocol:      String::new(),
+                host:          "0.0.0.0:0".parse().unwrap(),
+                user_approved: true,
+                token:         [0u8; 16],
+            });
+        }
+        devices.push(dev);
     }
 
     let contact_count = *data.get(pos)? as usize; pos += 1;
@@ -1654,13 +1676,15 @@ fn deserialize_device_sync_payload(data: &[u8]) -> Option<DeviceSyncData> {
 }
 
 /// Apply received device sync data to the node.
-/// Replaces all device and contact entries from the SG, but preserves the
-/// local device's own application list (managed locally, not pushed by the SG).
+/// Replaces all device and contact entries from the SG.  The local device's
+/// own application list is preserved: the SG's view of it may be stale if an
+/// app was just registered locally before the push arrived.
 fn apply_device_sync_data(data: DeviceSyncData, ctx: &WorkerContext) {
     let mut node = ctx.node.write().unwrap();
     let local_uuid = node.device_uuid;
 
-    // Preserve own apps before replacing the device list.
+    // Preserve own apps before replacing the device list; the local device is
+    // always authoritative for its own apps.
     let local_apps = node.owner.user.devices.iter()
         .find(|d| d.uuid == local_uuid)
         .map(|d| d.applications.clone())
@@ -1669,10 +1693,49 @@ fn apply_device_sync_data(data: DeviceSyncData, ctx: &WorkerContext) {
     node.owner.user.devices  = data.devices;
     node.owner.contact_users = data.contacts;
 
-    // Restore own app list — the SG doesn't track DG-local apps.
+    // Restore own app list.
     if let Some(d) = node.owner.user.devices.iter_mut().find(|d| d.uuid == local_uuid) {
         d.applications = local_apps;
     }
+}
+
+/// Parse an app list from a pull-request body: `[count: u8][ [id: u16][alias: u8+str] ... ]`.
+/// Returns an empty list if the body is empty or malformed.
+fn parse_app_list(data: &[u8]) -> Vec<Application> {
+    if data.is_empty() { return Vec::new(); }
+    let mut pos = 0usize;
+    let count = data[pos] as usize; pos += 1;
+    let mut apps = Vec::new();
+    for _ in 0..count {
+        let id_bytes: [u8; 2] = match read_arr(data, &mut pos) { Some(b) => b, None => break };
+        let id    = u16::from_be_bytes(id_bytes);
+        let alias = match read_str(data, &mut pos) { Some(s) => s, None => break };
+        apps.push(Application {
+            id,
+            alias,
+            protocol:      String::new(),
+            host:          "0.0.0.0:0".parse().unwrap(),
+            user_approved: true,
+            token:         [0u8; 16],
+        });
+    }
+    apps
+}
+
+/// Serialize the local device's app list for inclusion in a pull request body.
+fn serialize_own_app_list(node: &super::data_models::Node) -> Vec<u8> {
+    let local_uuid = node.device_uuid;
+    let apps: Vec<&Application> = node.owner.user.devices.iter()
+        .find(|d| d.uuid == local_uuid)
+        .map(|d| d.applications.iter().collect())
+        .unwrap_or_default();
+    let mut buf = Vec::new();
+    buf.push(apps.len() as u8);
+    for a in apps {
+        buf.extend_from_slice(&a.id.to_be_bytes());
+        push_str(&mut buf, &a.alias);
+    }
+    buf
 }
 
 /// Send a DeviceDataPush (0x62) to every own-user device (excluding self) that
@@ -1738,21 +1801,40 @@ pub fn device_data_push(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
 /// Op 0x63 — Device data pull request (device → own SG).
 ///
-/// Encrypted body: empty — active connection provides authentication.
+/// Encrypted body: `[app_count: u8][ [id: u16][alias: u8+str] ... ]`
 ///
-/// The SG replies with a DeviceDataPush containing the current device and
-/// contact lists.
+/// The sender includes its current app list so the SG can update its record.
+/// The SG replies with a DeviceDataPush containing the full device and contact lists.
 pub fn device_data_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let payload = {
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    // Decrypt and parse the sender's app list.
+    let sender_apps: Vec<Application> = {
         let node = ctx.node.read().unwrap();
-        if decrypt_packet_body(&node, &buf).is_none() {
+        let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
             eprintln!("[device_data_pull_request] decryption failed from {src}");
             return;
         };
+        parse_app_list(&plaintext)
+    };
+
+    // Update the sender device's app list in our node so the reply payload reflects it.
+    {
+        let mut node = ctx.node.write().unwrap();
+        let sender_uuid = node.owner.active_connections.get(&conn_id).map(|c| c.device_uuid);
+        if let Some(uuid) = sender_uuid {
+            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == uuid) {
+                dev.applications = sender_apps;
+            }
+        }
+    }
+    ctx.save_node();
+
+    let payload = {
+        let node = ctx.node.read().unwrap();
         serialize_device_sync_payload(&node)
     };
 
-    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
     let reply_pkt = {
         let node = ctx.node.read().unwrap();
         let Some(conn) = node.owner.active_connections.get(&conn_id) else {
@@ -1793,8 +1875,10 @@ pub fn sync_devices(ctx: &WorkerContext) {
         .find(|c| c.device_uuid == sg.uuid)
     else { return };
 
-    // Pull request body is empty; connection provides identity.
-    let pkt  = build_encrypted_packet(DEVICE_DATA_PULL_REQ_OP, conn, &[]);
+    // Pull request body carries the local device's app list so the SG can
+    // update its record before replying.
+    let body = serialize_own_app_list(&node);
+    let pkt  = build_encrypted_packet(DEVICE_DATA_PULL_REQ_OP, conn, &body);
     let dest = SocketAddr::V4(sg.host);
     drop(node);
 
@@ -2966,6 +3050,7 @@ fn approve_app(body: &[u8], ctx: &WorkerContext) {
     }
     ctx.save_node();
     push_data_to_contacts(ctx);
+    sync_devices(ctx);
 }
 
 fn reject_app(body: &[u8], ctx: &WorkerContext) {
@@ -2979,6 +3064,7 @@ fn reject_app(body: &[u8], ctx: &WorkerContext) {
     }
     ctx.save_node();
     push_data_to_contacts(ctx);
+    sync_devices(ctx);
 }
 
 // ── Invitation generation and bootstrap initiation ───────────────────────────
@@ -5211,8 +5297,8 @@ mod tests {
             }
         }
 
-        // DG sends an empty pull request.
-        let pkt = build_encrypted_packet(DEVICE_DATA_PULL_REQ_OP, &dg_conn, &[]);
+        // DG sends a pull request with an empty app list (no apps registered yet).
+        let pkt = build_encrypted_packet(DEVICE_DATA_PULL_REQ_OP, &dg_conn, &[0u8]);
         device_data_pull_request(SocketAddr::V4(dg_addr), pkt[1..].to_vec(), &t.ctx);
 
         // DG socket should receive a DeviceDataPush.
