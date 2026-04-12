@@ -570,6 +570,8 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let key_pair = generate_x25519_keypair();
         let pk_copy  = key_pair.public_key;
         let sk_copy  = node.owner.key_pair.private_key;
+        // Evict any stale connections to this device before inserting the new one.
+        node.owner.active_connections.retain(|_, c| c.device_uuid != initiator_device_uuid);
         node.owner.active_connections.insert(conn_id, ActiveConnection {
             id:                        conn_id,
             timeout:                   SystemTime::now() + CONNECTION_LIFETIME,
@@ -632,6 +634,9 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
 
     println!("[connect_ack] connection established with {src} (peer {:02x?})", &pending.peer_device_uuid[..4]);
+    // Evict any stale connections to this device before inserting the new one.
+    let peer_uuid = pending.peer_device_uuid;
+    node.owner.active_connections.retain(|_, c| c.device_uuid != peer_uuid);
     node.owner.active_connections.insert(our_conn_id, ActiveConnection {
         id:                        our_conn_id,
         timeout:                   SystemTime::now() + CONNECTION_LIFETIME,
