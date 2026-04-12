@@ -2740,6 +2740,10 @@ pub fn ui_request(
         }
         ("GET",  "/contacts")      => respond_html(&stream, 200, &render_contacts(ctx)),
         ("GET",  "/devices")       => respond_html(&stream, 200, &render_devices(ctx)),
+        ("POST", "/devices/sync")  => {
+            sync_devices(ctx);
+            respond_redirect(&stream, "/devices");
+        }
         ("GET",  "/invitations")   => respond_html(&stream, 200, &render_invitations(ctx, &query)),
         ("POST", "/invitations/device") => {
             let code = generate_device_invitation(ctx).unwrap_or_default();
@@ -3021,11 +3025,19 @@ fn render_devices(ctx: &WorkerContext) -> String {
         })
         .collect();
 
+    let heading = "\
+        <div style='display:flex;align-items:center;justify-content:space-between;margin-bottom:.75rem'>\
+          <h1 style='margin:0'>Devices</h1>\
+          <form method='post' action='/devices/sync'>\
+            <button type='submit'>Sync</button>\
+          </form>\
+        </div>";
+
     let body = if rows.is_empty() {
-        "<h1>Devices</h1><p class='empty'>No devices.</p>".to_string()
+        format!("{heading}<p class='empty'>No devices.</p>")
     } else {
         format!(
-            "<h1>Devices</h1>\
+            "{heading}\
              <table>\
                <tr><th>Alias</th><th>Host</th><th>Apps</th></tr>\
                {rows}\
