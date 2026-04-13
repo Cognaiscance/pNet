@@ -411,20 +411,16 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             // ── Direct path (this node has an active connection to dest) ──────
             // When the local device is an SG it may already hold a direct
             // connection to the destination DG.  Skip the relay and send an
-            // AppPacket straight to the destination.
+            // AppPacket straight to the destination using the peer's actual
+            // source address (not the potentially-stale d.host).
             let mut app_body = Vec::with_capacity(4 + payload.len());
             app_body.extend_from_slice(&dest_app_id.to_be_bytes());
             app_body.extend_from_slice(&sender_app_id.to_be_bytes());
             app_body.extend_from_slice(payload);
 
-            let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
-
-            let dest_host = node.owner.user.devices.iter()
-                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
-                .find(|d| d.uuid == dest_device_uuid)
-                .map(|d| d.host);
-
-            dest_host.map(|h| (pkt, SocketAddr::V4(h)))
+            let pkt  = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
+            let dest = dest_conn.peer_addr;
+            Some((pkt, dest))
         } else {
             // ── Standard relay path ───────────────────────────────────────────
             // Prefer the recipient's top-ranked SG (only one with a keep-alive
@@ -600,6 +596,7 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             peer_public_key:           initiator_ephemeral_pk,
             peer_active_connection_id: initiator_conn_id,
             device_uuid:               initiator_device_uuid,
+            peer_addr:                 src,
         });
         (conn_id, pk_copy, sk_copy)
     };
@@ -670,6 +667,7 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         peer_public_key:           responder_ephemeral_pk,
         peer_active_connection_id: responder_conn_id,
         device_uuid:               pending.peer_device_uuid,
+        peer_addr:                 src,
     });
     drop(node);
 
@@ -2466,6 +2464,7 @@ pub fn tunnel_connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext
                 peer_public_key:           sender_ephem_pk,
                 peer_active_connection_id: 0, // not used for tunnel decryption
                 device_uuid:               sender_device_uuid,
+                peer_addr:                 src,
             });
             node.owner.dg_tunnel_map.insert(tunnel_id, conn_id);
             (conn_id, pk_copy)
@@ -2560,6 +2559,7 @@ pub fn tunnel_connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             peer_public_key:           dest_ephem_pk,
             peer_active_connection_id: 0, // not used for tunnel packets
             device_uuid:               ptc.dest_device_uuid,
+            peer_addr:                 src,
         });
         node.owner.dg_tunnel_map.insert(tunnel_id, ptc.our_conn_id);
     } else {
@@ -4371,6 +4371,7 @@ mod tests {
                 peer_public_key: generate_key_bytes(),
                 peer_active_connection_id: 10,
                 device_uuid: slow_uuid,
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
             node.owner.active_connections.insert(2, ActiveConnection {
                 id: 2,
@@ -4379,6 +4380,7 @@ mod tests {
                 peer_public_key: generate_key_bytes(),
                 peer_active_connection_id: 20,
                 device_uuid: fast_uuid,
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
             node.sg_statuses.insert(slow_uuid, super::super::data_models::SgStatus {
                 up: true,
@@ -4412,6 +4414,7 @@ mod tests {
                 peer_public_key: generate_key_bytes(),
                 peer_active_connection_id: 10,
                 device_uuid: sg_uuid,
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
             // No sg_statuses entry — PollSG hasn't run.
         }
@@ -4438,6 +4441,7 @@ mod tests {
             peer_public_key:           receiver_kp.public_key,
             peer_active_connection_id: 7,
             device_uuid:               generate_uuid(),
+        peer_addr:   "127.0.0.1:0".parse().unwrap(),
         };
         let plaintext = b"hello relay";
         let pkt = build_encrypted_packet(RELAY_PACKET_OP, &conn, plaintext);
@@ -4457,6 +4461,7 @@ mod tests {
                 peer_public_key:           sender_kp.public_key,
                 peer_active_connection_id: 1,
                 device_uuid:               generate_uuid(),
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
         }
 
@@ -4501,6 +4506,7 @@ mod tests {
                 peer_public_key:           dg_sender_kp.public_key,
                 peer_active_connection_id: 10, // sender DG's local conn id
                 device_uuid:               generate_uuid(),
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
 
             // SG active connection #2: toward dest DG.
@@ -4511,6 +4517,7 @@ mod tests {
                 peer_public_key:           dest_kp.public_key,
                 peer_active_connection_id: 20, // dest DG's local conn id
                 device_uuid:               dest_device_uuid,
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
 
             // Dest device must be in the node's known devices/contacts.
@@ -4549,6 +4556,7 @@ mod tests {
             peer_public_key:           sg_from_dg_kp.public_key,
             peer_active_connection_id: 1, // SG's local conn ID
             device_uuid:               generate_uuid(),
+        peer_addr:   "127.0.0.1:0".parse().unwrap(),
         };
         let relay_pkt = build_encrypted_packet(RELAY_PACKET_OP, &sender_side_conn, &relay_body);
 
@@ -4568,6 +4576,7 @@ mod tests {
             peer_public_key:           sg_to_dest_kp.public_key,
             peer_active_connection_id: 2,
             device_uuid:               generate_uuid(),
+        peer_addr:   "127.0.0.1:0".parse().unwrap(),
         };
         let t2 = TestCtx::new();
         {
@@ -4579,6 +4588,7 @@ mod tests {
                 peer_public_key:           dest_side_conn.peer_public_key,
                 peer_active_connection_id: dest_side_conn.peer_active_connection_id,
                 device_uuid:               dest_side_conn.device_uuid,
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
         }
         let node     = t2.ctx.node.read().unwrap();
@@ -4626,6 +4636,7 @@ mod tests {
                 peer_public_key:           sg_kp.public_key,
                 peer_active_connection_id: 99,
                 device_uuid:               generate_uuid(),
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
         }
 
@@ -4643,6 +4654,7 @@ mod tests {
             peer_public_key:           local_kp.public_key,
             peer_active_connection_id: 5,
             device_uuid:               generate_uuid(),
+        peer_addr:   "127.0.0.1:0".parse().unwrap(),
         };
         let pkt = build_encrypted_packet(APP_PACKET_OP, &sg_side, &body);
 
@@ -4987,6 +4999,7 @@ mod tests {
                 peer_public_key:           sender_kp.public_key,
                 peer_active_connection_id: 42,
                 device_uuid:               contact_sg_uuid,
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
         }
 
@@ -4998,6 +5011,7 @@ mod tests {
             peer_public_key:           sg_kp.public_key,
             peer_active_connection_id: conn_id,
             device_uuid:               contact_sg_uuid,
+        peer_addr:   "127.0.0.1:0".parse().unwrap(),
         };
 
         (conn_id, sender_conn)
@@ -5118,6 +5132,7 @@ mod tests {
             peer_public_key:           sender_conn.peer_public_key,
             peer_active_connection_id: sender_conn.peer_active_connection_id,
             device_uuid:               sender_conn.device_uuid,
+        peer_addr:   "127.0.0.1:0".parse().unwrap(),
         });
         let plaintext = decrypt_packet_body(&reply_node, &buf[1..len])
             .expect("reply decryption failed");
@@ -5186,6 +5201,7 @@ mod tests {
                 peer_public_key:           generate_key_bytes(),
                 peer_active_connection_id: 10,
                 device_uuid:               contact_sg_uuid,
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
         }
 
@@ -5284,6 +5300,7 @@ mod tests {
                 peer_public_key:           dg_kp.public_key,
                 peer_active_connection_id: 99,
                 device_uuid:               dg_uuid,
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
         }
 
@@ -5295,6 +5312,7 @@ mod tests {
             peer_public_key:           sg_kp.public_key,
             peer_active_connection_id: conn_id,
             device_uuid:               dg_uuid,
+        peer_addr:   "127.0.0.1:0".parse().unwrap(),
         };
 
         (dg_uuid, dg_addr, dg_conn)
@@ -5344,6 +5362,7 @@ mod tests {
                 peer_public_key:           sender_conn.peer_public_key,
                 peer_active_connection_id: sender_conn.peer_active_connection_id,
                 device_uuid:               sender_conn.device_uuid,
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
         }
 
@@ -5408,6 +5427,7 @@ mod tests {
                 peer_public_key:           sender_conn.peer_public_key,
                 peer_active_connection_id: sender_conn.peer_active_connection_id,
                 device_uuid:               sender_conn.device_uuid,
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
         }
 
@@ -5458,6 +5478,7 @@ mod tests {
             peer_public_key:           dg_conn.peer_public_key,
             peer_active_connection_id: dg_conn.peer_active_connection_id,
             device_uuid:               dg_conn.device_uuid,
+        peer_addr:   "127.0.0.1:0".parse().unwrap(),
         });
         let plaintext = decrypt_packet_body(&reply_node, &buf[1..len])
             .expect("reply decryption failed");
@@ -5522,6 +5543,7 @@ mod tests {
                 peer_public_key:           generate_key_bytes(),
                 peer_active_connection_id: 10,
                 device_uuid:               peer_uuid,
+            peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
         }
 

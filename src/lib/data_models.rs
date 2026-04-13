@@ -164,6 +164,10 @@ pub struct ActiveConnection {
     pub peer_public_key:           PublicKey,
     pub peer_active_connection_id: u16,
     pub device_uuid:               Uuid,
+    /// The actual source address of the peer's last connection packet.
+    /// Used for direct sends (e.g. SG → DG AppPacket) instead of the
+    /// potentially-stale `d.host` stored at device-registration time.
+    pub peer_addr:                 std::net::SocketAddr,
 }
 
 /// A half-open connection: we sent a ConnectRequest and are waiting for a ConnectAck.
