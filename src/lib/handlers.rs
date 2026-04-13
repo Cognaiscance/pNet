@@ -449,6 +449,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 const SG_PING_OP:          u8 = 0x10;
 const SG_PONG_OP:          u8 = 0x11;
 const DG_KEEPALIVE_OP:     u8 = 0x12;
+const CONN_RESET_OP:       u8 = 0x13;
 const CONNECT_REQUEST_OP:  u8 = 0x20;
 const CONNECT_ACK_OP:      u8 = 0x21;
 const BOOTSTRAP_REQUEST_OP:  u8 = 0x30;
@@ -2696,13 +2697,17 @@ pub fn cleanup_tunnels(ctx: &WorkerContext) {
 
 /// Scheduled every 20 seconds on DG devices.
 ///
-/// Sends a 1-byte packet (op `0x12`) to the highest-ranked reachable SG owned
-/// by this device's user, keeping the NAT mapping alive so that SG can push
-/// packets back. Only one SG receives the keep-alive at a time: the top-ranked
-/// SG that is currently marked up by `poll_sg`. If the top-ranked SG is down,
-/// falls through to the next rank.
+/// Sends an encrypted keepalive packet (op `0x12`) to the highest-ranked
+/// reachable SG owned by this device's user.  Encrypting the keepalive with
+/// the DG↔SG shared key lets the SG detect a stale/unknown connection and
+/// reply with a conn-reset (op `0x13`) so the DG can reconnect immediately
+/// instead of waiting up to 24 hours for the connection to expire.
+///
+/// Only one SG receives the keepalive at a time: the top-ranked SG that is
+/// currently marked up by `poll_sg`. If the top-ranked SG is down, falls
+/// through to the next rank.
 pub fn keepalive_dg(ctx: &WorkerContext) {
-    let target: Option<SocketAddrV4> = {
+    let out: Option<(Vec<u8>, SocketAddr)> = {
         let node       = ctx.node.read().unwrap();
         let local_uuid = node.device_uuid;
 
@@ -2725,13 +2730,71 @@ pub fn keepalive_dg(ctx: &WorkerContext) {
         own_sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
 
         // Pick the highest-ranked SG that poll_sg considers up (treat unpolled as up).
-        own_sgs.iter()
+        let Some(sg) = own_sgs.iter()
             .find(|d| node.sg_statuses.get(&d.uuid).map(|s| s.up).unwrap_or(true))
-            .map(|d| d.host)
+        else { return; };
+
+        // Find the active connection to that SG.
+        let Some(conn) = node.owner.active_connections.values()
+            .find(|c| c.device_uuid == sg.uuid)
+        else { return; };
+
+        // Encrypt an empty plaintext so the SG can verify the connection is live.
+        let pkt = build_encrypted_packet(DG_KEEPALIVE_OP, conn, &[]);
+        Some((pkt, SocketAddr::V4(sg.host)))
     };
 
-    if let Some(host) = target {
-        send(ctx, SocketAddr::V4(host), &[DG_KEEPALIVE_OP]);
+    if let Some((pkt, dest)) = out {
+        send(ctx, dest, &pkt);
+    }
+}
+
+/// Op 0x12 — DG encrypted keepalive, received on the SG side.
+///
+/// Attempts to decrypt the keepalive using the named connection.  If the
+/// conn_id is unknown or decryption fails the SG replies with a conn-reset
+/// (op `0x13`) so the DG evicts the stale connection and reconnects.
+pub fn dg_keepalive_receive(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let ok = {
+        let node = ctx.node.read().unwrap();
+        decrypt_packet_body(&node, &buf).is_some()
+    };
+    if !ok {
+        send(ctx, src, &[CONN_RESET_OP]);
+    }
+}
+
+/// Op 0x13 — SG conn-reset, received on the DG side.
+///
+/// The SG couldn't decrypt our keepalive, meaning it has no record of this
+/// connection (e.g. it restarted).  Evict all active connections whose device
+/// lives at the SG's IP so that `maintain_connections` can establish fresh ones.
+pub fn conn_reset(src: SocketAddr, ctx: &WorkerContext) {
+    let src_ip = match ipv4_from(src) {
+        Some(ip) => ip,
+        None => return,
+    };
+
+    let evicted = {
+        let mut node = ctx.node.write().unwrap();
+
+        // Collect UUIDs of devices living at src_ip.
+        let stale: Vec<Uuid> = node.owner.user.devices.iter()
+            .chain(node.owner.contact_users.iter().flat_map(|cu| cu.user.devices.iter()))
+            .filter(|d| *d.host.ip() == src_ip)
+            .map(|d| d.uuid)
+            .collect();
+
+        let before = node.owner.active_connections.len();
+        node.owner.active_connections.retain(|_, c| !stale.contains(&c.device_uuid));
+        node.owner.active_connections.len() < before
+    };
+
+    if evicted {
+        ctx.scheduler_tx.send(super::action_queue::ScheduleRequest {
+            action: super::action_queue::Action::MaintainConnections,
+            delay:  Duration::ZERO,
+        }).ok();
     }
 }
 
