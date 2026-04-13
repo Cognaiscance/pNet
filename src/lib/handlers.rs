@@ -1925,7 +1925,9 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         None
     };
 
-    let (pkt, dest, dest_uuid) = {
+    // Decrypt and parse the body into owned values so we can branch on dest after
+    // releasing the lock.
+    let (local_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload) = {
         let node = ctx.node.read().unwrap();
 
         let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
@@ -1941,7 +1943,36 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let dest_device_uuid: Uuid = plaintext[0..16].try_into().unwrap();
         let dest_app_id            = u16::from_be_bytes([plaintext[16], plaintext[17]]);
         let sender_app_id          = u16::from_be_bytes([plaintext[18], plaintext[19]]);
-        let payload                = &plaintext[20..];
+        let payload                = plaintext[20..].to_vec();
+
+        (node.device_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload)
+    };
+
+    // If the destination is this device (i.e. the SG is both relay and recipient),
+    // deliver directly to the local app without going through active_connections.
+    if dest_device_uuid == local_uuid {
+        let app_host = {
+            let node = ctx.node.read().unwrap();
+            node.owner.user.devices.iter()
+                .find(|d| d.uuid == local_uuid)
+                .and_then(|d| d.applications.iter()
+                    .find(|a| a.id == dest_app_id && a.user_approved))
+                .map(|a| a.host)
+        };
+        let Some(app_host) = app_host else {
+            eprintln!("[relay_packet] no approved local app with id {dest_app_id}");
+            return;
+        };
+        let mut push = Vec::with_capacity(3 + payload.len());
+        push.push(APP_PUSH_OP);
+        push.extend_from_slice(&sender_app_id.to_be_bytes());
+        push.extend_from_slice(&payload);
+        send(ctx, SocketAddr::V4(app_host), &push);
+        return;
+    }
+
+    let (pkt, dest, dest_uuid) = {
+        let node = ctx.node.read().unwrap();
 
         // Find active connection to destination.
         let Some(dest_conn) = node.owner.active_connections.values()
@@ -1965,7 +1996,7 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let mut app_body = Vec::with_capacity(4 + payload.len());
         app_body.extend_from_slice(&dest_app_id.to_be_bytes());
         app_body.extend_from_slice(&sender_app_id.to_be_bytes());
-        app_body.extend_from_slice(payload);
+        app_body.extend_from_slice(&payload);
 
         let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
         (pkt, SocketAddr::V4(dest_host), dest_device_uuid)
