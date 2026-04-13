@@ -15,7 +15,6 @@ use super::data_models::{
 const OK:                u8 = 0x00;
 const ERR_BAD_PACKET:    u8 = 0x01;
 const ERR_TOKEN_UNKNOWN: u8 = 0x02;
-const ERR_NO_ROUTE:      u8 = 0x03;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -593,6 +592,11 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let sig = ed25519_sign(&our_longterm_sk, &pkt[0..37]);
     pkt[37..101].copy_from_slice(&sig);
     send(ctx, src, &pkt);
+
+    // Push fresh device data to all connected own devices now that this one
+    // has just joined.  Safe to call even if the connection list is small;
+    // sync_devices guards against non-SG callers internally.
+    sync_devices(ctx);
 }
 
 /// Op 0x21 — Acknowledgement from a peer node in response to our ConnectRequest.
@@ -645,6 +649,11 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         peer_active_connection_id: responder_conn_id,
         device_uuid:               pending.peer_device_uuid,
     });
+    drop(node);
+
+    // Pull fresh device data from the SG now that the connection is live.
+    // This corrects any stale app counts that persisted from a previous session.
+    sync_devices(ctx);
 }
 
 // ── Bootstrap crypto helpers ──────────────────────────────────────────────────
