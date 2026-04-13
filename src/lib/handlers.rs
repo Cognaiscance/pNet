@@ -265,6 +265,7 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     reply.extend_from_slice(&app.host.port().to_be_bytes());
     reply.push(app.user_approved as u8);
     reply.extend_from_slice(&app.token);
+    reply.extend_from_slice(&device_uuid);
 
     // Owner alias and UUID.
     push_str(&mut reply, &node.owner.user.alias);
