@@ -384,7 +384,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 });
             let Some(sg_conn) = sg_conn else {
                 eprintln!("[app_send_packet] no reachable SG for tunnel dest {:?}", dest_device_uuid);
-                return send_error(ctx, src, ERR_NO_ROUTE);
+                return;
             };
 
             // `peer_active_connection_id` is the SG's local conn_id for this DG's connection.
@@ -416,7 +416,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 });
             let Some(sg_conn) = sg_conn else {
                 eprintln!("[app_send_packet] no reachable SG for dest {:?}", dest_device_uuid);
-                return send_error(ctx, src, ERR_NO_ROUTE);
+                return;
             };
 
             let sg_uuid = sg_conn.device_uuid;
