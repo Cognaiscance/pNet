@@ -405,6 +405,26 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 .map(|d| d.host);
 
             sg_host.map(|h| (pkt, SocketAddr::V4(h)))
+        } else if let Some(dest_conn) = node.owner.active_connections.values()
+            .find(|c| c.device_uuid == dest_device_uuid)
+        {
+            // ── Direct path (this node has an active connection to dest) ──────
+            // When the local device is an SG it may already hold a direct
+            // connection to the destination DG.  Skip the relay and send an
+            // AppPacket straight to the destination.
+            let mut app_body = Vec::with_capacity(4 + payload.len());
+            app_body.extend_from_slice(&dest_app_id.to_be_bytes());
+            app_body.extend_from_slice(&sender_app_id.to_be_bytes());
+            app_body.extend_from_slice(payload);
+
+            let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
+
+            let dest_host = node.owner.user.devices.iter()
+                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
+                .find(|d| d.uuid == dest_device_uuid)
+                .map(|d| d.host);
+
+            dest_host.map(|h| (pkt, SocketAddr::V4(h)))
         } else {
             // ── Standard relay path ───────────────────────────────────────────
             // Prefer the recipient's top-ranked SG (only one with a keep-alive
