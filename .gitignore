@@ -1,2 +1,3 @@
 /target
 .claude/
+docker-compose.yml

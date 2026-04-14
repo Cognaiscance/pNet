@@ -1,0 +1,54 @@
+networks:
+  net-william:
+  net-chad:
+
+services:
+  sg-william:
+    build: .
+    restart: unless-stopped
+    networks:
+      - net-william
+    ports:
+      - "7777:7777/udp"
+      - "8777:8777/tcp"
+    volumes:
+      - /opt/pnet/william:/root/.pnet
+
+  deliverer-william:
+    build: ../pnet_deliverer
+    restart: unless-stopped
+    networks:
+      - net-william
+    environment:
+      - PNET_ADDR=sg-william:7777
+    ports:
+      - "3000:3000/tcp"
+    volumes:
+      - /opt/pnet-deliverer/william:/app
+    depends_on:
+      - sg-william
+
+  sg-chad:
+    build: .
+    restart: unless-stopped
+    networks:
+      - net-chad
+    ports:
+      - "7778:7777/udp"
+      - "8778:8777/tcp"
+    volumes:
+      - /opt/pnet/chad:/root/.pnet
+
+  deliverer-chad:
+    build: ../pnet_deliverer
+    restart: unless-stopped
+    networks:
+      - net-chad
+    environment:
+      - PNET_ADDR=sg-chad:7777
+    ports:
+      - "3001:3000/tcp"
+    volumes:
+      - /opt/pnet-deliverer/chad:/app
+    depends_on:
+      - sg-chad
