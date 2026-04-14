@@ -65,17 +65,16 @@ fn main() {
     }
 
     // ── 8. Start HTTP server ─────────────────────────────────────────────────
-    // SG devices bind on all interfaces so remote pNet nodes can reach the admin
-    // API. DG devices bind on loopback only.
+    // SG devices (and uninitialized nodes awaiting setup) bind on all interfaces
+    // so the admin UI is reachable. DG devices bind on loopback only.
     let http_bind = {
         let n = node.read().unwrap();
         let device_uuid = n.device_uuid;
         let local_device = n.owner.user.devices.iter()
-            .find(|d| d.uuid == device_uuid)
-            .expect("local device not found in node");
-        match local_device.grade {
-            DeviceGrade::SG => std::net::Ipv4Addr::UNSPECIFIED,
-            DeviceGrade::DG => std::net::Ipv4Addr::LOCALHOST,
+            .find(|d| d.uuid == device_uuid);
+        match local_device.map(|d| &d.grade) {
+            Some(DeviceGrade::DG) => std::net::Ipv4Addr::LOCALHOST,
+            _ => std::net::Ipv4Addr::UNSPECIFIED,
         }
     };
     let http = HttpServer::start(http_bind, 8777, Arc::clone(&queue), Arc::clone(&stop));
