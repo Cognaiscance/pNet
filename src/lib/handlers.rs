@@ -616,6 +616,7 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // has just joined.  Safe to call even if the connection list is small;
     // sync_devices guards against non-SG callers internally.
     sync_devices(ctx);
+    push_data_to_contacts(ctx);
 }
 
 /// Op 0x21 — Acknowledgement from a peer node in response to our ConnectRequest.
@@ -674,6 +675,7 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // Pull fresh device data from the SG now that the connection is live.
     // This corrects any stale app counts that persisted from a previous session.
     sync_devices(ctx);
+    push_data_to_contacts(ctx);
 }
 
 // ── Bootstrap crypto helpers ──────────────────────────────────────────────────
@@ -4062,6 +4064,7 @@ mod tests {
         assert_eq!(user_approved, 0); // not yet approved
         let token_back: [u8; 16] = reply[pos..pos + 16].try_into().unwrap(); pos += 16;
         assert_eq!(token_back, token.as_slice());
+        pos += 16; // local device uuid
 
         // Owner alias + uuid.
         let owner_alias = read_str(&reply, &mut pos).unwrap();
