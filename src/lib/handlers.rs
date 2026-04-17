@@ -1468,8 +1468,8 @@ fn push_data_to_contacts(ctx: &WorkerContext) {
         else { continue };
 
         let pkt = build_encrypted_packet(CONTACT_DATA_PUSH_OP, conn, &payload);
-        println!("[push_data_to_contacts] pushing to {} at {}", contact.user.alias, sg.host);
-        packets.push((pkt, SocketAddr::V4(sg.host)));
+        println!("[push_data_to_contacts] pushing to {} at {}", contact.user.alias, conn.peer_addr);
+        packets.push((pkt, conn.peer_addr));
     }
     drop(node);
 
@@ -1588,7 +1588,7 @@ pub fn sync_contacts(ctx: &WorkerContext) {
         else { continue };
 
         let pkt = build_encrypted_packet(CONTACT_DATA_PULL_REQ_OP, conn, &our_uuid);
-        packets.push((pkt, SocketAddr::V4(sg.host)));
+        packets.push((pkt, conn.peer_addr));
     }
     drop(node);
 
@@ -5022,7 +5022,7 @@ mod tests {
                 peer_public_key:           sender_kp.public_key,
                 peer_active_connection_id: 42,
                 device_uuid:               contact_sg_uuid,
-            peer_addr:   "127.0.0.1:0".parse().unwrap(),
+                peer_addr:                 SocketAddr::V4(contact_sg_host),
             });
         }
 
