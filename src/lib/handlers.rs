@@ -19,7 +19,9 @@ const ERR_TOKEN_UNKNOWN: u8 = 0x02;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn send(ctx: &WorkerContext, dest: SocketAddr, data: &[u8]) {
-    ctx.udp_socket.send_to(data, dest).ok();
+    if let Err(e) = ctx.udp_socket.send_to(data, dest) {
+        eprintln!("[send] send_to {dest} failed: {e}");
+    }
 }
 
 fn send_error(ctx: &WorkerContext, dest: SocketAddr, code: u8) {
@@ -1505,6 +1507,7 @@ fn apply_contact_data(data: ContactData, ctx: &WorkerContext) {
 ///
 /// Updates the sender's entry in the receiver's contact list.
 pub fn contact_data_push(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    println!("[contact_data_push] handling from {src} (len={})", buf.len());
     let node = ctx.node.read().unwrap();
     let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
         eprintln!("[contact_data_push] decryption failed from {src}");
