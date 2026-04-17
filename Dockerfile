@@ -5,5 +5,7 @@ COPY src ./src
 RUN cargo build --release
 
 FROM debian:bookworm-slim
+EXPOSE 7777/udp
+EXPOSE 8777/tcp
 COPY --from=builder /build/target/release/pnet /usr/local/bin/pnet
 CMD ["pnet"]
