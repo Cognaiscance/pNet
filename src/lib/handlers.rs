@@ -1466,6 +1466,7 @@ fn push_data_to_contacts(ctx: &WorkerContext) {
         else { continue };
 
         let pkt = build_encrypted_packet(CONTACT_DATA_PUSH_OP, conn, &payload);
+        println!("[push_data_to_contacts] pushing to {} at {}", contact.user.alias, sg.host);
         packets.push((pkt, SocketAddr::V4(sg.host)));
     }
     drop(node);
@@ -1516,6 +1517,7 @@ pub fn contact_data_push(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     };
 
+    println!("[contact_data_push] received from {src}");
     apply_contact_data(data, ctx);
     ctx.save_node();
     push_data_to_devices(ctx);
@@ -3102,11 +3104,26 @@ fn render_contacts(ctx: &WorkerContext) -> String {
     let contacts = &node.owner.contact_users;
 
     let rows: String = contacts.iter()
-        .map(|c| format!(
-            "<tr><td>{}</td><td>{}</td></tr>",
-            html_escape(&c.user.alias),
-            c.user.devices.len(),
-        ))
+        .map(|c| {
+            let dev_cells: String = c.user.devices.iter().map(|d| {
+                let app_count = d.applications.iter().filter(|a| a.user_approved).count();
+                format!(
+                    "<li style='font-size:.85rem'>{} — {} app{}</li>",
+                    html_escape(&d.alias),
+                    app_count,
+                    if app_count == 1 { "" } else { "s" },
+                )
+            }).collect();
+            let dev_list = if c.user.devices.is_empty() {
+                "<span style='color:#999;font-size:.85rem'>no devices</span>".to_string()
+            } else {
+                format!("<ul style='margin:0;padding-left:1.2rem'>{dev_cells}</ul>")
+            };
+            format!(
+                "<tr><td>{}</td><td>{dev_list}</td></tr>",
+                html_escape(&c.user.alias),
+            )
+        })
         .collect();
 
     let table = if rows.is_empty() {
@@ -3114,7 +3131,7 @@ fn render_contacts(ctx: &WorkerContext) -> String {
     } else {
         format!(
             "<table>\
-               <tr><th>Alias</th><th>Devices</th></tr>\
+               <tr><th>Alias</th><th>Devices &amp; Apps</th></tr>\
                {rows}\
              </table>"
         )
