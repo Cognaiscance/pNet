@@ -69,13 +69,13 @@ fn main() {
     // so the admin UI is reachable. DG devices bind on loopback only.
     let http_bind = {
         let n = node.read().unwrap();
-        let device_uuid = n.device_uuid;
-        let local_device = n.owner.user.devices.iter()
-            .find(|d| d.uuid == device_uuid);
-        match local_device.map(|d| &d.grade) {
-            Some(DeviceGrade::DG) => std::net::Ipv4Addr::LOCALHOST,
-            _ => std::net::Ipv4Addr::UNSPECIFIED,
-        }
+        let is_dg = n.is_initialized() && {
+            let device_uuid = n.device_uuid;
+            n.owner.user.devices.iter()
+                .find(|d| d.uuid == device_uuid)
+                .map_or(false, |d| matches!(d.grade, DeviceGrade::DG))
+        };
+        if is_dg { std::net::Ipv4Addr::LOCALHOST } else { std::net::Ipv4Addr::UNSPECIFIED }
     };
     let http = HttpServer::start(http_bind, 8777, Arc::clone(&queue), Arc::clone(&stop));
 
