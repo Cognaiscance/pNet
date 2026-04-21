@@ -15,7 +15,9 @@ services:
       - /opt/pnet/william:/root/.pnet
 
   deliverer-william:
-    build: ../pnet_deliverer
+    build:
+      context: .
+      dockerfile: apps/pnet_deliverer/Dockerfile
     restart: unless-stopped
     networks:
       - net-william
@@ -40,7 +42,9 @@ services:
       - /opt/pnet/chad:/root/.pnet
 
   deliverer-chad:
-    build: ../pnet_deliverer
+    build:
+      context: .
+      dockerfile: apps/pnet_deliverer/Dockerfile
     restart: unless-stopped
     networks:
       - net-chad
