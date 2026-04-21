@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "apps/*"]
+
 [package]
 name = "pnet"
 version = "0.1.0"
