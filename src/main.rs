@@ -20,11 +20,47 @@ fn data_dir() -> PathBuf {
     PathBuf::from(home).join(".pnet").join("data")
 }
 
+/// Parse the `PNET_HOSTS` env var into an advertised-hostname list.
+/// Comma-separated entries with optional `:port` suffix (default 7777).
+/// Returns empty vec if unset or contains only whitespace.
+fn parse_pnet_hosts() -> Vec<String> {
+    std::env::var("PNET_HOSTS")
+        .ok()
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Overwrite the local device's `hosts` list with the parsed `PNET_HOSTS`
+/// entries, if the node is already set up and the local device is SG-grade.
+/// Called on every startup — `PNET_HOSTS` is authoritative when set.
+fn apply_pnet_hosts(node: &Arc<RwLock<lib::data_models::Node>>, hosts: &[String]) {
+    if hosts.is_empty() { return; }
+    let mut n = node.write().unwrap();
+    if !n.is_initialized() { return; }
+    let local_uuid = n.device_uuid;
+    let Some(dev) = n.owner.user.devices.iter_mut().find(|d| d.uuid == local_uuid) else { return };
+    if !matches!(dev.grade, DeviceGrade::SG) { return; }
+    dev.hosts = hosts.to_vec();
+}
+
 fn main() {
     // ── 1. Load data from disk ───────────────────────────────────────────────
     let dir = data_dir();
     std::fs::create_dir_all(&dir).expect("could not create data directory");
     let node = Arc::new(RwLock::new(persistence::load(&dir)));
+
+    // ── 1a. Apply PNET_HOSTS (authoritative for the local SG device) ─────────
+    let pnet_hosts = parse_pnet_hosts();
+    apply_pnet_hosts(&node, &pnet_hosts);
+    if !pnet_hosts.is_empty() {
+        let toml = persistence::save(&node.read().unwrap());
+        std::fs::write(dir.join("node.toml"), &toml)
+            .expect("could not persist PNET_HOSTS update");
+        println!("[main] PNET_HOSTS applied: {pnet_hosts:?}");
+    }
 
     // ── 2. Start the shared queue ────────────────────────────────────────────
     let queue: SharedQueue = Arc::new((Mutex::new(ActionQueue::new()), Condvar::new()));

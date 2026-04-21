@@ -14,6 +14,8 @@ Shown only on first access, before the password is set.
 * Set owner alias
 * Set device alias
 
+SG-grade devices advertise their reachable addresses via the `PNET_HOSTS` environment variable rather than through the setup form — `PNET_HOSTS` is read at every startup and overwrites the local device's `hosts` list when set. DG-grade devices leave `hosts` empty; their peer address is learned from the source of incoming packets.
+
 ### Dashboard
 An overview of the node's current state.
 * Node and device identity (alias, uuid)
@@ -38,7 +40,7 @@ The owner's address book.
 
 ### Devices
 The owner's other devices running pNet.
-* Shows alias, host, and connection health for each device
+* Shows alias, advertised hosts list, and connection health for each device
 * Connection health indicated as online / idle / offline based on last contact
 * Last seen timestamp shown for each device
 
@@ -65,6 +67,6 @@ When the owner generates a device invitation, the node:
 1. Selects the target SG — itself if this device is an SG, otherwise the lowest-RTT up SG from `sg_statuses`.
 2. Creates an `Invitation` with a fresh ephemeral key pair and an expiry time.
 3. Stores it in `owner.device_invitations`. If this device is a DG, the invitation will be synced to the target SG by the future device-sync system before the new device tries to use it.
-4. Displays a shareable code: base64 of `invitation_id (16) || invitation_public_key (32) || sg_host (6)` — 72 characters, suitable for copy-paste or QR code.
+4. Displays a shareable code: base64 of `invitation_id (16) || invitation_public_key (32) || host_len (1) || host_bytes (host_len) || port (2)`, where `host_bytes` is the first entry from the target SG's `hosts` list (hostname or IP, no port suffix). Variable-length, suitable for copy-paste or QR code.
 
 On the new, unconfigured device, the owner enters the invitation code. The node parses out the invitation ID, public key, and SG host, then begins the bootstrap exchange (see pnet to pnet communication.md — Device Bootstrap). After the exchange completes, the owner is prompted to set an alias and grade for the new device before it registers with the SG.

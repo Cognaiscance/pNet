@@ -209,12 +209,11 @@ pub struct Device {
     /// Relay priority for SG-grade devices. Lower value = higher priority (1 = top).
     /// `None` for DG-grade devices (they do not act as relays).
     pub sg_rank:          Option<u32>,
-    #[serde(with = "serde_socket_addr_v4")]
-    pub host:             SocketAddrV4,
-    /// Original hostname entered during setup (e.g. "pnet.example.com").
-    /// Stored so invitation codes can embed the name instead of a raw IP.
-    #[serde(default)]
-    pub public_hostname:  Option<String>,
+    /// Advertised addresses for reaching this device, as hostnames or IPs with
+    /// optional ":port" suffix (default 7777). Resolved at connection time — a
+    /// name that only resolves inside one network simply fails to resolve
+    /// elsewhere and is skipped. Empty for DG-grade devices.
+    pub hosts:            Vec<String>,
     pub applications:     Vec<Application>,
 }
 
@@ -355,8 +354,9 @@ pub struct PendingTunnelConnection {
     pub dest_device_uuid: Uuid,
 }
 
-/// Runtime SG health telemetry for a single candidate SG device.
-/// Keyed by device UUID in `Node::sg_statuses`.
+/// Runtime SG health telemetry for a single (device, advertised-host) pair.
+/// Keyed by `(device_uuid, host_string)` in `Node::sg_statuses` so we track
+/// latency to every address a device advertises independently.
 pub struct SgStatus {
     pub last_rtt:    Option<Duration>,
     pub up:          bool,
@@ -369,8 +369,10 @@ pub struct Node {
     #[serde(with = "serde_bytes_16")]
     pub device_uuid: Uuid,
     /// Ephemeral — not persisted; refreshed by PollSG on each run.
+    /// Keyed by `(device_uuid, host_string)` — the host_string matches an
+    /// entry in that device's `hosts` list.
     #[serde(skip)]
-    pub sg_statuses: HashMap<Uuid, SgStatus>,
+    pub sg_statuses: HashMap<(Uuid, String), SgStatus>,
 }
 
 impl Node {
@@ -386,13 +388,12 @@ impl Node {
         let device_uuid = generate_uuid();
 
         let device = Device {
-            alias:           "This Device".to_string(),
-            uuid:            device_uuid,
-            grade:           DeviceGrade::DG,
-            sg_rank:         None,
-            host:            "0.0.0.0:0".parse().unwrap(),
-            public_hostname: None,
-            applications:    Vec::new(),
+            alias:        "This Device".to_string(),
+            uuid:         device_uuid,
+            grade:        DeviceGrade::DG,
+            sg_rank:      None,
+            hosts:        Vec::new(),
+            applications: Vec::new(),
         };
 
         Node {

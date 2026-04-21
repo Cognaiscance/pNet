@@ -36,6 +36,48 @@ fn ipv4_from(addr: SocketAddr) -> Option<Ipv4Addr> {
     }
 }
 
+/// Resolve a `Device.hosts` entry (hostname or IP, optional ":port", default 7777)
+/// to an IPv4 socket address via the OS DNS resolver. Returns `None` if the entry
+/// is malformed or fails to resolve — callers should treat that as "skip this
+/// address" silently; it's expected behaviour when a name only resolves inside
+/// certain networks.
+fn resolve_host_entry(entry: &str) -> Option<SocketAddrV4> {
+    use std::net::ToSocketAddrs;
+
+    let entry = entry.trim();
+    if entry.is_empty() { return None; }
+
+    // Direct "1.2.3.4:port" parse first.
+    if let Ok(addr) = entry.parse::<SocketAddrV4>() {
+        return Some(addr);
+    }
+
+    // Split optional ":port", default 7777.
+    let (host_part, port) = match entry.rfind(':') {
+        Some(pos) => {
+            let port: u16 = entry[pos + 1..].parse().ok()?;
+            (&entry[..pos], port)
+        }
+        None => (entry, 7777u16),
+    };
+
+    let addr_str = format!("{host_part}:{port}");
+    addr_str.to_socket_addrs().ok()?.find_map(|a| match a {
+        SocketAddr::V4(v4) => Some(v4),
+        _ => None,
+    })
+}
+
+/// Resolve every entry in a hosts list, dropping any that fail to resolve.
+/// Returns `(original_entry, resolved_addr)` pairs so downstream code (e.g.
+/// `sg_statuses`) can still key by the hostname string the operator
+/// configured, rather than by a transient resolved IP.
+fn resolve_hosts(hosts: &[String]) -> Vec<(String, SocketAddrV4)> {
+    hosts.iter()
+        .filter_map(|h| resolve_host_entry(h).map(|a| (h.clone(), a)))
+        .collect()
+}
+
 // ── App handlers ──────────────────────────────────────────────────────────────
 
 /// Op 0 — Application registration.
@@ -391,7 +433,6 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
             // `peer_active_connection_id` is the SG's local conn_id for this DG's connection.
             let sender_sg_conn_id = sg_conn.peer_active_connection_id;
-            let sg_uuid = sg_conn.device_uuid;
 
             // TUNNEL_FORWARD: [op=0x51][sender_sg_conn_id: u16][tunnel_id: u16][nonce: 24][ciphertext]
             let mut pkt = Vec::with_capacity(4 + 24 + ciphertext.len());
@@ -401,12 +442,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             pkt.extend_from_slice(&nonce);
             pkt.extend_from_slice(&ciphertext);
 
-            let sg_host = node.owner.user.devices.iter()
-                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
-                .find(|d| d.uuid == sg_uuid)
-                .map(|d| d.host);
-
-            sg_host.map(|h| (pkt, SocketAddr::V4(h)))
+            Some((pkt, sg_conn.peer_addr))
         } else if let Some(dest_conn) = node.owner.active_connections.values()
             .find(|c| c.device_uuid == dest_device_uuid)
         {
@@ -437,8 +473,6 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 return;
             };
 
-            let sg_uuid = sg_conn.device_uuid;
-
             // RelayPacket body: [dest_device_uuid: 16][dest_app_id: u16][sender_app_id: u16][payload]
             let mut plaintext = Vec::with_capacity(20 + payload.len());
             plaintext.extend_from_slice(&dest_device_uuid);
@@ -448,12 +482,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
             let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
 
-            let sg_host = node.owner.user.devices.iter()
-                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
-                .find(|d| d.uuid == sg_uuid)
-                .map(|d| d.host);
-
-            sg_host.map(|h| (pkt, SocketAddr::V4(h)))
+            Some((pkt, sg_conn.peer_addr))
         }
     };
 
@@ -781,6 +810,33 @@ fn decrypt_packet_body(node: &super::data_models::Node, buf: &[u8]) -> Option<Ve
     xchacha20_decrypt(&shared, &nonce, ciphertext)
 }
 
+/// Pick the best address for reaching `device_uuid`: the up entry with the
+/// lowest recorded RTT in `sg_statuses`. Falls back to the first resolvable
+/// entry in the device's host list when no poll data exists yet.
+///
+/// Cold-boot note: the first ConnectRequest after startup may land on a dead
+/// address if the happy-eyeballs data isn't populated yet; the next `poll_sg`
+/// cycle (≤30s) corrects that.
+fn best_address_for_device(
+    node: &super::data_models::Node,
+    device_uuid: &Uuid,
+) -> Option<SocketAddrV4> {
+    let best_polled: Option<SocketAddrV4> = node.sg_statuses.iter()
+        .filter(|((u, _), s)| *u == *device_uuid && s.up && s.last_rtt.is_some())
+        .min_by_key(|(_, s)| s.last_rtt.unwrap())
+        .and_then(|((_, host), _)| resolve_host_entry(host));
+
+    if best_polled.is_some() {
+        return best_polled;
+    }
+
+    let dev = node.owner.user.devices.iter()
+        .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
+        .find(|d| d.uuid == *device_uuid)?;
+
+    resolve_hosts(&dev.hosts).into_iter().next().map(|(_, a)| a)
+}
+
 /// Build the pool of candidate SG UUIDs for routing a packet to `dest_device_uuid`.
 /// Pool = all SGs owned by the local user + all SGs owned by the contact who holds that device.
 fn sg_candidates_for_dest(node: &super::data_models::Node, dest_device_uuid: &Uuid) -> Vec<Uuid> {
@@ -829,9 +885,20 @@ fn top_ranked_sg_for_device<'a>(
         .collect();
     sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
 
-    // Return the active connection to the highest-ranked SG that is up.
+    // Return the active connection to the highest-ranked SG that has at least
+    // one address marked up (or no poll data yet — be optimistic).
     sgs.iter()
-        .find(|d| node.sg_statuses.get(&d.uuid).map(|s| s.up).unwrap_or(true))
+        .find(|d| {
+            let mut any_entry = false;
+            let mut any_up = false;
+            for ((uuid, _), status) in &node.sg_statuses {
+                if *uuid == d.uuid {
+                    any_entry = true;
+                    if status.up { any_up = true; }
+                }
+            }
+            !any_entry || any_up
+        })
         .and_then(|d| node.owner.active_connections.values().find(|c| c.device_uuid == d.uuid))
 }
 
@@ -844,15 +911,17 @@ fn best_sg_connection<'a>(
     node: &'a super::data_models::Node,
     candidates: &[Uuid],
 ) -> Option<&'a ActiveConnection> {
-    // Primary: lowest RTT, must be up and have an active connection.
+    // Primary: lowest RTT across any address for that device, must be up and
+    // have an active connection.
     let polled = candidates.iter()
         .filter_map(|uuid| {
-            let status = node.sg_statuses.get(uuid)?;
-            if !status.up { return None; }
-            let rtt = status.last_rtt?;
+            let best_rtt = node.sg_statuses.iter()
+                .filter(|((u, _), s)| *u == *uuid && s.up)
+                .filter_map(|(_, s)| s.last_rtt)
+                .min()?;
             node.owner.active_connections.values()
                 .find(|c| c.device_uuid == *uuid)
-                .map(|c| (rtt, c))
+                .map(|c| (best_rtt, c))
         })
         .min_by_key(|(rtt, _)| *rtt)
         .map(|(_, c)| c);
@@ -876,7 +945,8 @@ fn best_sg_connection<'a>(
 //   [long_term_pk: 32]
 //   [long_term_sk: 32]
 //   [device_count: u8]
-//     each device: [uuid:16][alias: u8+bytes][grade:u8 (0=DG,1=SG)][ip:4][port:2 BE]
+//     each device: [uuid:16][alias: u8+bytes][grade:u8 (0=DG,1=SG)][rank:u8]
+//                  [host_count:u8][each host: u8+bytes]
 //   [contact_count: u8]
 //     each contact: [uuid:16][alias: u8+bytes][public_key:32][device_count:u8][...devices...]
 //
@@ -909,8 +979,11 @@ fn push_device(buf: &mut Vec<u8>, d: &Device) {
     buf.push(if matches!(d.grade, DeviceGrade::SG) { 1 } else { 0 });
     // sg_rank: 0 = None/DG, 1–255 = rank value (clamped to u8).
     buf.push(d.sg_rank.map(|r| r.min(255) as u8).unwrap_or(0));
-    buf.extend_from_slice(&d.host.ip().octets());
-    buf.extend_from_slice(&d.host.port().to_be_bytes());
+    // hosts: length-prefixed list of length-prefixed hostname strings.
+    buf.push(d.hosts.len().min(u8::MAX as usize) as u8);
+    for h in d.hosts.iter().take(u8::MAX as usize) {
+        push_str(buf, h);
+    }
 }
 
 fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
@@ -920,17 +993,18 @@ fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
     let grade        = if grade_byte == 1 { DeviceGrade::SG } else { DeviceGrade::DG };
     let rank_byte    = *data.get(*pos)?; *pos += 1;
     let sg_rank      = if rank_byte == 0 { None } else { Some(rank_byte as u32) };
-    let ip: [u8; 4]  = read_arr(data, pos)?;
-    let port_bytes: [u8; 2] = read_arr(data, pos)?;
-    let port         = u16::from_be_bytes(port_bytes);
+    let host_count   = *data.get(*pos)? as usize; *pos += 1;
+    let mut hosts    = Vec::with_capacity(host_count);
+    for _ in 0..host_count {
+        hosts.push(read_str(data, pos)?);
+    }
     Some(Device {
         uuid,
         alias,
         grade,
         sg_rank,
-        host:            SocketAddrV4::new(Ipv4Addr::from(ip), port),
-        public_hostname: None,
-        applications:    Vec::new(),
+        hosts,
+        applications: Vec::new(),
     })
 }
 
@@ -1208,7 +1282,8 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 //   [uuid: 16]
 //   [long_term_pk: 32]
 //   [device_count: u8]
-//     each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8][ip:4][port:2 BE]
+//     each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8]
+//                  [host_count:u8][each host: u8+bytes]
 
 fn serialize_contact_payload(node: &super::data_models::Node) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -1389,7 +1464,8 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 // Push payload format (encrypted body of ContactDataPush, op 0x60):
 //   [user_uuid: 16]
 //   [device_count: u8]
-//     each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8][ip:4][port:2 BE]
+//     each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8]
+//                  [host_count:u8][each host: u8+bytes]
 //       [app_count: u8]
 //         each approved app: [id: u16 BE][alias: u8+bytes]
 //
@@ -1604,12 +1680,14 @@ pub fn sync_contacts(ctx: &WorkerContext) {
 //
 // Push payload format (encrypted body of DeviceDataPush, op 0x62):
 //   [device_count: u8]
-//     each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8][ip:4][port:2 BE]
+//     each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8]
+//                  [host_count:u8][each host: u8+bytes]
 //   [contact_count: u8]
 //     each contact:
 //       [user_alias: u8+bytes][user_uuid: 16][contact_pk: 32]
 //       [device_count: u8]
-//         each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8][ip:4][port:2 BE]
+//         each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8]
+//                      [host_count:u8][each host: u8+bytes]
 //           [app_count: u8]
 //             each app: [id: u16 BE][alias: u8+bytes]
 //
@@ -1806,10 +1884,8 @@ fn push_data_to_devices(ctx: &WorkerContext) {
         let Some(conn) = node.owner.active_connections.values()
             .find(|c| c.device_uuid == *uuid)
         else { continue };
-        let Some(dev) = node.owner.user.devices.iter().find(|d| d.uuid == *uuid)
-        else { continue };
         let pkt = build_encrypted_packet(DEVICE_DATA_PUSH_OP, conn, &payload);
-        packets.push((pkt, SocketAddr::V4(dev.host)));
+        packets.push((pkt, conn.peer_addr));
     }
     drop(node);
 
@@ -1920,7 +1996,7 @@ pub fn sync_devices(ctx: &WorkerContext) {
     // update its record before replying.
     let body = serialize_own_app_list(&node);
     let pkt  = build_encrypted_packet(DEVICE_DATA_PULL_REQ_OP, conn, &body);
-    let dest = SocketAddr::V4(sg.host);
+    let dest = conn.peer_addr;
     drop(node);
 
     send(ctx, dest, &pkt);
@@ -2008,16 +2084,6 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         };
 
-        // Find destination device host.
-        let Some(dest_host) = node.owner.user.devices.iter()
-            .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
-            .find(|d| d.uuid == dest_device_uuid)
-            .map(|d| d.host)
-        else {
-            eprintln!("[relay_packet] dest device host not found for {:?}", dest_device_uuid);
-            return;
-        };
-
         // AppPacket body: [dest_app_id: u16][sender_app_id: u16][payload]
         let mut app_body = Vec::with_capacity(4 + payload.len());
         app_body.extend_from_slice(&dest_app_id.to_be_bytes());
@@ -2025,7 +2091,7 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         app_body.extend_from_slice(&payload);
 
         let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
-        (pkt, SocketAddr::V4(dest_host), dest_device_uuid)
+        (pkt, dest_conn.peer_addr, dest_device_uuid)
     };
 
     send(ctx, dest, &pkt);
@@ -2137,20 +2203,26 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// Candidate pool: all SG-grade devices owned by the local user (excluding the
 /// local device itself) plus all SG-grade devices of every contact user.
 pub fn poll_sg(ctx: &WorkerContext) {
-    // Collect (device_uuid, host) for every candidate SG.
-    let candidates: Vec<(Uuid, SocketAddrV4)> = {
+    // Collect (device_uuid, host_entry, resolved_addr) for every advertised
+    // address on every candidate SG. Unresolvable entries are silently skipped
+    // — expected when a name only resolves inside one network.
+    let candidates: Vec<(Uuid, String, SocketAddrV4)> = {
         let node = ctx.node.read().unwrap();
         let local_uuid = node.device_uuid;
-        let mut v: Vec<(Uuid, SocketAddrV4)> = Vec::new();
+        let mut v: Vec<(Uuid, String, SocketAddrV4)> = Vec::new();
         for d in &node.owner.user.devices {
             if matches!(d.grade, DeviceGrade::SG) && d.uuid != local_uuid {
-                v.push((d.uuid, d.host));
+                for (h, addr) in resolve_hosts(&d.hosts) {
+                    v.push((d.uuid, h, addr));
+                }
             }
         }
         for contact in &node.owner.contact_users {
             for d in &contact.user.devices {
                 if matches!(d.grade, DeviceGrade::SG) {
-                    v.push((d.uuid, d.host));
+                    for (h, addr) in resolve_hosts(&d.hosts) {
+                        v.push((d.uuid, h, addr));
+                    }
                 }
             }
         }
@@ -2168,15 +2240,15 @@ pub fn poll_sg(ctx: &WorkerContext) {
     };
     ping_socket.set_read_timeout(Some(SG_PING_TIMEOUT)).ok();
 
-    for (uuid, host) in candidates {
+    for (uuid, host, addr) in candidates {
         let nonce = generate_uuid();
         let mut packet = [0u8; 17];
         packet[0] = SG_PING_OP;
         packet[1..17].copy_from_slice(&nonce);
 
         let start = Instant::now();
-        if ping_socket.send_to(&packet, std::net::SocketAddr::V4(host)).is_err() {
-            record_sg_status(ctx, uuid, None);
+        if ping_socket.send_to(&packet, std::net::SocketAddr::V4(addr)).is_err() {
+            record_sg_status(ctx, uuid, host, None);
             continue;
         }
 
@@ -2187,13 +2259,13 @@ pub fn poll_sg(ctx: &WorkerContext) {
             }
             _ => None,
         };
-        record_sg_status(ctx, uuid, up);
+        record_sg_status(ctx, uuid, host, up);
     }
 }
 
-fn record_sg_status(ctx: &WorkerContext, uuid: Uuid, rtt: Option<Duration>) {
+fn record_sg_status(ctx: &WorkerContext, uuid: Uuid, host: String, rtt: Option<Duration>) {
     let mut node = ctx.node.write().unwrap();
-    node.sg_statuses.insert(uuid, SgStatus {
+    node.sg_statuses.insert((uuid, host), SgStatus {
         up:          rtt.is_some(),
         last_rtt:    rtt,
         last_polled: Instant::now(),
@@ -2227,17 +2299,24 @@ pub fn maintain_connections(ctx: &WorkerContext) {
             .unwrap_or(false);
 
         // Desired peers: own devices (all if SG, SGs-only if DG) + contact devices (same rule).
+        // Skip peers with no resolvable address — happy eyeballs data, if present,
+        // picks the lowest-RTT up address; otherwise we fall back to the first
+        // resolvable entry in the peer's host list.
         let mut desired: Vec<(Uuid, SocketAddrV4, PublicKey)> = Vec::new();
         for d in &node.owner.user.devices {
             if d.uuid == our_device_uuid { continue; }
             if is_sg || matches!(d.grade, DeviceGrade::SG) {
-                desired.push((d.uuid, d.host, our_longterm_pk));
+                if let Some(addr) = best_address_for_device(&node, &d.uuid) {
+                    desired.push((d.uuid, addr, our_longterm_pk));
+                }
             }
         }
         for contact in &node.owner.contact_users {
             for d in &contact.user.devices {
                 if is_sg || matches!(d.grade, DeviceGrade::SG) {
-                    desired.push((d.uuid, d.host, contact.public_key));
+                    if let Some(addr) = best_address_for_device(&node, &d.uuid) {
+                        desired.push((d.uuid, addr, contact.public_key));
+                    }
                 }
             }
         }
@@ -2326,7 +2405,7 @@ fn allocate_tunnel_id(node: &super::data_models::Node) -> u16 {
 /// Allocates a tunnel ID, stores a `PendingTunnel`, and sends `TUNNEL_INIT`
 /// (op 0x50) to the sender DG to kick off the DG-to-DG key exchange.
 pub fn setup_tunnel(sender_uuid: Uuid, dest_uuid: Uuid, ctx: &WorkerContext) {
-    let (tunnel_id, sender_host) = {
+    let (tunnel_id, sender_addr) = {
         let mut node = ctx.node.write().unwrap();
 
         // Abort if connections to either DG are gone.
@@ -2344,21 +2423,20 @@ pub fn setup_tunnel(sender_uuid: Uuid, dest_uuid: Uuid, ctx: &WorkerContext) {
             sender_ephem_pk:    None,
         });
 
-        let sender_host = node.owner.user.devices.iter()
-            .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
-            .find(|d| d.uuid == sender_uuid)
-            .map(|d| d.host);
+        let sender_addr = node.owner.active_connections.values()
+            .find(|c| c.device_uuid == sender_uuid)
+            .map(|c| c.peer_addr);
 
-        (tunnel_id, sender_host)
+        (tunnel_id, sender_addr)
     };
 
-    if let Some(host) = sender_host {
+    if let Some(dest) = sender_addr {
         // TUNNEL_INIT: [op=0x50][tunnel_id: u16][dest_device_uuid: 16]
         let mut pkt = [0u8; 19];
         pkt[0]     = TUNNEL_INIT_OP;
         pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
         pkt[3..19].copy_from_slice(&dest_uuid);
-        send(ctx, SocketAddr::V4(host), &pkt);
+        send(ctx, dest, &pkt);
     }
 }
 
@@ -2438,21 +2516,20 @@ pub fn tunnel_connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext
             let dest_uuid   = pending.dest_device_uuid;
             let sender_uuid = pending.sender_device_uuid;
 
-            let host = node.owner.user.devices.iter()
-                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
-                .find(|d| d.uuid == dest_uuid)
-                .map(|d| d.host);
-            (host, sender_uuid)
+            let addr = node.owner.active_connections.values()
+                .find(|c| c.device_uuid == dest_uuid)
+                .map(|c| c.peer_addr);
+            (addr, sender_uuid)
         };
 
-        if let (Some(host), sender_uuid) = dest_host {
+        if let (Some(dest), sender_uuid) = dest_host {
             // Forward to DG_dest: [op=0x52][tunnel_id: u16][sender_ephem_pk: 32][sender_device_uuid: 16]
             let mut pkt = [0u8; 51];
             pkt[0]      = TUNNEL_CONNECT_REQUEST_OP;
             pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
             pkt[3..35].copy_from_slice(&sender_ephem_pk);
             pkt[35..51].copy_from_slice(&sender_uuid);
-            send(ctx, SocketAddr::V4(host), &pkt);
+            send(ctx, dest, &pkt);
         }
     } else if buf.len() >= 50 {
         // ── DG_dest path ──────────────────────────────────────────────────────
@@ -2540,19 +2617,18 @@ pub fn tunnel_connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 });
             }
 
-            node.owner.user.devices.iter()
-                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
-                .find(|d| d.uuid == pending.sender_device_uuid)
-                .map(|d| d.host)
+            node.owner.active_connections.values()
+                .find(|c| c.device_uuid == pending.sender_device_uuid)
+                .map(|c| c.peer_addr)
         };
 
-        if let Some(host) = sender_host {
+        if let Some(dest) = sender_host {
             // Forward ack to DG_sender: [op=0x53][tunnel_id: u16][dest_ephem_pk: 32]
             let mut pkt = [0u8; 35];
             pkt[0]     = TUNNEL_CONNECT_ACK_OP;
             pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
             pkt[3..35].copy_from_slice(&dest_ephem_pk);
-            send(ctx, SocketAddr::V4(host), &pkt);
+            send(ctx, dest, &pkt);
         }
     } else if is_dg_sender {
         // ── DG_sender path ────────────────────────────────────────────────────
@@ -2607,24 +2683,17 @@ pub fn tunnel_forward(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
         tunnel.last_used_at = Instant::now();
 
-        let dest_uuid = node.owner.active_connections.get(&out_conn_id)
-            .map(|c| c.device_uuid);
-
-        dest_uuid.and_then(|uuid| {
-            node.owner.user.devices.iter()
-                .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
-                .find(|d| d.uuid == uuid)
-                .map(|d| d.host)
-        })
+        node.owner.active_connections.get(&out_conn_id)
+            .map(|c| c.peer_addr)
     };
 
-    if let Some(host) = dest_host {
+    if let Some(dest) = dest_host {
         // Forward as TUNNEL_DELIVERY (0x54): [op][tunnel_id: u16][nonce+ciphertext]
         let mut pkt = Vec::with_capacity(3 + payload.len());
         pkt.push(TUNNEL_DELIVERY_OP);
         pkt.extend_from_slice(&tunnel_id.to_be_bytes());
         pkt.extend_from_slice(payload);
-        send(ctx, SocketAddr::V4(host), &pkt);
+        send(ctx, dest, &pkt);
     }
 }
 
@@ -2758,7 +2827,17 @@ pub fn keepalive_dg(ctx: &WorkerContext) {
 
         // Pick the highest-ranked SG that poll_sg considers up (treat unpolled as up).
         let Some(sg) = own_sgs.iter()
-            .find(|d| node.sg_statuses.get(&d.uuid).map(|s| s.up).unwrap_or(true))
+            .find(|d| {
+                let mut any_entry = false;
+                let mut any_up = false;
+                for ((uuid, _), status) in &node.sg_statuses {
+                    if *uuid == d.uuid {
+                        any_entry = true;
+                        if status.up { any_up = true; }
+                    }
+                }
+                !any_entry || any_up
+            })
         else { return; };
 
         // Find the active connection to that SG.
@@ -2768,7 +2847,7 @@ pub fn keepalive_dg(ctx: &WorkerContext) {
 
         // Encrypt an empty plaintext so the SG can verify the connection is live.
         let pkt = build_encrypted_packet(DG_KEEPALIVE_OP, conn, &[]);
-        Some((pkt, SocketAddr::V4(sg.host)))
+        Some((pkt, conn.peer_addr))
     };
 
     if let Some((pkt, dest)) = out {
@@ -2804,16 +2883,16 @@ pub fn conn_reset(src: SocketAddr, ctx: &WorkerContext) {
 
     let evicted = {
         let mut node = ctx.node.write().unwrap();
-
-        // Collect UUIDs of devices living at src_ip.
-        let stale: Vec<Uuid> = node.owner.user.devices.iter()
-            .chain(node.owner.contact_users.iter().flat_map(|cu| cu.user.devices.iter()))
-            .filter(|d| *d.host.ip() == src_ip)
-            .map(|d| d.uuid)
-            .collect();
-
+        // Evict any connection whose peer_addr matches the reset source IP.
+        // This is strictly more correct than matching on a stored Device host
+        // — the connection already knows what address it's talking to.
         let before = node.owner.active_connections.len();
-        node.owner.active_connections.retain(|_, c| !stale.contains(&c.device_uuid));
+        node.owner.active_connections.retain(|_, c| {
+            match c.peer_addr {
+                SocketAddr::V4(a) => *a.ip() != src_ip,
+                _ => true,
+            }
+        });
         node.owner.active_connections.len() < before
     };
 
@@ -3170,7 +3249,7 @@ fn render_devices(ctx: &WorkerContext) -> String {
             format!(
                 "<tr><td>{}{suffix}</td><td>{}</td><td>{}</td></tr>",
                 html_escape(&d.alias),
-                html_escape(&d.host.to_string()),
+                html_escape(&d.hosts.join(", ")),
                 d.applications.len(),
             )
         })
@@ -3234,33 +3313,39 @@ fn reject_app(body: &[u8], ctx: &WorkerContext) {
 
 /// Generate a device invitation on the UI.  Picks the best SG (self if SG, else
 /// lowest-RTT up SG), creates an invitation, and returns the base64-encoded code.
+///
+/// Embeds the first entry from the chosen SG's `hosts` list. The full host list
+/// is delivered later by ContactDataPush after onboarding completes.
 fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
     use base64::Engine;
 
-    let (sg_host, sg_hostname): (SocketAddrV4, Option<String>) = {
+    let host_str: String = {
         let node = ctx.node.read().unwrap();
         let local_uuid   = node.device_uuid;
         let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid)?;
 
         if matches!(local_device.grade, DeviceGrade::SG) {
-            (local_device.host, local_device.public_hostname.clone())
+            local_device.hosts.first().cloned()?
         } else {
             // Find the lowest-RTT up SG among own devices.
-            let mut best: Option<(Duration, SocketAddrV4, Option<String>)> = None;
+            let mut best: Option<(Duration, String)> = None;
             for d in &node.owner.user.devices {
                 if !matches!(d.grade, DeviceGrade::SG) { continue; }
-                if let Some(s) = node.sg_statuses.get(&d.uuid) {
-                    if s.up {
-                        let rtt = s.last_rtt.unwrap_or(Duration::MAX);
-                        if best.as_ref().map_or(true, |(br, _, _)| rtt < *br) {
-                            best = Some((rtt, d.host, d.public_hostname.clone()));
-                        }
+                let Some(first_host) = d.hosts.first() else { continue; };
+                for ((uuid, _), s) in &node.sg_statuses {
+                    if *uuid != d.uuid || !s.up { continue; }
+                    let rtt = s.last_rtt.unwrap_or(Duration::MAX);
+                    if best.as_ref().map_or(true, |(br, _)| rtt < *br) {
+                        best = Some((rtt, first_host.clone()));
                     }
                 }
             }
-            best.map(|(_, h, hn)| (h, hn))?
+            best.map(|(_, h)| h)?
         }
     };
+
+    // Resolve to get the port embedded in the fixed-format code.
+    let sg_addr = resolve_host_entry(&host_str)?;
 
     let (inv_id, inv_pk) = {
         let mut node = ctx.node.write().unwrap();
@@ -3278,16 +3363,15 @@ fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
     ctx.save_node();
 
     // Encode: [inv_id:16][inv_pk:32][host_len:1][host:host_len][port:2]
-    // host is either the domain name (if one was configured) or the dotted-decimal IP string.
-    let host_str = sg_hostname.unwrap_or_else(|| sg_host.ip().to_string());
-    let host_bytes = host_str.as_bytes();
+    let host_for_code: String = host_str.split(':').next().unwrap_or(&host_str).to_string();
+    let host_bytes = host_for_code.as_bytes();
     let host_len = host_bytes.len().min(255) as u8;
     let mut raw = Vec::with_capacity(16 + 32 + 1 + host_len as usize + 2);
     raw.extend_from_slice(&inv_id);
     raw.extend_from_slice(&inv_pk);
     raw.push(host_len);
     raw.extend_from_slice(&host_bytes[..host_len as usize]);
-    raw.extend_from_slice(&sg_host.port().to_be_bytes());
+    raw.extend_from_slice(&sg_addr.port().to_be_bytes());
     Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw))
 }
 
@@ -3356,27 +3440,23 @@ fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
 fn generate_contact_invitation(ctx: &WorkerContext) -> Option<String> {
     use base64::Engine;
 
+    // Contact invitation code is fixed-length and embeds a pre-resolved IPv4
+    // address. Full hostname list arrives via ContactDataPush after onboarding.
     let sg_host: SocketAddrV4 = {
         let node = ctx.node.read().unwrap();
         let local_uuid   = node.device_uuid;
         let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid)?;
 
         if matches!(local_device.grade, DeviceGrade::SG) {
-            local_device.host
+            resolve_hosts(&local_device.hosts).into_iter().next().map(|(_, a)| a)?
         } else {
-            let mut best: Option<(Duration, SocketAddrV4)> = None;
-            for d in &node.owner.user.devices {
-                if !matches!(d.grade, DeviceGrade::SG) { continue; }
-                if let Some(s) = node.sg_statuses.get(&d.uuid) {
-                    if s.up {
-                        let rtt = s.last_rtt.unwrap_or(Duration::MAX);
-                        if best.map_or(true, |(br, _)| rtt < br) {
-                            best = Some((rtt, d.host));
-                        }
-                    }
-                }
-            }
-            best.map(|(_, h)| h)?
+            best_address_for_device(&node, &local_uuid)
+                .or_else(|| {
+                    // Fallback: best own SG.
+                    node.owner.user.devices.iter()
+                        .filter(|d| matches!(d.grade, DeviceGrade::SG))
+                        .find_map(|d| best_address_for_device(&node, &d.uuid))
+                })?
         }
     };
 
@@ -3580,35 +3660,6 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
         None
     };
 
-    // Resolve the public SG host if provided.
-    let (sg_host, sg_hostname): (Option<SocketAddrV4>, Option<String>) = if matches!(grade, DeviceGrade::SG) {
-        let raw = form_field(body, "sg_host").map(url_decode).unwrap_or_default();
-        let raw = raw.trim();
-        if raw.is_empty() {
-            (None, None)
-        } else {
-            match resolve_sg_host(raw) {
-                Some(addr) => {
-                    // Preserve hostname only if it isn't already a bare IP.
-                    let hostname = if raw.parse::<std::net::IpAddr>().is_err() {
-                        // Strip trailing :port if present so we store just the name.
-                        let name = match raw.rfind(':') {
-                            Some(pos) if raw[pos+1..].parse::<u16>().is_ok() => &raw[..pos],
-                            _ => raw,
-                        };
-                        Some(name.to_string())
-                    } else {
-                        None
-                    };
-                    (Some(addr), hostname)
-                }
-                None => return Some("host"),
-            }
-        }
-    } else {
-        (None, None)
-    };
-
     let key_pair = generate_ed25519_keypair();
 
     {
@@ -3621,10 +3672,8 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
             dev.alias           = device_alias;
             dev.grade           = grade;
             dev.sg_rank         = sg_rank;
-            dev.public_hostname = sg_hostname;
-            if let Some(host) = sg_host {
-                dev.host = host;
-            }
+            // `dev.hosts` is set separately from the `PNET_HOSTS` env var
+            // (see main::apply_pnet_hosts) — the setup form no longer collects it.
         }
     }
     ctx.save_node();
@@ -3635,28 +3684,7 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
 /// `SocketAddrV4`. Port defaults to 7777 if omitted. Returns `None` if the
 /// address cannot be resolved to an IPv4 address.
 fn resolve_sg_host(input: &str) -> Option<SocketAddrV4> {
-    use std::net::ToSocketAddrs;
-
-    // Try a direct parse first — handles "1.2.3.4:port".
-    if let Ok(addr) = input.parse::<SocketAddrV4>() {
-        return Some(addr);
-    }
-
-    // Split off a trailing :port if present, otherwise default to 7777.
-    let (host_part, port) = match input.rfind(':') {
-        Some(pos) => {
-            let port: u16 = input[pos + 1..].parse().ok()?;
-            (&input[..pos], port)
-        }
-        None => (input, 7777u16),
-    };
-
-    // Resolve via DNS (works for both bare IPs and domain names).
-    let addr_str = format!("{host_part}:{port}");
-    addr_str.to_socket_addrs().ok()?.find_map(|a| match a {
-        std::net::SocketAddr::V4(v4) => Some(v4),
-        _ => None,
-    })
+    resolve_host_entry(input)
 }
 
 fn render_setup(query: &str) -> String {
@@ -3722,13 +3750,12 @@ fn render_setup_new_user_form(error: &str) -> String {
     let error_msg = match error {
         "fields" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
                      Name and device name are required.</p>",
-        "host"   => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
-                     Could not resolve the public address. Check the IP or domain and try again.</p>",
         _        => "",
     };
     format!(
         "<h1>Create Your Identity</h1>\
-         <p class=\"swiz-sub\">Set your name and give this server a label.</p>\
+         <p class=\"swiz-sub\">Set your name and give this server a label. \
+         Reachable addresses are configured at startup via the <code>PNET_HOSTS</code> environment variable.</p>\
          {error_msg}\
          <form method=\"post\" action=\"/setup/create\" style=\"display:block\">\
            <input type=\"hidden\" name=\"grade\" value=\"sg\">\
@@ -3738,13 +3765,6 @@ fn render_setup_new_user_form(error: &str) -> String {
            <label class=\"swiz-label\">Device name</label>\
            <input class=\"swiz-input\" type=\"text\" name=\"device_alias\" \
                   placeholder=\"e.g. Home Server\" required autocomplete=\"off\">\
-           <label class=\"swiz-label\">Public address</label>\
-           <input class=\"swiz-input\" type=\"text\" name=\"sg_host\" \
-                  placeholder=\"e.g. 203.0.113.10 or sg.example.com\" autocomplete=\"off\">\
-           <p style=\"color:#888;font-size:.78rem;margin-top:-.5rem;margin-bottom:.75rem\">\
-             IP or domain name where this server can be reached. Port defaults to 7777. \
-             Used in invitation codes so other devices can connect.\
-           </p>\
            <label class=\"swiz-label\">SG rank (1 = highest priority relay)</label>\
            <input class=\"swiz-input\" type=\"number\" name=\"sg_rank\" \
                   value=\"1\" min=\"1\" max=\"255\" autocomplete=\"off\">\
@@ -4096,7 +4116,11 @@ mod tests {
         assert_eq!(device_count, 1);
         pos += 16; // device uuid
         let _dev_alias = read_str(&reply, &mut pos).unwrap();
-        pos += 1 + 1 + 4 + 2; // grade + sg_rank + ip + port
+        pos += 1 + 1; // grade + sg_rank
+        let host_count = reply[pos] as usize; pos += 1;
+        for _ in 0..host_count {
+            let _h = read_str(&reply, &mut pos).unwrap();
+        }
         let app_count = reply[pos] as usize; pos += 1;
         assert_eq!(app_count, 1); // the app we just registered
 
@@ -4158,8 +4182,7 @@ mod tests {
                     uuid:            device_uuid,
                     grade:           DeviceGrade::SG,
                     sg_rank:         Some(1),
-                    host:            "127.0.0.1:9999".parse().unwrap(),
-                    public_hostname: None,
+                    hosts:           vec!["127.0.0.1:9999".into()],
                     applications:    Vec::new(),
                 }],
             },
@@ -4334,8 +4357,7 @@ mod tests {
             uuid,
             grade:           DeviceGrade::SG,
             sg_rank:         Some(1),
-            host:            "127.0.0.1:9000".parse().unwrap(),
-            public_hostname: None,
+            hosts:           vec!["127.0.0.1:9000".into()],
             applications:    Vec::new(),
         }
     }
@@ -4362,8 +4384,7 @@ mod tests {
                             uuid:            dest_uuid,
                             grade:           DeviceGrade::DG,
                             sg_rank:         None,
-                            host:            "127.0.0.1:9001".parse().unwrap(),
-                            public_hostname: None,
+                            hosts:           vec!["127.0.0.1:9001".into()],
                             applications:    Vec::new(),
                         },
                     ],
@@ -4405,12 +4426,12 @@ mod tests {
                 device_uuid: fast_uuid,
             peer_addr:   "127.0.0.1:0".parse().unwrap(),
             });
-            node.sg_statuses.insert(slow_uuid, super::super::data_models::SgStatus {
+            node.sg_statuses.insert((slow_uuid, "slow".to_string()), super::super::data_models::SgStatus {
                 up: true,
                 last_rtt: Some(Duration::from_millis(80)),
                 last_polled: Instant::now(),
             });
-            node.sg_statuses.insert(fast_uuid, super::super::data_models::SgStatus {
+            node.sg_statuses.insert((fast_uuid, "fast".to_string()), super::super::data_models::SgStatus {
                 up: true,
                 last_rtt: Some(Duration::from_millis(20)),
                 last_polled: Instant::now(),
@@ -4446,6 +4467,77 @@ mod tests {
         let best = best_sg_connection(&node, &[sg_uuid]);
         assert!(best.is_some());
         assert_eq!(best.unwrap().device_uuid, sg_uuid);
+    }
+
+    // ── Host resolution ───────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_host_entry_parses_ip_port() {
+        let addr = resolve_host_entry("127.0.0.1:9001").unwrap();
+        assert_eq!(addr.port(), 9001);
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn resolve_host_entry_defaults_port() {
+        let addr = resolve_host_entry("127.0.0.1").unwrap();
+        assert_eq!(addr.port(), 7777);
+    }
+
+    #[test]
+    fn resolve_host_entry_rejects_unresolvable() {
+        assert!(resolve_host_entry("this.name.definitely.does.not.exist.invalid").is_none());
+    }
+
+    #[test]
+    fn best_address_for_device_picks_lowest_rtt_up() {
+        let t = TestCtx::new();
+        let dev_uuid = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:        "sg".to_string(),
+                uuid:         dev_uuid,
+                grade:        DeviceGrade::SG,
+                sg_rank:      Some(1),
+                hosts:        vec!["127.0.0.1:9001".into(), "127.0.0.1:9002".into()],
+                applications: Vec::new(),
+            });
+            node.sg_statuses.insert((dev_uuid, "127.0.0.1:9001".into()), super::super::data_models::SgStatus {
+                up: true,
+                last_rtt: Some(Duration::from_millis(80)),
+                last_polled: Instant::now(),
+            });
+            node.sg_statuses.insert((dev_uuid, "127.0.0.1:9002".into()), super::super::data_models::SgStatus {
+                up: true,
+                last_rtt: Some(Duration::from_millis(20)),
+                last_polled: Instant::now(),
+            });
+        }
+        let node = t.ctx.node.read().unwrap();
+        let addr = best_address_for_device(&node, &dev_uuid).unwrap();
+        assert_eq!(addr.port(), 9002);
+    }
+
+    #[test]
+    fn best_address_for_device_falls_back_to_first_resolvable() {
+        let t = TestCtx::new();
+        let dev_uuid = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:        "sg".to_string(),
+                uuid:         dev_uuid,
+                grade:        DeviceGrade::SG,
+                sg_rank:      Some(1),
+                hosts:        vec!["127.0.0.1:9003".into()],
+                applications: Vec::new(),
+            });
+            // No sg_statuses entry — cold-boot fallback should kick in.
+        }
+        let node = t.ctx.node.read().unwrap();
+        let addr = best_address_for_device(&node, &dev_uuid).unwrap();
+        assert_eq!(addr.port(), 9003);
     }
 
     // ── Packet encrypt/decrypt round-trip ─────────────────────────────────────
@@ -4540,7 +4632,7 @@ mod tests {
                 peer_public_key:           dest_kp.public_key,
                 peer_active_connection_id: 20, // dest DG's local conn id
                 device_uuid:               dest_device_uuid,
-            peer_addr:   "127.0.0.1:0".parse().unwrap(),
+                peer_addr:                 SocketAddr::V4(dest_addr),
             });
 
             // Dest device must be in the node's known devices/contacts.
@@ -4554,8 +4646,7 @@ mod tests {
                         uuid:            dest_device_uuid,
                         grade:           DeviceGrade::DG,
                         sg_rank:         None,
-                        host:            dest_addr,
-                        public_hostname: None,
+                        hosts:           vec![dest_addr.to_string()],
                         applications:    Vec::new(),
                     }],
                 },
@@ -5007,8 +5098,7 @@ mod tests {
                         uuid:            contact_sg_uuid,
                         grade:           DeviceGrade::SG,
                         sg_rank:         Some(1),
-                        host:            contact_sg_host,
-                        public_hostname: None,
+                        hosts:           vec![contact_sg_host.to_string()],
                         applications:    Vec::new(),
                     }],
                 },
@@ -5063,8 +5153,7 @@ mod tests {
             uuid:            new_device_uuid,
             grade:           DeviceGrade::SG,
             sg_rank:         Some(1),
-            host:            "127.0.0.1:8888".parse().unwrap(),
-            public_hostname: None,
+            hosts:           vec!["127.0.0.1:8888".into()],
             applications:    Vec::new(),
         });
         payload.push(1u8);              // app_count
@@ -5211,8 +5300,7 @@ mod tests {
                         uuid:            contact_sg_uuid,
                         grade:           DeviceGrade::SG,
                         sg_rank:         Some(1),
-                        host:            contact_sg_addr,
-                        public_hostname: None,
+                        hosts:           vec![contact_sg_addr.to_string()],
                         applications:    Vec::new(),
                     }],
                 },
@@ -5310,8 +5398,7 @@ mod tests {
                 uuid:            dg_uuid,
                 grade:           DeviceGrade::DG,
                 sg_rank:         None,
-                host:            dg_addr,
-                public_hostname: None,
+                hosts:           vec![dg_addr.to_string()],
                 applications:    Vec::new(),
             });
 
@@ -5362,8 +5449,7 @@ mod tests {
                 uuid:            new_device_uuid,
                 grade:           DeviceGrade::DG,
                 sg_rank:         None,
-                host:            "127.0.0.1:0".parse().unwrap(),
-                public_hostname: None,
+                hosts:           vec!["127.0.0.1:0".into()],
                 applications:    Vec::new(),
             });
         }
@@ -5428,8 +5514,7 @@ mod tests {
                 uuid:            receiver_uuid,
                 grade:           DeviceGrade::DG,
                 sg_rank:         None,
-                host:            "127.0.0.1:0".parse().unwrap(),
-                public_hostname: None,
+                hosts:           vec!["127.0.0.1:0".into()],
                 applications:    Vec::new(), // SG has no apps for this device
             };
             // Insert into the sender's node as well.
@@ -5473,11 +5558,18 @@ mod tests {
 
         let t = TestCtx::new();
         let (dg_uuid, _, dg_conn) = setup_sg_with_own_dg_conn(&t);
-        // Fix up the DG host so replies go to our listening socket.
+        // Retarget the DG's active connection so the reply packet reaches our
+        // listening socket.  `dev.hosts` no longer drives outgoing routing —
+        // the active connection's `peer_addr` does.
         {
             let mut node = t.ctx.node.write().unwrap();
             if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == dg_uuid) {
-                dev.host = dg_addr;
+                dev.hosts = vec![dg_addr.to_string()];
+            }
+            for c in node.owner.active_connections.values_mut() {
+                if c.device_uuid == dg_uuid {
+                    c.peer_addr = SocketAddr::V4(dg_addr);
+                }
             }
         }
 
@@ -5520,11 +5612,18 @@ mod tests {
 
         let t = TestCtx::new();
         let (dg_uuid, _, _) = setup_sg_with_own_dg_conn(&t);
-        // Point the DG host to our listening socket.
+        // Retarget the DG's active connection so the reply packet reaches our
+        // listening socket.  `dev.hosts` no longer drives outgoing routing —
+        // the active connection's `peer_addr` does.
         {
             let mut node = t.ctx.node.write().unwrap();
             if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == dg_uuid) {
-                dev.host = dg_addr;
+                dev.hosts = vec![dg_addr.to_string()];
+            }
+            for c in node.owner.active_connections.values_mut() {
+                if c.device_uuid == dg_uuid {
+                    c.peer_addr = SocketAddr::V4(dg_addr);
+                }
             }
         }
 
@@ -5555,8 +5654,7 @@ mod tests {
                 uuid:            peer_uuid,
                 grade:           DeviceGrade::SG,
                 sg_rank:         Some(1),
-                host:            peer_addr,
-                public_hostname: None,
+                hosts:           vec![peer_addr.to_string()],
                 applications:    Vec::new(),
             });
             node.owner.active_connections.insert(1, ActiveConnection {

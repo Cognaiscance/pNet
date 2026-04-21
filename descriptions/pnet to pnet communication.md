@@ -95,7 +95,7 @@ Before a new device can participate in the network it must receive a copy of the
 
 - The user has at least one configured device and at least one SG.
 - An invitation was generated on any configured device (see Administration UI — Invitations). The invitation contains a short-lived ephemeral key pair and the address of a target SG.
-- The invitation's `id`, `public_key`, and `sg_host` are shared with the new device out-of-band (copy-paste or QR code). The shareable code is the base64 encoding of `invitation_id (16) || invitation_public_key (32) || sg_host (6)` — 54 raw bytes / 72 base64 characters.
+- The invitation's `id`, `public_key`, and a resolvable SG address are shared with the new device out-of-band (copy-paste or QR code). The device-invitation code encodes `invitation_id (16) || invitation_public_key (32) || host_len (1) || host_bytes (host_len) || port (2)` — variable length, where `host_bytes` is the first entry from the SG's `hosts` list (hostname or IP, no port suffix). The contact-invitation code uses the fixed-length form `invitation_id (16) || invitation_public_key (32) || ipv4 (4) || port (2)` — 54 bytes / 72 base64 characters; the full hostname list arrives later via ContactDataPush.
 - If the invitation was generated on a DG, it is synced to the SG before use (handled by the future device-sync system).
 
 ### BootstrapRequest — op `0x30`
@@ -132,7 +132,7 @@ Sent by the SG back to the new device if the invitation is valid and not expired
 The encrypted payload contains the full user data needed to configure the new device:
 - User alias and UUID
 - User long-term key pair (public and private, 32 bytes each)
-- All of the user's known devices (alias, UUID, grade, host)
+- All of the user's known devices (alias, UUID, grade, sg_rank, hosts list). Each device encodes its address list as `[host_count:u8]` followed by `host_count` length-prefixed hostname strings.
 - All of the user's contacts (alias, UUID, public key, devices)
 
 After sending the response the SG removes the invitation — it is single-use.

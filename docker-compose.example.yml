@@ -1,6 +1,7 @@
 networks:
   net-william:
   net-chad:
+  net-sg-backbone:
 
 services:
   sg-william:
@@ -8,9 +9,12 @@ services:
     restart: unless-stopped
     networks:
       - net-william
+      - net-sg-backbone
     ports:
       - "7777:7777/udp"
       - "8777:8777/tcp"
+    environment:
+      - PNET_HOSTS=pnet.thehomegarage.com,sg-william
     volumes:
       - /opt/pnet/william:/root/.pnet
 
@@ -35,9 +39,12 @@ services:
     restart: unless-stopped
     networks:
       - net-chad
+      - net-sg-backbone
     ports:
       - "7778:7777/udp"
       - "8778:8777/tcp"
+    environment:
+      - PNET_HOSTS=pnet.thehomegarage.com,sg-chad
     volumes:
       - /opt/pnet/chad:/root/.pnet
 

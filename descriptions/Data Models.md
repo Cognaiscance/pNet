@@ -41,8 +41,17 @@ description: an invitation token used to add a contact or device
 description: holds information specific to a device (laptop, server, phone)
 * alias
 * uuid
-* host
-	* a SocketAddrV4 (ipv4 address with port number)
+* grade
+	* SG (Server Grade) or DG (Device Grade)
+* sg_rank
+	* Option<u32>. Relay priority for SG-grade devices, lower = higher priority. None for DG.
+* hosts
+	* Vec<String>. Advertised addresses for reaching this device, as hostnames or IPs
+	  with optional ":port" suffix (default 7777). Resolved at connection time — a
+	  name that only resolves inside one network simply fails to resolve elsewhere
+	  and is skipped. Empty for DG-grade devices (DG peer_addr is learned from the
+	  source address of incoming packets). On SG devices the list is populated at
+	  startup from the `PNET_HOSTS` environment variable.
 * applications
 
 # Application
