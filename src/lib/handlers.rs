@@ -18,6 +18,19 @@ const ERR_TOKEN_UNKNOWN: u8 = 0x02;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Parse the `PNET_HOSTS` env var into an advertised-hostname list.
+/// Comma-separated entries with optional `:port` suffix (default 7777).
+/// Returns empty vec if unset or contains only whitespace.
+pub fn parse_pnet_hosts() -> Vec<String> {
+    std::env::var("PNET_HOSTS")
+        .ok()
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn send(ctx: &WorkerContext, dest: SocketAddr, data: &[u8]) {
     if let Err(e) = ctx.udp_socket.send_to(data, dest) {
         eprintln!("[send] send_to {dest} failed: {e}");
@@ -3731,8 +3744,14 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
             dev.alias           = device_alias;
             dev.grade           = grade;
             dev.sg_rank         = sg_rank;
-            // `dev.hosts` is set separately from the `PNET_HOSTS` env var
-            // (see main::apply_pnet_hosts) — the setup form no longer collects it.
+            // Apply PNET_HOSTS here too: main's startup application is skipped
+            // on a fresh container (node not yet initialized).
+            if matches!(dev.grade, DeviceGrade::SG) {
+                let hosts = parse_pnet_hosts();
+                if !hosts.is_empty() {
+                    dev.hosts = hosts;
+                }
+            }
         }
     }
     ctx.save_node();

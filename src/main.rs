@@ -6,6 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use lib::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW};
 use lib::data_models::DeviceGrade;
+use lib::handlers::parse_pnet_hosts;
 use lib::http_server::HttpServer;
 use lib::persistence;
 use lib::scheduler::SchedulerThread;
@@ -20,22 +21,10 @@ fn data_dir() -> PathBuf {
     PathBuf::from(home).join(".pnet").join("data")
 }
 
-/// Parse the `PNET_HOSTS` env var into an advertised-hostname list.
-/// Comma-separated entries with optional `:port` suffix (default 7777).
-/// Returns empty vec if unset or contains only whitespace.
-fn parse_pnet_hosts() -> Vec<String> {
-    std::env::var("PNET_HOSTS")
-        .ok()
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
 /// Overwrite the local device's `hosts` list with the parsed `PNET_HOSTS`
 /// entries, if the node is already set up and the local device is SG-grade.
 /// Called on every startup — `PNET_HOSTS` is authoritative when set.
+/// On fresh containers, `complete_setup` re-applies after initialization.
 fn apply_pnet_hosts(node: &Arc<RwLock<lib::data_models::Node>>, hosts: &[String]) {
     if hosts.is_empty() { return; }
     let mut n = node.write().unwrap();
