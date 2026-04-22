@@ -14,7 +14,7 @@ services:
       - "7777:7777/udp"
       - "8777:8777/tcp"
     environment:
-      - PNET_HOSTS=pnet.thehomegarage.com,sg-william
+      - PNET_HOSTS=pnet.thehomegarage.com:7777,sg-william
     volumes:
       - /opt/pnet/william:/root/.pnet
 
@@ -44,7 +44,7 @@ services:
       - "7778:7777/udp"
       - "8778:8777/tcp"
     environment:
-      - PNET_HOSTS=pnet.thehomegarage.com,sg-chad
+      - PNET_HOSTS=pnet.thehomegarage.com:7778,sg-chad
     volumes:
       - /opt/pnet/chad:/root/.pnet
 
