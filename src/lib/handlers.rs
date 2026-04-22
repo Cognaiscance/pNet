@@ -2961,12 +2961,16 @@ pub fn ui_request(
         }
         ("GET",  "/invitations")   => respond_html(&stream, 200, &render_invitations(ctx, &query)),
         ("POST", "/invitations/device") => {
-            let code = generate_device_invitation(ctx).unwrap_or_default();
-            respond_redirect(&stream, &format!("/invitations?code={code}"));
+            match generate_device_invitation(ctx) {
+                Some(code) => respond_redirect(&stream, &format!("/invitations?code={code}")),
+                None       => respond_redirect(&stream, "/invitations?error=no_host"),
+            }
         }
         ("POST", "/invitations/contact") => {
-            let code = generate_contact_invitation(ctx).unwrap_or_default();
-            respond_redirect(&stream, &format!("/invitations?contact_code={code}"));
+            match generate_contact_invitation(ctx) {
+                Some(code) => respond_redirect(&stream, &format!("/invitations?contact_code={code}")),
+                None       => respond_redirect(&stream, "/invitations?error=no_host"),
+            }
         }
         ("POST", "/invitations/enter") => {
             initiate_bootstrap(&body, ctx);
@@ -3079,6 +3083,14 @@ fn render_dashboard(ctx: &WorkerContext) -> String {
     let n_apps: usize = node.owner.user.devices.iter().map(|d| d.applications.len()).sum();
     let n_conns      = node.owner.active_connections.len();
 
+    let hosts_line = match device {
+        Some(d) if d.hosts.is_empty() => {
+            "<span style='color:#900'>none — set <code>PNET_HOSTS</code> and restart</span>".to_string()
+        }
+        Some(d) => html_escape(&d.hosts.join(", ")),
+        None => "unknown".to_string(),
+    };
+
     let body = format!(
         "<h1>Dashboard</h1>\
          <div class=\"stats\">\
@@ -3089,6 +3101,7 @@ fn render_dashboard(ctx: &WorkerContext) -> String {
          <div class=\"card\">\
            <div class=\"label\">Owner</div><div>{owner_alias}</div>\
            <div class=\"label\" style=\"margin-top:.5rem\">Device</div><div>{device_alias}</div>\
+           <div class=\"label\" style=\"margin-top:.5rem\">Advertised hosts</div><div>{hosts_line}</div>\
          </div>"
     );
     layout("Dashboard", &body)
@@ -3322,10 +3335,13 @@ fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
     let host_str: String = {
         let node = ctx.node.read().unwrap();
         let local_uuid   = node.device_uuid;
-        let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid)?;
+        let Some(local_device) = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid) else {
+            eprintln!("[generate_device_invitation] local device not found in node");
+            return None;
+        };
 
-        if matches!(local_device.grade, DeviceGrade::SG) {
-            local_device.hosts.first().cloned()?
+        let picked = if matches!(local_device.grade, DeviceGrade::SG) {
+            local_device.hosts.first().cloned()
         } else {
             // Find the lowest-RTT up SG among own devices.
             let mut best: Option<(Duration, String)> = None;
@@ -3340,12 +3356,27 @@ fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
                     }
                 }
             }
-            best.map(|(_, h)| h)?
+            best.map(|(_, h)| h)
+        };
+
+        match picked {
+            Some(h) => h,
+            None => {
+                eprintln!(
+                    "[generate_device_invitation] no SG host configured — \
+                     local device hosts: {:?}. Set PNET_HOSTS and restart.",
+                    local_device.hosts,
+                );
+                return None;
+            }
         }
     };
 
     // Resolve to get the port embedded in the fixed-format code.
-    let sg_addr = resolve_host_entry(&host_str)?;
+    let Some(sg_addr) = resolve_host_entry(&host_str) else {
+        eprintln!("[generate_device_invitation] host {host_str:?} failed to resolve");
+        return None;
+    };
 
     let (inv_id, inv_pk) = {
         let mut node = ctx.node.write().unwrap();
@@ -3445,10 +3476,13 @@ fn generate_contact_invitation(ctx: &WorkerContext) -> Option<String> {
     let sg_host: SocketAddrV4 = {
         let node = ctx.node.read().unwrap();
         let local_uuid   = node.device_uuid;
-        let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid)?;
+        let Some(local_device) = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid) else {
+            eprintln!("[generate_contact_invitation] local device not found in node");
+            return None;
+        };
 
-        if matches!(local_device.grade, DeviceGrade::SG) {
-            resolve_hosts(&local_device.hosts).into_iter().next().map(|(_, a)| a)?
+        let resolved = if matches!(local_device.grade, DeviceGrade::SG) {
+            resolve_hosts(&local_device.hosts).into_iter().next().map(|(_, a)| a)
         } else {
             best_address_for_device(&node, &local_uuid)
                 .or_else(|| {
@@ -3456,7 +3490,19 @@ fn generate_contact_invitation(ctx: &WorkerContext) -> Option<String> {
                     node.owner.user.devices.iter()
                         .filter(|d| matches!(d.grade, DeviceGrade::SG))
                         .find_map(|d| best_address_for_device(&node, &d.uuid))
-                })?
+                })
+        };
+
+        match resolved {
+            Some(a) => a,
+            None => {
+                eprintln!(
+                    "[generate_contact_invitation] no resolvable SG host — \
+                     local device hosts: {:?}. Set PNET_HOSTS and restart.",
+                    local_device.hosts,
+                );
+                return None;
+            }
         }
     };
 
@@ -3543,6 +3589,18 @@ fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
     let contact_code_param = query.split('&')
         .find_map(|p| p.strip_prefix("contact_code="))
         .unwrap_or("");
+    let error_param = query.split('&')
+        .find_map(|p| p.strip_prefix("error="))
+        .unwrap_or("");
+
+    let error_section = match error_param {
+        "no_host" => "<div class='card' style='background:#fee;color:#900;border:1px solid #c66'>\
+            <strong>Could not generate invitation:</strong> no reachable host is configured \
+            for this device. Set the <code>PNET_HOSTS</code> environment variable before \
+            starting the node, then restart. See the server log for details.\
+            </div>".to_string(),
+        _ => String::new(),
+    };
 
     let code_section = if !code_param.is_empty() {
         format!(
@@ -3600,6 +3658,7 @@ fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
 
     let body = format!(
         "<h1>Invitations</h1>\
+         {error_section}\
          {code_section}\
          {contact_code_section}\
          <div class='card'>\
