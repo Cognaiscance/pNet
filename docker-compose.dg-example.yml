@@ -10,10 +10,8 @@ services:
     ports:
       - "7777:7777/udp"
       - "8777:8777/tcp"
-    environment:
-      - PNET_HOSTS=sg-william,pnet.thehomegarage.com:7777
     volumes:
-      - /opt/pnet/william:/root/.pnet
+      - /opt/pnet:/root/.pnet
 
   deliverer:
     build:
@@ -23,11 +21,11 @@ services:
     networks:
       - net-pnet
     environment:
-      - PNET_ADDR=sg-william:7777
+      - PNET_ADDR=dg:7777
     ports:
       - "3000:3000/tcp"
     volumes:
-      - /opt/pnet-deliverer/william:/app
+      - /opt/pnet-deliverer:/app
     depends_on:
-      - dg-william
+      - dg
 
