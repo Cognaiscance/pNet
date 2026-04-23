@@ -3481,42 +3481,58 @@ fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
 
 /// Generate a contact invitation code: stores the invitation in
 /// `contact_invitations` and returns the base64-encoded shareable code.
+///
+/// Embeds the hostname string (not a pre-resolved IP) so the receiver
+/// resolves it in its own DNS context — otherwise a docker service name
+/// would resolve to the generator's per-user network IP, which is
+/// unreachable from peers on other networks.
 fn generate_contact_invitation(ctx: &WorkerContext) -> Option<String> {
     use base64::Engine;
 
-    // Contact invitation code is fixed-length and embeds a pre-resolved IPv4
-    // address. Full hostname list arrives via ContactDataPush after onboarding.
-    let sg_host: SocketAddrV4 = {
+    let host_str: String = {
         let node = ctx.node.read().unwrap();
-        let local_uuid   = node.device_uuid;
+        let local_uuid = node.device_uuid;
         let Some(local_device) = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid) else {
             eprintln!("[generate_contact_invitation] local device not found in node");
             return None;
         };
 
-        let resolved = if matches!(local_device.grade, DeviceGrade::SG) {
-            resolve_hosts(&local_device.hosts).into_iter().next().map(|(_, a)| a)
+        let picked = if matches!(local_device.grade, DeviceGrade::SG) {
+            local_device.hosts.first().cloned()
         } else {
-            best_address_for_device(&node, &local_uuid)
-                .or_else(|| {
-                    // Fallback: best own SG.
-                    node.owner.user.devices.iter()
-                        .filter(|d| matches!(d.grade, DeviceGrade::SG))
-                        .find_map(|d| best_address_for_device(&node, &d.uuid))
-                })
+            // DG: pick the first host of the lowest-RTT up own SG.
+            let mut best: Option<(Duration, String)> = None;
+            for d in &node.owner.user.devices {
+                if !matches!(d.grade, DeviceGrade::SG) { continue; }
+                let Some(first_host) = d.hosts.first() else { continue; };
+                for ((uuid, _), s) in &node.sg_statuses {
+                    if *uuid != d.uuid || !s.up { continue; }
+                    let rtt = s.last_rtt.unwrap_or(Duration::MAX);
+                    if best.as_ref().map_or(true, |(br, _)| rtt < *br) {
+                        best = Some((rtt, first_host.clone()));
+                    }
+                }
+            }
+            best.map(|(_, h)| h)
         };
 
-        match resolved {
-            Some(a) => a,
+        match picked {
+            Some(h) => h,
             None => {
                 eprintln!(
-                    "[generate_contact_invitation] no resolvable SG host — \
+                    "[generate_contact_invitation] no SG host configured — \
                      local device hosts: {:?}. Set PNET_HOSTS and restart.",
                     local_device.hosts,
                 );
                 return None;
             }
         }
+    };
+
+    // Resolve once just to extract the port (default 7777 when unspecified).
+    let Some(sg_addr) = resolve_host_entry(&host_str) else {
+        eprintln!("[generate_contact_invitation] host {host_str:?} failed to resolve");
+        return None;
     };
 
     let (inv_id, inv_pk) = {
@@ -3534,12 +3550,17 @@ fn generate_contact_invitation(ctx: &WorkerContext) -> Option<String> {
 
     ctx.save_node();
 
-    let mut raw = [0u8; 54];
-    raw[0..16].copy_from_slice(&inv_id);
-    raw[16..48].copy_from_slice(&inv_pk);
-    raw[48..52].copy_from_slice(&sg_host.ip().octets());
-    raw[52..54].copy_from_slice(&sg_host.port().to_be_bytes());
-    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw))
+    // Encode: [inv_id:16][inv_pk:32][host_len:1][host:host_len][port:2]
+    let host_for_code: String = host_str.split(':').next().unwrap_or(&host_str).to_string();
+    let host_bytes = host_for_code.as_bytes();
+    let host_len = host_bytes.len().min(255) as u8;
+    let mut raw = Vec::with_capacity(16 + 32 + 1 + host_len as usize + 2);
+    raw.extend_from_slice(&inv_id);
+    raw.extend_from_slice(&inv_pk);
+    raw.push(host_len);
+    raw.extend_from_slice(&host_bytes[..host_len as usize]);
+    raw.extend_from_slice(&sg_addr.port().to_be_bytes());
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw))
 }
 
 /// Parse a contact invitation code and send a ContactRequest to the target's SG.
@@ -3551,16 +3572,28 @@ fn initiate_contact_exchange(body: &[u8], ctx: &WorkerContext) {
         eprintln!("[initiate_contact_exchange] invalid base64");
         return;
     };
-    if raw.len() != 54 {
-        eprintln!("[initiate_contact_exchange] wrong code length ({})", raw.len());
+    // Minimum: 16 (inv_id) + 32 (inv_pk) + 1 (host_len) + 1 (host min) + 2 (port) = 52
+    if raw.len() < 52 {
+        eprintln!("[initiate_contact_exchange] code too short ({} bytes)", raw.len());
         return;
     }
 
     let invitation_id: Uuid      = raw[0..16].try_into().unwrap();
     let invitation_pk: PublicKey = raw[16..48].try_into().unwrap();
-    let ip_bytes: [u8; 4]        = raw[48..52].try_into().unwrap();
-    let port = u16::from_be_bytes([raw[52], raw[53]]);
-    let sg_addr = SocketAddrV4::new(Ipv4Addr::from(ip_bytes), port);
+    let host_len = raw[48] as usize;
+    if raw.len() < 49 + host_len + 2 {
+        eprintln!("[initiate_contact_exchange] code truncated");
+        return;
+    }
+    let host_str = match std::str::from_utf8(&raw[49..49 + host_len]) {
+        Ok(s) => s,
+        Err(_) => { eprintln!("[initiate_contact_exchange] invalid host string"); return; }
+    };
+    let port = u16::from_be_bytes([raw[49 + host_len], raw[50 + host_len]]);
+    let Some(sg_addr) = resolve_sg_host(&format!("{host_str}:{port}")) else {
+        eprintln!("[initiate_contact_exchange] could not resolve host '{host_str}'");
+        return;
+    };
 
     let ephem_kp = generate_x25519_keypair();
     let ephem_pk = ephem_kp.public_key;
