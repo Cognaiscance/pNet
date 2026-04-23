@@ -277,7 +277,8 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 ///   [owner_alias: u8+bytes][owner_uuid: 16]
 ///   [device_count: u8]
 ///     each device:
-///       [uuid: 16][alias: u8+bytes][grade: u8][sg_rank: u8][ip: 4][port: 2 BE]
+///       [uuid: 16][alias: u8+bytes][grade: u8][sg_rank: u8]
+///       [host_count: u8][each host: u8+bytes]
 ///       [app_count: u8]
 ///         each app: [id: u16 BE][alias: u8+bytes][ip: 4][port: 2 BE][user_approved: u8]
 ///   [contact_count: u8]
@@ -285,7 +286,8 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 ///       [alias: u8+bytes][uuid: 16]
 ///       [device_count: u8]
 ///         each device:
-///           [uuid: 16][alias: u8+bytes][grade: u8][sg_rank: u8][ip: 4][port: 2 BE]
+///           [uuid: 16][alias: u8+bytes][grade: u8][sg_rank: u8]
+///           [host_count: u8][each host: u8+bytes]
 ///           [app_count: u8]
 ///             each app: [id: u16 BE][alias: u8+bytes]
 pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
