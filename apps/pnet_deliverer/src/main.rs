@@ -208,7 +208,12 @@ fn parse_get_data(reply: &[u8], inner: &mut Inner) {
         for _ in 0..device_count {
             let Some(dev_uuid) = read_bytes::<16>(reply, &mut pos) else { return };
             let Some(dev_alias) = read_str(reply, &mut pos) else { return };
-            pos += 1 + 1 + 4 + 2; // grade + sg_rank + ip + port
+            pos += 2; // grade + sg_rank
+            let Some(&host_count) = reply.get(pos) else { return };
+            pos += 1;
+            for _ in 0..host_count {
+                if read_str(reply, &mut pos).is_none() { return }
+            }
             let Some(&app_count) = reply.get(pos) else { return };
             pos += 1;
             for _ in 0..app_count {
