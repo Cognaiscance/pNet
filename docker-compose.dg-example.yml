@@ -1,0 +1,33 @@
+networks:
+  net-pnet:
+
+services:
+  dg:
+    build: .
+    restart: unless-stopped
+    networks:
+      - net-pnet
+    ports:
+      - "7777:7777/udp"
+      - "8777:8777/tcp"
+    environment:
+      - PNET_HOSTS=sg-william,pnet.thehomegarage.com:7777
+    volumes:
+      - /opt/pnet/william:/root/.pnet
+
+  deliverer:
+    build:
+      context: .
+      dockerfile: apps/pnet_deliverer/Dockerfile
+    restart: unless-stopped
+    networks:
+      - net-pnet
+    environment:
+      - PNET_ADDR=sg-william:7777
+    ports:
+      - "3000:3000/tcp"
+    volumes:
+      - /opt/pnet-deliverer/william:/app
+    depends_on:
+      - dg-william
+
