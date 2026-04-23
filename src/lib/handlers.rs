@@ -1961,6 +1961,7 @@ pub fn device_data_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
         }
     }
     ctx.save_node();
+    push_data_to_contacts(ctx);
 
     let payload = {
         let node = ctx.node.read().unwrap();
@@ -1992,6 +1993,7 @@ pub fn sync_devices(ctx: &WorkerContext) {
     if is_sg {
         drop(node);
         push_data_to_devices(ctx);
+        push_data_to_contacts(ctx);
         return;
     }
 
