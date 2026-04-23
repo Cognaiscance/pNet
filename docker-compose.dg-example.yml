@@ -7,8 +7,12 @@ services:
     restart: unless-stopped
     networks:
       - net-pnet
+    # No UDP 7777 publish: a DG only *initiates* flows to its SG, so
+    # responses come back through the existing NAT binding. Publishing it
+    # also collides with the container's outbound src_port=7777 under
+    # rootless podman (pasta) and causes outgoing bootstrap packets to be
+    # dropped on the host.
     ports:
-      - "7777:7777/udp"
       - "8777:8777/tcp"
     volumes:
       - ${HOME}/.pnet:/root/.pnet:Z
