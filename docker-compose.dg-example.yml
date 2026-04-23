@@ -11,7 +11,7 @@ services:
       - "7777:7777/udp"
       - "8777:8777/tcp"
     volumes:
-      - /opt/pnet:/root/.pnet
+      - ${HOME}/.pnet:/root/.pnet:Z
 
   deliverer:
     build:
@@ -24,8 +24,6 @@ services:
       - PNET_ADDR=dg:7777
     ports:
       - "3000:3000/tcp"
-    volumes:
-      - /opt/pnet-deliverer:/app
     depends_on:
       - dg
 
