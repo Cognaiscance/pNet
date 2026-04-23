@@ -3339,59 +3339,95 @@ fn reject_app(body: &[u8], ctx: &WorkerContext) {
 
 // ── Invitation generation and bootstrap initiation ───────────────────────────
 
+/// Select the SG hosts list to embed in an outbound invitation code.
+/// SG devices embed their own hosts; DG devices embed the lowest-RTT up SG's
+/// hosts.  Returns `None` (after logging) if no reachable SG is known.
+fn pick_invitation_hosts(ctx: &WorkerContext, label: &str) -> Option<Vec<String>> {
+    let node = ctx.node.read().unwrap();
+    let local_uuid = node.device_uuid;
+    let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid)?;
+
+    let hosts = if matches!(local_device.grade, DeviceGrade::SG) {
+        local_device.hosts.clone()
+    } else {
+        let mut best: Option<(Duration, Vec<String>)> = None;
+        for d in &node.owner.user.devices {
+            if !matches!(d.grade, DeviceGrade::SG) { continue; }
+            if d.hosts.is_empty() { continue; }
+            for ((uuid, _), s) in &node.sg_statuses {
+                if *uuid != d.uuid || !s.up { continue; }
+                let rtt = s.last_rtt.unwrap_or(Duration::MAX);
+                if best.as_ref().map_or(true, |(br, _)| rtt < *br) {
+                    best = Some((rtt, d.hosts.clone()));
+                }
+            }
+        }
+        best.map(|(_, h)| h).unwrap_or_default()
+    };
+
+    if hosts.is_empty() {
+        eprintln!(
+            "[{label}] no SG host configured — local device hosts: {:?}. \
+             Set PNET_HOSTS and restart.",
+            local_device.hosts,
+        );
+        return None;
+    }
+    Some(hosts)
+}
+
+/// Encode an invitation code with the full SG hosts list so the receiver can
+/// pick whichever entry is resolvable in its own DNS context (docker service
+/// name when co-located, public hostname when remote).
+///
+/// Format: `[inv_id:16][inv_pk:32][host_count:1] { [host_len:1][host_str:N] }*`
+/// Each `host_str` carries its own optional `:port` suffix (same grammar as
+/// `Device.hosts`); default port 7777 is applied at resolve time.
+fn encode_invitation_code(inv_id: &Uuid, inv_pk: &PublicKey, hosts: &[String]) -> String {
+    use base64::Engine;
+    let host_count = hosts.len().min(u8::MAX as usize);
+    let mut raw = Vec::with_capacity(16 + 32 + 1 + host_count * 32);
+    raw.extend_from_slice(inv_id);
+    raw.extend_from_slice(inv_pk);
+    raw.push(host_count as u8);
+    for h in hosts.iter().take(host_count) {
+        let b = h.as_bytes();
+        let len = b.len().min(u8::MAX as usize);
+        raw.push(len as u8);
+        raw.extend_from_slice(&b[..len]);
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw)
+}
+
+/// Decode an invitation code. Returns `(inv_id, inv_pk, hosts)`.
+fn decode_invitation_code(code_str: &str) -> Option<(Uuid, PublicKey, Vec<String>)> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(code_str.trim()).ok()?;
+    if raw.len() < 49 { return None; }
+    let inv_id:    Uuid      = raw[0..16].try_into().ok()?;
+    let inv_pk:    PublicKey = raw[16..48].try_into().ok()?;
+    let host_count = raw[48] as usize;
+    let mut off = 49;
+    let mut hosts = Vec::with_capacity(host_count);
+    for _ in 0..host_count {
+        if off >= raw.len() { return None; }
+        let len = raw[off] as usize;
+        off += 1;
+        if off + len > raw.len() { return None; }
+        let s = std::str::from_utf8(&raw[off..off + len]).ok()?.to_string();
+        off += len;
+        hosts.push(s);
+    }
+    Some((inv_id, inv_pk, hosts))
+}
+
 /// Generate a device invitation on the UI.  Picks the best SG (self if SG, else
 /// lowest-RTT up SG), creates an invitation, and returns the base64-encoded code.
 ///
-/// Embeds the first entry from the chosen SG's `hosts` list. The full host list
-/// is delivered later by ContactDataPush after onboarding completes.
+/// Embeds the full `hosts` list of the chosen SG so the receiver can pick
+/// whichever entry resolves in its own network.
 fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
-    use base64::Engine;
-
-    let host_str: String = {
-        let node = ctx.node.read().unwrap();
-        let local_uuid   = node.device_uuid;
-        let Some(local_device) = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid) else {
-            eprintln!("[generate_device_invitation] local device not found in node");
-            return None;
-        };
-
-        let picked = if matches!(local_device.grade, DeviceGrade::SG) {
-            local_device.hosts.first().cloned()
-        } else {
-            // Find the lowest-RTT up SG among own devices.
-            let mut best: Option<(Duration, String)> = None;
-            for d in &node.owner.user.devices {
-                if !matches!(d.grade, DeviceGrade::SG) { continue; }
-                let Some(first_host) = d.hosts.first() else { continue; };
-                for ((uuid, _), s) in &node.sg_statuses {
-                    if *uuid != d.uuid || !s.up { continue; }
-                    let rtt = s.last_rtt.unwrap_or(Duration::MAX);
-                    if best.as_ref().map_or(true, |(br, _)| rtt < *br) {
-                        best = Some((rtt, first_host.clone()));
-                    }
-                }
-            }
-            best.map(|(_, h)| h)
-        };
-
-        match picked {
-            Some(h) => h,
-            None => {
-                eprintln!(
-                    "[generate_device_invitation] no SG host configured — \
-                     local device hosts: {:?}. Set PNET_HOSTS and restart.",
-                    local_device.hosts,
-                );
-                return None;
-            }
-        }
-    };
-
-    // Resolve to get the port embedded in the fixed-format code.
-    let Some(sg_addr) = resolve_host_entry(&host_str) else {
-        eprintln!("[generate_device_invitation] host {host_str:?} failed to resolve");
-        return None;
-    };
+    let hosts = pick_invitation_hosts(ctx, "generate_device_invitation")?;
 
     let (inv_id, inv_pk) = {
         let mut node = ctx.node.write().unwrap();
@@ -3407,54 +3443,24 @@ fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
     };
 
     ctx.save_node();
-
-    // Encode: [inv_id:16][inv_pk:32][host_len:1][host:host_len][port:2]
-    let host_for_code: String = host_str.split(':').next().unwrap_or(&host_str).to_string();
-    let host_bytes = host_for_code.as_bytes();
-    let host_len = host_bytes.len().min(255) as u8;
-    let mut raw = Vec::with_capacity(16 + 32 + 1 + host_len as usize + 2);
-    raw.extend_from_slice(&inv_id);
-    raw.extend_from_slice(&inv_pk);
-    raw.push(host_len);
-    raw.extend_from_slice(&host_bytes[..host_len as usize]);
-    raw.extend_from_slice(&sg_addr.port().to_be_bytes());
-    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw))
+    Some(encode_invitation_code(&inv_id, &inv_pk, &hosts))
 }
 
 /// Parse an invitation code entered via the UI and send a BootstrapRequest to the SG.
 fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
-    use base64::Engine;
-
     let device_alias = form_field(body, "device_alias")
         .map(url_decode)
         .unwrap_or_default();
     let device_alias = device_alias.trim().to_string();
 
     let Some(code_str) = form_field(body, "code") else { return };
-    let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(code_str.trim()) else {
-        eprintln!("[initiate_bootstrap] invalid base64");
+    let Some((invitation_id, invitation_pk, hosts)) = decode_invitation_code(code_str) else {
+        eprintln!("[initiate_bootstrap] invalid invitation code");
         return;
     };
-    // Minimum: 16 (inv_id) + 32 (inv_pk) + 1 (host_len) + 1 (host min) + 2 (port) = 52
-    if raw.len() < 52 {
-        eprintln!("[initiate_bootstrap] code too short ({} bytes)", raw.len());
-        return;
-    }
 
-    let invitation_id: Uuid      = raw[0..16].try_into().unwrap();
-    let invitation_pk: PublicKey = raw[16..48].try_into().unwrap();
-    let host_len = raw[48] as usize;
-    if raw.len() < 49 + host_len + 2 {
-        eprintln!("[initiate_bootstrap] code truncated");
-        return;
-    }
-    let host_str = match std::str::from_utf8(&raw[49..49 + host_len]) {
-        Ok(s) => s,
-        Err(_) => { eprintln!("[initiate_bootstrap] invalid host string"); return; }
-    };
-    let port = u16::from_be_bytes([raw[49 + host_len], raw[50 + host_len]]);
-    let Some(sg_addr) = resolve_sg_host(&format!("{host_str}:{port}")) else {
-        eprintln!("[initiate_bootstrap] could not resolve host '{host_str}'");
+    let Some((picked_host, sg_addr)) = resolve_hosts(&hosts).into_iter().next() else {
+        eprintln!("[initiate_bootstrap] no host in invitation code resolved: {hosts:?}");
         return;
     };
 
@@ -3477,65 +3483,17 @@ fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
     pkt[0]      = BOOTSTRAP_REQUEST_OP;
     pkt[1..17].copy_from_slice(&invitation_id);
     pkt[17..49].copy_from_slice(&ephem_pk);
-    println!("[initiate_bootstrap] sending bootstrap request to {sg_addr}");
+    println!("[initiate_bootstrap] sending bootstrap request to {sg_addr} (picked {picked_host} from {hosts:?})");
     send(ctx, SocketAddr::V4(sg_addr), &pkt);
 }
 
 /// Generate a contact invitation code: stores the invitation in
 /// `contact_invitations` and returns the base64-encoded shareable code.
 ///
-/// Embeds the hostname string (not a pre-resolved IP) so the receiver
-/// resolves it in its own DNS context — otherwise a docker service name
-/// would resolve to the generator's per-user network IP, which is
-/// unreachable from peers on other networks.
+/// Embeds the full `hosts` list of the chosen SG so the receiver can pick
+/// whichever entry resolves in its own network.
 fn generate_contact_invitation(ctx: &WorkerContext) -> Option<String> {
-    use base64::Engine;
-
-    let host_str: String = {
-        let node = ctx.node.read().unwrap();
-        let local_uuid = node.device_uuid;
-        let Some(local_device) = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid) else {
-            eprintln!("[generate_contact_invitation] local device not found in node");
-            return None;
-        };
-
-        let picked = if matches!(local_device.grade, DeviceGrade::SG) {
-            local_device.hosts.first().cloned()
-        } else {
-            // DG: pick the first host of the lowest-RTT up own SG.
-            let mut best: Option<(Duration, String)> = None;
-            for d in &node.owner.user.devices {
-                if !matches!(d.grade, DeviceGrade::SG) { continue; }
-                let Some(first_host) = d.hosts.first() else { continue; };
-                for ((uuid, _), s) in &node.sg_statuses {
-                    if *uuid != d.uuid || !s.up { continue; }
-                    let rtt = s.last_rtt.unwrap_or(Duration::MAX);
-                    if best.as_ref().map_or(true, |(br, _)| rtt < *br) {
-                        best = Some((rtt, first_host.clone()));
-                    }
-                }
-            }
-            best.map(|(_, h)| h)
-        };
-
-        match picked {
-            Some(h) => h,
-            None => {
-                eprintln!(
-                    "[generate_contact_invitation] no SG host configured — \
-                     local device hosts: {:?}. Set PNET_HOSTS and restart.",
-                    local_device.hosts,
-                );
-                return None;
-            }
-        }
-    };
-
-    // Resolve once just to extract the port (default 7777 when unspecified).
-    let Some(sg_addr) = resolve_host_entry(&host_str) else {
-        eprintln!("[generate_contact_invitation] host {host_str:?} failed to resolve");
-        return None;
-    };
+    let hosts = pick_invitation_hosts(ctx, "generate_contact_invitation")?;
 
     let (inv_id, inv_pk) = {
         let mut node = ctx.node.write().unwrap();
@@ -3551,51 +3509,22 @@ fn generate_contact_invitation(ctx: &WorkerContext) -> Option<String> {
     };
 
     ctx.save_node();
-
-    // Encode: [inv_id:16][inv_pk:32][host_len:1][host:host_len][port:2]
-    let host_for_code: String = host_str.split(':').next().unwrap_or(&host_str).to_string();
-    let host_bytes = host_for_code.as_bytes();
-    let host_len = host_bytes.len().min(255) as u8;
-    let mut raw = Vec::with_capacity(16 + 32 + 1 + host_len as usize + 2);
-    raw.extend_from_slice(&inv_id);
-    raw.extend_from_slice(&inv_pk);
-    raw.push(host_len);
-    raw.extend_from_slice(&host_bytes[..host_len as usize]);
-    raw.extend_from_slice(&sg_addr.port().to_be_bytes());
-    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw))
+    Some(encode_invitation_code(&inv_id, &inv_pk, &hosts))
 }
 
 /// Parse a contact invitation code and send a ContactRequest to the target's SG.
 fn initiate_contact_exchange(body: &[u8], ctx: &WorkerContext) {
-    use base64::Engine;
-
     let Some(code_str) = form_field(body, "code") else { return };
-    let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(code_str.trim()) else {
-        eprintln!("[initiate_contact_exchange] invalid base64");
+    let Some((invitation_id, invitation_pk, hosts)) = decode_invitation_code(code_str) else {
+        eprintln!("[initiate_contact_exchange] invalid invitation code");
         return;
     };
-    // Minimum: 16 (inv_id) + 32 (inv_pk) + 1 (host_len) + 1 (host min) + 2 (port) = 52
-    if raw.len() < 52 {
-        eprintln!("[initiate_contact_exchange] code too short ({} bytes)", raw.len());
-        return;
-    }
 
-    let invitation_id: Uuid      = raw[0..16].try_into().unwrap();
-    let invitation_pk: PublicKey = raw[16..48].try_into().unwrap();
-    let host_len = raw[48] as usize;
-    if raw.len() < 49 + host_len + 2 {
-        eprintln!("[initiate_contact_exchange] code truncated");
-        return;
-    }
-    let host_str = match std::str::from_utf8(&raw[49..49 + host_len]) {
-        Ok(s) => s,
-        Err(_) => { eprintln!("[initiate_contact_exchange] invalid host string"); return; }
-    };
-    let port = u16::from_be_bytes([raw[49 + host_len], raw[50 + host_len]]);
-    let Some(sg_addr) = resolve_sg_host(&format!("{host_str}:{port}")) else {
-        eprintln!("[initiate_contact_exchange] could not resolve host '{host_str}'");
+    let Some((picked_host, sg_addr)) = resolve_hosts(&hosts).into_iter().next() else {
+        eprintln!("[initiate_contact_exchange] no host in invitation code resolved: {hosts:?}");
         return;
     };
+    println!("[initiate_contact_exchange] sending contact request to {sg_addr} (picked {picked_host} from {hosts:?})");
 
     let ephem_kp = generate_x25519_keypair();
     let ephem_pk = ephem_kp.public_key;
@@ -3791,13 +3720,6 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     }
     ctx.save_node();
     None
-}
-
-/// Parse a user-supplied SG address (IP or domain, optional :port) into a
-/// `SocketAddrV4`. Port defaults to 7777 if omitted. Returns `None` if the
-/// address cannot be resolved to an IPv4 address.
-fn resolve_sg_host(input: &str) -> Option<SocketAddrV4> {
-    resolve_host_entry(input)
 }
 
 fn render_setup(query: &str) -> String {
