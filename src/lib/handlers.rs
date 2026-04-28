@@ -2815,13 +2815,19 @@ fn render_modules(ctx: &WorkerContext) -> String {
 
     let rows: String = ctx.modules.iter().map(|m| {
         let id      = m.id();
+        let slug    = html_escape(m.slug());
         let on      = enabled.contains(&id);
         let label   = if on { "Disable" } else { "Enable" };
         let status  = if on { "<span style='color:#080'>on</span>" } else { "<span style='color:#999'>off</span>" };
+        let name_cell = if on {
+            format!("<a href='/apps/{slug}/'>{}</a>", html_escape(m.alias()))
+        } else {
+            html_escape(m.alias())
+        };
         format!(
             "<tr>\
-               <td>{}</td>\
-               <td><code>{}</code></td>\
+               <td>{name_cell}</td>\
+               <td><code>{slug}</code></td>\
                <td>{status}</td>\
                <td>\
                  <form method='post' action='/apps/toggle' style='margin:0'>\
@@ -2829,9 +2835,7 @@ fn render_modules(ctx: &WorkerContext) -> String {
                    <button type='submit'>{label}</button>\
                  </form>\
                </td>\
-             </tr>",
-            html_escape(m.alias()),
-            html_escape(m.slug()),
+             </tr>"
         )
     }).collect();
 
