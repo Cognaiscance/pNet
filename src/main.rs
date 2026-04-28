@@ -223,6 +223,11 @@ fn main() {
     println!("[main] draining queue and stopping workers...");
     pool.join();
 
+    // Workers are gone; drop main's WorkerContext clone so the writer's
+    // channel sender is the last reference. Without this drop, writer.join()
+    // blocks forever on recv().
+    drop(ctx);
+
     println!("[main] stopping writer...");
     writer.join();
 
