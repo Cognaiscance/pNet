@@ -192,7 +192,7 @@ pub struct Application {
     pub token:         Uuid,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceGrade {
     /// Server Grade — static IP or domain, acts as relay for the user's DGs.
     SG,
@@ -259,6 +259,10 @@ pub struct PendingBootstrap {
     pub sg_addr:            SocketAddrV4,
     /// Device alias entered by the user during setup — applied once bootstrap completes.
     pub device_alias:       String,
+    /// Grade to assign to the local device once bootstrap completes.
+    pub desired_grade:      DeviceGrade,
+    /// SG rank to assign to the local device — `Some` only when `desired_grade == SG`.
+    pub desired_sg_rank:    Option<u32>,
 }
 
 /// State held by an SG after sending a BootstrapResponse, while waiting for

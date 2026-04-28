@@ -14,6 +14,14 @@ services:
     # dropped on the host.
     ports:
       - "8777:8777/tcp"
+    # Headless first-run setup: when present, on first boot the container
+    # joins an existing user using the supplied invitation code. After
+    # initialization these vars are ignored. Generate the code from an
+    # existing SG via /invitations.
+    environment:
+      - PNET_GRADE=dg
+      - PNET_DEVICE_ALIAS=${PNET_DEVICE_ALIAS:-}
+      - PNET_INVITATION_CODE=${PNET_INVITATION_CODE:-}
     volumes:
       - ${HOME}/.pnet:/root/.pnet:Z
 

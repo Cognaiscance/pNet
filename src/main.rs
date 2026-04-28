@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use lib::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW};
 use lib::data_models::DeviceGrade;
-use lib::handlers::parse_pnet_hosts;
+use lib::handlers::{apply_new_user_setup, parse_pnet_hosts, start_bootstrap};
 use lib::http_server::HttpServer;
 use lib::persistence;
 use lib::scheduler::SchedulerThread;
@@ -33,6 +33,84 @@ fn apply_pnet_hosts(node: &Arc<RwLock<lib::data_models::Node>>, hosts: &[String]
     let Some(dev) = n.owner.user.devices.iter_mut().find(|d| d.uuid == local_uuid) else { return };
     if !matches!(dev.grade, DeviceGrade::SG) { return; }
     dev.hosts = hosts.to_vec();
+}
+
+/// Drive first-run setup from environment variables when the container is
+/// started headless (no admin UI access). Reads:
+///
+///   PNET_GRADE             "sg" | "dg" — selects SG-new vs join path
+///   PNET_DEVICE_ALIAS      Always required.
+///   PNET_USER_ALIAS        SG-new only (no PNET_INVITATION_CODE).
+///   PNET_SG_RANK           SG only — defaults to 1.
+///   PNET_INVITATION_CODE   Required for SG-join and DG; absent for SG-new.
+///   PNET_HOSTS             Required for SG-new and SG-join.
+///
+/// No-op if the node is already initialized or `PNET_GRADE` is unset. For the
+/// join path, sends the BootstrapRequest immediately and lets the existing
+/// async response handler complete initialization.
+fn apply_env_setup(ctx: &WorkerContext) {
+    if ctx.node.read().unwrap().is_initialized() { return; }
+    let Ok(grade_str) = std::env::var("PNET_GRADE") else { return };
+
+    let grade = match grade_str.to_ascii_lowercase().as_str() {
+        "sg" => DeviceGrade::SG,
+        "dg" => DeviceGrade::DG,
+        other => {
+            eprintln!("[apply_env_setup] PNET_GRADE={other:?} not recognized; expected 'sg' or 'dg'");
+            return;
+        }
+    };
+
+    let device_alias = std::env::var("PNET_DEVICE_ALIAS").unwrap_or_default();
+    if device_alias.trim().is_empty() {
+        eprintln!("[apply_env_setup] PNET_DEVICE_ALIAS is required");
+        return;
+    }
+
+    let sg_rank = if matches!(grade, DeviceGrade::SG) {
+        Some(std::env::var("PNET_SG_RANK")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1)
+            .max(1))
+    } else {
+        None
+    };
+
+    let invitation_code = std::env::var("PNET_INVITATION_CODE").ok();
+    match invitation_code {
+        Some(code) if !code.trim().is_empty() => {
+            // SG-join or DG-join path.
+            if let Err(e) = start_bootstrap(device_alias.trim(), code.trim(), grade, sg_rank, ctx) {
+                eprintln!("[apply_env_setup] bootstrap failed: {e}");
+                return;
+            }
+            println!("[apply_env_setup] bootstrap request sent; waiting for SG acceptance");
+        }
+        _ => {
+            // SG-new path — must be SG, must have user alias.
+            if !matches!(grade, DeviceGrade::SG) {
+                eprintln!("[apply_env_setup] PNET_GRADE=dg requires PNET_INVITATION_CODE");
+                return;
+            }
+            let user_alias = std::env::var("PNET_USER_ALIAS").unwrap_or_default();
+            if user_alias.trim().is_empty() {
+                eprintln!("[apply_env_setup] PNET_USER_ALIAS is required for SG-new setup");
+                return;
+            }
+            if let Some(err) = apply_new_user_setup(
+                user_alias.trim(),
+                device_alias.trim(),
+                grade,
+                sg_rank,
+                ctx,
+            ) {
+                eprintln!("[apply_env_setup] new-user setup failed: {err}");
+                return;
+            }
+            println!("[apply_env_setup] new-user SG setup complete");
+        }
+    }
 }
 
 fn main() {
@@ -80,7 +158,11 @@ fn main() {
         writer_tx:    writer.sender(),
         scheduler_tx,
     });
-    let mut pool = ThreadPool::new(WORKER_COUNT, Arc::clone(&queue), Arc::clone(&stop), ctx);
+
+    // ── 6a. Headless env-driven first-run setup, if requested ────────────────
+    apply_env_setup(&ctx);
+
+    let mut pool = ThreadPool::new(WORKER_COUNT, Arc::clone(&queue), Arc::clone(&stop), Arc::clone(&ctx));
 
     // ── 7. Kick off initial connection maintenance ───────────────────────────
     {
@@ -91,7 +173,9 @@ fn main() {
 
     // ── 8. Start HTTP server ─────────────────────────────────────────────────
     // SG devices (and uninitialized nodes awaiting setup) bind on all interfaces
-    // so the admin UI is reachable. DG devices bind on loopback only.
+    // so the admin UI is reachable. DG devices bind on loopback only, unless
+    // PNET_HTTP_BIND_ALL=1 — set by docker-compose so the host can reach the UI
+    // through the container's port publish.
     let http_bind = {
         let n = node.read().unwrap();
         let is_dg = n.is_initialized() && {
@@ -100,7 +184,10 @@ fn main() {
                 .find(|d| d.uuid == device_uuid)
                 .map_or(false, |d| matches!(d.grade, DeviceGrade::DG))
         };
-        if is_dg { std::net::Ipv4Addr::LOCALHOST } else { std::net::Ipv4Addr::UNSPECIFIED }
+        let force_all = std::env::var("PNET_HTTP_BIND_ALL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if is_dg && !force_all { std::net::Ipv4Addr::LOCALHOST } else { std::net::Ipv4Addr::UNSPECIFIED }
     };
     let http = HttpServer::start(http_bind, 8777, Arc::clone(&queue), Arc::clone(&stop));
 

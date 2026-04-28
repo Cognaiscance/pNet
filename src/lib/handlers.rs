@@ -1157,7 +1157,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let ciphertext: &[u8]    = &buf[24..];
 
     // Retrieve pending bootstrap state — we need it before taking the write lock.
-    let (shared_secret, invitation_id, sg_addr, device_alias) = {
+    let (shared_secret, invitation_id, sg_addr, device_alias, desired_grade, desired_sg_rank) = {
         let node = ctx.node.read().unwrap();
         let Some(pb) = &node.owner.pending_bootstrap else {
             eprintln!("[bootstrap_response] no pending bootstrap, ignoring from {src}");
@@ -1168,7 +1168,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         }
         let ss = x25519_shared(&pb.our_ephem_key_pair.private_key, &pb.invitation_pk);
-        (ss, pb.invitation_id, pb.sg_addr, pb.device_alias.clone())
+        (ss, pb.invitation_id, pb.sg_addr, pb.device_alias.clone(), pb.desired_grade, pb.desired_sg_rank)
     };
 
     let Some(plaintext) = xchacha20_decrypt(&shared_secret, &nonce, ciphertext) else {
@@ -1196,10 +1196,19 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         node.owner.contact_users  = data.contacts;
         node.owner.pending_bootstrap = None;
 
-        // Apply the user-chosen alias to the local device.
-        if !device_alias.is_empty() {
-            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == local_uuid) {
+        // Apply the user-chosen alias, grade, and rank to the local device.
+        if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == local_uuid) {
+            if !device_alias.is_empty() {
                 dev.alias = device_alias;
+            }
+            dev.grade   = desired_grade;
+            dev.sg_rank = desired_sg_rank;
+            // For SG joiners, PNET_HOSTS is authoritative for advertised hosts.
+            if matches!(dev.grade, DeviceGrade::SG) {
+                let hosts = parse_pnet_hosts();
+                if !hosts.is_empty() {
+                    dev.hosts = hosts;
+                }
             }
         }
 
@@ -3453,20 +3462,42 @@ fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
     let device_alias = form_field(body, "device_alias")
         .map(url_decode)
         .unwrap_or_default();
-    let device_alias = device_alias.trim().to_string();
-
     let Some(code_str) = form_field(body, "code") else { return };
+    let grade_str = form_field(body, "grade").unwrap_or("dg");
+    let grade = if grade_str == "sg" { DeviceGrade::SG } else { DeviceGrade::DG };
+    let sg_rank = if matches!(grade, DeviceGrade::SG) {
+        Some(form_field(body, "sg_rank")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1)
+            .max(1))
+    } else {
+        None
+    };
+
+    if let Err(e) = start_bootstrap(device_alias.trim(), code_str, grade, sg_rank, ctx) {
+        eprintln!("[initiate_bootstrap] {e}");
+    }
+}
+
+/// Typed entry point for kicking off a bootstrap join. Used by both the HTTP
+/// form handler and `main`'s env-driven startup path. Decodes the invitation
+/// code, stashes `PendingBootstrap`, and sends the BootstrapRequest packet.
+pub fn start_bootstrap(
+    device_alias: &str,
+    code_str: &str,
+    desired_grade: DeviceGrade,
+    desired_sg_rank: Option<u32>,
+    ctx: &WorkerContext,
+) -> Result<(), &'static str> {
     let Some((invitation_id, invitation_pk, hosts)) = decode_invitation_code(code_str) else {
-        eprintln!("[initiate_bootstrap] invalid invitation code");
-        return;
+        return Err("invalid invitation code");
     };
 
     let Some((picked_host, sg_addr)) = resolve_hosts(&hosts).into_iter().next() else {
-        eprintln!("[initiate_bootstrap] no host in invitation code resolved: {hosts:?}");
-        return;
+        eprintln!("[start_bootstrap] no host in invitation code resolved: {hosts:?}");
+        return Err("no host resolved from invitation code");
     };
 
-    // Generate our ephemeral key pair and store PendingBootstrap.
     let ephem_kp = generate_x25519_keypair();
     let ephem_pk = ephem_kp.public_key;
     {
@@ -3476,17 +3507,20 @@ fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
             our_ephem_key_pair: ephem_kp,
             invitation_pk,
             sg_addr,
-            device_alias,
+            device_alias: device_alias.to_string(),
+            desired_grade,
+            desired_sg_rank,
         });
     }
 
     // Send BootstrapRequest: [op=0x30][invitation_id:16][our_ephem_pk:32]
     let mut pkt = [0u8; 49];
-    pkt[0]      = BOOTSTRAP_REQUEST_OP;
+    pkt[0] = BOOTSTRAP_REQUEST_OP;
     pkt[1..17].copy_from_slice(&invitation_id);
     pkt[17..49].copy_from_slice(&ephem_pk);
-    println!("[initiate_bootstrap] sending bootstrap request to {sg_addr} (picked {picked_host} from {hosts:?})");
+    println!("[start_bootstrap] sending bootstrap request to {sg_addr} (picked {picked_host} from {hosts:?})");
     send(ctx, SocketAddr::V4(sg_addr), &pkt);
+    Ok(())
 }
 
 /// Generate a contact invitation code: stores the invitation in
@@ -3673,43 +3707,51 @@ fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
 
 // ── Setup wizard ─────────────────────────────────────────────────────────────
 
-/// Apply first-run setup from the new-user form.  Returns false if required
+/// Apply first-run setup from the new-user form.
 /// Returns `None` on success, or `Some(error_code)` if a field is invalid.
 fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     let alias        = form_field(body, "alias").map(url_decode).unwrap_or_default();
     let device_alias = form_field(body, "device_alias").map(url_decode).unwrap_or_default();
     let grade_str    = form_field(body, "grade").unwrap_or("sg");
 
-    let alias        = alias.trim().to_string();
-    let device_alias = device_alias.trim().to_string();
-
-    if alias.is_empty() || device_alias.is_empty() {
-        return Some("fields");
-    }
-
-    let grade   = if grade_str == "sg" { DeviceGrade::SG } else { DeviceGrade::DG };
+    let grade = if grade_str == "sg" { DeviceGrade::SG } else { DeviceGrade::DG };
     let sg_rank = if matches!(grade, DeviceGrade::SG) {
-        let rank = form_field(body, "sg_rank")
+        Some(form_field(body, "sg_rank")
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(1)
-            .max(1);
-        Some(rank)
+            .max(1))
     } else {
         None
     };
 
+    apply_new_user_setup(alias.trim(), device_alias.trim(), grade, sg_rank, ctx)
+}
+
+/// Typed entry point for first-run new-user setup. Used by both the HTTP form
+/// handler and `main`'s env-driven startup path.
+pub fn apply_new_user_setup(
+    alias: &str,
+    device_alias: &str,
+    grade: DeviceGrade,
+    sg_rank: Option<u32>,
+    ctx: &WorkerContext,
+) -> Option<&'static str> {
+    if alias.is_empty() || device_alias.is_empty() {
+        return Some("fields");
+    }
+
     let key_pair = generate_ed25519_keypair();
 
     {
-        let mut node    = ctx.node.write().unwrap();
-        node.owner.user.alias = alias;
+        let mut node = ctx.node.write().unwrap();
+        node.owner.user.alias = alias.to_string();
         node.owner.key_pair   = key_pair;
 
         let device_uuid = node.device_uuid;
         if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) {
-            dev.alias           = device_alias;
-            dev.grade           = grade;
-            dev.sg_rank         = sg_rank;
+            dev.alias   = device_alias.to_string();
+            dev.grade   = grade;
+            dev.sg_rank = sg_rank;
             // Apply PNET_HOSTS here too: main's startup application is skipped
             // on a fresh container (node not yet initialized).
             if matches!(dev.grade, DeviceGrade::SG) {
@@ -3813,10 +3855,12 @@ fn render_setup_new_user_form(error: &str) -> String {
 
 fn render_setup_code_entry(grade: &str) -> String {
     let back = if grade == "sg" { "/setup?grade=sg" } else { "/setup" };
+    let form_grade = if grade == "sg" { "sg" } else { "dg" };
     format!(
         "<h1>Enter Invitation Code</h1>\
          <p class=\"swiz-sub\">Paste the invitation code generated on your existing device.</p>\
          <form method=\"post\" action=\"/setup/join\" style=\"display:block\">\
+           <input type=\"hidden\" name=\"grade\" value=\"{form_grade}\">\
            <label class=\"swiz-label\">Device name</label>\
            <input name=\"device_alias\" type=\"text\" \
              style=\"width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #ccc;\
@@ -5750,5 +5794,102 @@ mod tests {
         assert_eq!(data.contacts[0].user.devices.len(), 1);
         assert_eq!(data.contacts[0].user.devices[0].applications.len(), 1);
         assert_eq!(data.contacts[0].user.devices[0].applications[0].id, 11);
+    }
+
+    // ── Headless first-run setup ──────────────────────────────────────────────
+
+    #[test]
+    fn apply_new_user_setup_initializes_node_and_local_device() {
+        let t = TestCtx::new();
+        assert!(!t.ctx.node.read().unwrap().is_initialized());
+
+        let res = apply_new_user_setup("alice", "alice-laptop", DeviceGrade::SG, Some(2), &t.ctx);
+        assert!(res.is_none(), "setup should succeed");
+
+        let node = t.ctx.node.read().unwrap();
+        assert!(node.is_initialized(), "key_pair should be populated");
+        assert_eq!(node.owner.user.alias, "alice");
+
+        let device_uuid = node.device_uuid;
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
+        assert_eq!(dev.alias, "alice-laptop");
+        assert!(matches!(dev.grade, DeviceGrade::SG));
+        assert_eq!(dev.sg_rank, Some(2));
+    }
+
+    #[test]
+    fn apply_new_user_setup_dg_clears_sg_rank() {
+        let t = TestCtx::new();
+        let res = apply_new_user_setup("bob", "bob-phone", DeviceGrade::DG, None, &t.ctx);
+        assert!(res.is_none());
+
+        let node = t.ctx.node.read().unwrap();
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == node.device_uuid).unwrap();
+        assert!(matches!(dev.grade, DeviceGrade::DG));
+        assert_eq!(dev.sg_rank, None);
+    }
+
+    #[test]
+    fn apply_new_user_setup_rejects_empty_aliases() {
+        let t = TestCtx::new();
+        assert_eq!(
+            apply_new_user_setup("", "device", DeviceGrade::SG, Some(1), &t.ctx),
+            Some("fields"),
+        );
+        assert_eq!(
+            apply_new_user_setup("user", "", DeviceGrade::SG, Some(1), &t.ctx),
+            Some("fields"),
+        );
+        assert!(!t.ctx.node.read().unwrap().is_initialized(),
+            "failed setup must not flip the node to initialized");
+    }
+
+    #[test]
+    fn start_bootstrap_stashes_pending_with_grade_and_rank() {
+        let t = TestCtx::new();
+        let inv_id = generate_uuid();
+        let inv_pk = generate_x25519_keypair().public_key;
+        // Resolvable host so resolve_hosts returns at least one entry. The
+        // socket send may fail (nothing's listening) but pending_bootstrap
+        // is stashed before the send.
+        let hosts = vec!["127.0.0.1:65530".to_string()];
+        let code = encode_invitation_code(&inv_id, &inv_pk, &hosts);
+
+        start_bootstrap("my-laptop", &code, DeviceGrade::DG, None, &t.ctx)
+            .expect("bootstrap should succeed");
+
+        let node = t.ctx.node.read().unwrap();
+        let pb = node.owner.pending_bootstrap.as_ref()
+            .expect("pending_bootstrap should be set");
+        assert_eq!(pb.invitation_id, inv_id);
+        assert_eq!(pb.invitation_pk, inv_pk);
+        assert_eq!(pb.device_alias, "my-laptop");
+        assert!(matches!(pb.desired_grade, DeviceGrade::DG));
+        assert_eq!(pb.desired_sg_rank, None);
+    }
+
+    #[test]
+    fn start_bootstrap_preserves_sg_grade_and_rank() {
+        let t = TestCtx::new();
+        let inv_id = generate_uuid();
+        let inv_pk = generate_x25519_keypair().public_key;
+        let hosts = vec!["127.0.0.1:65531".to_string()];
+        let code = encode_invitation_code(&inv_id, &inv_pk, &hosts);
+
+        start_bootstrap("backup-sg", &code, DeviceGrade::SG, Some(3), &t.ctx)
+            .expect("bootstrap should succeed");
+
+        let node = t.ctx.node.read().unwrap();
+        let pb = node.owner.pending_bootstrap.as_ref().unwrap();
+        assert!(matches!(pb.desired_grade, DeviceGrade::SG));
+        assert_eq!(pb.desired_sg_rank, Some(3));
+    }
+
+    #[test]
+    fn start_bootstrap_rejects_garbage_invitation_code() {
+        let t = TestCtx::new();
+        let res = start_bootstrap("my-laptop", "not-a-real-code", DeviceGrade::DG, None, &t.ctx);
+        assert!(res.is_err());
+        assert!(t.ctx.node.read().unwrap().owner.pending_bootstrap.is_none());
     }
 }

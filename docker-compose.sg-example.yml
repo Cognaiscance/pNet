@@ -13,8 +13,15 @@ services:
     ports:
       - "7777:7777/udp"
       - "8777:8777/tcp"
+    # PNET_HOSTS is authoritative for advertised SG hosts on every restart.
+    # PNET_USER_ALIAS / PNET_DEVICE_ALIAS / PNET_GRADE / PNET_SG_RANK drive
+    # headless first-run setup; ignored once the node is initialized.
     environment:
       - PNET_HOSTS=sg-william,pnet.thehomegarage.com:7777
+      - PNET_GRADE=sg
+      - PNET_USER_ALIAS=william
+      - PNET_DEVICE_ALIAS=sg-william
+      - PNET_SG_RANK=1
     volumes:
       - /opt/pnet/william:/root/.pnet
 
@@ -45,6 +52,10 @@ services:
       - "8778:8777/tcp"
     environment:
       - PNET_HOSTS=sg-chad,pnet.thehomegarage.com:7778
+      - PNET_GRADE=sg
+      - PNET_USER_ALIAS=chad
+      - PNET_DEVICE_ALIAS=sg-chad
+      - PNET_SG_RANK=1
     volumes:
       - /opt/pnet/chad:/root/.pnet
 
