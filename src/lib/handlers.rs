@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::action_queue::WorkerContext;
 use super::data_models::{
-    ActiveConnection, ActiveTunnel, Application, Contact, Device, DeviceGrade, Invitation,
+    ActiveConnection, ActiveTunnel, Contact, Device, DeviceGrade, Invitation,
     KeyPair, PendingBootstrap, PendingConnection, PendingContactExchange, PendingDeviceAcceptance,
     PendingTunnel, PendingTunnelConnection, PublicKey, SgStatus, TunnelCounter, User, Uuid,
     CONNECTION_LIFETIME, RENEW_THRESHOLD, TUNNEL_COUNTER_WINDOW, TUNNEL_THRESHOLD,
@@ -91,420 +91,6 @@ fn resolve_hosts(hosts: &[String]) -> Vec<(String, SocketAddrV4)> {
         .collect()
 }
 
-// ── App handlers ──────────────────────────────────────────────────────────────
-
-/// Op 0 — Application registration.
-///
-/// Request body (after op byte):
-///   [alias_len: u8][alias: alias_len bytes][port: u16 be]
-///   [protocol_len: u8][protocol: protocol_len bytes]
-///
-/// Reply on success:  [0x00][token: 16 bytes]
-/// Reply on error:    [0x01][error_code: u8]
-pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    // Parse.
-    if buf.is_empty() {
-        return send_error(ctx, src, ERR_BAD_PACKET);
-    }
-    let alias_len = buf[0] as usize;
-    if buf.len() < 1 + alias_len + 2 {
-        return send_error(ctx, src, ERR_BAD_PACKET);
-    }
-    let alias = match std::str::from_utf8(&buf[1..1 + alias_len]) {
-        Ok(s) if !s.is_empty() => s.to_string(),
-        _ => return send_error(ctx, src, ERR_BAD_PACKET),
-    };
-    let port = u16::from_be_bytes([buf[1 + alias_len], buf[2 + alias_len]]);
-    if port == 0 {
-        return send_error(ctx, src, ERR_BAD_PACKET);
-    }
-    let mut pos = 3 + alias_len;
-    if pos >= buf.len() {
-        return send_error(ctx, src, ERR_BAD_PACKET);
-    }
-    let protocol_len = buf[pos] as usize;
-    pos += 1;
-    if buf.len() < pos + protocol_len {
-        return send_error(ctx, src, ERR_BAD_PACKET);
-    }
-    let protocol = match std::str::from_utf8(&buf[pos..pos + protocol_len]) {
-        Ok(s) if !s.is_empty() => s.to_string(),
-        _ => return send_error(ctx, src, ERR_BAD_PACKET),
-    };
-    let ip = match ipv4_from(src) {
-        Some(ip) => ip,
-        None => return send_error(ctx, src, ERR_BAD_PACKET),
-    };
-
-    // Update node.
-    let token = {
-        let mut node = ctx.node.write().unwrap();
-        let device_uuid = node.device_uuid;
-
-        let device = node
-            .owner
-            .user
-            .devices
-            .iter_mut()
-            .find(|d| d.uuid == device_uuid)
-            .expect("local device not found in node");
-
-        let next_id = device
-            .applications
-            .iter()
-            .map(|a| a.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-
-        let token = generate_uuid();
-        device.applications.push(Application {
-            id: next_id,
-            alias,
-            protocol,
-            host: SocketAddrV4::new(ip, port),
-            user_approved: false,
-            token,
-        });
-        token
-        // write lock released here
-    };
-
-    ctx.save_node();
-    sync_devices(ctx);
-
-    // Reply: [OK][token: 16 bytes]
-    let mut reply = [0u8; 17];
-    reply[0] = OK;
-    reply[1..17].copy_from_slice(&token);
-    send(ctx, src, &reply);
-}
-
-/// Op 1 — Application update.
-///
-/// Request body (after op byte):
-///   [token: 16 bytes][flags: u8]
-///   if flags & 0x01: [alias_len: u8][alias: alias_len bytes]
-///   if flags & 0x02: [port: u16 be]  (IP is taken from src)
-///
-/// Reply on success:  [0x00]
-/// Reply on error:    [0x01][error_code: u8]
-pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    // Parse header.
-    if buf.len() < 17 {
-        return send_error(ctx, src, ERR_BAD_PACKET);
-    }
-    let token: [u8; 16] = buf[0..16].try_into().unwrap();
-    let flags = buf[16];
-    let mut pos = 17usize;
-
-    let mut new_alias: Option<String> = None;
-    let mut new_port:  Option<u16>   = None;
-
-    if flags & 0x01 != 0 {
-        if pos >= buf.len() {
-            return send_error(ctx, src, ERR_BAD_PACKET);
-        }
-        let alias_len = buf[pos] as usize;
-        pos += 1;
-        if pos + alias_len > buf.len() {
-            return send_error(ctx, src, ERR_BAD_PACKET);
-        }
-        match std::str::from_utf8(&buf[pos..pos + alias_len]) {
-            Ok(s) if !s.is_empty() => new_alias = Some(s.to_string()),
-            _ => return send_error(ctx, src, ERR_BAD_PACKET),
-        }
-        pos += alias_len;
-    }
-
-    if flags & 0x02 != 0 {
-        if pos + 2 > buf.len() {
-            return send_error(ctx, src, ERR_BAD_PACKET);
-        }
-        new_port = Some(u16::from_be_bytes([buf[pos], buf[pos + 1]]));
-    }
-
-    // Update node.
-    let found = {
-        let mut node = ctx.node.write().unwrap();
-        let device_uuid = node.device_uuid;
-        let device = node
-            .owner
-            .user
-            .devices
-            .iter_mut()
-            .find(|d| d.uuid == device_uuid)
-            .expect("local device not found in node");
-
-        if let Some(app) = device.applications.iter_mut().find(|a| a.token == token) {
-            if let Some(alias) = new_alias {
-                app.alias = alias;
-            }
-            if let Some(port) = new_port {
-                if let Some(ip) = ipv4_from(src) {
-                    app.host = SocketAddrV4::new(ip, port);
-                }
-            }
-            true
-        } else {
-            false
-        }
-        // write lock released here
-    };
-
-    if found {
-        ctx.save_node();
-        sync_devices(ctx);
-        send(ctx, src, &[OK]);
-    } else {
-        send_error(ctx, src, ERR_TOKEN_UNKNOWN);
-    }
-}
-
-/// Op 2 — Application get data.
-///
-/// Request body (after op byte):
-///   [token: 16 bytes]
-///
-/// Authenticates the app via its token and returns its view of the node data tree.
-///
-/// Response format:
-///   [OK: 1]
-///   -- Requesting app's own data (full Application struct) --
-///   [app_id: u16 BE][app_alias: u8+bytes][app_host_ip: 4][app_host_port: 2 BE]
-///   [app_user_approved: u8][app_token: 16]
-///   -- Owner data tree (no crypto keys) --
-///   [owner_alias: u8+bytes][owner_uuid: 16]
-///   [device_count: u8]
-///     each device:
-///       [uuid: 16][alias: u8+bytes][grade: u8][sg_rank: u8]
-///       [host_count: u8][each host: u8+bytes]
-///       [app_count: u8]
-///         each app: [id: u16 BE][alias: u8+bytes][ip: 4][port: 2 BE][user_approved: u8]
-///   [contact_count: u8]
-///     each contact:
-///       [alias: u8+bytes][uuid: 16]
-///       [device_count: u8]
-///         each device:
-///           [uuid: 16][alias: u8+bytes][grade: u8][sg_rank: u8]
-///           [host_count: u8][each host: u8+bytes]
-///           [app_count: u8]
-///             each app: [id: u16 BE][alias: u8+bytes]
-pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    if buf.len() < 16 {
-        return send_error(ctx, src, ERR_BAD_PACKET);
-    }
-    let token: [u8; 16] = buf[0..16].try_into().unwrap();
-
-    let node = ctx.node.read().unwrap();
-    let device_uuid = node.device_uuid;
-    let device = node
-        .owner
-        .user
-        .devices
-        .iter()
-        .find(|d| d.uuid == device_uuid)
-        .expect("local device not found in node");
-
-    let app = device.applications.iter().find(|a| a.token == token).cloned();
-    drop(node);
-
-    let app = match app {
-        Some(a) => a,
-        None    => return send_error(ctx, src, ERR_TOKEN_UNKNOWN),
-    };
-
-    let node = ctx.node.read().unwrap();
-    let mut reply = vec![OK];
-
-    // Requesting app's own data.
-    reply.extend_from_slice(&app.id.to_be_bytes());
-    push_str(&mut reply, &app.alias);
-    reply.extend_from_slice(&app.host.ip().octets());
-    reply.extend_from_slice(&app.host.port().to_be_bytes());
-    reply.push(app.user_approved as u8);
-    reply.extend_from_slice(&app.token);
-    reply.extend_from_slice(&device_uuid);
-
-    // Owner alias and UUID.
-    push_str(&mut reply, &node.owner.user.alias);
-    reply.extend_from_slice(&node.owner.user.uuid);
-
-    // Own devices with apps.
-    reply.push(node.owner.user.devices.len() as u8);
-    for d in &node.owner.user.devices {
-        push_device(&mut reply, d);
-        reply.push(d.applications.len() as u8);
-        for a in &d.applications {
-            reply.extend_from_slice(&a.id.to_be_bytes());
-            push_str(&mut reply, &a.alias);
-            reply.extend_from_slice(&a.host.ip().octets());
-            reply.extend_from_slice(&a.host.port().to_be_bytes());
-            reply.push(a.user_approved as u8);
-        }
-    }
-
-    // Contacts with devices and apps.
-    reply.push(node.owner.contact_users.len() as u8);
-    for contact in &node.owner.contact_users {
-        push_str(&mut reply, &contact.user.alias);
-        reply.extend_from_slice(&contact.user.uuid);
-        reply.push(contact.user.devices.len() as u8);
-        for d in &contact.user.devices {
-            push_device(&mut reply, d);
-            let approved: Vec<&Application> = d.applications.iter()
-                .filter(|a| a.user_approved)
-                .collect();
-            reply.push(approved.len() as u8);
-            for a in approved {
-                reply.extend_from_slice(&a.id.to_be_bytes());
-                push_str(&mut reply, &a.alias);
-            }
-        }
-    }
-
-    drop(node);
-    send(ctx, src, &reply);
-}
-
-/// Op 3 — Application send packet.
-///
-/// Request body (after op byte):
-///   [token: 16 bytes][target_device_uuid: 16 bytes][target_app_id: u16 be][payload: ...]
-///
-/// Looks up the active connection for the target device, encrypts the payload,
-/// and forwards the packet to the peer pnet node.
-/// Not yet implemented — requires ephemeral key exchange to be established first.
-/// Op 3 — Application send packet.
-///
-/// Request body (after op byte):
-///   [token: 16][dest_device_uuid: 16][dest_app_id: u16][payload: rest]
-///
-/// Builds a RelayPacket (op 0x40) and sends it to the lowest-RTT reachable SG
-/// from the combined pool of the local user's SGs and the destination user's SGs.
-pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    const MIN_LEN: usize = 16 + 16 + 2;
-    if buf.len() < MIN_LEN {
-        return send_error(ctx, src, ERR_BAD_PACKET);
-    }
-
-    let token: Uuid            = buf[0..16].try_into().unwrap();
-    let dest_device_uuid: Uuid = buf[16..32].try_into().unwrap();
-    let dest_app_id            = u16::from_be_bytes([buf[32], buf[33]]);
-    let payload                = &buf[34..];
-
-    // Build packet and look up the SG address under a single read lock.
-    let out: Option<(Vec<u8>, SocketAddr)> = {
-        let node = ctx.node.read().unwrap();
-
-        // Find the sending app by token.
-        let device_uuid = node.device_uuid;
-        let Some(sender_app_id) = node.owner.user.devices.iter()
-            .find(|d| d.uuid == device_uuid)
-            .and_then(|d| d.applications.iter()
-                .find(|a| a.token == token && a.user_approved))
-            .map(|a| a.id)
-        else {
-            return send_error(ctx, src, ERR_TOKEN_UNKNOWN);
-        };
-
-        // ── Tunnel path (if a DG-to-DG tunnel is active for this destination) ──
-        // Only use if the tunnel's ActiveConnection still exists.
-        let tunnel_info: Option<(u16, u16)> = node.owner.dg_tunnel_map.iter()
-            .find(|(tid, conn_id)| {
-                let _ = *tid;
-                node.owner.active_connections.get(*conn_id)
-                    .map(|c| c.device_uuid == dest_device_uuid)
-                    .unwrap_or(false)
-            })
-            .map(|(tid, cid)| (*tid, *cid))
-            .filter(|(_, cid)| node.owner.active_connections.contains_key(cid));
-
-        if let Some((tunnel_id, dg_dg_conn_id)) = tunnel_info {
-            // Encrypt with the DG-to-DG shared secret.
-            let Some(dg_dg_conn) = node.owner.active_connections.get(&dg_dg_conn_id) else {
-                unreachable!("filtered above");
-            };
-            let shared = x25519_shared(&dg_dg_conn.key_pair.private_key, &dg_dg_conn.peer_public_key);
-
-            // Plaintext format: [dest_app_id: u16][sender_app_id: u16][payload]
-            let mut plaintext = Vec::with_capacity(4 + payload.len());
-            plaintext.extend_from_slice(&dest_app_id.to_be_bytes());
-            plaintext.extend_from_slice(&sender_app_id.to_be_bytes());
-            plaintext.extend_from_slice(payload);
-
-            let (ciphertext, nonce) = xchacha20_encrypt(&shared, &plaintext);
-
-            // Route the tunnel forward packet via the relay SG.
-            let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid)
-                .or_else(|| {
-                    let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
-                    best_sg_connection(&node, &candidates)
-                });
-            let Some(sg_conn) = sg_conn else {
-                eprintln!("[app_send_packet] no reachable SG for tunnel dest {:?}", dest_device_uuid);
-                return;
-            };
-
-            // `peer_active_connection_id` is the SG's local conn_id for this DG's connection.
-            let sender_sg_conn_id = sg_conn.peer_active_connection_id;
-
-            // TUNNEL_FORWARD: [op=0x51][sender_sg_conn_id: u16][tunnel_id: u16][nonce: 24][ciphertext]
-            let mut pkt = Vec::with_capacity(4 + 24 + ciphertext.len());
-            pkt.push(TUNNEL_FORWARD_OP);
-            pkt.extend_from_slice(&sender_sg_conn_id.to_be_bytes());
-            pkt.extend_from_slice(&tunnel_id.to_be_bytes());
-            pkt.extend_from_slice(&nonce);
-            pkt.extend_from_slice(&ciphertext);
-
-            Some((pkt, sg_conn.peer_addr))
-        } else if let Some(dest_conn) = node.owner.active_connections.values()
-            .find(|c| c.device_uuid == dest_device_uuid)
-        {
-            // ── Direct path (this node has an active connection to dest) ──────
-            // When the local device is an SG it may already hold a direct
-            // connection to the destination DG.  Skip the relay and send an
-            // AppPacket straight to the destination using the peer's actual
-            // source address (not the potentially-stale d.host).
-            let mut app_body = Vec::with_capacity(4 + payload.len());
-            app_body.extend_from_slice(&dest_app_id.to_be_bytes());
-            app_body.extend_from_slice(&sender_app_id.to_be_bytes());
-            app_body.extend_from_slice(payload);
-
-            let pkt  = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
-            let dest = dest_conn.peer_addr;
-            Some((pkt, dest))
-        } else {
-            // ── Standard relay path ───────────────────────────────────────────
-            // Prefer the recipient's top-ranked SG (only one with a keep-alive
-            // tunnel to the destination DG). Fall back to lowest-RTT SG.
-            let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid)
-                .or_else(|| {
-                    let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
-                    best_sg_connection(&node, &candidates)
-                });
-            let Some(sg_conn) = sg_conn else {
-                eprintln!("[app_send_packet] no reachable SG for dest {:?}", dest_device_uuid);
-                return;
-            };
-
-            // RelayPacket body: [dest_device_uuid: 16][dest_app_id: u16][sender_app_id: u16][payload]
-            let mut plaintext = Vec::with_capacity(20 + payload.len());
-            plaintext.extend_from_slice(&dest_device_uuid);
-            plaintext.extend_from_slice(&dest_app_id.to_be_bytes());
-            plaintext.extend_from_slice(&sender_app_id.to_be_bytes());
-            plaintext.extend_from_slice(payload);
-
-            let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
-
-            Some((pkt, sg_conn.peer_addr))
-        }
-    };
-
-    if let Some((pkt, dest)) = out {
-        send(ctx, dest, &pkt);
-    }
-}
 
 // ── Peer pNet node handlers ───────────────────────────────────────────────────
 
@@ -525,7 +111,6 @@ const DEVICE_DATA_PUSH_OP:        u8 = 0x62;
 const DEVICE_DATA_PULL_REQ_OP:    u8 = 0x63;
 const RELAY_PACKET_OP:            u8 = 0x40;
 const APP_PACKET_OP:              u8 = 0x41;
-const APP_PUSH_OP:                u8 = 0x04;
 const TUNNEL_INIT_OP:             u8 = 0x50;
 const TUNNEL_FORWARD_OP:          u8 = 0x51;
 const TUNNEL_CONNECT_REQUEST_OP:  u8 = 0x52;
@@ -954,6 +539,150 @@ fn best_sg_connection<'a>(
 
 // ── Bootstrap payload serialization ──────────────────────────────────────────
 //
+// ── Module dispatch / routing helpers ────────────────────────────────────────
+
+/// Walk the local node's user + contact tables to find which user owns a
+/// given device. Returns None if the device is unknown to this node.
+pub(crate) fn user_for_device(node: &super::data_models::Node, device_uuid: &Uuid) -> Option<Uuid> {
+    if node.owner.user.devices.iter().any(|d| d.uuid == *device_uuid) {
+        return Some(node.owner.user.uuid);
+    }
+    for c in &node.owner.contact_users {
+        if c.user.devices.iter().any(|d| d.uuid == *device_uuid) {
+            return Some(c.user.uuid);
+        }
+    }
+    None
+}
+
+/// Hand a payload to the destination module on this device. Drops silently if
+/// the module isn't registered or the user hasn't enabled it.
+pub(crate) fn deliver_to_module(
+    ctx:         &WorkerContext,
+    from_user:   Uuid,
+    from_device: Uuid,
+    from_module: super::modules::ModuleId,
+    dest_module: super::modules::ModuleId,
+    payload:     &[u8],
+) {
+    let Some(module) = ctx.modules.iter().find(|m| m.id() == dest_module).cloned() else {
+        eprintln!("[deliver] module {dest_module} not registered");
+        return;
+    };
+    let enabled = ctx.node.read().unwrap()
+        .owner.user.enabled_modules.contains(&dest_module);
+    if !enabled {
+        eprintln!("[deliver] module {dest_module} not enabled by user");
+        return;
+    }
+    let mctx = super::modules::ModuleCtx { inner: ctx, module: dest_module };
+    let source = super::modules::PacketSource {
+        user:   from_user,
+        device: from_device,
+        module: from_module,
+    };
+    module.on_receive(source, payload, &mctx);
+}
+
+/// Route a module-originated send. Tunnel path → direct active-conn path → SG
+/// relay; if the destination is this device, deliver in-process.
+pub(crate) fn route_app_send(
+    ctx:           &WorkerContext,
+    sender_module: super::modules::ModuleId,
+    target:        super::modules::PacketTarget,
+    payload:       &[u8],
+) -> Result<(), super::modules::SendError> {
+    use super::modules::SendError;
+
+    // Local short-circuit: dest is this device.
+    {
+        let node = ctx.node.read().unwrap();
+        if target.device == node.device_uuid {
+            let from_user   = node.owner.user.uuid;
+            let from_device = node.device_uuid;
+            drop(node);
+            deliver_to_module(ctx, from_user, from_device, sender_module, target.module, payload);
+            return Ok(());
+        }
+    }
+
+    let out: Option<(Vec<u8>, std::net::SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+
+        // Tunnel path: a DG-to-DG tunnel is active for this destination.
+        let tunnel_info: Option<(u16, u16)> = node.owner.dg_tunnel_map.iter()
+            .find(|(_, conn_id)| {
+                node.owner.active_connections.get(*conn_id)
+                    .map(|c| c.device_uuid == target.device)
+                    .unwrap_or(false)
+            })
+            .map(|(tid, cid)| (*tid, *cid))
+            .filter(|(_, cid)| node.owner.active_connections.contains_key(cid));
+
+        if let Some((tunnel_id, dg_dg_conn_id)) = tunnel_info {
+            let dg_dg_conn = node.owner.active_connections.get(&dg_dg_conn_id).unwrap();
+            let shared = x25519_shared(&dg_dg_conn.key_pair.private_key, &dg_dg_conn.peer_public_key);
+
+            let mut plaintext = Vec::with_capacity(4 + payload.len());
+            plaintext.extend_from_slice(&target.module.to_be_bytes());
+            plaintext.extend_from_slice(&sender_module.to_be_bytes());
+            plaintext.extend_from_slice(payload);
+
+            let (ciphertext, nonce) = xchacha20_encrypt(&shared, &plaintext);
+
+            let sg_conn = top_ranked_sg_for_device(&node, &target.device)
+                .or_else(|| {
+                    let candidates = sg_candidates_for_dest(&node, &target.device);
+                    best_sg_connection(&node, &candidates)
+                });
+            let Some(sg_conn) = sg_conn else { return Err(SendError::NoPath); };
+            let sender_sg_conn_id = sg_conn.peer_active_connection_id;
+
+            let mut pkt = Vec::with_capacity(5 + 24 + ciphertext.len());
+            pkt.push(TUNNEL_FORWARD_OP);
+            pkt.extend_from_slice(&sender_sg_conn_id.to_be_bytes());
+            pkt.extend_from_slice(&tunnel_id.to_be_bytes());
+            pkt.extend_from_slice(&nonce);
+            pkt.extend_from_slice(&ciphertext);
+
+            Some((pkt, sg_conn.peer_addr))
+        } else if let Some(dest_conn) = node.owner.active_connections.values()
+            .find(|c| c.device_uuid == target.device)
+        {
+            // Direct path: this node already has an active connection to dest.
+            let mut app_body = Vec::with_capacity(4 + payload.len());
+            app_body.extend_from_slice(&target.module.to_be_bytes());
+            app_body.extend_from_slice(&sender_module.to_be_bytes());
+            app_body.extend_from_slice(payload);
+
+            let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
+            Some((pkt, dest_conn.peer_addr))
+        } else {
+            // SG relay path.
+            let sg_conn = top_ranked_sg_for_device(&node, &target.device)
+                .or_else(|| {
+                    let candidates = sg_candidates_for_dest(&node, &target.device);
+                    best_sg_connection(&node, &candidates)
+                });
+            let Some(sg_conn) = sg_conn else { return Err(SendError::NoPath); };
+
+            let mut plaintext = Vec::with_capacity(20 + payload.len());
+            plaintext.extend_from_slice(&target.device);
+            plaintext.extend_from_slice(&target.module.to_be_bytes());
+            plaintext.extend_from_slice(&sender_module.to_be_bytes());
+            plaintext.extend_from_slice(payload);
+
+            let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
+            Some((pkt, sg_conn.peer_addr))
+        }
+    };
+
+    if let Some((pkt, dest)) = out {
+        send(ctx, dest, &pkt);
+    }
+    Ok(())
+}
+
 // Format of the bootstrap payload (user data, encrypted in BootstrapResponse):
 //   [alias: u8 len + bytes]
 //   [uuid: 16]
@@ -988,6 +717,26 @@ fn read_arr<const N: usize>(data: &[u8], pos: &mut usize) -> Option<[u8; N]> {
     Some(slice)
 }
 
+/// Serialize a list of enabled module ids: `[count: u8][id: u16 BE]*`.
+fn push_enabled_modules(buf: &mut Vec<u8>, modules: &[u16]) {
+    let n = modules.len().min(u8::MAX as usize);
+    buf.push(n as u8);
+    for &id in modules.iter().take(n) {
+        buf.extend_from_slice(&id.to_be_bytes());
+    }
+}
+
+fn read_enabled_modules(data: &[u8], pos: &mut usize) -> Option<Vec<u16>> {
+    let count = *data.get(*pos)? as usize;
+    *pos += 1;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id_bytes: [u8; 2] = read_arr(data, pos)?;
+        out.push(u16::from_be_bytes(id_bytes));
+    }
+    Some(out)
+}
+
 fn push_device(buf: &mut Vec<u8>, d: &Device) {
     buf.extend_from_slice(&d.uuid);
     push_str(buf, &d.alias);
@@ -1019,7 +768,6 @@ fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
         grade,
         sg_rank,
         hosts,
-        applications: Vec::new(),
     })
 }
 
@@ -1033,6 +781,7 @@ fn serialize_bootstrap_payload(node: &super::data_models::Node) -> Vec<u8> {
     buf.extend_from_slice(&owner.key_pair.private_key);
     buf.push(user.devices.len() as u8);
     for d in &user.devices { push_device(&mut buf, d); }
+    push_enabled_modules(&mut buf, &user.enabled_modules);
     buf.push(owner.contact_users.len() as u8);
     for c in &owner.contact_users {
         buf.extend_from_slice(&c.user.uuid);
@@ -1040,16 +789,18 @@ fn serialize_bootstrap_payload(node: &super::data_models::Node) -> Vec<u8> {
         buf.extend_from_slice(&c.public_key);
         buf.push(c.user.devices.len() as u8);
         for d in &c.user.devices { push_device(&mut buf, d); }
+        push_enabled_modules(&mut buf, &c.user.enabled_modules);
     }
     buf
 }
 
 struct BootstrapPayload {
-    user_alias: String,
-    user_uuid:  Uuid,
-    key_pair:   KeyPair,
-    devices:    Vec<Device>,
-    contacts:   Vec<Contact>,
+    user_alias:      String,
+    user_uuid:       Uuid,
+    key_pair:        KeyPair,
+    devices:         Vec<Device>,
+    enabled_modules: Vec<u16>,
+    contacts:        Vec<Contact>,
 }
 
 fn deserialize_bootstrap_payload(data: &[u8]) -> Option<BootstrapPayload> {
@@ -1062,6 +813,7 @@ fn deserialize_bootstrap_payload(data: &[u8]) -> Option<BootstrapPayload> {
     let device_count = *data.get(pos)? as usize; pos += 1;
     let mut devices = Vec::new();
     for _ in 0..device_count { devices.push(read_device(data, &mut pos)?); }
+    let enabled_modules = read_enabled_modules(data, &mut pos)?;
     let contact_count = *data.get(pos)? as usize; pos += 1;
     let mut contacts = Vec::new();
     for _ in 0..contact_count {
@@ -1071,12 +823,13 @@ fn deserialize_bootstrap_payload(data: &[u8]) -> Option<BootstrapPayload> {
         let c_dev_count = *data.get(pos)? as usize; pos += 1;
         let mut c_devices = Vec::new();
         for _ in 0..c_dev_count { c_devices.push(read_device(data, &mut pos)?); }
+        let c_enabled = read_enabled_modules(data, &mut pos)?;
         contacts.push(Contact {
-            user:       User { alias: c_alias, uuid: c_uuid, devices: c_devices },
+            user:       User { alias: c_alias, uuid: c_uuid, devices: c_devices, enabled_modules: c_enabled },
             public_key: c_pk,
         });
     }
-    Some(BootstrapPayload { user_alias, user_uuid, key_pair, devices, contacts })
+    Some(BootstrapPayload { user_alias, user_uuid, key_pair, devices, enabled_modules, contacts })
 }
 
 // ── Bootstrap handlers ────────────────────────────────────────────────────────
@@ -1187,6 +940,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         node.owner.user.alias  = data.user_alias;
         node.owner.user.uuid   = data.user_uuid;
         node.owner.key_pair    = data.key_pair;
+        node.owner.user.enabled_modules = data.enabled_modules;
         // Add received devices, skipping any that share our local UUID.
         for d in data.devices {
             if d.uuid != local_uuid && !node.owner.user.devices.iter().any(|x| x.uuid == d.uuid) {
@@ -1317,14 +1071,16 @@ fn serialize_contact_payload(node: &super::data_models::Node) -> Vec<u8> {
     buf.extend_from_slice(&node.owner.key_pair.public_key);
     buf.push(user.devices.len() as u8);
     for d in &user.devices { push_device(&mut buf, d); }
+    push_enabled_modules(&mut buf, &user.enabled_modules);
     buf
 }
 
 struct ContactPayload {
-    alias:      String,
-    uuid:       Uuid,
-    public_key: PublicKey,
-    devices:    Vec<Device>,
+    alias:           String,
+    uuid:            Uuid,
+    public_key:      PublicKey,
+    devices:         Vec<Device>,
+    enabled_modules: Vec<u16>,
 }
 
 fn deserialize_contact_payload(data: &[u8]) -> Option<ContactPayload> {
@@ -1335,7 +1091,8 @@ fn deserialize_contact_payload(data: &[u8]) -> Option<ContactPayload> {
     let device_count = *data.get(pos)? as usize; pos += 1;
     let mut devices = Vec::new();
     for _ in 0..device_count { devices.push(read_device(data, &mut pos)?); }
-    Some(ContactPayload { alias, uuid, public_key: pk, devices })
+    let enabled_modules = read_enabled_modules(data, &mut pos)?;
+    Some(ContactPayload { alias, uuid, public_key: pk, devices, enabled_modules })
 }
 
 // ── Contact exchange handlers ─────────────────────────────────────────────────
@@ -1394,7 +1151,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         if !node.owner.contact_users.iter().any(|c| c.user.uuid == data.uuid) {
             eprintln!("[contact_request] adding contact '{}' from {src}", data.alias);
             node.owner.contact_users.push(Contact {
-                user:       User { alias: data.alias, uuid: data.uuid, devices: data.devices },
+                user:       User { alias: data.alias, uuid: data.uuid, devices: data.devices, enabled_modules: data.enabled_modules },
                 public_key: data.public_key,
             });
         }
@@ -1464,7 +1221,7 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         if !node.owner.contact_users.iter().any(|c| c.user.uuid == data.uuid) {
             eprintln!("[contact_response] adding contact '{}' from {src}", data.alias);
             node.owner.contact_users.push(Contact {
-                user:       User { alias: data.alias, uuid: data.uuid, devices: data.devices },
+                user:       User { alias: data.alias, uuid: data.uuid, devices: data.devices, enabled_modules: data.enabled_modules },
                 public_key: data.public_key,
             });
         }
@@ -1503,21 +1260,15 @@ fn serialize_contact_data(node: &super::data_models::Node) -> Vec<u8> {
     buf.push(user.devices.len() as u8);
     for d in &user.devices {
         push_device(&mut buf, d);
-        let approved: Vec<&Application> = d.applications.iter()
-            .filter(|a| a.user_approved)
-            .collect();
-        buf.push(approved.len() as u8);
-        for a in approved {
-            buf.extend_from_slice(&a.id.to_be_bytes());
-            push_str(&mut buf, &a.alias);
-        }
     }
+    push_enabled_modules(&mut buf, &user.enabled_modules);
     buf
 }
 
 struct ContactData {
-    user_uuid: Uuid,
-    devices:   Vec<(Device, Vec<(u16, String)>)>, // (device, vec of (app_id, app_alias))
+    user_uuid:       Uuid,
+    devices:         Vec<Device>,
+    enabled_modules: Vec<u16>,
 }
 
 fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
@@ -1526,18 +1277,10 @@ fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
     let device_count = *data.get(pos)? as usize; pos += 1;
     let mut devices = Vec::new();
     for _ in 0..device_count {
-        let device = read_device(data, &mut pos)?;
-        let app_count = *data.get(pos)? as usize; pos += 1;
-        let mut apps = Vec::new();
-        for _ in 0..app_count {
-            let id_bytes: [u8; 2] = read_arr(data, &mut pos)?;
-            let id    = u16::from_be_bytes(id_bytes);
-            let alias = read_str(data, &mut pos)?;
-            apps.push((id, alias));
-        }
-        devices.push((device, apps));
+        devices.push(read_device(data, &mut pos)?);
     }
-    Some(ContactData { user_uuid, devices })
+    let enabled_modules = read_enabled_modules(data, &mut pos)?;
+    Some(ContactData { user_uuid, devices, enabled_modules })
 }
 
 /// Send a ContactDataPush to the top-ranked reachable SG of every contact.
@@ -1578,7 +1321,8 @@ fn push_data_to_contacts(ctx: &WorkerContext) {
     }
 }
 
-/// Apply received contact data, updating the matching contact's device and app lists.
+/// Apply received contact data, updating the matching contact's device list
+/// and enabled-modules list.
 fn apply_contact_data(data: ContactData, ctx: &WorkerContext) {
     let mut node = ctx.node.write().unwrap();
     let Some(contact) = node.owner.contact_users.iter_mut()
@@ -1588,22 +1332,13 @@ fn apply_contact_data(data: ContactData, ctx: &WorkerContext) {
         return;
     };
 
-    contact.user.devices = data.devices.into_iter().map(|(mut dev, apps)| {
-        dev.applications = apps.into_iter().map(|(id, alias)| Application {
-            id,
-            alias,
-            protocol:      String::new(),
-            host:          "0.0.0.0:0".parse().unwrap(),
-            user_approved: true,
-            token:         [0u8; 16],
-        }).collect();
-        dev
-    }).collect();
+    contact.user.devices         = data.devices;
+    contact.user.enabled_modules = data.enabled_modules;
 }
 
 /// Op 0x60 — Contact data push (SG → contact's SG).
 ///
-/// Encrypted body: [user_uuid:16][device_count:u8][ ...devices+apps... ]
+/// Encrypted body: [user_uuid:16][device_count:u8][devices][enabled_modules]
 ///
 /// Updates the sender's entry in the receiver's contact list.
 pub fn contact_data_push(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
@@ -1722,18 +1457,14 @@ fn serialize_device_sync_payload(node: &super::data_models::Node) -> Vec<u8> {
     let mut buf = Vec::new();
     let user = &node.owner.user;
 
-    // Own device list with apps.
+    // Own device list.
     buf.push(user.devices.len() as u8);
     for d in &user.devices {
         push_device(&mut buf, d);
-        buf.push(d.applications.len() as u8);
-        for a in &d.applications {
-            buf.extend_from_slice(&a.id.to_be_bytes());
-            push_str(&mut buf, &a.alias);
-        }
     }
+    push_enabled_modules(&mut buf, &user.enabled_modules);
 
-    // Contact list with devices and apps.
+    // Contact list.
     buf.push(node.owner.contact_users.len() as u8);
     for contact in &node.owner.contact_users {
         push_str(&mut buf, &contact.user.alias);
@@ -1742,22 +1473,16 @@ fn serialize_device_sync_payload(node: &super::data_models::Node) -> Vec<u8> {
         buf.push(contact.user.devices.len() as u8);
         for d in &contact.user.devices {
             push_device(&mut buf, d);
-            let approved: Vec<&Application> = d.applications.iter()
-                .filter(|a| a.user_approved)
-                .collect();
-            buf.push(approved.len() as u8);
-            for a in approved {
-                buf.extend_from_slice(&a.id.to_be_bytes());
-                push_str(&mut buf, &a.alias);
-            }
         }
+        push_enabled_modules(&mut buf, &contact.user.enabled_modules);
     }
     buf
 }
 
 struct DeviceSyncData {
-    devices:  Vec<Device>,
-    contacts: Vec<Contact>,
+    devices:         Vec<Device>,
+    enabled_modules: Vec<u16>,
+    contacts:        Vec<Contact>,
 }
 
 fn deserialize_device_sync_payload(data: &[u8]) -> Option<DeviceSyncData> {
@@ -1766,23 +1491,9 @@ fn deserialize_device_sync_payload(data: &[u8]) -> Option<DeviceSyncData> {
     let device_count = *data.get(pos)? as usize; pos += 1;
     let mut devices = Vec::new();
     for _ in 0..device_count {
-        let mut dev = read_device(data, &mut pos)?;
-        let app_count = *data.get(pos)? as usize; pos += 1;
-        for _ in 0..app_count {
-            let id_bytes: [u8; 2] = read_arr(data, &mut pos)?;
-            let id    = u16::from_be_bytes(id_bytes);
-            let alias = read_str(data, &mut pos)?;
-            dev.applications.push(Application {
-                id,
-                alias,
-                protocol:      String::new(),
-                host:          "0.0.0.0:0".parse().unwrap(),
-                user_approved: true,
-                token:         [0u8; 16],
-            });
-        }
-        devices.push(dev);
+        devices.push(read_device(data, &mut pos)?);
     }
+    let enabled_modules = read_enabled_modules(data, &mut pos)?;
 
     let contact_count = *data.get(pos)? as usize; pos += 1;
     let mut contacts = Vec::new();
@@ -1793,91 +1504,38 @@ fn deserialize_device_sync_payload(data: &[u8]) -> Option<DeviceSyncData> {
         let dev_count   = *data.get(pos)? as usize; pos += 1;
         let mut contact_devices = Vec::new();
         for _ in 0..dev_count {
-            let mut dev = read_device(data, &mut pos)?;
-            let app_count = *data.get(pos)? as usize; pos += 1;
-            for _ in 0..app_count {
-                let id_bytes: [u8; 2] = read_arr(data, &mut pos)?;
-                let id    = u16::from_be_bytes(id_bytes);
-                let alias = read_str(data, &mut pos)?;
-                dev.applications.push(Application {
-                    id,
-                    alias,
-                    protocol:      String::new(),
-                    host:          "0.0.0.0:0".parse().unwrap(),
-                    user_approved: true,
-                    token:         [0u8; 16],
-                });
-            }
-            contact_devices.push(dev);
+            contact_devices.push(read_device(data, &mut pos)?);
         }
+        let c_enabled = read_enabled_modules(data, &mut pos)?;
         contacts.push(Contact {
             public_key,
-            user: User { alias: user_alias, uuid: user_uuid, devices: contact_devices },
+            user: User { alias: user_alias, uuid: user_uuid, devices: contact_devices, enabled_modules: c_enabled },
         });
     }
-    Some(DeviceSyncData { devices, contacts })
+    Some(DeviceSyncData { devices, enabled_modules, contacts })
 }
 
 /// Apply received device sync data to the node.
-/// Replaces all device and contact entries from the SG.  The local device's
-/// own application list is preserved: the SG's view of it may be stale if an
-/// app was just registered locally before the push arrived.
+/// Replaces device, contact, and enabled-modules entries from the SG.
 fn apply_device_sync_data(data: DeviceSyncData, ctx: &WorkerContext) {
     let mut node = ctx.node.write().unwrap();
-    let local_uuid = node.device_uuid;
-
-    // Preserve own apps before replacing the device list; the local device is
-    // always authoritative for its own apps.
-    let local_apps = node.owner.user.devices.iter()
-        .find(|d| d.uuid == local_uuid)
-        .map(|d| d.applications.clone())
-        .unwrap_or_default();
-
-    node.owner.user.devices  = data.devices;
-    node.owner.contact_users = data.contacts;
-
-    // Restore own app list.
-    if let Some(d) = node.owner.user.devices.iter_mut().find(|d| d.uuid == local_uuid) {
-        d.applications = local_apps;
-    }
+    node.owner.user.devices         = data.devices;
+    node.owner.user.enabled_modules = data.enabled_modules;
+    node.owner.contact_users        = data.contacts;
 }
 
-/// Parse an app list from a pull-request body: `[count: u8][ [id: u16][alias: u8+str] ... ]`.
-/// Returns an empty list if the body is empty or malformed.
-fn parse_app_list(data: &[u8]) -> Vec<Application> {
+/// Parse an enabled-modules list from a pull-request body:
+/// `[count: u8][id: u16 BE]*`. Returns empty if the body is empty or malformed.
+fn parse_enabled_modules_body(data: &[u8]) -> Vec<u16> {
     if data.is_empty() { return Vec::new(); }
     let mut pos = 0usize;
-    let count = data[pos] as usize; pos += 1;
-    let mut apps = Vec::new();
-    for _ in 0..count {
-        let id_bytes: [u8; 2] = match read_arr(data, &mut pos) { Some(b) => b, None => break };
-        let id    = u16::from_be_bytes(id_bytes);
-        let alias = match read_str(data, &mut pos) { Some(s) => s, None => break };
-        apps.push(Application {
-            id,
-            alias,
-            protocol:      String::new(),
-            host:          "0.0.0.0:0".parse().unwrap(),
-            user_approved: true,
-            token:         [0u8; 16],
-        });
-    }
-    apps
+    read_enabled_modules(data, &mut pos).unwrap_or_default()
 }
 
-/// Serialize the local device's app list for inclusion in a pull request body.
-fn serialize_own_app_list(node: &super::data_models::Node) -> Vec<u8> {
-    let local_uuid = node.device_uuid;
-    let apps: Vec<&Application> = node.owner.user.devices.iter()
-        .find(|d| d.uuid == local_uuid)
-        .map(|d| d.applications.iter().collect())
-        .unwrap_or_default();
+/// Serialize the local user's enabled modules for inclusion in a pull request body.
+fn serialize_own_enabled_modules(node: &super::data_models::Node) -> Vec<u8> {
     let mut buf = Vec::new();
-    buf.push(apps.len() as u8);
-    for a in apps {
-        buf.extend_from_slice(&a.id.to_be_bytes());
-        push_str(&mut buf, &a.alias);
-    }
+    push_enabled_modules(&mut buf, &node.owner.user.enabled_modules);
     buf
 }
 
@@ -1942,32 +1600,27 @@ pub fn device_data_push(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
 /// Op 0x63 — Device data pull request (device → own SG).
 ///
-/// Encrypted body: `[app_count: u8][ [id: u16][alias: u8+str] ... ]`
+/// Encrypted body: `[count: u8][module_id: u16 BE]*`
 ///
-/// The sender includes its current app list so the SG can update its record.
-/// The SG replies with a DeviceDataPush containing the full device and contact lists.
+/// The sender includes its enabled_modules so the SG can adopt it before
+/// replying. The SG replies with a DeviceDataPush containing the full
+/// device and contact lists.
 pub fn device_data_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
 
-    // Decrypt and parse the sender's app list.
-    let sender_apps: Vec<Application> = {
+    let sender_modules: Vec<u16> = {
         let node = ctx.node.read().unwrap();
         let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
             eprintln!("[device_data_pull_request] decryption failed from {src}");
             return;
         };
-        parse_app_list(&plaintext)
+        parse_enabled_modules_body(&plaintext)
     };
 
-    // Update the sender device's app list in our node so the reply payload reflects it.
+    // Adopt the sender's enabled_modules at the user level.
     {
         let mut node = ctx.node.write().unwrap();
-        let sender_uuid = node.owner.active_connections.get(&conn_id).map(|c| c.device_uuid);
-        if let Some(uuid) = sender_uuid {
-            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == uuid) {
-                dev.applications = sender_apps;
-            }
-        }
+        node.owner.user.enabled_modules = sender_modules;
     }
     ctx.save_node();
     push_data_to_contacts(ctx);
@@ -2018,9 +1671,9 @@ pub fn sync_devices(ctx: &WorkerContext) {
         .find(|c| c.device_uuid == sg.uuid)
     else { return };
 
-    // Pull request body carries the local device's app list so the SG can
-    // update its record before replying.
-    let body = serialize_own_app_list(&node);
+    // Pull request body carries the local user's enabled_modules so the SG
+    // can adopt it before replying.
+    let body = serialize_own_enabled_modules(&node);
     let pkt  = build_encrypted_packet(DEVICE_DATA_PULL_REQ_OP, conn, &body);
     let dest = conn.peer_addr;
     drop(node);
@@ -2077,25 +1730,21 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     };
 
     // If the destination is this device (i.e. the SG is both relay and recipient),
-    // deliver directly to the local app without going through active_connections.
+    // deliver directly to the local module.
     if dest_device_uuid == local_uuid {
-        let app_host = {
+        let (from_user, from_device) = {
             let node = ctx.node.read().unwrap();
-            node.owner.user.devices.iter()
-                .find(|d| d.uuid == local_uuid)
-                .and_then(|d| d.applications.iter()
-                    .find(|a| a.id == dest_app_id && a.user_approved))
-                .map(|a| a.host)
+            let Some(sd) = sender_uuid else {
+                eprintln!("[relay_packet] missing sender device for local delivery");
+                return;
+            };
+            let Some(fu) = user_for_device(&node, &sd) else {
+                eprintln!("[relay_packet] no user for sender device {sd:?}");
+                return;
+            };
+            (fu, sd)
         };
-        let Some(app_host) = app_host else {
-            eprintln!("[relay_packet] no approved local app with id {dest_app_id}");
-            return;
-        };
-        let mut push = Vec::with_capacity(3 + payload.len());
-        push.push(APP_PUSH_OP);
-        push.extend_from_slice(&sender_app_id.to_be_bytes());
-        push.extend_from_slice(&payload);
-        send(ctx, SocketAddr::V4(app_host), &push);
+        deliver_to_module(ctx, from_user, from_device, sender_app_id, dest_app_id, &payload);
         return;
     }
 
@@ -2178,50 +1827,44 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
 /// Op 0x41 — App packet (SG → destination node).
 ///
-/// The destination node decrypts the body, finds the local app by dest_app_id,
-/// and pushes the payload to the app via UDP.
+/// The destination node decrypts the body, finds the destination module by
+/// id, and hands the payload off via Module::on_receive.
 ///
-/// Encrypted body: [dest_app_id: u16][sender_app_id: u16][payload]
-/// Push to app:    [0x04][sender_app_id: u16][payload]
+/// Encrypted body: [dest_module_id: u16][sender_module_id: u16][payload]
 pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let (push_pkt, app_host) = {
+    let parsed = {
         let node = ctx.node.read().unwrap();
 
         let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
             eprintln!("[app_packet] decryption failed from {src}");
             return;
         };
-
         if plaintext.len() < 4 {
             eprintln!("[app_packet] plaintext too short from {src}");
             return;
         }
-        let dest_app_id   = u16::from_be_bytes([plaintext[0], plaintext[1]]);
-        let sender_app_id = u16::from_be_bytes([plaintext[2], plaintext[3]]);
-        let payload       = &plaintext[4..];
 
-        // Find the destination app on this node.
-        let device_uuid = node.device_uuid;
-        let Some(app_host) = node.owner.user.devices.iter()
-            .find(|d| d.uuid == device_uuid)
-            .and_then(|d| d.applications.iter()
-                .find(|a| a.id == dest_app_id && a.user_approved))
-            .map(|a| a.host)
-        else {
-            eprintln!("[app_packet] no approved app with id {dest_app_id}");
+        let dest_module   = u16::from_be_bytes([plaintext[0], plaintext[1]]);
+        let sender_module = u16::from_be_bytes([plaintext[2], plaintext[3]]);
+        let payload       = plaintext[4..].to_vec();
+
+        // The first two bytes of buf are our local connection id for this peer.
+        let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+        let Some(conn) = node.owner.active_connections.get(&conn_id) else {
+            eprintln!("[app_packet] no active connection for id {conn_id}");
             return;
         };
-
-        // Build push packet: [0x04][sender_app_id: u16][payload]
-        let mut push = Vec::with_capacity(3 + payload.len());
-        push.push(APP_PUSH_OP);
-        push.extend_from_slice(&sender_app_id.to_be_bytes());
-        push.extend_from_slice(payload);
-
-        (push, app_host)
+        let from_device = conn.device_uuid;
+        let Some(from_user) = user_for_device(&node, &from_device) else {
+            eprintln!("[app_packet] no user for device {from_device:?}");
+            return;
+        };
+        Some((from_user, from_device, sender_module, dest_module, payload))
     };
 
-    send(ctx, SocketAddr::V4(app_host), &push_pkt);
+    if let Some((from_user, from_device, sender_module, dest_module, payload)) = parsed {
+        deliver_to_module(ctx, from_user, from_device, sender_module, dest_module, &payload);
+    }
 }
 
 /// Ping every candidate SG, record RTT, and mark each one up or down.
@@ -2738,7 +2381,7 @@ pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let nonce: [u8; 24] = buf[2..26].try_into().unwrap();
     let ciphertext      = &buf[26..];
 
-    let (push_pkt, app_host) = {
+    let parsed = {
         let node = ctx.node.read().unwrap();
 
         let Some(&conn_id) = node.owner.dg_tunnel_map.get(&tunnel_id) else {
@@ -2760,29 +2403,21 @@ pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         }
 
-        let dest_app_id   = u16::from_be_bytes([plaintext[0], plaintext[1]]);
-        let sender_app_id = u16::from_be_bytes([plaintext[2], plaintext[3]]);
-        let payload       = &plaintext[4..];
+        let dest_module   = u16::from_be_bytes([plaintext[0], plaintext[1]]);
+        let sender_module = u16::from_be_bytes([plaintext[2], plaintext[3]]);
+        let payload       = plaintext[4..].to_vec();
 
-        let device_uuid = node.device_uuid;
-        let Some(app_host) = node.owner.user.devices.iter()
-            .find(|d| d.uuid == device_uuid)
-            .and_then(|d| d.applications.iter().find(|a| a.id == dest_app_id))
-            .map(|a| a.host)
-        else {
-            eprintln!("[tunnel_delivery] no app {dest_app_id} for tunnel {tunnel_id}");
+        let from_device = conn.device_uuid;
+        let Some(from_user) = user_for_device(&node, &from_device) else {
+            eprintln!("[tunnel_delivery] no user for device {from_device:?}");
             return;
         };
-
-        let mut push = Vec::with_capacity(3 + payload.len());
-        push.push(APP_PUSH_OP);
-        push.extend_from_slice(&sender_app_id.to_be_bytes());
-        push.extend_from_slice(payload);
-
-        (push, app_host)
+        Some((from_user, from_device, sender_module, dest_module, payload))
     };
 
-    send(ctx, SocketAddr::V4(app_host), &push_pkt);
+    if let Some((from_user, from_device, sender_module, dest_module, payload)) = parsed {
+        deliver_to_module(ctx, from_user, from_device, sender_module, dest_module, &payload);
+    }
 }
 
 /// Recurring cleanup: remove idle tunnels and stale counters.
@@ -2963,21 +2598,12 @@ pub fn ui_request(
             initiate_bootstrap(&body, ctx);
             respond_redirect(&stream, "/setup?waiting=1")
         }
-        ("GET",  "/")                     => respond_redirect(&stream, "/dashboard"),
-        ("GET",  "/dashboard")            => respond_html(&stream, 200, &render_dashboard(ctx)),
-        ("GET",  "/pending-apps")         => respond_html(&stream, 200, &render_pending_apps(ctx)),
-        ("POST", "/pending-apps/approve") => {
-            approve_app(&body, ctx);
-            respond_redirect(&stream, "/pending-apps");
-        }
-        ("POST", "/pending-apps/reject")  => {
-            reject_app(&body, ctx);
-            respond_redirect(&stream, "/pending-apps");
-        }
-        ("GET",  "/applications")  => respond_html(&stream, 200, &render_applications(ctx)),
-        ("POST", "/applications/delete") => {
-            reject_app(&body, ctx);
-            respond_redirect(&stream, "/applications");
+        ("GET",  "/")              => respond_redirect(&stream, "/dashboard"),
+        ("GET",  "/dashboard")     => respond_html(&stream, 200, &render_dashboard(ctx)),
+        ("GET",  "/apps")          => respond_html(&stream, 200, &render_modules(ctx)),
+        ("POST", "/apps/toggle")   => {
+            toggle_module(&body, ctx);
+            respond_redirect(&stream, "/apps");
         }
         ("GET",  "/contacts")      => respond_html(&stream, 200, &render_contacts(ctx)),
         ("GET",  "/devices")       => respond_html(&stream, 200, &render_devices(ctx)),
@@ -3006,19 +2632,69 @@ pub fn ui_request(
             initiate_contact_exchange(&body, ctx);
             respond_redirect(&stream, "/contacts");
         }
+        (_, p) if p.starts_with("/apps/") => {
+            match dispatch_module_http(&method, p, &query, &body, ctx) {
+                Some(resp) => respond_bytes(&stream, resp.status, resp.content_type, &resp.body),
+                None       => respond_html(&stream, 404, &layout("Not Found", "<h1>404 — Not Found</h1>")),
+            }
+        }
         _ => respond_html(&stream, 404, &layout("Not Found", "<h1>404 — Not Found</h1>")),
     }
+}
+
+/// Dispatch a request beneath `/apps/<slug>/...` to the matching enabled module.
+/// Returns None when no module owns the slug or the module's `on_http` declines.
+fn dispatch_module_http(
+    method: &str,
+    path:   &str,
+    query:  &str,
+    body:   &[u8],
+    ctx:    &WorkerContext,
+) -> Option<super::modules::HttpResponse> {
+    let rest = path.strip_prefix("/apps/")?;
+    let (slug, suffix) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None    => (rest, "/"),
+    };
+    if slug.is_empty() { return None; }
+
+    let module = ctx.modules.iter().find(|m| m.slug() == slug)?.clone();
+    let enabled = ctx.node.read().unwrap()
+        .owner.user.enabled_modules.contains(&module.id());
+    if !enabled { return None; }
+
+    let req = super::modules::HttpRequest {
+        method: method.to_string(),
+        path:   suffix.to_string(),
+        query:  query.to_string(),
+        body:   body.to_vec(),
+    };
+    let mctx = super::modules::ModuleCtx { inner: ctx, module: module.id() };
+    module.on_http(&req, &mctx)
 }
 
 // ── Routing helpers ───────────────────────────────────────────────────────────
 
 fn respond_html(stream: &std::net::TcpStream, status: u16, html: &str) {
+    respond_bytes(stream, status, "text/html; charset=utf-8", html.as_bytes());
+}
+
+fn respond_bytes(stream: &std::net::TcpStream, status: u16, content_type: &str, body: &[u8]) {
     use std::io::Write;
-    let status_text = match status { 200 => "OK", 404 => "Not Found", _ => "OK" };
-    let body = html.as_bytes();
+    let status_text = match status {
+        200 => "OK",
+        301 => "Moved Permanently",
+        302 => "Found",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _   => "OK",
+    };
     let header = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
-         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n",
         body.len()
@@ -3106,7 +2782,7 @@ fn render_dashboard(ctx: &WorkerContext) -> String {
     let owner_alias  = html_escape(&node.owner.user.alias);
     let device_alias = html_escape(device.map(|d| d.alias.as_str()).unwrap_or("unknown"));
     let n_contacts   = node.owner.contact_users.len();
-    let n_apps: usize = node.owner.user.devices.iter().map(|d| d.applications.len()).sum();
+    let n_apps: usize = node.owner.user.enabled_modules.len();
     let n_conns      = node.owner.active_connections.len();
 
     let hosts_line = match device {
@@ -3133,91 +2809,44 @@ fn render_dashboard(ctx: &WorkerContext) -> String {
     layout("Dashboard", &body)
 }
 
-fn render_pending_apps(ctx: &WorkerContext) -> String {
-    let node        = ctx.node.read().unwrap();
-    let device_uuid = node.device_uuid;
-    let device      = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
+fn render_modules(ctx: &WorkerContext) -> String {
+    let enabled: Vec<u16> = ctx.node.read().unwrap()
+        .owner.user.enabled_modules.clone();
 
-    let rows: String = device
-        .map(|d| {
-            d.applications.iter()
-                .filter(|a| !a.user_approved)
-                .map(|a| format!(
-                    "<tr>\
-                       <td>{}</td>\
-                       <td>{}</td>\
-                       <td>{}</td>\
-                       <td>\
-                         <form method='post' action='/pending-apps/approve'>\
-                           <input type='hidden' name='id' value='{}'>\
-                           <button class='approve' type='submit'>Approve</button>\
-                         </form>\
-                         <form method='post' action='/pending-apps/reject'>\
-                           <input type='hidden' name='id' value='{}'>\
-                           <button class='reject' type='submit'>Reject</button>\
-                         </form>\
-                       </td>\
-                     </tr>",
-                    html_escape(&a.alias),
-                    html_escape(&a.protocol),
-                    html_escape(&a.host.to_string()),
-                    a.id,
-                    a.id,
-                ))
-                .collect()
-        })
-        .unwrap_or_default();
+    let rows: String = ctx.modules.iter().map(|m| {
+        let id      = m.id();
+        let on      = enabled.contains(&id);
+        let label   = if on { "Disable" } else { "Enable" };
+        let status  = if on { "<span style='color:#080'>on</span>" } else { "<span style='color:#999'>off</span>" };
+        format!(
+            "<tr>\
+               <td>{}</td>\
+               <td><code>{}</code></td>\
+               <td>{status}</td>\
+               <td>\
+                 <form method='post' action='/apps/toggle' style='margin:0'>\
+                   <input type='hidden' name='id' value='{id}'>\
+                   <button type='submit'>{label}</button>\
+                 </form>\
+               </td>\
+             </tr>",
+            html_escape(m.alias()),
+            html_escape(m.slug()),
+        )
+    }).collect();
 
-    let body = if rows.is_empty() {
-        "<h1>Pending Apps</h1><p class='empty'>No pending applications.</p>".to_string()
+    let body = if ctx.modules.is_empty() {
+        "<h1>Apps</h1><p class='empty'>No modules compiled into this build.</p>".to_string()
     } else {
         format!(
-            "<h1>Pending Apps</h1>\
+            "<h1>Apps</h1>\
              <table>\
-               <tr><th>Alias</th><th>Protocol</th><th>Host</th><th>Actions</th></tr>\
+               <tr><th>Name</th><th>Slug</th><th>Status</th><th></th></tr>\
                {rows}\
              </table>"
         )
     };
-    layout("Pending Apps", &body)
-}
-
-fn render_applications(ctx: &WorkerContext) -> String {
-    let node        = ctx.node.read().unwrap();
-    let device_uuid = node.device_uuid;
-    let device      = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
-
-    let rows: String = device
-        .map(|d| {
-            d.applications.iter()
-                .filter(|a| a.user_approved)
-                .map(|a| format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td>\
-                     <td><form method='post' action='/applications/delete' style='margin:0'>\
-                       <input type='hidden' name='id' value='{}'>\
-                       <button type='submit'>Delete</button>\
-                     </form></td></tr>",
-                    html_escape(&a.alias),
-                    html_escape(&a.protocol),
-                    html_escape(&a.host.to_string()),
-                    a.id,
-                ))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let body = if rows.is_empty() {
-        "<h1>Applications</h1><p class='empty'>No approved applications.</p>".to_string()
-    } else {
-        format!(
-            "<h1>Applications</h1>\
-             <table>\
-               <tr><th>Alias</th><th>Protocol</th><th>Host</th><th></th></tr>\
-               {rows}\
-             </table>"
-        )
-    };
-    layout("Applications", &body)
+    layout("Apps", &body)
 }
 
 fn render_contacts(ctx: &WorkerContext) -> String {
@@ -3227,12 +2856,9 @@ fn render_contacts(ctx: &WorkerContext) -> String {
     let rows: String = contacts.iter()
         .map(|c| {
             let dev_cells: String = c.user.devices.iter().map(|d| {
-                let app_count = d.applications.iter().filter(|a| a.user_approved).count();
                 format!(
-                    "<li style='font-size:.85rem'>{} — {} app{}</li>",
+                    "<li style='font-size:.85rem'>{}</li>",
                     html_escape(&d.alias),
-                    app_count,
-                    if app_count == 1 { "" } else { "s" },
                 )
             }).collect();
             let dev_list = if c.user.devices.is_empty() {
@@ -3240,8 +2866,9 @@ fn render_contacts(ctx: &WorkerContext) -> String {
             } else {
                 format!("<ul style='margin:0;padding-left:1.2rem'>{dev_cells}</ul>")
             };
+            let app_count = c.user.enabled_modules.len();
             format!(
-                "<tr><td>{}</td><td>{dev_list}</td></tr>",
+                "<tr><td>{}</td><td>{dev_list}</td><td>{app_count}</td></tr>",
                 html_escape(&c.user.alias),
             )
         })
@@ -3252,7 +2879,7 @@ fn render_contacts(ctx: &WorkerContext) -> String {
     } else {
         format!(
             "<table>\
-               <tr><th>Alias</th><th>Devices &amp; Apps</th></tr>\
+               <tr><th>Alias</th><th>Devices</th><th>Apps</th></tr>\
                {rows}\
              </table>"
         )
@@ -3286,10 +2913,9 @@ fn render_devices(ctx: &WorkerContext) -> String {
         .map(|d| {
             let suffix = if d.uuid == device_uuid { " <em>(this device)</em>" } else { "" };
             format!(
-                "<tr><td>{}{suffix}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}{suffix}</td><td>{}</td></tr>",
                 html_escape(&d.alias),
                 html_escape(&d.hosts.join(", ")),
-                d.applications.len(),
             )
         })
         .collect();
@@ -3308,7 +2934,7 @@ fn render_devices(ctx: &WorkerContext) -> String {
         format!(
             "{heading}\
              <table>\
-               <tr><th>Alias</th><th>Host</th><th>Apps</th></tr>\
+               <tr><th>Alias</th><th>Host</th></tr>\
                {rows}\
              </table>"
         )
@@ -3316,33 +2942,36 @@ fn render_devices(ctx: &WorkerContext) -> String {
     layout("Devices", &body)
 }
 
-// ── App approval / rejection ──────────────────────────────────────────────────
+// ── Module enable / disable ───────────────────────────────────────────────────
 
-fn approve_app(body: &[u8], ctx: &WorkerContext) {
+/// Toggle the user's enabled state for the module identified in the form body.
+/// Calls Module::on_enable or on_disable, persists, and propagates the new
+/// enabled_modules list to the user's other devices and contacts.
+fn toggle_module(body: &[u8], ctx: &WorkerContext) {
     let Some(id_str) = form_field(body, "id") else { return };
     let Ok(id) = id_str.parse::<u16>() else { return };
-    {
-        let mut node    = ctx.node.write().unwrap();
-        let device_uuid = node.device_uuid;
-        let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else { return };
-        if let Some(app) = device.applications.iter_mut().find(|a| a.id == id) {
-            app.user_approved = true;
+
+    // Confirm the module is actually compiled in before toggling.
+    if !ctx.modules.iter().any(|m| m.id() == id) {
+        return;
+    }
+
+    let now_on = {
+        let mut node = ctx.node.write().unwrap();
+        let list = &mut node.owner.user.enabled_modules;
+        if let Some(pos) = list.iter().position(|x| *x == id) {
+            list.remove(pos);
+            false
+        } else {
+            list.push(id);
+            true
         }
-    }
-    ctx.save_node();
-    push_data_to_contacts(ctx);
-    sync_devices(ctx);
-}
+    };
 
-fn reject_app(body: &[u8], ctx: &WorkerContext) {
-    let Some(id_str) = form_field(body, "id") else { return };
-    let Ok(id) = id_str.parse::<u16>() else { return };
-    {
-        let mut node    = ctx.node.write().unwrap();
-        let device_uuid = node.device_uuid;
-        let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else { return };
-        device.applications.retain(|a| a.id != id);
-    }
+    let module = ctx.modules.iter().find(|m| m.id() == id).cloned().unwrap();
+    let mctx = super::modules::ModuleCtx { inner: ctx, module: id };
+    if now_on { module.on_enable(&mctx); } else { module.on_disable(&mctx); }
+
     ctx.save_node();
     push_data_to_contacts(ctx);
     sync_devices(ctx);
@@ -3913,8 +3542,7 @@ fn layout(title: &str, body: &str) -> String {
     html.push_str("<nav>\n");
     html.push_str("  <span class=\"brand\">pNet</span>\n");
     html.push_str("  <a href=\"/dashboard\">Dashboard</a>\n");
-    html.push_str("  <a href=\"/pending-apps\">Pending Apps</a>\n");
-    html.push_str("  <a href=\"/applications\">Applications</a>\n");
+    html.push_str("  <a href=\"/apps\">Apps</a>\n");
     html.push_str("  <a href=\"/contacts\">Contacts</a>\n");
     html.push_str("  <a href=\"/devices\">Devices</a>\n");
     html.push_str("  <a href=\"/invitations\">Invitations</a>\n");
@@ -3993,7 +3621,13 @@ mod tests {
             let (writer_tx, _writer_rx) = mpsc::sync_channel(64);
             let (scheduler_tx, _sched_rx) = mpsc::channel();
 
-            let ctx = WorkerContext { node, udp_socket: pnet_socket, writer_tx, scheduler_tx };
+            let ctx = WorkerContext {
+                node,
+                udp_socket: pnet_socket,
+                writer_tx,
+                scheduler_tx,
+                modules: Arc::new(super::super::modules::all()),
+            };
             TestCtx { ctx, app_socket, _writer_rx, _sched_rx }
         }
 
@@ -4011,142 +3645,6 @@ mod tests {
         }
     }
 
-    // ── AppRegister ───────────────────────────────────────────────────────────
-
-    fn register_packet(alias: &str, port: u16, protocol: &str) -> Vec<u8> {
-        let mut buf = vec![alias.len() as u8];
-        buf.extend_from_slice(alias.as_bytes());
-        buf.extend_from_slice(&port.to_be_bytes());
-        buf.push(protocol.len() as u8);
-        buf.extend_from_slice(protocol.as_bytes());
-        buf
-    }
-
-    #[test]
-    fn app_register_returns_token() {
-        let t = TestCtx::new();
-        app_register(t.app_addr(), register_packet("myapp", 9001, "udp"), &t.ctx);
-
-        let reply = t.recv_reply();
-        assert_eq!(reply[0], OK);
-        assert_eq!(reply.len(), 17, "reply should be status + 16-byte token");
-    }
-
-    #[test]
-    fn app_register_adds_application_to_node() {
-        let t = TestCtx::new();
-        app_register(t.app_addr(), register_packet("myapp", 9001, "udp"), &t.ctx);
-
-        let node = t.ctx.node.read().unwrap();
-        let device_uuid = node.device_uuid;
-        let device = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
-        assert_eq!(device.applications.len(), 1);
-        assert_eq!(device.applications[0].alias, "myapp");
-        assert_eq!(device.applications[0].host.port(), 9001);
-        assert!(!device.applications[0].user_approved);
-    }
-
-    #[test]
-    fn app_register_each_app_gets_unique_id_and_token() {
-        let t = TestCtx::new();
-        app_register(t.app_addr(), register_packet("app1", 9001, "udp"), &t.ctx);
-        let reply1 = t.recv_reply();
-        app_register(t.app_addr(), register_packet("app2", 9002, "udp"), &t.ctx);
-        let reply2 = t.recv_reply();
-
-        let token1 = &reply1[1..17];
-        let token2 = &reply2[1..17];
-        assert_ne!(token1, token2, "tokens must be unique");
-
-        let node = t.ctx.node.read().unwrap();
-        let device_uuid = node.device_uuid;
-        let device = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
-        assert_eq!(device.applications.len(), 2);
-        assert_ne!(device.applications[0].id, device.applications[1].id);
-    }
-
-    #[test]
-    fn app_register_rejects_bad_packet() {
-        let t = TestCtx::new();
-        app_register(t.app_addr(), vec![], &t.ctx); // empty buf
-
-        let reply = t.recv_reply();
-        assert_eq!(reply[0], 0x01); // error
-        assert_eq!(reply[1], ERR_BAD_PACKET);
-    }
-
-    // ── AppUpdate ─────────────────────────────────────────────────────────────
-
-    /// Register an app and return its token.
-    fn register_and_get_token(t: &TestCtx, alias: &str, port: u16) -> [u8; 16] {
-        app_register(t.app_addr(), register_packet(alias, port, "udp"), t.ctx());
-        let reply = t.recv_reply();
-        assert_eq!(reply[0], OK);
-        reply[1..17].try_into().unwrap()
-    }
-
-    fn update_packet(token: &[u8; 16], new_alias: Option<&str>, new_port: Option<u16>) -> Vec<u8> {
-        let mut buf = token.to_vec();
-        let mut flags: u8 = 0;
-        let mut extra: Vec<u8> = Vec::new();
-
-        if let Some(alias) = new_alias {
-            flags |= 0x01;
-            extra.push(alias.len() as u8);
-            extra.extend_from_slice(alias.as_bytes());
-        }
-        if let Some(port) = new_port {
-            flags |= 0x02;
-            extra.extend_from_slice(&port.to_be_bytes());
-        }
-
-        buf.push(flags);
-        buf.extend(extra);
-        buf
-    }
-
-    impl TestCtx {
-        fn ctx(&self) -> &WorkerContext { &self.ctx }
-    }
-
-    #[test]
-    fn app_update_alias() {
-        let t = TestCtx::new();
-        let token = register_and_get_token(&t, "original", 9001);
-
-        app_update(t.app_addr(), update_packet(&token, Some("renamed"), None), &t.ctx);
-        assert_eq!(t.recv_reply(), vec![OK]);
-
-        let node = t.ctx.node.read().unwrap();
-        let device_uuid = node.device_uuid;
-        let device = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
-        assert_eq!(device.applications[0].alias, "renamed");
-    }
-
-    #[test]
-    fn app_update_port() {
-        let t = TestCtx::new();
-        let token = register_and_get_token(&t, "myapp", 9001);
-
-        app_update(t.app_addr(), update_packet(&token, None, Some(9999)), &t.ctx);
-        assert_eq!(t.recv_reply(), vec![OK]);
-
-        let node = t.ctx.node.read().unwrap();
-        let device_uuid = node.device_uuid;
-        let device = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
-        assert_eq!(device.applications[0].host.port(), 9999);
-    }
-
-    #[test]
-    fn app_update_unknown_token_returns_error() {
-        let t = TestCtx::new();
-        let bad_token = [0xFFu8; 16];
-        app_update(t.app_addr(), update_packet(&bad_token, Some("x"), None), &t.ctx);
-
-        let reply = t.recv_reply();
-        assert_eq!(reply[0], 0x01);
-        assert_eq!(reply[1], ERR_TOKEN_UNKNOWN);
-    }
 
     // ── SgPing ────────────────────────────────────────────────────────────────
 
@@ -4160,64 +3658,6 @@ mod tests {
         assert_eq!(reply.len(), 17);
         assert_eq!(reply[0], SG_PONG_OP);
         assert_eq!(reply[1..17], nonce);
-    }
-
-    // ── AppGetData ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn app_get_data_returns_app_and_node_tree() {
-        let t = TestCtx::new();
-        let token = register_and_get_token(&t, "myapp", 9001);
-
-        app_get_data(t.app_addr(), token.to_vec(), &t.ctx);
-        let reply = t.recv_reply();
-        assert_eq!(reply[0], OK);
-
-        let mut pos = 1usize;
-
-        // App's own data.
-        let app_id = u16::from_be_bytes([reply[pos], reply[pos + 1]]); pos += 2;
-        assert!(app_id > 0);
-        let alias = read_str(&reply, &mut pos).unwrap();
-        assert_eq!(alias, "myapp");
-        pos += 4 + 2; // host ip + port
-        let user_approved = reply[pos]; pos += 1;
-        assert_eq!(user_approved, 0); // not yet approved
-        let token_back: [u8; 16] = reply[pos..pos + 16].try_into().unwrap(); pos += 16;
-        assert_eq!(token_back, token.as_slice());
-        pos += 16; // local device uuid
-
-        // Owner alias + uuid.
-        let owner_alias = read_str(&reply, &mut pos).unwrap();
-        assert!(!owner_alias.is_empty());
-        pos += 16; // owner uuid
-
-        // Own devices.
-        let device_count = reply[pos] as usize; pos += 1;
-        assert_eq!(device_count, 1);
-        pos += 16; // device uuid
-        let _dev_alias = read_str(&reply, &mut pos).unwrap();
-        pos += 1 + 1; // grade + sg_rank
-        let host_count = reply[pos] as usize; pos += 1;
-        for _ in 0..host_count {
-            let _h = read_str(&reply, &mut pos).unwrap();
-        }
-        let app_count = reply[pos] as usize; pos += 1;
-        assert_eq!(app_count, 1); // the app we just registered
-
-        // Contact count (none registered).
-        let contact_count = reply[pos] as usize;
-        assert_eq!(contact_count, 0);
-    }
-
-    #[test]
-    fn app_get_data_unknown_token_returns_error() {
-        let t = TestCtx::new();
-        app_get_data(t.app_addr(), vec![0xFFu8; 16], &t.ctx);
-
-        let reply = t.recv_reply();
-        assert_eq!(reply[0], 0x01);
-        assert_eq!(reply[1], ERR_TOKEN_UNKNOWN);
     }
 
     // ── Ed25519 helpers ───────────────────────────────────────────────────────
@@ -4264,8 +3704,8 @@ mod tests {
                     grade:           DeviceGrade::SG,
                     sg_rank:         Some(1),
                     hosts:           vec!["127.0.0.1:9999".into()],
-                    applications:    Vec::new(),
                 }],
+                enabled_modules: Vec::new(),
             },
         });
         (device_uuid, kp)
@@ -4439,7 +3879,6 @@ mod tests {
             grade:           DeviceGrade::SG,
             sg_rank:         Some(1),
             hosts:           vec!["127.0.0.1:9000".into()],
-            applications:    Vec::new(),
         }
     }
 
@@ -4466,9 +3905,9 @@ mod tests {
                             grade:           DeviceGrade::DG,
                             sg_rank:         None,
                             hosts:           vec!["127.0.0.1:9001".into()],
-                            applications:    Vec::new(),
                         },
                     ],
+                    enabled_modules: Vec::new(),
                 },
             });
         }
@@ -4582,7 +4021,6 @@ mod tests {
                 grade:        DeviceGrade::SG,
                 sg_rank:      Some(1),
                 hosts:        vec!["127.0.0.1:9001".into(), "127.0.0.1:9002".into()],
-                applications: Vec::new(),
             });
             node.sg_statuses.insert((dev_uuid, "127.0.0.1:9001".into()), super::super::data_models::SgStatus {
                 up: true,
@@ -4612,7 +4050,6 @@ mod tests {
                 grade:        DeviceGrade::SG,
                 sg_rank:      Some(1),
                 hosts:        vec!["127.0.0.1:9003".into()],
-                applications: Vec::new(),
             });
             // No sg_statuses entry — cold-boot fallback should kick in.
         }
@@ -4728,8 +4165,8 @@ mod tests {
                         grade:           DeviceGrade::DG,
                         sg_rank:         None,
                         hosts:           vec![dest_addr.to_string()],
-                        applications:    Vec::new(),
                     }],
+                    enabled_modules: Vec::new(),
                 },
             });
         }
@@ -4793,74 +4230,6 @@ mod tests {
         assert_eq!(u16::from_be_bytes([decrypted[0], decrypted[1]]), dest_app_id);
         assert_eq!(u16::from_be_bytes([decrypted[2], decrypted[3]]), sender_app_id);
         assert_eq!(&decrypted[4..], b"payload");
-    }
-
-    // ── app_packet delivers to local app ──────────────────────────────────────
-
-    #[test]
-    fn app_packet_delivers_to_local_app() {
-        let t = TestCtx::new();
-
-        // Set up: an approved app on the local device.
-        let app_id: u16     = 9;
-        let sender_app_id   = 3u16;
-        let sg_kp           = generate_x25519_keypair();
-        let local_kp        = generate_x25519_keypair();
-
-        // Register the app first so we have an approved app with a known port.
-        let app_addr = t.app_addr(); // we'll use app_socket as the "app"
-        {
-            let mut node = t.ctx.node.write().unwrap();
-            let device_uuid = node.device_uuid;
-            let dev = node.owner.user.devices.iter_mut()
-                .find(|d| d.uuid == device_uuid).unwrap();
-            dev.applications.push(super::super::data_models::Application {
-                id:            app_id,
-                alias:         "myapp".to_string(),
-                protocol:      "udp".to_string(),
-                host:          app_addr.to_string().parse().unwrap(),
-                user_approved: true,
-                token:         generate_uuid(),
-            });
-
-            // Active connection #5: from SG (our peer is the SG).
-            node.owner.active_connections.insert(5, ActiveConnection {
-                id:                        5,
-                timeout:                   SystemTime::now() + Duration::from_secs(3600),
-                key_pair:                  local_kp.clone(),
-                peer_public_key:           sg_kp.public_key,
-                peer_active_connection_id: 99,
-                device_uuid:               generate_uuid(),
-            peer_addr:   "127.0.0.1:0".parse().unwrap(),
-            });
-        }
-
-        // Build AppPacket body: [dest_app_id: u16][sender_app_id: u16][payload]
-        let mut body = Vec::new();
-        body.extend_from_slice(&app_id.to_be_bytes());
-        body.extend_from_slice(&sender_app_id.to_be_bytes());
-        body.extend_from_slice(b"hello app");
-
-        // SG encrypts using its side of conn #5.
-        let sg_side = ActiveConnection {
-            id:                        99,
-            timeout:                   SystemTime::now() + Duration::from_secs(3600),
-            key_pair:                  sg_kp,
-            peer_public_key:           local_kp.public_key,
-            peer_active_connection_id: 5,
-            device_uuid:               generate_uuid(),
-        peer_addr:   "127.0.0.1:0".parse().unwrap(),
-        };
-        let pkt = build_encrypted_packet(APP_PACKET_OP, &sg_side, &body);
-
-        // Feed the AppPacket (buf after op byte) to the handler.
-        app_packet(t.app_addr(), pkt[1..].to_vec(), &t.ctx);
-
-        // app_socket should receive the push.
-        let push = t.recv_reply();
-        assert_eq!(push[0], APP_PUSH_OP);
-        assert_eq!(u16::from_be_bytes([push[1], push[2]]), sender_app_id);
-        assert_eq!(&push[3..], b"hello app");
     }
 
     // ── Contact exchange (0x33 / 0x34) ───────────────────────────────────────
@@ -5067,6 +4436,7 @@ mod tests {
         payload.extend_from_slice(&target_uuid);
         payload.extend_from_slice(&target_pk);
         payload.push(0u8); // 0 devices
+        push_enabled_modules(&mut payload, &[]);
 
         let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
         let mut buf = Vec::new();
@@ -5180,8 +4550,8 @@ mod tests {
                         grade:           DeviceGrade::SG,
                         sg_rank:         Some(1),
                         hosts:           vec![contact_sg_host.to_string()],
-                        applications:    Vec::new(),
                     }],
+                    enabled_modules: Vec::new(),
                 },
             });
 
@@ -5223,37 +4593,31 @@ mod tests {
             &t, contact_uuid, contact_sg_uuid, contact_sg_host,
         );
 
-        // Build a ContactDataPush payload: contact user has 1 device + 1 approved app.
+        // Build a ContactDataPush payload: contact has 1 device + 2 enabled modules.
         let new_device_uuid = generate_uuid();
         let mut payload = Vec::new();
         payload.extend_from_slice(&contact_uuid); // user_uuid
         payload.push(1u8);                        // device_count
-        // device: uuid + alias + grade(SG=1) + sg_rank(1) + ip + port
         push_device(&mut payload, &Device {
             alias:           "chad-laptop".to_string(),
             uuid:            new_device_uuid,
             grade:           DeviceGrade::SG,
             sg_rank:         Some(1),
             hosts:           vec!["127.0.0.1:8888".into()],
-            applications:    Vec::new(),
         });
-        payload.push(1u8);              // app_count
-        payload.extend_from_slice(&42u16.to_be_bytes()); // app id
-        push_str(&mut payload, "chad-app");
+        push_enabled_modules(&mut payload, &[42u16, 7u16]);
 
         let pkt = build_encrypted_packet(CONTACT_DATA_PUSH_OP, &sender_conn, &payload);
         contact_data_push(t.app_addr(), pkt[1..].to_vec(), &t.ctx);
 
-        // Contact's device list should now reflect the pushed data.
+        // Contact's device + module lists should now reflect the pushed data.
         let node = t.ctx.node.read().unwrap();
         let contact = node.owner.contact_users.iter()
             .find(|c| c.user.uuid == contact_uuid)
             .expect("contact not found");
         assert_eq!(contact.user.devices.len(), 1);
         assert_eq!(contact.user.devices[0].alias, "chad-laptop");
-        assert_eq!(contact.user.devices[0].applications.len(), 1);
-        assert_eq!(contact.user.devices[0].applications[0].id, 42);
-        assert_eq!(contact.user.devices[0].applications[0].alias, "chad-app");
+        assert_eq!(contact.user.enabled_modules, vec![42u16, 7u16]);
     }
 
     #[test]
@@ -5382,8 +4746,8 @@ mod tests {
                         grade:           DeviceGrade::SG,
                         sg_rank:         Some(1),
                         hosts:           vec![contact_sg_addr.to_string()],
-                        applications:    Vec::new(),
                     }],
+                    enabled_modules: Vec::new(),
                 },
             });
             node.owner.active_connections.insert(1, ActiveConnection {
@@ -5409,29 +4773,11 @@ mod tests {
 
     #[test]
     fn contact_data_roundtrip_serialization() {
-        // Verify serialize → deserialize preserves all fields.
+        // Verify serialize → deserialize preserves devices and enabled_modules.
         let t = TestCtx::new();
         {
             let mut node = t.ctx.node.write().unwrap();
-            let device_uuid = node.device_uuid;
-            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) {
-                dev.applications.push(Application {
-                    id:            7,
-                    alias:         "test-app".to_string(),
-                    protocol:      "udp".to_string(),
-                    host:          "127.0.0.1:5000".parse().unwrap(),
-                    user_approved: true,
-                    token:         generate_uuid(),
-                });
-                dev.applications.push(Application {
-                    id:            8,
-                    alias:         "pending-app".to_string(),
-                    protocol:      "udp".to_string(),
-                    host:          "127.0.0.1:5001".parse().unwrap(),
-                    user_approved: false, // should be excluded from sync
-                    token:         generate_uuid(),
-                });
-            }
+            node.owner.user.enabled_modules = vec![7, 8];
         }
 
         let payload = {
@@ -5444,11 +4790,7 @@ mod tests {
         let node = t.ctx.node.read().unwrap();
         assert_eq!(data.user_uuid, node.owner.user.uuid);
         assert_eq!(data.devices.len(), 1);
-        let (_, apps) = &data.devices[0];
-        // Only the approved app should be present.
-        assert_eq!(apps.len(), 1);
-        assert_eq!(apps[0].0, 7);
-        assert_eq!(apps[0].1, "test-app");
+        assert_eq!(data.enabled_modules, vec![7u16, 8u16]);
     }
 
     // ── Device data sync ──────────────────────────────────────────────────────
@@ -5480,7 +4822,6 @@ mod tests {
                 grade:           DeviceGrade::DG,
                 sg_rank:         None,
                 hosts:           vec![dg_addr.to_string()],
-                applications:    Vec::new(),
             });
 
             // Active connection to the DG.
@@ -5531,7 +4872,6 @@ mod tests {
                 grade:           DeviceGrade::DG,
                 sg_rank:         None,
                 hosts:           vec!["127.0.0.1:0".into()],
-                applications:    Vec::new(),
             });
         }
 
@@ -5564,70 +4904,6 @@ mod tests {
         // Contact list should be populated.
         assert_eq!(node.owner.contact_users.len(), 1);
         assert_eq!(node.owner.contact_users[0].user.uuid, contact_uuid);
-    }
-
-    #[test]
-    fn device_data_push_preserves_own_apps() {
-        // When a DG receives a DeviceDataPush, its locally registered apps must
-        // not be wiped even though the SG doesn't include them in the payload.
-        let t = TestCtx::new();
-        let (_, _, sender_conn) = setup_sg_with_own_dg_conn(&t);
-
-        // The receiver is the DG — give it a local app.
-        let receiver = TestCtx::new();
-        let receiver_uuid = receiver.ctx.node.read().unwrap().device_uuid;
-        {
-            let mut node = receiver.ctx.node.write().unwrap();
-            if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == receiver_uuid) {
-                dev.applications.push(Application {
-                    id:            55,
-                    alias:         "local-app".to_string(),
-                    protocol:      "udp".to_string(),
-                    host:          "127.0.0.1:9000".parse().unwrap(),
-                    user_approved: true,
-                    token:         generate_uuid(),
-                });
-            }
-            // Add the receiver's own device to the sender's device list so it
-            // appears in the payload (SG knows about this device).
-            let dg_device = Device {
-                alias:           "my-dg".to_string(),
-                uuid:            receiver_uuid,
-                grade:           DeviceGrade::DG,
-                sg_rank:         None,
-                hosts:           vec!["127.0.0.1:0".into()],
-                applications:    Vec::new(), // SG has no apps for this device
-            };
-            // Insert into the sender's node as well.
-            drop(node);
-            t.ctx.node.write().unwrap().owner.user.devices.push(dg_device);
-        }
-
-        let payload = serialize_device_sync_payload(&t.ctx.node.read().unwrap());
-        let pkt = build_encrypted_packet(DEVICE_DATA_PUSH_OP, &sender_conn, &payload);
-
-        {
-            let mut node = receiver.ctx.node.write().unwrap();
-            let recv_conn_id = u16::from_be_bytes([pkt[1], pkt[2]]);
-            node.owner.active_connections.insert(recv_conn_id, ActiveConnection {
-                id:                        recv_conn_id,
-                timeout:                   SystemTime::now() + Duration::from_secs(3600),
-                key_pair:                  sender_conn.key_pair.clone(),
-                peer_public_key:           sender_conn.peer_public_key,
-                peer_active_connection_id: sender_conn.peer_active_connection_id,
-                device_uuid:               sender_conn.device_uuid,
-            peer_addr:   "127.0.0.1:0".parse().unwrap(),
-            });
-        }
-
-        device_data_push(t.app_addr(), pkt[1..].to_vec(), &receiver.ctx);
-
-        let node = receiver.ctx.node.read().unwrap();
-        let own_dev = node.owner.user.devices.iter()
-            .find(|d| d.uuid == receiver_uuid)
-            .expect("own device missing after push");
-        assert_eq!(own_dev.applications.len(), 1, "local app was wiped by device sync");
-        assert_eq!(own_dev.applications[0].id, 55);
     }
 
     #[test]
@@ -5736,7 +5012,6 @@ mod tests {
                 grade:           DeviceGrade::SG,
                 sg_rank:         Some(1),
                 hosts:           vec![peer_addr.to_string()],
-                applications:    Vec::new(),
             });
             node.owner.active_connections.insert(1, ActiveConnection {
                 id:                        1,
@@ -5767,20 +5042,12 @@ mod tests {
 
         setup_sg_node_with_contact_conn(&t, contact_uuid, contact_sg_uuid, contact_sg_host);
 
-        // Add an app to the contact's device so it appears in the serialized payload.
+        // Set enabled_modules on contact + own user so they appear in the payload.
         {
             let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.enabled_modules = vec![1u16, 2u16];
             if let Some(contact) = node.owner.contact_users.iter_mut().find(|c| c.user.uuid == contact_uuid) {
-                if let Some(dev) = contact.user.devices.first_mut() {
-                    dev.applications.push(Application {
-                        id:            11,
-                        alias:         "contact-app".to_string(),
-                        protocol:      "udp".to_string(),
-                        host:          "127.0.0.1:0".parse().unwrap(),
-                        user_approved: true,
-                        token:         generate_uuid(),
-                    });
-                }
+                contact.user.enabled_modules = vec![11u16];
             }
         }
 
@@ -5789,11 +5056,11 @@ mod tests {
 
         let node = t.ctx.node.read().unwrap();
         assert_eq!(data.devices.len(), node.owner.user.devices.len());
+        assert_eq!(data.enabled_modules, vec![1u16, 2u16]);
         assert_eq!(data.contacts.len(), 1);
         assert_eq!(data.contacts[0].user.uuid, contact_uuid);
         assert_eq!(data.contacts[0].user.devices.len(), 1);
-        assert_eq!(data.contacts[0].user.devices[0].applications.len(), 1);
-        assert_eq!(data.contacts[0].user.devices[0].applications[0].id, 11);
+        assert_eq!(data.contacts[0].user.enabled_modules, vec![11u16]);
     }
 
     // ── Headless first-run setup ──────────────────────────────────────────────

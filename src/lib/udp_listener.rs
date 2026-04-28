@@ -60,10 +60,6 @@ impl UdpListener {
                 let payload = buf[1..len].to_vec();
 
                 let action = match op {
-                    0x00 => Action::AppRegister   { src, buf: payload },
-                    0x01 => Action::AppUpdate     { src, buf: payload },
-                    0x02 => Action::AppGetData    { src, buf: payload },
-                    0x03 => Action::AppSendPacket { src, buf: payload },
                     0x10 => {
                         if payload.len() < 16 {
                             eprintln!("[udp] sg_ping too short from {src}");
@@ -141,10 +137,6 @@ mod tests {
     #[test]
     fn op_bytes_map_to_correct_action_variants() {
         let cases: &[(u8, fn(&Action) -> bool)] = &[
-            (0x00, |a| matches!(a, Action::AppRegister      { .. })),
-            (0x01, |a| matches!(a, Action::AppUpdate        { .. })),
-            (0x02, |a| matches!(a, Action::AppGetData       { .. })),
-            (0x03, |a| matches!(a, Action::AppSendPacket    { .. })),
             (0x10, |a| matches!(a, Action::SgPing           { .. })),
             (0x20, |a| matches!(a, Action::ConnectRequest   { .. })),
             (0x21, |a| matches!(a, Action::ConnectAck       { .. })),

@@ -3,6 +3,7 @@ use std::sync::{mpsc, Arc, RwLock};
 use std::time::Duration;
 
 use super::data_models::Node;
+use super::modules::Module;
 use super::writer::WriteRequest;
 
 pub const PRIORITY_HIGH:   u8 = 0;
@@ -10,12 +11,6 @@ pub const PRIORITY_NORMAL: u8 = 1;
 pub const PRIORITY_LOW:    u8 = 2;
 
 pub enum Action {
-    // From local apps (op byte in first byte of UDP packet)
-    AppRegister   { src: SocketAddr, buf: Vec<u8> },
-    AppUpdate     { src: SocketAddr, buf: Vec<u8> },
-    AppGetData    { src: SocketAddr, buf: Vec<u8> },
-    AppSendPacket { src: SocketAddr, buf: Vec<u8> },
-
     // From HTTP UI
     UiRequest { stream: TcpStream, method: String, path: String, query: String, body: Vec<u8> },
 
@@ -66,6 +61,9 @@ pub struct WorkerContext {
     pub udp_socket:   Arc<UdpSocket>,
     pub writer_tx:    mpsc::SyncSender<WriteRequest>,
     pub scheduler_tx: mpsc::Sender<ScheduleRequest>,
+    /// All modules compiled into this binary, regardless of whether the user
+    /// has enabled them. Look up by ModuleId before delivering or sending.
+    pub modules:      Arc<Vec<Arc<dyn Module>>>,
 }
 
 impl WorkerContext {
@@ -81,10 +79,6 @@ impl Action {
     pub fn dispatch(self, ctx: &WorkerContext) {
         use super::handlers;
         match self {
-            Action::AppRegister   { src, buf } => handlers::app_register(src, buf, ctx),
-            Action::AppUpdate     { src, buf } => handlers::app_update(src, buf, ctx),
-            Action::AppGetData    { src, buf } => handlers::app_get_data(src, buf, ctx),
-            Action::AppSendPacket { src, buf } => handlers::app_send_packet(src, buf, ctx),
             Action::UiRequest { stream, method, path, query, body } => {
                 handlers::ui_request(stream, method, path, query, body, ctx)
             }
@@ -182,8 +176,8 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000)
     }
 
-    fn reg() -> Action { Action::AppRegister { src: addr(), buf: vec![] } }
-    fn upd() -> Action { Action::AppUpdate   { src: addr(), buf: vec![] } }
+    fn reg() -> Action { Action::SgPing { src: addr(), nonce: [0u8; 16] } }
+    fn upd() -> Action { Action::DgKeepalive { src: addr(), buf: vec![] } }
 
     #[test]
     fn pop_empty_returns_none() {
@@ -195,7 +189,7 @@ mod tests {
     fn push_and_pop_single() {
         let mut q = ActionQueue::new();
         q.push(0, reg());
-        assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+        assert!(matches!(q.pop().unwrap(), Action::SgPing { .. }));
         assert!(q.pop().is_none());
     }
 
@@ -204,7 +198,7 @@ mod tests {
         let mut q = ActionQueue::new();
         q.push(3, Action::MaintainConnections);
         q.push(0, reg());
-        assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+        assert!(matches!(q.pop().unwrap(), Action::SgPing { .. }));
         assert!(matches!(q.pop().unwrap(), Action::MaintainConnections));
     }
 
@@ -213,8 +207,8 @@ mod tests {
         let mut q = ActionQueue::new();
         q.push(1, reg());
         q.push(1, upd());
-        assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
-        assert!(matches!(q.pop().unwrap(), Action::AppUpdate   { .. }));
+        assert!(matches!(q.pop().unwrap(), Action::SgPing { .. }));
+        assert!(matches!(q.pop().unwrap(), Action::DgKeepalive { .. }));
     }
 
     #[test]
@@ -223,8 +217,8 @@ mod tests {
         q.push(0, reg());
         q.push(0, upd());
         q.push(1, Action::MaintainConnections);
-        assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
-        assert!(matches!(q.pop().unwrap(), Action::AppUpdate   { .. }));
+        assert!(matches!(q.pop().unwrap(), Action::SgPing { .. }));
+        assert!(matches!(q.pop().unwrap(), Action::DgKeepalive { .. }));
         assert!(matches!(q.pop().unwrap(), Action::MaintainConnections));
     }
 
@@ -249,7 +243,7 @@ mod tests {
 
         // First STARVATION_THRESHOLD pops should all be bucket-0 items.
         for _ in 0..STARVATION_THRESHOLD {
-            assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+            assert!(matches!(q.pop().unwrap(), Action::SgPing { .. }));
         }
 
         // The very next pop must yield the lower-priority item.
@@ -277,7 +271,7 @@ mod tests {
         }
         q.push(1, Action::MaintainConnections);
         for _ in 0..STARVATION_THRESHOLD - 1 {
-            assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+            assert!(matches!(q.pop().unwrap(), Action::SgPing { .. }));
         }
         // KeyRotation should still be in the queue (streak hasn't hit threshold yet).
         assert!(matches!(q.pop().unwrap(), Action::MaintainConnections));
@@ -292,7 +286,7 @@ mod tests {
             q.push(0, reg());
         }
         for _ in 0..=STARVATION_THRESHOLD {
-            assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+            assert!(matches!(q.pop().unwrap(), Action::SgPing { .. }));
         }
         assert!(q.pop().is_none());
     }

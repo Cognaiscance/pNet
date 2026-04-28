@@ -20,18 +20,16 @@ SG-grade devices advertise their reachable addresses via the `PNET_HOSTS` enviro
 An overview of the node's current state.
 * Node and device identity (alias, uuid)
 * Number of contacts
-* Number of registered applications
+* Number of enabled modules (`User.enabled_modules.len()`)
 * Number of active connections
 * Recent activity feed (abbreviated, links to full Activity Log)
 
-### Pending Apps
-A list of applications that have registered but not yet been approved.
-* Shows each app's alias and host
-* Owner can approve or reject each one
+### Apps
+A list of every module compiled into this binary. Each row shows the module's name, slug, and current state, with an Enable/Disable toggle.
 
-### Applications
-A list of all approved applications registered on this node.
-* Shows alias, host, and approval status for each app
+* Toggling a module mutates `User.enabled_modules`, calls `Module::on_enable` or `on_disable`, and propagates the change to the user's other devices (op 0x62/0x63) and to contacts (op 0x60/0x61).
+* A module's own UI, if any, is mounted under `/apps/<slug>/...` once it is enabled. Requests beneath that prefix are routed to the module's `on_http` handler with the prefix stripped — so `/apps/debug/inbox` arrives at the module as `/inbox`. Disabled or unknown modules return a 404. See *Apps and modules* for the trait surface.
+* The bundled **debug** module (slug `debug`) renders the node state, an inbox of received packets, and a send form — useful for verifying routing end-to-end.
 
 ### Contacts
 The owner's address book.
@@ -46,11 +44,11 @@ The owner's other devices running pNet.
 
 ### Activity Log
 A high-level log of notable events on the node.
-* App sent a packet to a contact's device
-* App received a packet
+* Module sent a packet to a contact's device
+* Module received a packet
 * Contact added or removed
 * Device came online or went offline
-* App approved or rejected
+* Module enabled or disabled
 * Invitation created or used
 * Each entry includes a timestamp
 

@@ -157,6 +157,7 @@ fn main() {
         udp_socket:   Arc::clone(&udp.socket),
         writer_tx:    writer.sender(),
         scheduler_tx,
+        modules:      Arc::new(lib::modules::all()),
     });
 
     // ── 6a. Headless env-driven first-run setup, if requested ────────────────
@@ -257,6 +258,7 @@ mod tests {
             udp_socket:   Arc::clone(&udp.socket),
             writer_tx:    writer.sender(),
             scheduler_tx,
+            modules:      Arc::new(lib::modules::all()),
         });
         let mut pool = ThreadPool::new(2, Arc::clone(&queue), Arc::clone(&stop), ctx);
 

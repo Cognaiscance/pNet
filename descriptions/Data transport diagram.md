@@ -18,24 +18,15 @@ The final hop to a recipient's DG must always go through that user's **top-ranke
 ```mermaid
 flowchart LR
     subgraph user1
-        A[messenger app: DG1]
-        B[file sync app: DG1]
-        DG1[pNet: user1: DG1]
-        D[file sync app: DG2]
-        DG2[pNet: user1: DG2]
-        SG1["pNet: user1: SG (rank 1)"]
+        DG1["pNet: user1: DG1<br/>(messenger, file-sync modules)"]
+        DG2["pNet: user1: DG2<br/>(file-sync module)"]
+        SG1["pNet: user1: SG (rank 1)<br/>(messenger, file-sync modules)"]
     end
 
     subgraph user2
-        C[messenger app: DG3]
-        DG3[pNet: user2: DG3]
-        SG2["pNet: user2: SG (rank 1)"]
+        DG3["pNet: user2: DG3<br/>(messenger module)"]
+        SG2["pNet: user2: SG (rank 1)<br/>(messenger module)"]
     end
-
-    A <-->|encrypted udp|DG1
-    B <-->|encrypted udp|DG1
-    D <-->|encrypted udp|DG2
-    C <-->|encrypted udp|DG3
 
     DG1 <-->|keep-alive + data|SG1
     DG2 <-->|keep-alive + data|SG1
@@ -43,9 +34,11 @@ flowchart LR
     SG2 <-->|encrypted udp|DG3
 ```
 
-The diagram shows the simple case where each user has one SG (automatically rank 1). DG1 and DG2 (both belonging to user1) maintain their keep-alive tunnels exclusively with user1's top-ranked SG. A message from the messenger app on user1's DG1 travels to user2's DG3: DG1 → SG1 → SG2 → DG3. Only SG2 can deliver to DG3 because it is user2's top-ranked SG and the only one holding an active tunnel to DG3. File data from DG1 to DG2 (same user) also routes through SG1 as the shared relay.
+The diagram shows the simple case where each user has one SG (automatically rank 1). DG1 and DG2 (both belonging to user1) maintain their keep-alive tunnels exclusively with user1's top-ranked SG. A message from user1's DG1 to user2's DG3 travels DG1 → SG1 → SG2 → DG3. Only SG2 can deliver to DG3 because it is user2's top-ranked SG and the only one holding an active tunnel to DG3. File data from DG1 to DG2 (same user) also routes through SG1 as the shared relay.
 
-pNet is responsible for maintaining network location information, SG rank data, and encryption keys to connect and send packets to other pNet nodes, which then forward that data to the appropriate app on the device. The SG/DG split ensures reliable delivery even in difficult network environments (double NAT, advanced ISP routing) by guaranteeing that at least one reachable, top-ranked relay exists per user at all times.
+Modules are not separate processes — they are compiled into the pnet binary and run in-process on every device the user owns. A module's instance on the destination receives the packet directly via `Module::on_receive`. This includes the SG: a module enabled by the user runs on the SG too, so a messaging-shaped app can address the recipient's top-ranked SG and have its module instance there persist messages until the recipient's DG comes online.
+
+pNet is responsible for maintaining network location information, SG rank data, and encryption keys to connect and send packets to other pNet nodes, which then dispatch that data to the appropriate module on the device. The SG/DG split ensures reliable delivery even in difficult network environments (double NAT, advanced ISP routing) by guaranteeing that at least one reachable, top-ranked relay exists per user at all times.
 
 ---
 

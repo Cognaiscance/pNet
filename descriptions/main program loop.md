@@ -15,22 +15,28 @@ Each item in the queue is a variant of the `Action` enum — one variant per act
 
 Known action variants:
 
-**From local apps (via UDP op byte):**
-- `AppRegister` — op 0, app sends alias + port, pnet replies with token
-- `AppUpdate` — op 1, app sends token + fields to change
-- `AppGetData` — op 2, app requests the data tree
-- `AppSendPacket` — op 3, app sends token + delivery path + payload
+**From local apps:**
+- *(none — apps are in-process modules, not separate processes. They call into pnet directly via `ModuleCtx::send` rather than enqueueing actions. See *Apps and modules*.)*
 
 **From peer pnet nodes (via UDP):**
-- *(to be defined — see communication methods.md)*
+- `SgPing` (0x10) / `DgKeepalive` (0x12) / `ConnReset` (0x13)
+- `ConnectRequest` (0x20) / `ConnectAck` (0x21)
+- `BootstrapRequest` (0x30) / `BootstrapResponse` (0x31) / `DeviceRegistration` (0x32)
+- `ContactRequest` (0x33) / `ContactResponse` (0x34)
+- `RelayPacket` (0x40) / `AppPacket` (0x41)
+- `TunnelInit` (0x50) / `TunnelForward` (0x51) / `TunnelConnectRequest` (0x52) / `TunnelConnectAck` (0x53) / `TunnelDelivery` (0x54)
+- `ContactDataPush` (0x60) / `ContactDataPullRequest` (0x61) / `DeviceDataPush` (0x62) / `DeviceDataPullRequest` (0x63)
 
 **From the HTTP UI:**
-- *(to be defined)*
+- `UiRequest` — wraps the parsed method/path/query/body and the open TCP stream
 
 **Scheduled:**
-- `KeyRotation` — rotate ephemeral keys on a fixed timer (see background systems.md)
+- `MaintainConnections` — top up the `ActiveConnection` set; runs every 5 minutes (see background systems.md)
 - `PollSG` — ping candidate SGs to measure RTT and detect downtime (see background systems.md)
-- `RetryMessage` — retry an unACKed outbound message
+- `KeepAliveDG` — DG-only; refresh NAT mappings to each connected SG every 20 seconds
+- `CleanupTunnels` — expire idle DG-to-DG tunnels and stale relay counters
+- `SyncContacts` / `SyncDevices` — daily push or pull of the user's data (see *pnet to pnet communication*)
+- `SetupTunnel` — one-shot, scheduled by an SG when a sender/destination pair crosses the relay-traffic threshold
 
 ## Producers
 

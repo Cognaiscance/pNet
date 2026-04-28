@@ -133,7 +133,8 @@ The encrypted payload contains the full user data needed to configure the new de
 - User alias and UUID
 - User long-term key pair (public and private, 32 bytes each)
 - All of the user's known devices (alias, UUID, grade, sg_rank, hosts list). Each device encodes its address list as `[host_count:u8]` followed by `host_count` length-prefixed hostname strings.
-- All of the user's contacts (alias, UUID, public key, devices)
+- The user's `enabled_modules`: `[count:u8]` followed by `count` `u16` (BE) module ids.
+- All of the user's contacts (alias, UUID, public key, devices, and the contact's own `enabled_modules` so this node can target apps on them).
 
 After sending the response the SG removes the invitation — it is single-use.
 
@@ -163,10 +164,35 @@ The SG decrypts using the same shared secret, adds the new device to `owner.user
 
 ---
 
-## Administration Operations
+## Data sync
 
-The following operations are used to manage the state of the network and are not yet fully defined:
+Two ops keep contacts up to date with each other, two more keep a user's own devices in step. All four are encrypted on existing `ActiveConnection`s.
 
-* **Connection establishment** — handled by ConnectRequest/ConnectAck above; driven automatically by `MaintainConnections`
-* **Updating contact or device details** — propagating changes such as a new host address
-* **Synchronizing user data** — keeping pNet nodes owned by the same user consistent with each other. This should be handled automatically by a background task. Implementation not yet defined.
+### ContactDataPush — op `0x60`
+
+Pushed by an SG to a contact's top-ranked SG whenever the local user's data changes (after a contact is added, a module is toggled, etc.).
+
+Encrypted body:
+- `user_uuid` (16) — the sender's own user uuid
+- `device_count` (u8), then for each: device record produced by `push_device` (uuid, alias, grade, sg_rank, hosts)
+- `enabled_modules`: `[count:u8]` followed by `count` `u16` (BE) module ids
+
+The receiver replaces that contact's `devices` and `enabled_modules` with the pushed values.
+
+### ContactDataPullRequest — op `0x61`
+
+Sent daily by every node to each known contact's SG. Carries the local user's uuid; the SG replies with a `ContactDataPush` so receivers can recover from missed pushes.
+
+### DeviceDataPush — op `0x62`
+
+Pushed by the user's SG to each of the user's other devices on every change. Encrypted body:
+
+- `device_count` (u8) and per-device records for the user's own devices
+- `enabled_modules` (`[count:u8][u16 BE]*`) for the user
+- `contact_count` (u8) and per-contact records: alias, uuid, public_key, devices, contact's own `enabled_modules`
+
+Receivers replace their `owner.user.devices`, `owner.user.enabled_modules`, and `owner.contact_users` with the pushed payload.
+
+### DeviceDataPullRequest — op `0x63`
+
+Sent by a DG to its top-ranked own SG. The body is the requesting device's `enabled_modules` (`[count:u8][u16 BE]*`); the SG adopts it as the authoritative user-level value, then replies with a `DeviceDataPush`.

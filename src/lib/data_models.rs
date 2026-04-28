@@ -180,19 +180,7 @@ pub struct PendingConnection {
     pub peer_longterm_pk: PublicKey,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Application {
-    pub id:            u16,
-    pub alias:         String,
-    pub protocol:      String,
-    #[serde(with = "serde_socket_addr_v4")]
-    pub host:          SocketAddrV4,
-    pub user_approved: bool,
-    #[serde(with = "serde_bytes_16")]
-    pub token:         Uuid,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeviceGrade {
     /// Server Grade — static IP or domain, acts as relay for the user's DGs.
     SG,
@@ -214,7 +202,6 @@ pub struct Device {
     /// name that only resolves inside one network simply fails to resolve
     /// elsewhere and is skipped. Empty for DG-grade devices.
     pub hosts:            Vec<String>,
-    pub applications:     Vec<Application>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -223,6 +210,12 @@ pub struct User {
     #[serde(with = "serde_bytes_16")]
     pub uuid:    Uuid,
     pub devices: Vec<Device>,
+    /// Module ids this user has turned on. Active across all of the user's
+    /// devices; synced via the existing device-data path (op 0x62/0x63).
+    /// Also propagated to contacts (op 0x60/0x61) so they know which modules
+    /// to address packets at.
+    #[serde(default)]
+    pub enabled_modules: Vec<u16>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -281,6 +274,11 @@ pub struct Owner {
     pub key_pair:            KeyPair,
     pub contact_invitations: Vec<Invitation>,
     pub device_invitations:  Vec<Invitation>,
+    /// Per-module private blob. Persisted with the node and synced to the
+    /// user's other devices via the device-data path. The shape is opaque
+    /// to pnet — each module serializes/deserializes its own state.
+    #[serde(default)]
+    pub module_state: HashMap<u16, Vec<u8>>,
     /// Ephemeral — not persisted; rebuilt as connections are established.
     #[serde(skip)]
     pub active_connections:  HashMap<u16, ActiveConnection>,
@@ -397,7 +395,6 @@ impl Node {
             grade:        DeviceGrade::DG,
             sg_rank:      None,
             hosts:        Vec::new(),
-            applications: Vec::new(),
         };
 
         Node {
@@ -408,11 +405,13 @@ impl Node {
                     alias:   "Owner".to_string(),
                     uuid:    owner_uuid,
                     devices: vec![device],
+                    enabled_modules: Vec::new(),
                 },
                 contact_users:       Vec::new(),
                 key_pair:            KeyPair { public_key: [0; 32], private_key: [0; 32] }, // TODO: generate real Curve25519 keys
                 contact_invitations:        Vec::new(),
                 device_invitations:         Vec::new(),
+                module_state:               HashMap::new(),
                 active_connections:         HashMap::new(),
                 pending_connections:        HashMap::new(),
                 pending_contact_exchange:   None,
