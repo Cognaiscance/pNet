@@ -22,6 +22,8 @@ services:
       - PNET_GRADE=dg
       - PNET_DEVICE_ALIAS=${PNET_DEVICE_ALIAS:-}
       - PNET_INVITATION_CODE=${PNET_INVITATION_CODE:-}
+      # Testing only: auto-approves any app that registers, skipping the UI step.
+      - PNET_AUTO_APPROVE_APPS=1
     volumes:
       - ${HOME}/.pnet:/root/.pnet:Z
 

@@ -136,6 +136,14 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         None => return send_error(ctx, src, ERR_BAD_PACKET),
     };
 
+    // PNET_AUTO_APPROVE_APPS=1 (testing only) skips the manual approval step so
+    // headless harnesses can register apps without UI interaction.
+    let auto_approve = std::env::var("PNET_AUTO_APPROVE_APPS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let alias_for_log = alias.clone();
+
     // Update node.
     let token = {
         let mut node = ctx.node.write().unwrap();
@@ -163,7 +171,7 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             alias,
             protocol,
             host: SocketAddrV4::new(ip, port),
-            user_approved: false,
+            user_approved: auto_approve,
             token,
         });
         token
@@ -172,6 +180,10 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     ctx.save_node();
     sync_devices(ctx);
+    if auto_approve {
+        push_data_to_contacts(ctx);
+        println!("[app_register] auto-approved '{alias_for_log}' via PNET_AUTO_APPROVE_APPS");
+    }
 
     // Reply: [OK][token: 16 bytes]
     let mut reply = [0u8; 17];
