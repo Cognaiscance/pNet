@@ -1,0 +1,123 @@
+# Stage A test topology — single user (william) with 2 SGs and 2 DGs.
+#
+# Goal: exercise intra-user device-to-device messaging (SG↔SG, SG↔DG, DG↔DG),
+# device-list sync, and SG rank-1 → rank-2 failover, all on one docker network.
+#
+# Bring-up is *not* a single `compose up`: sg-william-2 / dg-william-a /
+# dg-william-b each need an invitation code minted from sg-william-1, which
+# only exists once sg-william-1 is running. The harness in tests/stage-a/run.sh
+# is responsible for: starting sg-william-1 + probe-sg-1 → minting 3 codes via
+# its admin HTTP on host port 8801 → exporting INV_SG2 / INV_DGA / INV_DGB →
+# starting the rest.
+#
+# `compose down -v` blows away the named volumes, so every test run starts
+# from a clean slate. Combined with PNET_AUTO_APPROVE_APPS=1 and the probe's
+# no-token-persistence design, no manual cleanup is needed between iterations.
+
+networks:
+  net-pnet:
+
+volumes:
+  pnet-data-sg-william-1:
+  pnet-data-sg-william-2:
+  pnet-data-dg-william-a:
+  pnet-data-dg-william-b:
+
+services:
+  # ── pnet daemons ──────────────────────────────────────────────────────────
+
+  sg-william-1:
+    build: .
+    networks: [net-pnet]
+    # Admin HTTP published so the harness can mint invitation codes.
+    ports:
+      - "8801:8777/tcp"
+    environment:
+      - PNET_GRADE=sg
+      - PNET_USER_ALIAS=william
+      - PNET_DEVICE_ALIAS=sg-william-1
+      - PNET_SG_RANK=1
+      - PNET_HOSTS=sg-william-1
+      - PNET_AUTO_APPROVE_APPS=1
+    volumes:
+      - pnet-data-sg-william-1:/root/.pnet
+
+  sg-william-2:
+    build: .
+    networks: [net-pnet]
+    environment:
+      - PNET_GRADE=sg
+      - PNET_DEVICE_ALIAS=sg-william-2
+      - PNET_SG_RANK=2
+      - PNET_HOSTS=sg-william-2
+      - PNET_INVITATION_CODE=${INV_SG2:-}
+      - PNET_AUTO_APPROVE_APPS=1
+    volumes:
+      - pnet-data-sg-william-2:/root/.pnet
+    depends_on: [sg-william-1]
+
+  dg-william-a:
+    build: .
+    networks: [net-pnet]
+    environment:
+      - PNET_GRADE=dg
+      - PNET_DEVICE_ALIAS=dg-william-a
+      - PNET_INVITATION_CODE=${INV_DGA:-}
+      - PNET_AUTO_APPROVE_APPS=1
+    volumes:
+      - pnet-data-dg-william-a:/root/.pnet
+    depends_on: [sg-william-1]
+
+  dg-william-b:
+    build: .
+    networks: [net-pnet]
+    environment:
+      - PNET_GRADE=dg
+      - PNET_DEVICE_ALIAS=dg-william-b
+      - PNET_INVITATION_CODE=${INV_DGB:-}
+      - PNET_AUTO_APPROVE_APPS=1
+    volumes:
+      - pnet-data-dg-william-b:/root/.pnet
+    depends_on: [sg-william-1]
+
+  # ── probes (one per pnet daemon) ──────────────────────────────────────────
+
+  probe-sg-1:
+    build:
+      context: .
+      dockerfile: apps/pnet_test_probe/Dockerfile
+    networks: [net-pnet]
+    ports: ["3001:3000/tcp"]
+    environment:
+      - PNET_ADDR=sg-william-1:7777
+    depends_on: [sg-william-1]
+
+  probe-sg-2:
+    build:
+      context: .
+      dockerfile: apps/pnet_test_probe/Dockerfile
+    networks: [net-pnet]
+    ports: ["3002:3000/tcp"]
+    environment:
+      - PNET_ADDR=sg-william-2:7777
+    depends_on: [sg-william-2]
+
+  probe-dg-a:
+    build:
+      context: .
+      dockerfile: apps/pnet_test_probe/Dockerfile
+    networks: [net-pnet]
+    ports: ["3003:3000/tcp"]
+    environment:
+      - PNET_ADDR=dg-william-a:7777
+    depends_on: [dg-william-a]
+
+  probe-dg-b:
+    build:
+      context: .
+      dockerfile: apps/pnet_test_probe/Dockerfile
+    networks: [net-pnet]
+    ports: ["3004:3000/tcp"]
+    environment:
+      - PNET_ADDR=dg-william-b:7777
+    depends_on: [dg-william-b]
