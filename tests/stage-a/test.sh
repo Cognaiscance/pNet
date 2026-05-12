@@ -20,10 +20,10 @@ COMPOSE=(podman compose -f "$COMPOSE_FILE")
 
 # Probe alias → host-port map.
 declare -A PROBE_PORT=(
-    [sg-william-1]=3001
-    [sg-william-2]=3002
-    [dg-william-a]=3003
-    [dg-william-b]=3004
+    [sg-william-1]=3801
+    [sg-william-2]=3802
+    [dg-william-a]=3803
+    [dg-william-b]=3804
 )
 ALIASES=(sg-william-1 sg-william-2 dg-william-a dg-william-b)
 

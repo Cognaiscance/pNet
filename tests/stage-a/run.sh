@@ -27,10 +27,10 @@ SG1_ADMIN="http://localhost:8801"
 
 # probe-name : host-port pairs
 PROBES=(
-    "probe-sg-1:3001"
-    "probe-sg-2:3002"
-    "probe-dg-a:3003"
-    "probe-dg-b:3004"
+    "probe-sg-1:3801"
+    "probe-sg-2:3802"
+    "probe-dg-a:3803"
+    "probe-dg-b:3804"
 )
 
 ADMIN_WAIT_SECS=30      # sg-william-1 admin HTTP up
@@ -192,8 +192,8 @@ say "waiting up to ${CONVERGE_WAIT_SECS}s for all 4 probes to agree on the devic
 wait_for_convergence "$CONVERGE_WAIT_SECS"
 
 say "Stage A topology up — 8 services running, device-app graph converged."
-say "  probe-sg-1: http://localhost:3001/status"
-say "  probe-sg-2: http://localhost:3002/status"
-say "  probe-dg-a: http://localhost:3003/status"
-say "  probe-dg-b: http://localhost:3004/status"
+say "  probe-sg-1: http://localhost:3801/status"
+say "  probe-sg-2: http://localhost:3802/status"
+say "  probe-dg-a: http://localhost:3803/status"
+say "  probe-dg-b: http://localhost:3804/status"
 say "  sg-william-1 admin: http://localhost:8801/"

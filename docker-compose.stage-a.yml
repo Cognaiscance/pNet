@@ -87,7 +87,7 @@ services:
       context: .
       dockerfile: apps/pnet_test_probe/Dockerfile
     networks: [net-pnet]
-    ports: ["3001:3000/tcp"]
+    ports: ["3801:3000/tcp"]
     environment:
       - PNET_ADDR=sg-william-1:7777
     depends_on: [sg-william-1]
@@ -97,7 +97,7 @@ services:
       context: .
       dockerfile: apps/pnet_test_probe/Dockerfile
     networks: [net-pnet]
-    ports: ["3002:3000/tcp"]
+    ports: ["3802:3000/tcp"]
     environment:
       - PNET_ADDR=sg-william-2:7777
     depends_on: [sg-william-2]
@@ -107,7 +107,7 @@ services:
       context: .
       dockerfile: apps/pnet_test_probe/Dockerfile
     networks: [net-pnet]
-    ports: ["3003:3000/tcp"]
+    ports: ["3803:3000/tcp"]
     environment:
       - PNET_ADDR=dg-william-a:7777
     depends_on: [dg-william-a]
@@ -117,7 +117,7 @@ services:
       context: .
       dockerfile: apps/pnet_test_probe/Dockerfile
     networks: [net-pnet]
-    ports: ["3004:3000/tcp"]
+    ports: ["3804:3000/tcp"]
     environment:
       - PNET_ADDR=dg-william-b:7777
     depends_on: [dg-william-b]
