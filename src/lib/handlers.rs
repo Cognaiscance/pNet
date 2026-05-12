@@ -3336,26 +3336,32 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 ///
 /// Candidate pool: all SG-grade devices owned by the local user (excluding the
 /// local device itself) plus all SG-grade devices of every contact user.
+///
+/// Every advertised host is recorded — including hosts whose name fails to
+/// resolve. An unresolvable host is treated as down (not "no data"), so
+/// `top_ranked_sg_for_device`'s optimistic "no poll data" branch doesn't
+/// mistakenly pick a peer whose DNS entry just vanished (e.g. a stopped
+/// docker container).
 pub fn poll_sg(ctx: &WorkerContext) {
-    // Collect (device_uuid, host_entry, resolved_addr) for every advertised
-    // address on every candidate SG. Unresolvable entries are silently skipped
-    // — expected when a name only resolves inside one network.
-    let candidates: Vec<(Uuid, String, SocketAddrV4)> = {
+    // Collect (device_uuid, host_entry, resolved_addr_opt) for every advertised
+    // address on every candidate SG. `None` addr means the host failed to
+    // resolve and will be recorded as down without a ping attempt.
+    let candidates: Vec<(Uuid, String, Option<SocketAddrV4>)> = {
         let node = ctx.node.read().unwrap();
         let local_uuid = node.device_uuid;
-        let mut v: Vec<(Uuid, String, SocketAddrV4)> = Vec::new();
+        let mut v: Vec<(Uuid, String, Option<SocketAddrV4>)> = Vec::new();
         for d in &node.owner.user.devices {
             if matches!(d.grade, DeviceGrade::SG) && d.uuid != local_uuid {
-                for (h, addr) in resolve_hosts(&d.hosts) {
-                    v.push((d.uuid, h, addr));
+                for h in &d.hosts {
+                    v.push((d.uuid, h.clone(), resolve_host_entry(h)));
                 }
             }
         }
         for contact in &node.owner.contact_users {
             for d in &contact.user.devices {
                 if matches!(d.grade, DeviceGrade::SG) {
-                    for (h, addr) in resolve_hosts(&d.hosts) {
-                        v.push((d.uuid, h, addr));
+                    for h in &d.hosts {
+                        v.push((d.uuid, h.clone(), resolve_host_entry(h)));
                     }
                 }
             }
@@ -3374,7 +3380,12 @@ pub fn poll_sg(ctx: &WorkerContext) {
     };
     ping_socket.set_read_timeout(Some(SG_PING_TIMEOUT)).ok();
 
-    for (uuid, host, addr) in candidates {
+    for (uuid, host, addr_opt) in candidates {
+        let Some(addr) = addr_opt else {
+            // Unresolvable host: record down without attempting a ping.
+            record_sg_status(ctx, uuid, host, None);
+            continue;
+        };
         let nonce = generate_uuid();
         let mut packet = [0u8; 17];
         packet[0] = SG_PING_OP;
