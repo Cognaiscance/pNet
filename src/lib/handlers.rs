@@ -940,21 +940,39 @@ pub enum WriterTarget {
     Unreachable,
 }
 
-/// Determine the writer SG from this node's perspective.
+/// Determine the writer SG from this node's perspective, for the write path.
 ///
-/// Walks all of the user's own SGs in rank order (lowest = best) and returns
-/// the first one that is reachable. Reachability rules:
+/// Two-tier selection:
 ///
-/// - **Self** (when this node is an SG): always reachable to itself.
-/// - **Peer SG**: must have an active connection AND, if `sg_statuses` has
-///   entries for it, at least one address marked up. Optimistic when no poll
-///   data exists yet — matches the convention used by `top_ranked_sg_for_device`.
+/// 1. **Known-writer fast path**: if our `public_version.writer_sg_uuid` is
+///    populated from a prior `SyncPullResponse` or `SyncWriteAck`, the network
+///    has told us who the writer is. Use that — return `Remote` if reachable,
+///    fall through to the rank walk if not (so partition recovery / failover
+///    can elect a new writer).
+/// 2. **Rank walk** (fresh node, or known writer down): walk SGs by rank.
+///    At our own UUID return `Local`. At a higher-rank peer:
+///    - If `sg_statuses` has entries that unanimously say down, skip it —
+///      failover treats it as out of the network.
+///    - Else if reachable (active connection + not polled-down), return `Remote`.
+///    - Else return `Unreachable`. Do **not** fall through to lower-rank
+///      SGs: writing to a non-writer would just elicit `NOT_WRITER` acks that
+///      currently fall on the floor (see [[pnet-sync-v1-design-rules]]).
 ///
-/// Used both for issuing writes (find where to send a SyncWriteRequest) and
-/// for the SG-side forward-up-the-rank rule (an SG receiving a write returns
-/// `Local` only when no higher-rank peer is reachable to it).
+/// Used for both originating writes (where to send `SyncWriteRequest`) and
+/// for the SG-side accept decision (`Local` ↔ I'll accept this write).
 pub fn find_writer_sg(node: &super::data_models::Node) -> WriterTarget {
     let local_uuid = node.device_uuid;
+
+    if !node.owner.public_version.is_initial() {
+        let known = node.owner.public_version.writer_sg_uuid;
+        if known == local_uuid {
+            return WriterTarget::Local;
+        }
+        if let Some(t) = remote_if_reachable(node, &known) {
+            return t;
+        }
+        // Known writer unreachable — fall through to rank walk for failover.
+    }
 
     let mut sgs: Vec<&Device> = node.owner.user.devices.iter()
         .filter(|d| matches!(d.grade, DeviceGrade::SG))
@@ -965,21 +983,67 @@ pub fn find_writer_sg(node: &super::data_models::Node) -> WriterTarget {
         if d.uuid == local_uuid {
             return WriterTarget::Local;
         }
-        let has_conn = node.owner.active_connections.values()
-            .any(|c| c.device_uuid == d.uuid);
-        if !has_conn { continue; }
-
-        let mut any_entry = false;
-        let mut any_up    = false;
-        for ((uuid, _), status) in &node.sg_statuses {
-            if *uuid == d.uuid {
-                any_entry = true;
-                if status.up { any_up = true; }
-            }
+        if is_polled_down(node, &d.uuid) {
+            continue;
         }
-        let polled_up = !any_entry || any_up;
-        if polled_up {
-            return WriterTarget::Remote(d.uuid);
+        if let Some(t) = remote_if_reachable(node, &d.uuid) {
+            return t;
+        }
+        return WriterTarget::Unreachable;
+    }
+    WriterTarget::Unreachable
+}
+
+/// `Some(Remote(uuid))` iff we have an active connection to `uuid` AND poll
+/// data either doesn't exist yet OR has at least one entry marked up. Helper
+/// shared by `find_writer_sg` and `find_pull_source`.
+fn remote_if_reachable(node: &super::data_models::Node, uuid: &Uuid) -> Option<WriterTarget> {
+    let has_conn = node.owner.active_connections.values()
+        .any(|c| c.device_uuid == *uuid);
+    if !has_conn { return None; }
+    let mut any_entry = false;
+    let mut any_up    = false;
+    for ((u, _), status) in &node.sg_statuses {
+        if u == uuid {
+            any_entry = true;
+            if status.up { any_up = true; }
+        }
+    }
+    let polled_up = !any_entry || any_up;
+    if polled_up { Some(WriterTarget::Remote(*uuid)) } else { None }
+}
+
+/// True iff we have poll entries for `uuid` and they are *all* marked down.
+/// Used by `find_writer_sg` to detect a higher-rank SG that has dropped out
+/// (failover), and skip past it in the rank walk.
+fn is_polled_down(node: &super::data_models::Node, uuid: &Uuid) -> bool {
+    let mut any_entry = false;
+    let mut any_up    = false;
+    for ((u, _), status) in &node.sg_statuses {
+        if u == uuid {
+            any_entry = true;
+            if status.up { any_up = true; }
+        }
+    }
+    any_entry && !any_up
+}
+
+/// Permissive variant of `find_writer_sg` for the pull path. Returns the
+/// best reachable own SG without requiring it to be the actual writer —
+/// `sync_pull` just needs *some* peer's state to bootstrap `writer_sg_uuid`
+/// before the strict write-path selection can work.
+fn find_pull_source(node: &super::data_models::Node) -> WriterTarget {
+    let local_uuid = node.device_uuid;
+    let mut sgs: Vec<&Device> = node.owner.user.devices.iter()
+        .filter(|d| matches!(d.grade, DeviceGrade::SG))
+        .collect();
+    sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
+    for d in &sgs {
+        if d.uuid == local_uuid {
+            return WriterTarget::Local;
+        }
+        if let Some(t) = remote_if_reachable(node, &d.uuid) {
+            return t;
         }
     }
     WriterTarget::Unreachable
@@ -2441,18 +2505,21 @@ fn notify_own_peers(
 
 /// Periodic / on-reconnect pull entry point. Called by the scheduler on its
 /// `SYNC_PULL_INTERVAL` tick and by `connect_ack` immediately after a fresh
-/// active connection lands. Sends one `SyncPullRequest` per scope to the
-/// elected writer SG; no-op if this node is itself the writer (`Local`) or
-/// has no reachable own SG (`Unreachable`).
+/// active connection lands. Sends one `SyncPullRequest` per scope to the best
+/// reachable own SG (which carries the writer's state for us either directly
+/// or via its own prior pull); no-op if this node is itself that source
+/// (`Local`) or has no reachable own SG (`Unreachable`). Uses the permissive
+/// `find_pull_source` rather than `find_writer_sg` so a fresh node with
+/// `writer_sg_uuid == [0;16]` can still bootstrap its writer metadata.
 pub fn sync_pull(ctx: &WorkerContext) {
     let (target, last_priv, last_pub) = {
         let node = ctx.node.read().unwrap();
-        (find_writer_sg(&node), node.owner.private_version, node.owner.public_version)
+        (find_pull_source(&node), node.owner.private_version, node.owner.public_version)
     };
     let writer_uuid = match target {
         WriterTarget::Local       => return,
         WriterTarget::Unreachable => {
-            println!("[sync_pull] no reachable writer SG — skipping");
+            println!("[sync_pull] no reachable own SG — skipping");
             return;
         }
         WriterTarget::Remote(u)   => u,
@@ -2465,7 +2532,7 @@ pub fn sync_pull(ctx: &WorkerContext) {
             .map(|c| c.id)
     };
     let Some(conn_id) = conn_id else {
-        eprintln!("[sync_pull] writer {writer_uuid:?} has no active connection");
+        eprintln!("[sync_pull] pull source {writer_uuid:?} has no active connection");
         return;
     };
 
@@ -5785,13 +5852,17 @@ mod tests {
     }
 
     #[test]
-    fn find_writer_local_rank2_takes_over_when_rank1_disconnected() {
-        // No active_connection to the rank-1 peer.
+    fn find_writer_local_rank2_disconnected_from_rank1_is_unreachable() {
+        // No active_connection to the rank-1 peer, but poll data still shows
+        // it alive: this is a transient disconnection, not failover. Self-
+        // electing as writer here would diverge from SG-1's still-active
+        // writes — wait for the connection to recover or for poll data to
+        // confirm SG-1 is down.
         let t = TestCtx::new();
         promote_local_to_sg(&t, 2);
         add_peer_sg(&t, 1, false, Some(true));
         let node = t.ctx.node.read().unwrap();
-        assert_eq!(find_writer_sg(&node), WriterTarget::Local);
+        assert_eq!(find_writer_sg(&node), WriterTarget::Unreachable);
     }
 
     // ── Change serialization & apply ──────────────────────────────────────────
