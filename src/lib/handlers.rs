@@ -15,6 +15,7 @@ use super::data_models::{
 const OK:                u8 = 0x00;
 const ERR_BAD_PACKET:    u8 = 0x01;
 const ERR_TOKEN_UNKNOWN: u8 = 0x02;
+const ERR_NO_WRITER:     u8 = 0x03;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -178,19 +179,36 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         // write lock released here
     };
 
-    ctx.save_node();
-    sync_devices(ctx);
     if auto_approve {
-        push_data_to_contacts(ctx);
-        println!("[app_register] auto-approved '{alias_for_log}' via PNET_AUTO_APPROVE_APPS");
-        // Sync v1: publish id+alias to peers via the writer SG. Runs
-        // alongside the legacy sync_devices/push_data_to_contacts above
-        // until phase 7b removes the legacy paths.
-        let _ = request_change(Change::AddApplication {
+        // Sync v1: publish id+alias to peers via the writer SG. A DG without
+        // a reachable writer SG cannot publish state changes — roll back the
+        // local app and reject the registration. The caller is responsible
+        // for retrying when a writer is online.
+        if let Err(e) = request_change(Change::AddApplication {
             device_uuid,
             app_id:    next_id,
             app_alias: alias_for_log.clone(),
-        }, ctx);
+        }, ctx) {
+            {
+                let mut node = ctx.node.write().unwrap();
+                if let Some(device) = node.owner.user.devices.iter_mut()
+                    .find(|d| d.uuid == device_uuid)
+                {
+                    device.applications.retain(|a| a.id != next_id);
+                }
+            }
+            ctx.save_node();
+            eprintln!("[app_register] rejecting '{alias_for_log}': {e:?}");
+            return send_error(ctx, src, ERR_NO_WRITER);
+        }
+        println!("[app_register] auto-approved '{alias_for_log}' via PNET_AUTO_APPROVE_APPS");
+    }
+
+    ctx.save_node();
+    // Legacy paths — to be deleted in Phase 7b.
+    sync_devices(ctx);
+    if auto_approve {
+        push_data_to_contacts(ctx);
     }
 
     // Reply: [OK][token: 16 bytes]
