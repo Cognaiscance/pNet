@@ -2281,33 +2281,39 @@ fn read_sync_version(data: &[u8], pos: &mut usize) -> Option<SyncVersion> {
 // the right counter(s) on accept. Wire `change_kind` is a single byte — the
 // payload after it is variant-specific.
 
-const CHANGE_KIND_ADD_APPLICATION: u8 = 0x01;
+const CHANGE_KIND_ADD_APPLICATION:    u8 = 0x01;
+const CHANGE_KIND_REMOVE_APPLICATION: u8 = 0x02;
 
 /// State mutations that flow through the writer SG.
-///
-/// `AddApplication` is the only variant in v1 of v1; remove/update/contact
-/// variants land in follow-up phases without architectural changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    /// Public-scope: add an app entry (id + alias + approval flag) to the
-    /// device identified by `device_uuid` in the user's device list. The
-    /// originating DG keeps the private fields (token, host, port) locally —
-    /// they are not shared with the writer SG or peers.
+    /// Public-scope: add an app entry (id + alias) to the device identified
+    /// by `device_uuid` in the user's device list. The originating DG keeps
+    /// the private fields (token, host, protocol) locally — they are not
+    /// shared with the writer SG or peers.
     AddApplication {
         device_uuid: Uuid,
         app_id:      u16,
         app_alias:   String,
     },
+    /// Public-scope: remove the app identified by `(device_uuid, app_id)`
+    /// from the user's device list. Idempotent — a remove for an app id
+    /// that's already absent is a no-op (no version bump).
+    RemoveApplication {
+        device_uuid: Uuid,
+        app_id:      u16,
+    },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
-/// by `apply_change_locally` and (in phase 5) by the notify fan-out to know
-/// which `UpdateAvailable` notifications to emit.
+/// by `apply_change_locally` and by the notify fan-out to know which
+/// `UpdateAvailable` notifications to emit.
 fn change_scopes(c: &Change) -> &'static [Scope] {
     match c {
         // Only the public fields (id+alias) are recorded at the writer; the
         // originating DG's private fields stay local.
-        Change::AddApplication { .. } => &[Scope::Public],
+        Change::AddApplication { .. }    => &[Scope::Public],
+        Change::RemoveApplication { .. } => &[Scope::Public],
     }
 }
 
@@ -2319,6 +2325,11 @@ fn serialize_change(c: &Change) -> Vec<u8> {
             buf.extend_from_slice(device_uuid);
             buf.extend_from_slice(&app_id.to_be_bytes());
             push_str(&mut buf, app_alias);
+        }
+        Change::RemoveApplication { device_uuid, app_id } => {
+            buf.push(CHANGE_KIND_REMOVE_APPLICATION);
+            buf.extend_from_slice(device_uuid);
+            buf.extend_from_slice(&app_id.to_be_bytes());
         }
     }
     buf
@@ -2335,6 +2346,12 @@ fn deserialize_change(data: &[u8]) -> Option<Change> {
             let app_id    = u16::from_be_bytes(id_bytes);
             let app_alias = read_str(data, &mut pos)?;
             Some(Change::AddApplication { device_uuid, app_id, app_alias })
+        }
+        CHANGE_KIND_REMOVE_APPLICATION => {
+            let device_uuid: Uuid = read_arr(data, &mut pos)?;
+            let id_bytes:  [u8; 2] = read_arr(data, &mut pos)?;
+            let app_id    = u16::from_be_bytes(id_bytes);
+            Some(Change::RemoveApplication { device_uuid, app_id })
         }
         _ => None,
     }
@@ -2386,6 +2403,16 @@ fn apply_change_locally(
                 });
                 true
             }
+        }
+        Change::RemoveApplication { device_uuid, app_id } => {
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == *device_uuid)
+                .ok_or_else(|| WriteError::Validation(format!(
+                    "unknown device_uuid {device_uuid:?}"
+                )))?;
+            let before = dev.applications.len();
+            dev.applications.retain(|a| a.id != *app_id);
+            before != dev.applications.len()
         }
     };
 
@@ -2622,14 +2649,23 @@ fn serialize_public_state(node: &super::data_models::Node) -> Vec<u8> {
     buf
 }
 
-/// Parse a Public-state blob and apply it to the node, merging additively:
+/// Parse a Public-state blob and apply it to the node:
 ///
 /// - Own user `alias`/`uuid`: replace.
 /// - Own devices, by `uuid`: existing entries get public fields refreshed
-///   (alias/grade/sg_rank/hosts) but their local app `token`/`host`/
-///   `protocol` stay untouched. Apps are merged by id — incoming alias
-///   overwrites; new apps land with zeroed token/host. Apps not in the
-///   incoming blob are NOT removed (RemoveApplication change is not in Phase 5).
+///   (alias/grade/sg_rank/hosts). App handling depends on whether the entry
+///   is the **local** device (this node) or a peer device:
+///   - **Local device**: apps are merged additively — incoming alias updates
+///     matching ids, new ids are added, but apps in local state that aren't
+///     in incoming are preserved. This protects in-flight `request_change`
+///     pre-mutates (e.g., an app the local DG just registered or rejected
+///     but whose write hasn't yet been acknowledged by the writer).
+///   - **Peer device**: incoming is authoritative — apps absent from
+///     incoming are removed from local state. This is how `RemoveApplication`
+///     propagates from the writer's view to peers.
+///   In both cases, an app entry that already exists locally keeps its
+///   private fields (`token`/`host`/`protocol`/`user_approved`); only the
+///   public `alias` is overwritten from incoming.
 /// - Contacts, by `uuid`: existing get updated public fields, new are added,
 ///   none removed.
 ///
@@ -2696,32 +2732,56 @@ fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
         contacts.push(ParsedContact { alias, uuid, public_key, devices: devs });
     }
 
-    // Apply (merge additively).
+    // Apply.
     let mut node = ctx.node.write().unwrap();
+    let local_uuid = node.device_uuid;
     node.owner.user.alias = user_alias;
     node.owner.user.uuid  = user_uuid;
 
     for parsed in devices {
         let p = parsed.device;
         let apps = parsed.apps;
+        let is_local = p.uuid == local_uuid;
         if let Some(existing) = node.owner.user.devices.iter_mut().find(|d| d.uuid == p.uuid) {
             existing.alias   = p.alias;
             existing.grade   = p.grade;
             existing.sg_rank = p.sg_rank;
             existing.hosts   = p.hosts;
-            for (id, alias) in apps {
-                if let Some(local_app) = existing.applications.iter_mut().find(|a| a.id == id) {
-                    local_app.alias = alias;
-                    // token/host/protocol/user_approved preserved
-                } else {
-                    existing.applications.push(Application {
-                        id,
-                        alias,
-                        protocol:      String::new(),
-                        host:          "0.0.0.0:0".parse().unwrap(),
-                        user_approved: true,
-                        token:         [0u8; 16],
-                    });
+            if is_local {
+                // Local device: additive merge so in-flight request_change
+                // pre-mutates aren't clobbered.
+                for (id, alias) in apps {
+                    if let Some(local_app) = existing.applications.iter_mut().find(|a| a.id == id) {
+                        local_app.alias = alias;
+                    } else {
+                        existing.applications.push(Application {
+                            id,
+                            alias,
+                            protocol:      String::new(),
+                            host:          "0.0.0.0:0".parse().unwrap(),
+                            user_approved: true,
+                            token:         [0u8; 16],
+                        });
+                    }
+                }
+            } else {
+                // Peer device: authoritative — drop apps the writer no longer
+                // reports, so RemoveApplication propagates.
+                let incoming_ids: HashSet<u16> = apps.iter().map(|(id, _)| *id).collect();
+                existing.applications.retain(|a| incoming_ids.contains(&a.id));
+                for (id, alias) in apps {
+                    if let Some(local_app) = existing.applications.iter_mut().find(|a| a.id == id) {
+                        local_app.alias = alias;
+                    } else {
+                        existing.applications.push(Application {
+                            id,
+                            alias,
+                            protocol:      String::new(),
+                            host:          "0.0.0.0:0".parse().unwrap(),
+                            user_approved: true,
+                            token:         [0u8; 16],
+                        });
+                    }
                 }
             }
         } else {
@@ -4508,15 +4568,29 @@ fn approve_app(body: &[u8], ctx: &WorkerContext) {
 fn reject_app(body: &[u8], ctx: &WorkerContext) {
     let Some(id_str) = form_field(body, "id") else { return };
     let Ok(id) = id_str.parse::<u16>() else { return };
-    {
+    let (device_uuid, existed) = {
         let mut node    = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
-        let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else { return };
+        let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid)
+            else { return };
+        let before = device.applications.len();
         device.applications.retain(|a| a.id != id);
+        (device_uuid, before != device.applications.len())
+    };
+    if !existed {
+        return;
     }
     ctx.save_node();
+    // Cross-user propagation still rides the legacy contact path; sync v1's
+    // intra-user fan-out happens inside the `request_change` call below.
     push_data_to_contacts(ctx);
-    sync_devices(ctx);
+
+    // Publish the removal via sync v1. The error is currently swallowed; a
+    // follow-up will surface it the same way `app_register` does.
+    let _ = request_change(Change::RemoveApplication {
+        device_uuid,
+        app_id: id,
+    }, ctx);
 }
 
 // ── Invitation generation and bootstrap initiation ───────────────────────────
@@ -5989,6 +6063,69 @@ mod tests {
         assert!(node.owner.public_version.is_initial());
     }
 
+    #[test]
+    fn change_remove_application_roundtrips() {
+        let dev_uuid = generate_uuid();
+        let original = Change::RemoveApplication {
+            device_uuid: dev_uuid,
+            app_id:      0xCAFE,
+        };
+        let bytes = serialize_change(&original);
+        assert_eq!(bytes[0], CHANGE_KIND_REMOVE_APPLICATION);
+        let parsed = deserialize_change(&bytes).expect("parse");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn apply_remove_application_drops_app_and_bumps_public() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+        let writer = local;
+
+        // Seed an app so there's something to remove.
+        apply_change_locally(
+            &Change::AddApplication {
+                device_uuid: local, app_id: 3, app_alias: "doomed".into(),
+            },
+            writer, &t.ctx,
+        ).expect("seed");
+        let pub_after_add = t.ctx.node.read().unwrap().owner.public_version;
+
+        let (priv_v, pub_v) = apply_change_locally(
+            &Change::RemoveApplication { device_uuid: local, app_id: 3 },
+            writer, &t.ctx,
+        ).expect("remove");
+
+        // Private untouched; public bumped from the seed-add value.
+        assert!(priv_v.is_initial());
+        assert_eq!(pub_v.writer_sg_uuid, writer);
+        assert_eq!(pub_v.epoch, pub_after_add.epoch);
+        assert_eq!(pub_v.seq,   pub_after_add.seq + 1);
+
+        // App actually gone.
+        let node = t.ctx.node.read().unwrap();
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
+        assert!(dev.applications.iter().all(|a| a.id != 3));
+    }
+
+    #[test]
+    fn apply_remove_application_is_idempotent_for_missing_app() {
+        // Removing an app id that's already absent must NOT bump the version —
+        // matches AddApplication's idempotency contract so retries don't
+        // inflate seq.
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+        let writer = local;
+
+        let pub_before = t.ctx.node.read().unwrap().owner.public_version;
+        apply_change_locally(
+            &Change::RemoveApplication { device_uuid: local, app_id: 999 },
+            writer, &t.ctx,
+        ).expect("idempotent remove ok");
+        let pub_after = t.ctx.node.read().unwrap().owner.public_version;
+        assert_eq!(pub_before, pub_after, "no-op remove must not bump");
+    }
+
     // ── request_change driver ────────────────────────────────────────────────
 
     #[test]
@@ -6365,6 +6502,98 @@ mod tests {
         let t = TestCtx::new();
         let blob = vec![5u8, b'h', b'i']; // claims 5-byte alias but has 2
         assert!(!apply_public_state(&blob, &t.ctx));
+    }
+
+    /// Build a minimal Public-state blob for `apply_public_state` tests:
+    ///   - keeps the existing local user alias/uuid
+    ///   - includes exactly the (device, apps) entries listed
+    ///   - zero contacts
+    /// Each device is rendered as DG, sg_rank=0, hosts=[], for compactness.
+    fn build_public_state_blob(t: &TestCtx, devs: &[(Uuid, &str, Vec<(u16, &str)>)]) -> Vec<u8> {
+        let (user_alias, user_uuid) = {
+            let node = t.ctx.node.read().unwrap();
+            (node.owner.user.alias.clone(), node.owner.user.uuid)
+        };
+        let mut blob = Vec::new();
+        push_str(&mut blob, &user_alias);
+        blob.extend_from_slice(&user_uuid);
+        blob.push(devs.len() as u8);
+        for (uuid, alias, apps) in devs {
+            blob.extend_from_slice(uuid);
+            push_str(&mut blob, alias);
+            blob.push(0u8);      // grade = DG (0)
+            blob.push(0u8);      // sg_rank = 0
+            blob.push(0u8);      // host_count = 0
+            blob.push(apps.len() as u8);
+            for (id, app_alias) in apps {
+                blob.extend_from_slice(&id.to_be_bytes());
+                push_str(&mut blob, app_alias);
+            }
+        }
+        blob.push(0u8);          // 0 contacts
+        blob
+    }
+
+    #[test]
+    fn apply_public_state_drops_peer_apps_not_in_incoming() {
+        // Peer device has app 5 locally. Incoming blob doesn't list app 5 for
+        // that peer — apply_public_state must remove it (RemoveApplication
+        // propagation via FullState pull).
+        let t = TestCtx::new();
+        let peer_uuid = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:        "peer".into(),
+                uuid:         peer_uuid,
+                grade:        DeviceGrade::DG,
+                sg_rank:      None,
+                hosts:        vec![],
+                applications: vec![Application {
+                    id: 5, alias: "stale".into(),
+                    protocol: "".into(),
+                    host: "0.0.0.0:0".parse().unwrap(),
+                    user_approved: true, token: [0u8; 16],
+                }],
+            });
+        }
+
+        let blob = build_public_state_blob(&t, &[(peer_uuid, "peer", vec![])]);
+        assert!(apply_public_state(&blob, &t.ctx));
+
+        let node = t.ctx.node.read().unwrap();
+        let peer = node.owner.user.devices.iter().find(|d| d.uuid == peer_uuid).unwrap();
+        assert!(peer.applications.is_empty(),
+            "incoming was authoritative for peer device — stale app should be dropped");
+    }
+
+    #[test]
+    fn apply_public_state_preserves_local_apps_not_in_incoming() {
+        // Local device has an in-flight pre-mutated app that the writer hasn't
+        // acknowledged yet. A pull that races ahead of the ack would receive
+        // a blob without that app — apply_public_state must NOT drop it,
+        // otherwise the user's pending registration would briefly vanish.
+        let t = TestCtx::new();
+        let local_uuid = t.ctx.node.read().unwrap().device_uuid;
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == local_uuid).unwrap();
+            dev.applications.push(Application {
+                id: 9, alias: "in-flight".into(),
+                protocol: "udp".into(),
+                host: "10.0.0.1:9999".parse().unwrap(),
+                user_approved: true, token: [0xCC; 16],
+            });
+        }
+
+        let blob = build_public_state_blob(&t, &[(local_uuid, "local", vec![])]);
+        assert!(apply_public_state(&blob, &t.ctx));
+
+        let node = t.ctx.node.read().unwrap();
+        let local = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid).unwrap();
+        assert_eq!(local.applications.len(), 1, "in-flight local app must survive");
+        assert_eq!(local.applications[0].id, 9);
     }
 
     #[test]
