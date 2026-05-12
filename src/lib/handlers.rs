@@ -205,8 +205,8 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
 
     ctx.save_node();
-    // Legacy paths — to be deleted in Phase 7b.
-    sync_devices(ctx);
+    // Cross-user propagation still rides the legacy contact path; sync v1's
+    // intra-user fan-out happens inside the `request_change` call above.
     if auto_approve {
         push_data_to_contacts(ctx);
     }
@@ -4486,12 +4486,15 @@ fn approve_app(body: &[u8], ctx: &WorkerContext) {
         }
     };
     ctx.save_node();
+    // Cross-user propagation still rides the legacy contact path; sync v1's
+    // intra-user fan-out happens inside the `request_change` call below.
     push_data_to_contacts(ctx);
-    sync_devices(ctx);
 
-    // Sync v1: publish id+alias to peers via the writer SG. Only fire when
-    // the app actually existed and was approved — guards against a stray UI
-    // POST for an unknown id. Runs alongside the legacy paths until 7b.
+    // Publish id+alias to peers via the writer SG. Only fire when the app
+    // actually existed and was approved — guards against a stray UI POST for
+    // an unknown id. The error is currently swallowed; a follow-up will
+    // surface a UI-visible failure on Unreachable / NOT_WRITER acks the same
+    // way `app_register` does.
     if let Some(app_alias) = approved_alias {
         let device_uuid = ctx.node.read().unwrap().device_uuid;
         let _ = request_change(Change::AddApplication {
