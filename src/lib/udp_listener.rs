@@ -89,6 +89,11 @@ impl UdpListener {
                     0x61 => Action::ContactDataPullRequest { src, buf: payload },
                     0x62 => Action::DeviceDataPush         { src, buf: payload },
                     0x63 => Action::DeviceDataPullRequest  { src, buf: payload },
+                    0x70 => Action::SyncWriteRequest       { src, buf: payload },
+                    0x71 => Action::SyncWriteAck           { src, buf: payload },
+                    0x72 => Action::SyncUpdateAvailable    { src, buf: payload },
+                    0x73 => Action::SyncPullRequest        { src, buf: payload },
+                    0x74 => Action::SyncPullResponse       { src, buf: payload },
                     0x40 => Action::RelayPacket        { src, buf: payload },
                     0x41 => Action::AppPacket          { src, buf: payload },
                     0x50 => Action::TunnelInit           { src, buf: payload },
@@ -151,6 +156,11 @@ mod tests {
             (0x30, |a| matches!(a, Action::BootstrapRequest   { .. })),
             (0x31, |a| matches!(a, Action::BootstrapResponse  { .. })),
             (0x32, |a| matches!(a, Action::DeviceRegistration { .. })),
+            (0x70, |a| matches!(a, Action::SyncWriteRequest      { .. })),
+            (0x71, |a| matches!(a, Action::SyncWriteAck          { .. })),
+            (0x72, |a| matches!(a, Action::SyncUpdateAvailable   { .. })),
+            (0x73, |a| matches!(a, Action::SyncPullRequest       { .. })),
+            (0x74, |a| matches!(a, Action::SyncPullResponse      { .. })),
         ];
 
         for (op, check) in cases {

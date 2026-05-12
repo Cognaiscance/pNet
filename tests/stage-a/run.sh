@@ -47,7 +47,8 @@ require() {
 }
 
 wait_for_url() {
-    local url="$1" timeout="$2" deadline=$(( $(date +%s) + timeout ))
+    local url="$1" timeout="$2"
+    local deadline=$(( $(date +%s) + timeout ))
     until curl -sSf "$url" >/dev/null 2>&1; do
         [[ $(date +%s) -ge $deadline ]] && die "timeout waiting for $url"
         sleep "$POLL_INTERVAL"
@@ -87,7 +88,8 @@ probe_ready() {
 }
 
 wait_for_probes() {
-    local timeout="$1" deadline=$(( $(date +%s) + timeout ))
+    local timeout="$1"
+    local deadline=$(( $(date +%s) + timeout ))
     while :; do
         local all=1 not_ready=()
         for p in "${PROBES[@]}"; do

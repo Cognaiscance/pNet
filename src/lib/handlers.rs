@@ -6,9 +6,9 @@ use super::action_queue::WorkerContext;
 use super::data_models::{
     ActiveConnection, ActiveTunnel, Application, Contact, Device, DeviceGrade, Invitation,
     KeyPair, PendingBootstrap, PendingConnection, PendingContactExchange, PendingDeviceAcceptance,
-    PendingTunnel, PendingTunnelConnection, PublicKey, SgStatus, TunnelCounter, User, Uuid,
-    CONNECTION_LIFETIME, RENEW_THRESHOLD, TUNNEL_COUNTER_WINDOW, TUNNEL_THRESHOLD,
-    generate_key_bytes, generate_uuid,
+    PendingTunnel, PendingTunnelConnection, PublicKey, Scope, SgStatus, SyncVersion,
+    TunnelCounter, User, Uuid, CONNECTION_LIFETIME, RENEW_THRESHOLD, TUNNEL_COUNTER_WINDOW,
+    TUNNEL_THRESHOLD, generate_key_bytes, generate_uuid,
 };
 
 // ── Reply status bytes ────────────────────────────────────────────────────────
@@ -145,7 +145,7 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let alias_for_log = alias.clone();
 
     // Update node.
-    let token = {
+    let (token, next_id, device_uuid) = {
         let mut node = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
 
@@ -174,7 +174,7 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             user_approved: auto_approve,
             token,
         });
-        token
+        (token, next_id, device_uuid)
         // write lock released here
     };
 
@@ -183,6 +183,14 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if auto_approve {
         push_data_to_contacts(ctx);
         println!("[app_register] auto-approved '{alias_for_log}' via PNET_AUTO_APPROVE_APPS");
+        // Sync v1: publish id+alias to peers via the writer SG. Runs
+        // alongside the legacy sync_devices/push_data_to_contacts above
+        // until phase 7b removes the legacy paths.
+        let _ = request_change(Change::AddApplication {
+            device_uuid,
+            app_id:    next_id,
+            app_alias: alias_for_log.clone(),
+        }, ctx);
     }
 
     // Reply: [OK][token: 16 bytes]
@@ -535,6 +543,15 @@ const CONTACT_DATA_PUSH_OP:       u8 = 0x60;
 const CONTACT_DATA_PULL_REQ_OP:   u8 = 0x61;
 const DEVICE_DATA_PUSH_OP:        u8 = 0x62;
 const DEVICE_DATA_PULL_REQ_OP:    u8 = 0x63;
+// Sync v1 ops (see descriptions/data sync.md).
+// 0x70/0x71 — DG/SG→writer write request and writer→originator ack.
+// 0x72      — writer→peers "you have a stale version, pull when ready".
+// 0x73/0x74 — any node→writer pull request and writer's response (delta or NoUpdates).
+const SYNC_WRITE_REQUEST_OP:    u8 = 0x70;
+const SYNC_WRITE_ACK_OP:        u8 = 0x71;
+const SYNC_UPDATE_AVAILABLE_OP: u8 = 0x72;
+const SYNC_PULL_REQUEST_OP:     u8 = 0x73;
+const SYNC_PULL_RESPONSE_OP:    u8 = 0x74;
 const RELAY_PACKET_OP:            u8 = 0x40;
 const APP_PACKET_OP:              u8 = 0x41;
 const APP_PUSH_OP:                u8 = 0x04;
@@ -734,6 +751,11 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // This corrects any stale app counts that persisted from a previous session.
     sync_devices(ctx);
     push_data_to_contacts(ctx);
+    // Sync v1: if the freshly-connected peer is our writer SG, immediately
+    // catch up on any `SyncUpdateAvailable` notifications missed while
+    // disconnected. `sync_pull` is a no-op when the writer is `Local` or no
+    // writer is reachable, so it's safe to call unconditionally.
+    sync_pull(ctx);
 }
 
 // ── Bootstrap crypto helpers ──────────────────────────────────────────────────
@@ -884,6 +906,65 @@ fn sg_candidates_for_dest(node: &super::data_models::Node, dest_device_uuid: &Uu
         }
     }
     uuids
+}
+
+/// Identifies the writer SG from this node's perspective per the design rule
+/// in `descriptions/data sync.md`: "the highest-rank reachable own SG,
+/// including this node if it is itself an SG." See `find_writer_sg`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterTarget {
+    /// This node is the writer — accept writes locally.
+    Local,
+    /// A peer SG is the writer; send writes to its UUID.
+    Remote(Uuid),
+    /// No own SG is reachable. Only happens on a DG that has lost contact
+    /// with all of its user's SGs. Writes from such a DG must error to the app.
+    Unreachable,
+}
+
+/// Determine the writer SG from this node's perspective.
+///
+/// Walks all of the user's own SGs in rank order (lowest = best) and returns
+/// the first one that is reachable. Reachability rules:
+///
+/// - **Self** (when this node is an SG): always reachable to itself.
+/// - **Peer SG**: must have an active connection AND, if `sg_statuses` has
+///   entries for it, at least one address marked up. Optimistic when no poll
+///   data exists yet — matches the convention used by `top_ranked_sg_for_device`.
+///
+/// Used both for issuing writes (find where to send a SyncWriteRequest) and
+/// for the SG-side forward-up-the-rank rule (an SG receiving a write returns
+/// `Local` only when no higher-rank peer is reachable to it).
+pub fn find_writer_sg(node: &super::data_models::Node) -> WriterTarget {
+    let local_uuid = node.device_uuid;
+
+    let mut sgs: Vec<&Device> = node.owner.user.devices.iter()
+        .filter(|d| matches!(d.grade, DeviceGrade::SG))
+        .collect();
+    sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
+
+    for d in &sgs {
+        if d.uuid == local_uuid {
+            return WriterTarget::Local;
+        }
+        let has_conn = node.owner.active_connections.values()
+            .any(|c| c.device_uuid == d.uuid);
+        if !has_conn { continue; }
+
+        let mut any_entry = false;
+        let mut any_up    = false;
+        for ((uuid, _), status) in &node.sg_statuses {
+            if *uuid == d.uuid {
+                any_entry = true;
+                if status.up { any_up = true; }
+            }
+        }
+        let polled_up = !any_entry || any_up;
+        if polled_up {
+            return WriterTarget::Remote(d.uuid);
+        }
+    }
+    WriterTarget::Unreachable
 }
 
 /// Return the UUID of the highest-ranked SG that owns `dest_device_uuid` and
@@ -2038,6 +2119,933 @@ pub fn sync_devices(ctx: &WorkerContext) {
     drop(node);
 
     send(ctx, dest, &pkt);
+}
+
+// ── Sync v1 (ops 0x70 – 0x74) ────────────────────────────────────────────────
+//
+// Version-aware sync protocol described in `descriptions/data sync.md`.
+// Phase 4 lands the writer-side acceptance pipeline for AddApplication;
+// other Change variants and the originator-side ack handling land in 5–7.
+//
+// Encrypted body layouts:
+//
+//   SyncWriteRequest    (0x70)  [change_kind:1][change_payload:var]
+//   SyncWriteAck        (0x71)  [result:1][private_version:28][public_version:28]
+//   SyncUpdateAvailable (0x72)  [scope:1][version:28]
+//   SyncPullRequest     (0x73)  [scope:1][last_seen_version:28]
+//   SyncPullResponse    (0x74)  [scope:1][result:1][version:28][state:var]
+//
+// Where `version:28` = [writer_sg_uuid:16][epoch:u32 BE][seq:u64 BE].
+// WriteAck always returns the writer's current versions for both scopes so
+// originators have an authoritative pin regardless of which scope the change
+// touched (or whether it was rejected). Result bytes:
+//   WriteAck:    0=accepted, 1=not_writer, 2=validation_error
+//   PullResponse: 0=NoUpdates, 1=FullState  (delta encoding deferred)
+
+const SCOPE_PRIVATE: u8 = 0;
+const SCOPE_PUBLIC:  u8 = 1;
+
+const WRITE_ACK_OK:                u8 = 0;
+const WRITE_ACK_NOT_WRITER:        u8 = 1;
+const WRITE_ACK_VALIDATION_ERROR:  u8 = 2;
+
+const PULL_RESULT_NO_UPDATES: u8 = 0;
+const PULL_RESULT_FULL_STATE: u8 = 1;
+
+/// Wire size of `SyncVersion` on the wire: 16 (uuid) + 4 (epoch) + 8 (seq).
+const SYNC_VERSION_WIRE_LEN: usize = 28;
+
+fn write_scope(buf: &mut Vec<u8>, scope: Scope) {
+    buf.push(match scope {
+        Scope::Private => SCOPE_PRIVATE,
+        Scope::Public  => SCOPE_PUBLIC,
+    });
+}
+
+fn read_scope(data: &[u8], pos: &mut usize) -> Option<Scope> {
+    let b = *data.get(*pos)?;
+    *pos += 1;
+    match b {
+        SCOPE_PRIVATE => Some(Scope::Private),
+        SCOPE_PUBLIC  => Some(Scope::Public),
+        _             => None,
+    }
+}
+
+fn write_sync_version(buf: &mut Vec<u8>, v: &SyncVersion) {
+    buf.extend_from_slice(&v.writer_sg_uuid);
+    buf.extend_from_slice(&v.epoch.to_be_bytes());
+    buf.extend_from_slice(&v.seq.to_be_bytes());
+}
+
+fn read_sync_version(data: &[u8], pos: &mut usize) -> Option<SyncVersion> {
+    let writer_sg_uuid: Uuid     = read_arr(data, pos)?;
+    let epoch_bytes:    [u8; 4]  = read_arr(data, pos)?;
+    let seq_bytes:      [u8; 8]  = read_arr(data, pos)?;
+    Some(SyncVersion {
+        writer_sg_uuid,
+        epoch: u32::from_be_bytes(epoch_bytes),
+        seq:   u64::from_be_bytes(seq_bytes),
+    })
+}
+
+// ── Change types ──────────────────────────────────────────────────────────────
+//
+// A `Change` is the unit of state mutation the writer SG accepts. Each variant
+// declares which scope(s) it touches via `change_scopes`, so the writer bumps
+// the right counter(s) on accept. Wire `change_kind` is a single byte — the
+// payload after it is variant-specific.
+
+const CHANGE_KIND_ADD_APPLICATION: u8 = 0x01;
+
+/// State mutations that flow through the writer SG.
+///
+/// `AddApplication` is the only variant in v1 of v1; remove/update/contact
+/// variants land in follow-up phases without architectural changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// Public-scope: add an app entry (id + alias + approval flag) to the
+    /// device identified by `device_uuid` in the user's device list. The
+    /// originating DG keeps the private fields (token, host, port) locally —
+    /// they are not shared with the writer SG or peers.
+    AddApplication {
+        device_uuid: Uuid,
+        app_id:      u16,
+        app_alias:   String,
+    },
+}
+
+/// Returns the scope(s) a given change is expected to bump on accept. Used
+/// by `apply_change_locally` and (in phase 5) by the notify fan-out to know
+/// which `UpdateAvailable` notifications to emit.
+fn change_scopes(c: &Change) -> &'static [Scope] {
+    match c {
+        // Only the public fields (id+alias) are recorded at the writer; the
+        // originating DG's private fields stay local.
+        Change::AddApplication { .. } => &[Scope::Public],
+    }
+}
+
+fn serialize_change(c: &Change) -> Vec<u8> {
+    let mut buf = Vec::new();
+    match c {
+        Change::AddApplication { device_uuid, app_id, app_alias } => {
+            buf.push(CHANGE_KIND_ADD_APPLICATION);
+            buf.extend_from_slice(device_uuid);
+            buf.extend_from_slice(&app_id.to_be_bytes());
+            push_str(&mut buf, app_alias);
+        }
+    }
+    buf
+}
+
+fn deserialize_change(data: &[u8]) -> Option<Change> {
+    let mut pos = 0usize;
+    let kind = *data.get(pos)?;
+    pos += 1;
+    match kind {
+        CHANGE_KIND_ADD_APPLICATION => {
+            let device_uuid: Uuid = read_arr(data, &mut pos)?;
+            let id_bytes:  [u8; 2] = read_arr(data, &mut pos)?;
+            let app_id    = u16::from_be_bytes(id_bytes);
+            let app_alias = read_str(data, &mut pos)?;
+            Some(Change::AddApplication { device_uuid, app_id, app_alias })
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// No reachable own SG. Caller should report the error to the requesting app.
+    Unreachable,
+    /// Change refers to state the writer doesn't have (e.g., unknown device_uuid).
+    Validation(String),
+}
+
+/// Apply a `Change` to local state, bump the relevant scope version(s), and
+/// queue the result for persistence.
+///
+/// Idempotent at the data level: calling with a change that's already
+/// reflected (e.g., AddApplication for an `app_id` that already exists on the
+/// device) is a no-op and does NOT bump versions — so retries don't inflate
+/// the seq counter.
+///
+/// Returns the (private, public) versions after the operation (current values
+/// when no-op, post-bump values when applied).
+fn apply_change_locally(
+    change: &Change,
+    writer_uuid: Uuid,
+    ctx: &WorkerContext,
+) -> Result<(SyncVersion, SyncVersion), WriteError> {
+    let mut node = ctx.node.write().unwrap();
+    let applied = match change {
+        Change::AddApplication { device_uuid, app_id, app_alias } => {
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == *device_uuid)
+                .ok_or_else(|| WriteError::Validation(format!(
+                    "unknown device_uuid {device_uuid:?}"
+                )))?;
+            if dev.applications.iter().any(|a| a.id == *app_id) {
+                false
+            } else {
+                dev.applications.push(Application {
+                    id:            *app_id,
+                    alias:         app_alias.clone(),
+                    protocol:      String::new(),
+                    // Private-scope fields stay zero on the writer SG — the
+                    // originating DG holds the real token/host locally.
+                    host:          "0.0.0.0:0".parse().unwrap(),
+                    user_approved: true,
+                    token:         [0u8; 16],
+                });
+                true
+            }
+        }
+    };
+
+    if applied {
+        for scope in change_scopes(change) {
+            node.owner.bump_version(*scope, writer_uuid);
+        }
+    }
+    let private = node.owner.private_version;
+    let public  = node.owner.public_version;
+    drop(node);
+    if applied {
+        ctx.save_node();
+    }
+    Ok((private, public))
+}
+
+/// Drive a state change through the writer-SG model. Used by any node that
+/// wants to mutate state (UI, app-approval flow in phase 7, etc.):
+///
+/// - `WriterTarget::Local`  — apply locally; returns `Ok(())` after persist.
+/// - `WriterTarget::Remote` — send a SyncWriteRequest to the elected writer
+///   and return `Ok(())` immediately. The matching ack arrives later via
+///   `sync_write_ack`. Phase 5 will turn the ack into "trigger a pull to
+///   refresh local state and clear pending UI."
+/// - `WriterTarget::Unreachable` — return `Err(Unreachable)`.
+pub fn request_change(change: Change, ctx: &WorkerContext) -> Result<(), WriteError> {
+    let target = {
+        let node = ctx.node.read().unwrap();
+        find_writer_sg(&node)
+    };
+    match target {
+        WriterTarget::Local => {
+            let local_uuid = ctx.node.read().unwrap().device_uuid;
+            apply_change_locally(&change, local_uuid, ctx)?;
+            // Originator semantics: advance the scope's version even when
+            // `apply_change_locally` was a data-level no-op. This is the
+            // common path when the originator pre-mutated the local record
+            // (e.g. `app_register` adding the app with token+host before
+            // calling `request_change` to publish id+alias). The receiver
+            // path (`sync_write_request`) keeps the stricter
+            // bump-only-on-actual-mutation rule for retry idempotency.
+            let scopes_to_bump = change_scopes(&change);
+            let (post_priv, post_pub) = {
+                let mut node = ctx.node.write().unwrap();
+                for &scope in scopes_to_bump {
+                    node.owner.bump_version(scope, local_uuid);
+                }
+                (node.owner.private_version, node.owner.public_version)
+            };
+            ctx.save_node();
+            let bumped: Vec<Scope> = scopes_to_bump.iter().copied().collect();
+            notify_own_peers(&bumped, post_priv, post_pub, ctx);
+            Ok(())
+        }
+        WriterTarget::Remote(writer_uuid) => {
+            send_sync_write_request(&change, writer_uuid, ctx);
+            Ok(())
+        }
+        WriterTarget::Unreachable => Err(WriteError::Unreachable),
+    }
+}
+
+/// Compare pre/post versions to determine which scopes were bumped by an
+/// `apply_change_locally` call. Empty vec means the apply was a no-op
+/// (idempotent retry — see the AddApplication idempotency contract).
+fn bumped_scopes(
+    pre_priv: SyncVersion,
+    pre_pub:  SyncVersion,
+    post_priv: SyncVersion,
+    post_pub:  SyncVersion,
+) -> Vec<Scope> {
+    let mut out = Vec::new();
+    if pre_priv != post_priv { out.push(Scope::Private); }
+    if pre_pub  != post_pub  { out.push(Scope::Public);  }
+    out
+}
+
+/// Fan out `SyncUpdateAvailable` notifications to every own-user peer device
+/// that this node has an active connection to, for each bumped scope.
+///
+/// Phase 5 only notifies own-user devices. Cross-user notification (writer SG
+/// → contacts' SGs for public-scope changes) lands in a follow-up phase.
+fn notify_own_peers(
+    bumped: &[Scope],
+    private: SyncVersion,
+    public:  SyncVersion,
+    ctx:     &WorkerContext,
+) {
+    let packets: Vec<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        let local_uuid = node.device_uuid;
+        let own_uuids: Vec<Uuid> = node.owner.user.devices.iter()
+            .filter(|d| d.uuid != local_uuid)
+            .map(|d| d.uuid)
+            .collect();
+        let mut out = Vec::new();
+        for &scope in bumped {
+            let v = match scope { Scope::Private => private, Scope::Public => public };
+            for uuid in &own_uuids {
+                let Some(conn) = node.owner.active_connections.values()
+                    .find(|c| c.device_uuid == *uuid)
+                else { continue };
+                let mut body = Vec::with_capacity(1 + SYNC_VERSION_WIRE_LEN);
+                write_scope(&mut body, scope);
+                write_sync_version(&mut body, &v);
+                let pkt = build_encrypted_packet(SYNC_UPDATE_AVAILABLE_OP, conn, &body);
+                out.push((pkt, conn.peer_addr));
+            }
+        }
+        out
+    };
+    for (pkt, dest) in packets {
+        send(ctx, dest, &pkt);
+    }
+}
+
+/// Periodic / on-reconnect pull entry point. Called by the scheduler on its
+/// `SYNC_PULL_INTERVAL` tick and by `connect_ack` immediately after a fresh
+/// active connection lands. Sends one `SyncPullRequest` per scope to the
+/// elected writer SG; no-op if this node is itself the writer (`Local`) or
+/// has no reachable own SG (`Unreachable`).
+pub fn sync_pull(ctx: &WorkerContext) {
+    let (target, last_priv, last_pub) = {
+        let node = ctx.node.read().unwrap();
+        (find_writer_sg(&node), node.owner.private_version, node.owner.public_version)
+    };
+    let writer_uuid = match target {
+        WriterTarget::Local       => return,
+        WriterTarget::Unreachable => {
+            println!("[sync_pull] no reachable writer SG — skipping");
+            return;
+        }
+        WriterTarget::Remote(u)   => u,
+    };
+
+    let conn_id = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.values()
+            .find(|c| c.device_uuid == writer_uuid)
+            .map(|c| c.id)
+    };
+    let Some(conn_id) = conn_id else {
+        eprintln!("[sync_pull] writer {writer_uuid:?} has no active connection");
+        return;
+    };
+
+    send_pull_request(Scope::Public,  last_pub,  conn_id, ctx);
+    send_pull_request(Scope::Private, last_priv, conn_id, ctx);
+}
+
+/// Send a `SyncPullRequest` for `scope` to a specific peer connection.
+/// Used both as the immediate response to `SyncUpdateAvailable` and by the
+/// periodic / on-reconnect pull (`sync_pull`).
+fn send_pull_request(scope: Scope, last_seen: SyncVersion, conn_id: u16, ctx: &WorkerContext) {
+    let mut body = Vec::with_capacity(1 + SYNC_VERSION_WIRE_LEN);
+    write_scope(&mut body, scope);
+    write_sync_version(&mut body, &last_seen);
+
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.get(&conn_id)
+            .map(|conn| (
+                build_encrypted_packet(SYNC_PULL_REQUEST_OP, conn, &body),
+                conn.peer_addr,
+            ))
+    };
+    let Some((pkt, addr)) = pkt_and_addr else {
+        eprintln!("[send_pull_request] no active connection {conn_id}");
+        return;
+    };
+    send(ctx, addr, &pkt);
+}
+
+// ── Scoped state serialization ───────────────────────────────────────────────
+//
+// Wire format for a Public-scope state blob (carried in a SyncPullResponse
+// when the writer has new state for the puller):
+//
+//   [user_alias: u8+bytes]
+//   [user_uuid: 16]
+//   [device_count: u8]
+//     each device:
+//       [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8]
+//       [host_count:u8] each [host: u8+bytes]
+//       [app_count: u8] each [id: u16 BE][alias: u8+bytes]
+//   [contact_count: u8]
+//     each contact:
+//       [user_alias: u8+bytes][user_uuid:16][public_key:32]
+//       [device_count: u8] each device (same shape as own devices, apps included)
+//
+// Apps in the Public-scope blob carry only `id` and `alias`; the originating
+// DG's private fields (`token`, `host`, `protocol`) stay local and are
+// merged in by `apply_public_state` rather than overwritten.
+//
+// The Private-scope state blob is intentionally empty in Phase 5 — no
+// Change variant currently bumps Private. Future phases (RemoveApplication,
+// invitation sync) will populate it.
+
+fn serialize_public_state(node: &super::data_models::Node) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let user = &node.owner.user;
+    push_str(&mut buf, &user.alias);
+    buf.extend_from_slice(&user.uuid);
+
+    buf.push(user.devices.len().min(u8::MAX as usize) as u8);
+    for d in user.devices.iter().take(u8::MAX as usize) {
+        push_device(&mut buf, d);
+        buf.push(d.applications.len().min(u8::MAX as usize) as u8);
+        for a in d.applications.iter().take(u8::MAX as usize) {
+            buf.extend_from_slice(&a.id.to_be_bytes());
+            push_str(&mut buf, &a.alias);
+        }
+    }
+
+    buf.push(node.owner.contact_users.len().min(u8::MAX as usize) as u8);
+    for contact in node.owner.contact_users.iter().take(u8::MAX as usize) {
+        push_str(&mut buf, &contact.user.alias);
+        buf.extend_from_slice(&contact.user.uuid);
+        buf.extend_from_slice(&contact.public_key);
+        buf.push(contact.user.devices.len().min(u8::MAX as usize) as u8);
+        for d in contact.user.devices.iter().take(u8::MAX as usize) {
+            push_device(&mut buf, d);
+            buf.push(d.applications.len().min(u8::MAX as usize) as u8);
+            for a in d.applications.iter().take(u8::MAX as usize) {
+                buf.extend_from_slice(&a.id.to_be_bytes());
+                push_str(&mut buf, &a.alias);
+            }
+        }
+    }
+    buf
+}
+
+/// Parse a Public-state blob and apply it to the node, merging additively:
+///
+/// - Own user `alias`/`uuid`: replace.
+/// - Own devices, by `uuid`: existing entries get public fields refreshed
+///   (alias/grade/sg_rank/hosts) but their local app `token`/`host`/
+///   `protocol` stay untouched. Apps are merged by id — incoming alias
+///   overwrites; new apps land with zeroed token/host. Apps not in the
+///   incoming blob are NOT removed (RemoveApplication change is not in Phase 5).
+/// - Contacts, by `uuid`: existing get updated public fields, new are added,
+///   none removed.
+///
+/// Returns `true` on a clean apply, `false` if the blob is malformed (in
+/// which case node state is unchanged).
+fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
+    let mut pos = 0usize;
+
+    let Some(user_alias) = read_str(state, &mut pos) else { return false; };
+    let Some(user_uuid)  = read_arr::<16>(state, &mut pos) else { return false; };
+
+    let Some(&dev_count) = state.get(pos) else { return false; };
+    pos += 1;
+
+    // Parse all devices into a temp vec first so a malformed blob can't
+    // half-apply.
+    struct ParsedDevice {
+        device: Device,
+        apps:   Vec<(u16, String)>,
+    }
+    let mut devices: Vec<ParsedDevice> = Vec::with_capacity(dev_count as usize);
+    for _ in 0..dev_count {
+        let Some(d) = read_device(state, &mut pos) else { return false; };
+        let Some(&app_count) = state.get(pos) else { return false; };
+        pos += 1;
+        let mut apps = Vec::with_capacity(app_count as usize);
+        for _ in 0..app_count {
+            let Some(id_bytes) = read_arr::<2>(state, &mut pos) else { return false; };
+            let Some(alias)    = read_str(state, &mut pos)       else { return false; };
+            apps.push((u16::from_be_bytes(id_bytes), alias));
+        }
+        devices.push(ParsedDevice { device: d, apps });
+    }
+
+    let Some(&contact_count) = state.get(pos) else { return false; };
+    pos += 1;
+
+    struct ParsedContact {
+        alias:      String,
+        uuid:       Uuid,
+        public_key: PublicKey,
+        devices:    Vec<ParsedDevice>,
+    }
+    let mut contacts: Vec<ParsedContact> = Vec::with_capacity(contact_count as usize);
+    for _ in 0..contact_count {
+        let Some(alias)      = read_str(state, &mut pos) else { return false; };
+        let Some(uuid)       = read_arr::<16>(state, &mut pos) else { return false; };
+        let Some(public_key) = read_arr::<32>(state, &mut pos) else { return false; };
+        let Some(&dc) = state.get(pos) else { return false; };
+        pos += 1;
+        let mut devs = Vec::with_capacity(dc as usize);
+        for _ in 0..dc {
+            let Some(d) = read_device(state, &mut pos) else { return false; };
+            let Some(&ac) = state.get(pos) else { return false; };
+            pos += 1;
+            let mut apps = Vec::with_capacity(ac as usize);
+            for _ in 0..ac {
+                let Some(id_bytes) = read_arr::<2>(state, &mut pos) else { return false; };
+                let Some(alias)    = read_str(state, &mut pos)       else { return false; };
+                apps.push((u16::from_be_bytes(id_bytes), alias));
+            }
+            devs.push(ParsedDevice { device: d, apps });
+        }
+        contacts.push(ParsedContact { alias, uuid, public_key, devices: devs });
+    }
+
+    // Apply (merge additively).
+    let mut node = ctx.node.write().unwrap();
+    node.owner.user.alias = user_alias;
+    node.owner.user.uuid  = user_uuid;
+
+    for parsed in devices {
+        let p = parsed.device;
+        let apps = parsed.apps;
+        if let Some(existing) = node.owner.user.devices.iter_mut().find(|d| d.uuid == p.uuid) {
+            existing.alias   = p.alias;
+            existing.grade   = p.grade;
+            existing.sg_rank = p.sg_rank;
+            existing.hosts   = p.hosts;
+            for (id, alias) in apps {
+                if let Some(local_app) = existing.applications.iter_mut().find(|a| a.id == id) {
+                    local_app.alias = alias;
+                    // token/host/protocol/user_approved preserved
+                } else {
+                    existing.applications.push(Application {
+                        id,
+                        alias,
+                        protocol:      String::new(),
+                        host:          "0.0.0.0:0".parse().unwrap(),
+                        user_approved: true,
+                        token:         [0u8; 16],
+                    });
+                }
+            }
+        } else {
+            let mut new_dev = p;
+            for (id, alias) in apps {
+                new_dev.applications.push(Application {
+                    id,
+                    alias,
+                    protocol:      String::new(),
+                    host:          "0.0.0.0:0".parse().unwrap(),
+                    user_approved: true,
+                    token:         [0u8; 16],
+                });
+            }
+            node.owner.user.devices.push(new_dev);
+        }
+    }
+
+    for c in contacts {
+        if let Some(existing) = node.owner.contact_users.iter_mut().find(|x| x.user.uuid == c.uuid) {
+            existing.user.alias = c.alias;
+            existing.public_key = c.public_key;
+            // Replace the contact's device list — we don't have local
+            // private fields to preserve for contact-owned apps.
+            existing.user.devices = c.devices.into_iter().map(|p| {
+                let mut dev = p.device;
+                for (id, alias) in p.apps {
+                    dev.applications.push(Application {
+                        id, alias,
+                        protocol:      String::new(),
+                        host:          "0.0.0.0:0".parse().unwrap(),
+                        user_approved: true,
+                        token:         [0u8; 16],
+                    });
+                }
+                dev
+            }).collect();
+        } else {
+            let devs = c.devices.into_iter().map(|p| {
+                let mut dev = p.device;
+                for (id, alias) in p.apps {
+                    dev.applications.push(Application {
+                        id, alias,
+                        protocol:      String::new(),
+                        host:          "0.0.0.0:0".parse().unwrap(),
+                        user_approved: true,
+                        token:         [0u8; 16],
+                    });
+                }
+                dev
+            }).collect();
+            node.owner.contact_users.push(Contact {
+                public_key: c.public_key,
+                user: User { alias: c.alias, uuid: c.uuid, devices: devs },
+            });
+        }
+    }
+
+    drop(node);
+    ctx.save_node();
+    true
+}
+
+/// Send a SyncWriteRequest (op 0x70) to the writer SG identified by `writer_uuid`.
+fn send_sync_write_request(change: &Change, writer_uuid: Uuid, ctx: &WorkerContext) {
+    let payload = serialize_change(change);
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.values()
+            .find(|c| c.device_uuid == writer_uuid)
+            .map(|conn| (
+                build_encrypted_packet(SYNC_WRITE_REQUEST_OP, conn, &payload),
+                conn.peer_addr,
+            ))
+    };
+    let Some((pkt, addr)) = pkt_and_addr else {
+        eprintln!("[send_sync_write_request] no active connection to writer {writer_uuid:?}");
+        return;
+    };
+    send(ctx, addr, &pkt);
+}
+
+fn build_write_ack_body(result: u8, private: SyncVersion, public: SyncVersion) -> Vec<u8> {
+    let mut body = Vec::with_capacity(1 + SYNC_VERSION_WIRE_LEN * 2);
+    body.push(result);
+    write_sync_version(&mut body, &private);
+    write_sync_version(&mut body, &public);
+    body
+}
+
+/// Op 0x70 — Sync write request (DG/SG → writer SG).
+///
+/// Decrypts, parses the change, and either accepts (if this node is the
+/// elected writer per `find_writer_sg`) or rejects with `WRITE_ACK_NOT_WRITER`.
+/// Forwarding up the rank chain is documented in `descriptions/data sync.md`
+/// but deferred — for now an originator that picked the wrong SG will see
+/// NOT_WRITER and (in phase 5+6) re-elect on its next pull.
+pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 2 {
+        eprintln!("[sync_write_request] header too short from {src}");
+        return;
+    }
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[sync_write_request] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+
+    let Some(change) = deserialize_change(&plaintext) else {
+        eprintln!("[sync_write_request] unparseable change from {src}");
+        return;
+    };
+
+    let (target, local_uuid) = {
+        let node = ctx.node.read().unwrap();
+        (find_writer_sg(&node), node.device_uuid)
+    };
+
+    let (result, private_v, public_v, bumped) = match target {
+        WriterTarget::Local => {
+            let (pre_priv, pre_pub) = {
+                let node = ctx.node.read().unwrap();
+                (node.owner.private_version, node.owner.public_version)
+            };
+            match apply_change_locally(&change, local_uuid, ctx) {
+                Ok((priv_v, pub_v)) => {
+                    let bumped = bumped_scopes(pre_priv, pre_pub, priv_v, pub_v);
+                    (WRITE_ACK_OK, priv_v, pub_v, bumped)
+                }
+                Err(WriteError::Validation(msg)) => {
+                    eprintln!("[sync_write_request] validation error from {src}: {msg}");
+                    let node = ctx.node.read().unwrap();
+                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new())
+                }
+                Err(WriteError::Unreachable) => {
+                    // Cannot occur in the Local branch — defensive only.
+                    let node = ctx.node.read().unwrap();
+                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new())
+                }
+            }
+        }
+        WriterTarget::Remote(_) | WriterTarget::Unreachable => {
+            let node = ctx.node.read().unwrap();
+            (WRITE_ACK_NOT_WRITER, node.owner.private_version, node.owner.public_version, Vec::new())
+        }
+    };
+
+    let body = build_write_ack_body(result, private_v, public_v);
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.get(&conn_id)
+            .map(|conn| (
+                build_encrypted_packet(SYNC_WRITE_ACK_OP, conn, &body),
+                conn.peer_addr,
+            ))
+    };
+    let Some((pkt, addr)) = pkt_and_addr else {
+        eprintln!("[sync_write_request] no connection {conn_id} to ack from {src}");
+        return;
+    };
+    send(ctx, addr, &pkt);
+
+    // Fan out UpdateAvailable notifications to peers when the write actually
+    // changed state. The originator gets one too — its `sync_update_available`
+    // handler will trigger the confirming pull, replacing the simple ack-only
+    // path used in phase 4.
+    if !bumped.is_empty() {
+        notify_own_peers(&bumped, private_v, public_v, ctx);
+    }
+}
+
+/// Op 0x71 — Sync write ack (writer SG → originator).
+///
+/// Phase 4: decrypt + parse + log. Phase 5 will use the returned versions to
+/// trigger an immediate `SyncPullRequest` so the originator's view of the
+/// state catches up with the authoritative writer record.
+pub fn sync_write_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[sync_write_ack] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+    let mut pos = 0usize;
+    let Some(&result) = plaintext.get(pos) else {
+        eprintln!("[sync_write_ack] missing result from {src}");
+        return;
+    };
+    pos += 1;
+    let Some(private_v) = read_sync_version(&plaintext, &mut pos) else {
+        eprintln!("[sync_write_ack] truncated private_version from {src}");
+        return;
+    };
+    let Some(public_v) = read_sync_version(&plaintext, &mut pos) else {
+        eprintln!("[sync_write_ack] truncated public_version from {src}");
+        return;
+    };
+    println!(
+        "[sync_write_ack] from {src} result={result} private=(e={},s={}) public=(e={},s={}) (phase 5: pull on accepted)",
+        private_v.epoch, private_v.seq, public_v.epoch, public_v.seq,
+    );
+}
+
+/// Op 0x72 — Sync update available (writer SG → notify list).
+///
+/// Decrypts the announced `(scope, version)` and, if it is strictly newer
+/// than the local last-applied version for that scope, immediately sends a
+/// `SyncPullRequest` back to the source. A "newer from a different writer"
+/// (cross-writer comparison) is also treated as needing a pull — that
+/// surfaces partition-recovery situations the design doc covers.
+pub fn sync_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 2 {
+        eprintln!("[sync_update_available] header too short from {src}");
+        return;
+    }
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[sync_update_available] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+
+    let mut pos = 0usize;
+    let Some(scope) = read_scope(&plaintext, &mut pos) else {
+        eprintln!("[sync_update_available] bad scope from {src}");
+        return;
+    };
+    let Some(announced) = read_sync_version(&plaintext, &mut pos) else {
+        eprintln!("[sync_update_available] truncated version from {src}");
+        return;
+    };
+
+    let local_v = {
+        let node = ctx.node.read().unwrap();
+        node.owner.version(scope)
+    };
+
+    use std::cmp::Ordering;
+    let needs_pull = match announced.cmp_same_writer(&local_v) {
+        Some(Ordering::Greater) => true,
+        Some(_)                 => false,
+        None                    => true, // cross-writer: pull and let the writer's state win.
+    };
+    if needs_pull {
+        send_pull_request(scope, local_v, conn_id, ctx);
+    }
+}
+
+/// Op 0x73 — Sync pull request (any node → writer SG).
+///
+/// Compares the sender's `last_seen` against this node's current version for
+/// `scope` and replies with either `NoUpdates` (versions equal) or
+/// `FullState` carrying a serialized state blob. Cross-writer comparisons
+/// also send `FullState` so the puller adopts the local writer's state.
+///
+/// Private-scope pulls return an empty state blob in Phase 5 (no Change
+/// variant currently bumps Private). Future phases will populate it.
+pub fn sync_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 2 {
+        eprintln!("[sync_pull_request] header too short from {src}");
+        return;
+    }
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[sync_pull_request] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+
+    let mut pos = 0usize;
+    let Some(scope) = read_scope(&plaintext, &mut pos) else {
+        eprintln!("[sync_pull_request] bad scope from {src}");
+        return;
+    };
+    let Some(last_seen) = read_sync_version(&plaintext, &mut pos) else {
+        eprintln!("[sync_pull_request] truncated version from {src}");
+        return;
+    };
+
+    let (current_v, state_blob) = {
+        let node = ctx.node.read().unwrap();
+        let v = node.owner.version(scope);
+        let blob = match scope {
+            Scope::Public  => serialize_public_state(&node),
+            Scope::Private => Vec::new(), // empty in phase 5
+        };
+        (v, blob)
+    };
+
+    use std::cmp::Ordering;
+    let send_full = match last_seen.cmp_same_writer(&current_v) {
+        Some(Ordering::Equal) => false,
+        Some(_) | None        => true,
+    };
+
+    let mut body = Vec::new();
+    write_scope(&mut body, scope);
+    if send_full {
+        body.push(PULL_RESULT_FULL_STATE);
+        write_sync_version(&mut body, &current_v);
+        body.extend_from_slice(&state_blob);
+    } else {
+        body.push(PULL_RESULT_NO_UPDATES);
+        write_sync_version(&mut body, &current_v);
+        // No state blob on NoUpdates.
+    }
+
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.get(&conn_id)
+            .map(|conn| (
+                build_encrypted_packet(SYNC_PULL_RESPONSE_OP, conn, &body),
+                conn.peer_addr,
+            ))
+    };
+    let Some((pkt, addr)) = pkt_and_addr else {
+        eprintln!("[sync_pull_request] no connection {conn_id} to reply to from {src}");
+        return;
+    };
+    send(ctx, addr, &pkt);
+}
+
+/// Op 0x74 — Sync pull response (writer SG → puller).
+///
+/// `NoUpdates`: pin our local last-applied version to the writer's current
+/// version (we are caught up). `FullState`: parse and merge the state blob
+/// for `scope`, then advance the local version. A malformed blob leaves
+/// state and version unchanged.
+pub fn sync_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[sync_pull_response] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+
+    let mut pos = 0usize;
+    let Some(scope) = read_scope(&plaintext, &mut pos) else {
+        eprintln!("[sync_pull_response] bad scope from {src}");
+        return;
+    };
+    let Some(&result) = plaintext.get(pos) else {
+        eprintln!("[sync_pull_response] missing result from {src}");
+        return;
+    };
+    pos += 1;
+    let Some(new_version) = read_sync_version(&plaintext, &mut pos) else {
+        eprintln!("[sync_pull_response] truncated version from {src}");
+        return;
+    };
+
+    match result {
+        PULL_RESULT_NO_UPDATES => {
+            // Caught up — pin the local version to the writer's current.
+            let mut node = ctx.node.write().unwrap();
+            match scope {
+                Scope::Private => node.owner.private_version = new_version,
+                Scope::Public  => node.owner.public_version  = new_version,
+            }
+            drop(node);
+            ctx.save_node();
+        }
+        PULL_RESULT_FULL_STATE => {
+            let state_blob = &plaintext[pos..];
+            let applied = match scope {
+                Scope::Public  => apply_public_state(state_blob, ctx),
+                // Private state blob is empty in Phase 5 — nothing to apply.
+                Scope::Private => state_blob.is_empty(),
+            };
+            if !applied {
+                eprintln!("[sync_pull_response] failed to apply state for {scope:?} from {src}");
+                return;
+            }
+            let mut node = ctx.node.write().unwrap();
+            match scope {
+                Scope::Private => node.owner.private_version = new_version,
+                Scope::Public  => node.owner.public_version  = new_version,
+            }
+            drop(node);
+            ctx.save_node();
+        }
+        other => {
+            eprintln!("[sync_pull_response] unknown result {other} from {src}");
+        }
+    }
 }
 
 // ── Scheduled action handlers ─────────────────────────────────────────────────
@@ -3333,17 +4341,33 @@ fn render_devices(ctx: &WorkerContext) -> String {
 fn approve_app(body: &[u8], ctx: &WorkerContext) {
     let Some(id_str) = form_field(body, "id") else { return };
     let Ok(id) = id_str.parse::<u16>() else { return };
-    {
+    let approved_alias: Option<String> = {
         let mut node    = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
         let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else { return };
-        if let Some(app) = device.applications.iter_mut().find(|a| a.id == id) {
-            app.user_approved = true;
+        match device.applications.iter_mut().find(|a| a.id == id) {
+            Some(app) => {
+                app.user_approved = true;
+                Some(app.alias.clone())
+            }
+            None => None,
         }
-    }
+    };
     ctx.save_node();
     push_data_to_contacts(ctx);
     sync_devices(ctx);
+
+    // Sync v1: publish id+alias to peers via the writer SG. Only fire when
+    // the app actually existed and was approved — guards against a stray UI
+    // POST for an unknown id. Runs alongside the legacy paths until 7b.
+    if let Some(app_alias) = approved_alias {
+        let device_uuid = ctx.node.read().unwrap().device_uuid;
+        let _ = request_change(Change::AddApplication {
+            device_uuid,
+            app_id: id,
+            app_alias,
+        }, ctx);
+    }
 }
 
 fn reject_app(body: &[u8], ctx: &WorkerContext) {
@@ -4560,6 +5584,1034 @@ mod tests {
         let best = best_sg_connection(&node, &[sg_uuid]);
         assert!(best.is_some());
         assert_eq!(best.unwrap().device_uuid, sg_uuid);
+    }
+
+    // ── Writer election ───────────────────────────────────────────────────────
+
+    /// Add a peer SG device to the node, optionally with an active connection
+    /// and an `sg_statuses` entry. Returns the peer's UUID for assertions.
+    fn add_peer_sg(
+        t: &TestCtx,
+        rank: u32,
+        with_conn: bool,
+        polled_up: Option<bool>,
+    ) -> Uuid {
+        use std::time::Instant;
+        let uuid = generate_uuid();
+        let mut node = t.ctx.node.write().unwrap();
+        node.owner.user.devices.push(Device {
+            alias:        format!("sg-{rank}"),
+            uuid,
+            grade:        DeviceGrade::SG,
+            sg_rank:      Some(rank),
+            hosts:        vec![format!("127.0.0.1:{}", 9000 + rank)],
+            applications: Vec::new(),
+        });
+        if with_conn {
+            // Insert at a unique connection-ID slot (rank doubles as a stand-in).
+            node.owner.active_connections.insert(rank as u16, ActiveConnection {
+                id: rank as u16,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: generate_x25519_keypair(),
+                peer_public_key: generate_key_bytes(),
+                peer_active_connection_id: 100 + rank as u16,
+                device_uuid: uuid,
+                peer_addr:   "127.0.0.1:0".parse().unwrap(),
+            });
+        }
+        if let Some(up) = polled_up {
+            node.sg_statuses.insert(
+                (uuid, format!("127.0.0.1:{}", 9000 + rank)),
+                super::super::data_models::SgStatus {
+                    up,
+                    last_rtt: Some(Duration::from_millis(20)),
+                    last_polled: Instant::now(),
+                },
+            );
+        }
+        uuid
+    }
+
+    /// Promote the local device to SG with the given rank.
+    fn promote_local_to_sg(t: &TestCtx, rank: u32) -> Uuid {
+        let mut node = t.ctx.node.write().unwrap();
+        let local_uuid = node.device_uuid;
+        let dev = node.owner.user.devices.iter_mut()
+            .find(|d| d.uuid == local_uuid)
+            .expect("local device exists");
+        dev.grade   = DeviceGrade::SG;
+        dev.sg_rank = Some(rank);
+        local_uuid
+    }
+
+    #[test]
+    fn find_writer_dg_with_no_own_sgs_is_unreachable() {
+        let t = TestCtx::new();
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(find_writer_sg(&node), WriterTarget::Unreachable);
+    }
+
+    #[test]
+    fn find_writer_dg_with_one_reachable_sg_returns_remote() {
+        let t = TestCtx::new();
+        let sg = add_peer_sg(&t, 1, /*conn*/ true, /*polled_up*/ Some(true));
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(find_writer_sg(&node), WriterTarget::Remote(sg));
+    }
+
+    #[test]
+    fn find_writer_dg_optimistic_when_unpolled() {
+        // No sg_statuses entry yet (cold boot) — should still pick the SG.
+        let t = TestCtx::new();
+        let sg = add_peer_sg(&t, 1, /*conn*/ true, /*polled_up*/ None);
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(find_writer_sg(&node), WriterTarget::Remote(sg));
+    }
+
+    #[test]
+    fn find_writer_dg_skips_sg_marked_down() {
+        let t = TestCtx::new();
+        add_peer_sg(&t, 1, /*conn*/ true, /*polled_up*/ Some(false));
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(find_writer_sg(&node), WriterTarget::Unreachable);
+    }
+
+    #[test]
+    fn find_writer_dg_skips_sg_with_no_connection() {
+        let t = TestCtx::new();
+        add_peer_sg(&t, 1, /*conn*/ false, /*polled_up*/ Some(true));
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(find_writer_sg(&node), WriterTarget::Unreachable);
+    }
+
+    #[test]
+    fn find_writer_dg_prefers_lower_rank() {
+        let t = TestCtx::new();
+        let sg1 = add_peer_sg(&t, 1, true, Some(true));
+        let _sg2 = add_peer_sg(&t, 2, true, Some(true));
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(find_writer_sg(&node), WriterTarget::Remote(sg1));
+    }
+
+    #[test]
+    fn find_writer_dg_falls_over_when_top_rank_down() {
+        let t = TestCtx::new();
+        let _sg1 = add_peer_sg(&t, 1, true, Some(false)); // rank 1 down
+        let sg2  = add_peer_sg(&t, 2, true, Some(true));  // rank 2 up
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(find_writer_sg(&node), WriterTarget::Remote(sg2));
+    }
+
+    #[test]
+    fn find_writer_local_sg_alone_is_local() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 1);
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(find_writer_sg(&node), WriterTarget::Local);
+    }
+
+    #[test]
+    fn find_writer_local_rank2_with_rank1_reachable_returns_remote() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 2);
+        let sg1 = add_peer_sg(&t, 1, true, Some(true));
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(find_writer_sg(&node), WriterTarget::Remote(sg1));
+    }
+
+    #[test]
+    fn find_writer_local_rank2_takes_over_when_rank1_down() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 2);
+        add_peer_sg(&t, 1, true, Some(false));
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(find_writer_sg(&node), WriterTarget::Local);
+    }
+
+    #[test]
+    fn find_writer_local_rank2_takes_over_when_rank1_disconnected() {
+        // No active_connection to the rank-1 peer.
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 2);
+        add_peer_sg(&t, 1, false, Some(true));
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(find_writer_sg(&node), WriterTarget::Local);
+    }
+
+    // ── Change serialization & apply ──────────────────────────────────────────
+
+    #[test]
+    fn change_add_application_roundtrips() {
+        let dev_uuid = generate_uuid();
+        let original = Change::AddApplication {
+            device_uuid: dev_uuid,
+            app_id:      0xCAFE,
+            app_alias:   "messenger".to_string(),
+        };
+        let bytes = serialize_change(&original);
+        assert_eq!(bytes[0], CHANGE_KIND_ADD_APPLICATION);
+        let parsed = deserialize_change(&bytes).expect("parse");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn deserialize_change_rejects_unknown_kind() {
+        // A buffer with an unknown change_kind byte should fail cleanly,
+        // not panic. Future variants can be added without breaking older
+        // peers — they'll see this error and emit WRITE_ACK_VALIDATION_ERROR.
+        assert!(deserialize_change(&[0xFE, 0x00, 0x00]).is_none());
+    }
+
+    #[test]
+    fn deserialize_change_rejects_truncated_payload() {
+        let dev_uuid = generate_uuid();
+        let original = Change::AddApplication {
+            device_uuid: dev_uuid,
+            app_id:      1,
+            app_alias:   "foo".to_string(),
+        };
+        let mut bytes = serialize_change(&original);
+        bytes.truncate(bytes.len() - 1); // chop last byte of alias
+        assert!(deserialize_change(&bytes).is_none());
+    }
+
+    #[test]
+    fn apply_add_application_appends_app_and_bumps_public_only() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+        let writer = local;
+
+        let change = Change::AddApplication {
+            device_uuid: local,
+            app_id:      7,
+            app_alias:   "myapp".to_string(),
+        };
+        let (priv_v, pub_v) = apply_change_locally(&change, writer, &t.ctx).expect("apply");
+
+        // Public bumped, private untouched.
+        assert!(priv_v.is_initial(), "private should not bump for public-only change");
+        assert_eq!(pub_v.writer_sg_uuid, writer);
+        assert_eq!(pub_v.epoch, 1);
+        assert_eq!(pub_v.seq,   1);
+
+        // App was actually appended.
+        let node = t.ctx.node.read().unwrap();
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
+        assert_eq!(dev.applications.len(), 1);
+        assert_eq!(dev.applications[0].id, 7);
+        assert_eq!(dev.applications[0].alias, "myapp");
+        // Token/host stay zero on the writer's record by design.
+        assert_eq!(dev.applications[0].token, [0u8; 16]);
+    }
+
+    #[test]
+    fn apply_add_application_is_idempotent() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+        let writer = local;
+
+        let change = Change::AddApplication {
+            device_uuid: local,
+            app_id:      7,
+            app_alias:   "myapp".to_string(),
+        };
+        apply_change_locally(&change, writer, &t.ctx).expect("first apply");
+        let pub_after_first = t.ctx.node.read().unwrap().owner.public_version;
+
+        // Second apply should be a no-op — same id is already present.
+        apply_change_locally(&change, writer, &t.ctx).expect("second apply");
+        let pub_after_second = t.ctx.node.read().unwrap().owner.public_version;
+        assert_eq!(pub_after_first, pub_after_second, "no-op apply must not bump");
+
+        // App list unchanged.
+        let node = t.ctx.node.read().unwrap();
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
+        assert_eq!(dev.applications.len(), 1);
+    }
+
+    #[test]
+    fn apply_add_application_unknown_device_returns_validation_error() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+        let bogus_uuid = generate_uuid();
+
+        let change = Change::AddApplication {
+            device_uuid: bogus_uuid,
+            app_id:      1,
+            app_alias:   "x".to_string(),
+        };
+        let res = apply_change_locally(&change, local, &t.ctx);
+        assert!(matches!(res, Err(WriteError::Validation(_))));
+
+        // No version bumped.
+        let node = t.ctx.node.read().unwrap();
+        assert!(node.owner.public_version.is_initial());
+    }
+
+    // ── request_change driver ────────────────────────────────────────────────
+
+    #[test]
+    fn request_change_local_path_applies_directly() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+
+        let change = Change::AddApplication {
+            device_uuid: local,
+            app_id:      9,
+            app_alias:   "ui-app".to_string(),
+        };
+        request_change(change, &t.ctx).expect("request_change ok");
+
+        let node = t.ctx.node.read().unwrap();
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
+        assert_eq!(dev.applications.len(), 1);
+        assert_eq!(node.owner.public_version.epoch, 1);
+    }
+
+    #[test]
+    fn request_change_unreachable_returns_error() {
+        // Default test ctx is a DG with no own SGs.
+        let t = TestCtx::new();
+        let dev_uuid = t.ctx.node.read().unwrap().device_uuid;
+        let change = Change::AddApplication {
+            device_uuid: dev_uuid,
+            app_id:      1,
+            app_alias:   "x".to_string(),
+        };
+        assert_eq!(request_change(change, &t.ctx), Err(WriteError::Unreachable));
+    }
+
+    #[test]
+    fn request_change_remote_path_sends_packet() {
+        // Set up a DG (local) with one reachable own SG. request_change
+        // should send a SyncWriteRequest to that SG's address.
+        let t = TestCtx::new();
+
+        // Bind a socket at the SG-side address; this is where the packet should land.
+        let sg_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sg_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let sg_addr = sg_socket.local_addr().unwrap();
+
+        let dg_uuid = t.ctx.node.read().unwrap().device_uuid;
+        let sg_uuid = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:        "my-sg".to_string(),
+                uuid:         sg_uuid,
+                grade:        DeviceGrade::SG,
+                sg_rank:      Some(1),
+                hosts:        vec![sg_addr.to_string()],
+                applications: Vec::new(),
+            });
+            // Active connection to the SG with peer_addr matching the test socket.
+            node.owner.active_connections.insert(11, ActiveConnection {
+                id:                        11,
+                timeout:                   SystemTime::now() + Duration::from_secs(3600),
+                key_pair:                  generate_x25519_keypair(),
+                peer_public_key:           generate_key_bytes(),
+                peer_active_connection_id: 22,
+                device_uuid:               sg_uuid,
+                peer_addr:                 sg_addr,
+            });
+        }
+
+        let change = Change::AddApplication {
+            device_uuid: dg_uuid,
+            app_id:      3,
+            app_alias:   "x".to_string(),
+        };
+        request_change(change, &t.ctx).expect("request_change ok");
+
+        // The SG socket should receive a SyncWriteRequest packet (op 0x70).
+        let mut buf = [0u8; 1024];
+        let (len, _) = sg_socket.recv_from(&mut buf).expect("packet should arrive");
+        assert!(len >= 1);
+        assert_eq!(buf[0], SYNC_WRITE_REQUEST_OP);
+    }
+
+    // ── sync_write_request handler ───────────────────────────────────────────
+
+    /// Set up a local SG with an active connection from a peer DG and return
+    /// the (conn_id_on_sg, dg_conn_for_sender_side, dg_uuid) so a test can
+    /// build packets the SG will decrypt and address acks back to the DG.
+    fn setup_writer_sg_with_dg_peer(t: &TestCtx) -> (u16, ActiveConnection, Uuid, std::net::SocketAddr) {
+        let sg_kp = generate_x25519_keypair();
+        let dg_kp = generate_x25519_keypair();
+        let conn_id = 5u16;
+        let dg_uuid = generate_uuid();
+        let dg_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let local_uuid = node.device_uuid;
+            if let Some(d) = node.owner.user.devices.iter_mut().find(|d| d.uuid == local_uuid) {
+                d.grade   = DeviceGrade::SG;
+                d.sg_rank = Some(1);
+            }
+            node.owner.user.devices.push(Device {
+                alias:        "peer-dg".to_string(),
+                uuid:         dg_uuid,
+                grade:        DeviceGrade::DG,
+                sg_rank:      None,
+                hosts:        Vec::new(),
+                applications: Vec::new(),
+            });
+            node.owner.active_connections.insert(conn_id, ActiveConnection {
+                id: conn_id,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: sg_kp.clone(),
+                peer_public_key: dg_kp.public_key,
+                peer_active_connection_id: 99,
+                device_uuid: dg_uuid,
+                peer_addr: dg_addr,
+            });
+        }
+        let dg_conn = ActiveConnection {
+            id: 99,
+            timeout: SystemTime::now() + Duration::from_secs(3600),
+            key_pair: dg_kp,
+            peer_public_key: sg_kp.public_key,
+            peer_active_connection_id: conn_id,
+            device_uuid: dg_uuid,
+            peer_addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        (conn_id, dg_conn, dg_uuid, dg_addr)
+    }
+
+    /// Parse a SyncWriteAck payload (everything after the op byte) using a
+    /// peer-side ActiveConnection. Returns (result, private_version, public_version).
+    fn parse_write_ack(buf: &[u8], conn: &ActiveConnection) -> (u8, SyncVersion, SyncVersion) {
+        // Mock a node with this connection so we can call decrypt_packet_body.
+        let mut node = super::super::data_models::Node::new();
+        node.owner.active_connections.insert(conn.id, ActiveConnection {
+            id: conn.id,
+            timeout: conn.timeout,
+            key_pair: conn.key_pair.clone(),
+            peer_public_key: conn.peer_public_key,
+            peer_active_connection_id: conn.peer_active_connection_id,
+            device_uuid: conn.device_uuid,
+            peer_addr: conn.peer_addr,
+        });
+        let plaintext = decrypt_packet_body(&node, buf).expect("decrypt ack");
+        let mut pos = 0usize;
+        let result = plaintext[pos]; pos += 1;
+        let private_v = read_sync_version(&plaintext, &mut pos).unwrap();
+        let public_v  = read_sync_version(&plaintext, &mut pos).unwrap();
+        (result, private_v, public_v)
+    }
+
+    /// Bind a socket and use it as the DG's address so the SG's ack is captured.
+    fn writer_setup_with_capture(t: &TestCtx) -> (u16, ActiveConnection, UdpSocket) {
+        let dg_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        dg_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let dg_addr = dg_socket.local_addr().unwrap();
+
+        let (_, dg_conn, dg_uuid, _) = setup_writer_sg_with_dg_peer(t);
+        // Replace the SG-side connection's peer_addr so acks land on dg_socket.
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            for c in node.owner.active_connections.values_mut() {
+                if c.device_uuid == dg_uuid {
+                    c.peer_addr = dg_addr;
+                }
+            }
+        }
+        let conn_id = dg_conn.peer_active_connection_id;
+        (conn_id, dg_conn, dg_socket)
+    }
+
+    #[test]
+    fn sync_write_request_writer_accepts_and_acks_ok() {
+        let t = TestCtx::new();
+        let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+        let dg_uuid = dg_conn.device_uuid;
+
+        let change = Change::AddApplication {
+            device_uuid: dg_uuid,
+            app_id:      42,
+            app_alias:   "acked".to_string(),
+        };
+        let payload = serialize_change(&change);
+        let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
+
+        sync_write_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        // SG should have appended the app and bumped public_version.
+        let node = t.ctx.node.read().unwrap();
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == dg_uuid).unwrap();
+        assert_eq!(dev.applications.len(), 1);
+        assert_eq!(node.owner.public_version.epoch, 1);
+        drop(node);
+
+        // Capture the ack and verify result + bumped public version.
+        let mut buf = [0u8; 1024];
+        let (len, _) = dg_socket.recv_from(&mut buf).expect("ack received");
+        assert_eq!(buf[0], SYNC_WRITE_ACK_OP);
+        let (result, priv_v, pub_v) = parse_write_ack(&buf[1..len], &dg_conn);
+        assert_eq!(result, WRITE_ACK_OK);
+        assert!(priv_v.is_initial());
+        assert_eq!(pub_v.epoch, 1);
+        assert_eq!(pub_v.seq,   1);
+    }
+
+    #[test]
+    fn sync_write_request_validation_error_for_unknown_device() {
+        let t = TestCtx::new();
+        let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+        let bogus = generate_uuid();
+
+        let change = Change::AddApplication {
+            device_uuid: bogus,
+            app_id:      1,
+            app_alias:   "nope".to_string(),
+        };
+        let payload = serialize_change(&change);
+        let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
+        sync_write_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 1024];
+        let (len, _) = dg_socket.recv_from(&mut buf).expect("ack received");
+        assert_eq!(buf[0], SYNC_WRITE_ACK_OP);
+        let (result, priv_v, pub_v) = parse_write_ack(&buf[1..len], &dg_conn);
+        assert_eq!(result, WRITE_ACK_VALIDATION_ERROR);
+        assert!(priv_v.is_initial());
+        assert!(pub_v.is_initial(), "validation failure must not bump version");
+    }
+
+    #[test]
+    fn sync_write_request_non_writer_acks_not_writer() {
+        // SG with rank 2; rank 1 is reachable. find_writer_sg returns Remote(rank-1),
+        // so this SG should reject any write request with NOT_WRITER.
+        let t = TestCtx::new();
+        let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+        let dg_uuid = dg_conn.device_uuid;
+
+        // Demote local to rank 2 and add a reachable rank-1 peer SG.
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let local_uuid = node.device_uuid;
+            for d in node.owner.user.devices.iter_mut() {
+                if d.uuid == local_uuid {
+                    d.sg_rank = Some(2);
+                }
+            }
+        }
+        let _ = add_peer_sg(&t, 1, /*conn*/ true, /*polled_up*/ Some(true));
+
+        let change = Change::AddApplication {
+            device_uuid: dg_uuid,
+            app_id:      1,
+            app_alias:   "nope".to_string(),
+        };
+        let payload = serialize_change(&change);
+        let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
+        sync_write_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        // Local state must not have been mutated.
+        let node = t.ctx.node.read().unwrap();
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == dg_uuid).unwrap();
+        assert!(dev.applications.is_empty());
+        drop(node);
+
+        let mut buf = [0u8; 1024];
+        let (len, _) = dg_socket.recv_from(&mut buf).expect("ack received");
+        let (result, _, pub_v) = parse_write_ack(&buf[1..len], &dg_conn);
+        assert_eq!(result, WRITE_ACK_NOT_WRITER);
+        assert!(pub_v.is_initial());
+    }
+
+    // ── Phase 5: notify, pull, public-state ───────────────────────────────────
+
+    #[test]
+    fn bumped_scopes_detects_what_changed() {
+        let z = SyncVersion::zero();
+        let v = SyncVersion { writer_sg_uuid: [1; 16], epoch: 1, seq: 1 };
+        assert!(bumped_scopes(z, z, z, z).is_empty());
+        assert_eq!(bumped_scopes(z, z, v, z), vec![Scope::Private]);
+        assert_eq!(bumped_scopes(z, z, z, v), vec![Scope::Public]);
+        assert_eq!(bumped_scopes(z, z, v, v), vec![Scope::Private, Scope::Public]);
+    }
+
+    #[test]
+    fn public_state_serialize_apply_roundtrip() {
+        // Build a populated source node, serialize, apply onto a fresh target
+        // node, and verify both look the same in their public-scope view.
+        let src = TestCtx::new();
+        let local = promote_local_to_sg(&src, 1);
+        let app1 = Change::AddApplication { device_uuid: local, app_id: 11, app_alias: "a1".into() };
+        let app2 = Change::AddApplication { device_uuid: local, app_id: 22, app_alias: "a2".into() };
+        apply_change_locally(&app1, local, &src.ctx).unwrap();
+        apply_change_locally(&app2, local, &src.ctx).unwrap();
+
+        let blob = serialize_public_state(&src.ctx.node.read().unwrap());
+
+        let dst = TestCtx::new();
+        assert!(apply_public_state(&blob, &dst.ctx));
+
+        let dst_node = dst.ctx.node.read().unwrap();
+        let src_node = src.ctx.node.read().unwrap();
+        assert_eq!(dst_node.owner.user.alias, src_node.owner.user.alias);
+        assert_eq!(dst_node.owner.user.uuid,  src_node.owner.user.uuid);
+        // Source has the local device in its list; the destination should now
+        // have an entry for that uuid with the same public fields and apps.
+        let src_dev = src_node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
+        let dst_dev = dst_node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
+        assert_eq!(dst_dev.alias, src_dev.alias);
+        assert_eq!(dst_dev.applications.len(), 2);
+        let mut ids: Vec<u16> = dst_dev.applications.iter().map(|a| a.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![11, 22]);
+    }
+
+    #[test]
+    fn apply_public_state_preserves_local_app_token_and_host() {
+        // The originating DG holds a real token and host for an app it owns.
+        // When a Public-state pull lands, alias may update but token/host stay.
+        let t = TestCtx::new();
+        let local_uuid = t.ctx.node.read().unwrap().device_uuid;
+        let real_host: SocketAddrV4 = "10.0.0.1:5555".parse().unwrap();
+        let real_token: Uuid = [0x42; 16];
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == local_uuid).unwrap();
+            dev.applications.push(Application {
+                id: 7, alias: "old-alias".into(),
+                protocol: "udp".into(), host: real_host,
+                user_approved: true, token: real_token,
+            });
+        }
+
+        // Build a public-state blob that reports the same app id with a new alias.
+        let mut blob = Vec::new();
+        let user_alias = t.ctx.node.read().unwrap().owner.user.alias.clone();
+        let user_uuid  = t.ctx.node.read().unwrap().owner.user.uuid;
+        push_str(&mut blob, &user_alias);
+        blob.extend_from_slice(&user_uuid);
+        blob.push(1u8); // 1 device
+        // device record (matches the local device's uuid)
+        let dev_clone = {
+            let node = t.ctx.node.read().unwrap();
+            let d = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid).unwrap();
+            (d.alias.clone(), d.uuid, matches!(d.grade, DeviceGrade::SG), d.sg_rank, d.hosts.clone())
+        };
+        blob.extend_from_slice(&dev_clone.1);
+        push_str(&mut blob, &dev_clone.0);
+        blob.push(if dev_clone.2 { 1 } else { 0 });
+        blob.push(dev_clone.3.map(|r| r.min(255) as u8).unwrap_or(0));
+        blob.push(dev_clone.4.len() as u8);
+        for h in &dev_clone.4 { push_str(&mut blob, h); }
+        blob.push(1u8); // 1 app
+        blob.extend_from_slice(&7u16.to_be_bytes());
+        push_str(&mut blob, "new-alias");
+        blob.push(0u8); // 0 contacts
+
+        assert!(apply_public_state(&blob, &t.ctx));
+
+        let node = t.ctx.node.read().unwrap();
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid).unwrap();
+        assert_eq!(dev.applications.len(), 1);
+        let app = &dev.applications[0];
+        assert_eq!(app.alias, "new-alias", "alias should update from wire");
+        assert_eq!(app.host, real_host,    "local host must be preserved");
+        assert_eq!(app.token, real_token,  "local token must be preserved");
+        assert_eq!(app.protocol, "udp",    "protocol stays local");
+    }
+
+    #[test]
+    fn apply_public_state_rejects_truncated_blob() {
+        let t = TestCtx::new();
+        let blob = vec![5u8, b'h', b'i']; // claims 5-byte alias but has 2
+        assert!(!apply_public_state(&blob, &t.ctx));
+    }
+
+    #[test]
+    fn sync_write_request_fans_out_update_available() {
+        // Writer SG accepts a SyncWriteRequest and should emit BOTH a WriteAck
+        // (back to the originator) and a SyncUpdateAvailable (to all own peers).
+        // Originator's connection captures both — the ack arrives via the
+        // request connection, the notification arrives because the originator
+        // is itself an own-user peer.
+        let t = TestCtx::new();
+        let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+        let dg_uuid = dg_conn.device_uuid;
+
+        let change = Change::AddApplication {
+            device_uuid: dg_uuid, app_id: 5, app_alias: "fan".into(),
+        };
+        let payload = serialize_change(&change);
+        let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
+        sync_write_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        // Collect both packets (order is implementation-defined).
+        let mut got_ack = false;
+        let mut got_notify = false;
+        for _ in 0..2 {
+            let mut buf = [0u8; 1024];
+            let (len, _) = dg_socket.recv_from(&mut buf).expect("expected packet");
+            match buf[0] {
+                op if op == SYNC_WRITE_ACK_OP        => got_ack = true,
+                op if op == SYNC_UPDATE_AVAILABLE_OP => {
+                    // Decrypt and verify the announced version is the bumped one.
+                    let plaintext = decrypt_packet_body(
+                        &{
+                            let mut node = super::super::data_models::Node::new();
+                            node.owner.active_connections.insert(dg_conn.id, ActiveConnection {
+                                id: dg_conn.id, timeout: dg_conn.timeout,
+                                key_pair: dg_conn.key_pair.clone(),
+                                peer_public_key: dg_conn.peer_public_key,
+                                peer_active_connection_id: dg_conn.peer_active_connection_id,
+                                device_uuid: dg_conn.device_uuid,
+                                peer_addr: dg_conn.peer_addr,
+                            });
+                            node
+                        },
+                        &buf[1..len],
+                    ).unwrap();
+                    let mut pos = 0;
+                    let scope = read_scope(&plaintext, &mut pos).unwrap();
+                    let v = read_sync_version(&plaintext, &mut pos).unwrap();
+                    assert_eq!(scope, Scope::Public);
+                    assert_eq!(v.epoch, 1);
+                    assert_eq!(v.seq,   1);
+                    got_notify = true;
+                }
+                other => panic!("unexpected op byte {other}"),
+            }
+        }
+        assert!(got_ack, "WriteAck missing");
+        assert!(got_notify, "UpdateAvailable missing");
+    }
+
+    /// Set up a local DG with an active connection to a "writer SG" peer
+    /// whose address is a captured UDP socket. Returns
+    /// (sg_conn_for_encrypting, sg_socket_for_capture).
+    fn dg_setup_with_writer_capture(t: &TestCtx) -> (ActiveConnection, UdpSocket) {
+        let sg_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sg_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let sg_addr = sg_socket.local_addr().unwrap();
+
+        let dg_kp  = generate_x25519_keypair();
+        let sg_kp  = generate_x25519_keypair();
+        let conn_id = 5u16;
+        let sg_uuid = generate_uuid();
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            // Local stays a DG (TestCtx default); add the SG as a known device.
+            node.owner.user.devices.push(Device {
+                alias: "writer-sg".into(),
+                uuid: sg_uuid,
+                grade: DeviceGrade::SG,
+                sg_rank: Some(1),
+                hosts: vec![sg_addr.to_string()],
+                applications: Vec::new(),
+            });
+            node.owner.active_connections.insert(conn_id, ActiveConnection {
+                id: conn_id,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: dg_kp.clone(),
+                peer_public_key: sg_kp.public_key,
+                peer_active_connection_id: 99,
+                device_uuid: sg_uuid,
+                peer_addr: sg_addr,
+            });
+        }
+        let sg_conn = ActiveConnection {
+            id: 99,
+            timeout: SystemTime::now() + Duration::from_secs(3600),
+            key_pair: sg_kp,
+            peer_public_key: dg_kp.public_key,
+            peer_active_connection_id: conn_id,
+            device_uuid: sg_uuid,
+            peer_addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        (sg_conn, sg_socket)
+    }
+
+    #[test]
+    fn sync_update_available_triggers_pull_when_announced_is_newer() {
+        let t = TestCtx::new();
+        let (sg_conn, sg_socket) = dg_setup_with_writer_capture(&t);
+
+        // Announce a version newer than the DG's local zero.
+        let announced = SyncVersion {
+            writer_sg_uuid: sg_conn.device_uuid, epoch: 1, seq: 5,
+        };
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        write_sync_version(&mut body, &announced);
+        let pkt = build_encrypted_packet(SYNC_UPDATE_AVAILABLE_OP, &sg_conn, &body);
+
+        sync_update_available("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 1024];
+        let (len, _) = sg_socket.recv_from(&mut buf).expect("PullRequest expected");
+        assert_eq!(buf[0], SYNC_PULL_REQUEST_OP);
+        assert!(len > 1, "non-empty body");
+    }
+
+    #[test]
+    fn sync_update_available_skips_pull_when_caught_up() {
+        let t = TestCtx::new();
+        let (sg_conn, sg_socket) = dg_setup_with_writer_capture(&t);
+
+        let v = SyncVersion {
+            writer_sg_uuid: sg_conn.device_uuid, epoch: 1, seq: 5,
+        };
+        // Pin local to the same version the SG will announce.
+        t.ctx.node.write().unwrap().owner.public_version = v;
+
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        write_sync_version(&mut body, &v);
+        let pkt = build_encrypted_packet(SYNC_UPDATE_AVAILABLE_OP, &sg_conn, &body);
+
+        sync_update_available("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 1024];
+        assert!(sg_socket.recv_from(&mut buf).is_err(), "no PullRequest expected");
+    }
+
+    #[test]
+    fn sync_pull_request_returns_full_state_when_stale() {
+        // Writer SG with a populated public state. A pull from a DG with a
+        // zero last_seen should get FullState back with a non-empty blob.
+        let t = TestCtx::new();
+        let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+        // Add an app so the public state is non-empty.
+        let local_uuid = t.ctx.node.read().unwrap().device_uuid;
+        apply_change_locally(&Change::AddApplication {
+            device_uuid: local_uuid, app_id: 1, app_alias: "ax".into(),
+        }, local_uuid, &t.ctx).unwrap();
+
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        write_sync_version(&mut body, &SyncVersion::zero());
+        let pkt = build_encrypted_packet(SYNC_PULL_REQUEST_OP, &dg_conn, &body);
+        sync_pull_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 4096];
+        let (len, _) = dg_socket.recv_from(&mut buf).expect("response expected");
+        assert_eq!(buf[0], SYNC_PULL_RESPONSE_OP);
+
+        // Decrypt and inspect.
+        let plaintext = {
+            let mut node = super::super::data_models::Node::new();
+            node.owner.active_connections.insert(dg_conn.id, ActiveConnection {
+                id: dg_conn.id, timeout: dg_conn.timeout,
+                key_pair: dg_conn.key_pair.clone(),
+                peer_public_key: dg_conn.peer_public_key,
+                peer_active_connection_id: dg_conn.peer_active_connection_id,
+                device_uuid: dg_conn.device_uuid,
+                peer_addr: dg_conn.peer_addr,
+            });
+            decrypt_packet_body(&node, &buf[1..len]).unwrap()
+        };
+        let mut pos = 0;
+        let scope = read_scope(&plaintext, &mut pos).unwrap();
+        let result = plaintext[pos]; pos += 1;
+        let v      = read_sync_version(&plaintext, &mut pos).unwrap();
+        assert_eq!(scope, Scope::Public);
+        assert_eq!(result, PULL_RESULT_FULL_STATE);
+        assert_eq!(v.epoch, 1);
+        assert!(plaintext.len() > pos, "FullState should carry a state blob");
+    }
+
+    #[test]
+    fn sync_pull_request_returns_no_updates_when_caught_up() {
+        let t = TestCtx::new();
+        let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+        let local_uuid = t.ctx.node.read().unwrap().device_uuid;
+        apply_change_locally(&Change::AddApplication {
+            device_uuid: local_uuid, app_id: 1, app_alias: "ax".into(),
+        }, local_uuid, &t.ctx).unwrap();
+        let current = t.ctx.node.read().unwrap().owner.public_version;
+
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        write_sync_version(&mut body, &current); // already up to date
+        let pkt = build_encrypted_packet(SYNC_PULL_REQUEST_OP, &dg_conn, &body);
+        sync_pull_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 4096];
+        let (len, _) = dg_socket.recv_from(&mut buf).expect("response expected");
+        let plaintext = {
+            let mut node = super::super::data_models::Node::new();
+            node.owner.active_connections.insert(dg_conn.id, ActiveConnection {
+                id: dg_conn.id, timeout: dg_conn.timeout,
+                key_pair: dg_conn.key_pair.clone(),
+                peer_public_key: dg_conn.peer_public_key,
+                peer_active_connection_id: dg_conn.peer_active_connection_id,
+                device_uuid: dg_conn.device_uuid,
+                peer_addr: dg_conn.peer_addr,
+            });
+            decrypt_packet_body(&node, &buf[1..len]).unwrap()
+        };
+        let mut pos = 0;
+        let _scope  = read_scope(&plaintext, &mut pos).unwrap();
+        let result  = plaintext[pos]; pos += 1;
+        let _v      = read_sync_version(&plaintext, &mut pos).unwrap();
+        assert_eq!(result, PULL_RESULT_NO_UPDATES);
+        // No state blob on NoUpdates.
+        assert_eq!(plaintext.len(), pos);
+    }
+
+    #[test]
+    fn sync_pull_response_full_state_applies_and_pins_version() {
+        // Build a writer's view of state by populating a temp node, then
+        // package it as a SyncPullResponse and feed it to a fresh DG.
+        let writer = TestCtx::new();
+        let writer_local = promote_local_to_sg(&writer, 1);
+        apply_change_locally(&Change::AddApplication {
+            device_uuid: writer_local, app_id: 99, app_alias: "ww".into(),
+        }, writer_local, &writer.ctx).unwrap();
+        let writer_pub_v = writer.ctx.node.read().unwrap().owner.public_version;
+        let blob = serialize_public_state(&writer.ctx.node.read().unwrap());
+
+        let dg = TestCtx::new();
+        let (sg_conn, _sg_socket) = dg_setup_with_writer_capture(&dg);
+
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        body.push(PULL_RESULT_FULL_STATE);
+        write_sync_version(&mut body, &writer_pub_v);
+        body.extend_from_slice(&blob);
+        let pkt = build_encrypted_packet(SYNC_PULL_RESPONSE_OP, &sg_conn, &body);
+
+        sync_pull_response("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &dg.ctx);
+
+        let node = dg.ctx.node.read().unwrap();
+        // Version pinned.
+        assert_eq!(node.owner.public_version, writer_pub_v);
+        // Writer's device record is now in our state with the new app.
+        let writer_dev = node.owner.user.devices.iter().find(|d| d.uuid == writer_local).unwrap();
+        assert_eq!(writer_dev.applications.len(), 1);
+        assert_eq!(writer_dev.applications[0].id, 99);
+        assert_eq!(writer_dev.applications[0].alias, "ww");
+    }
+
+    #[test]
+    fn request_change_local_bumps_even_on_idempotent_apply() {
+        // Originator semantics: when local state already reflects the change
+        // (e.g., app_register added the app with token+host before publishing
+        // id+alias), request_change must still bump the version so peers
+        // find out. The receiver-side handler (sync_write_request) keeps the
+        // stricter "bump only on actual mutation" rule.
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+
+        // Pre-mutate: add the app directly to local state (no version bump).
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let dev = node.owner.user.devices.iter_mut().find(|d| d.uuid == local).unwrap();
+            dev.applications.push(Application {
+                id: 17, alias: "preadded".into(),
+                protocol: "udp".into(),
+                host: "127.0.0.1:9000".parse().unwrap(),
+                user_approved: true,
+                token: [0xAB; 16],
+            });
+        }
+        assert!(t.ctx.node.read().unwrap().owner.public_version.is_initial());
+
+        // Call request_change for the SAME change. apply_change_locally
+        // returns idempotent no-op, but request_change must still bump.
+        request_change(Change::AddApplication {
+            device_uuid: local, app_id: 17, app_alias: "preadded".into(),
+        }, &t.ctx).expect("request_change ok");
+
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(node.owner.public_version.writer_sg_uuid, local);
+        assert_eq!(node.owner.public_version.epoch, 1);
+        assert_eq!(node.owner.public_version.seq,   1);
+
+        // App's private fields preserved (apply_change_locally never wrote
+        // over them since it was a no-op).
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
+        let app = dev.applications.iter().find(|a| a.id == 17).unwrap();
+        assert_eq!(app.token, [0xAB; 16]);
+        assert_eq!(app.host, "127.0.0.1:9000".parse::<SocketAddrV4>().unwrap());
+    }
+
+    #[test]
+    fn sync_pull_remote_writer_sends_pull_for_both_scopes() {
+        // DG with a reachable writer SG: sync_pull should emit one
+        // SyncPullRequest per scope (Public + Private) on the SG connection.
+        let t = TestCtx::new();
+        let (sg_conn, sg_socket) = dg_setup_with_writer_capture(&t);
+
+        sync_pull(&t.ctx);
+
+        let mut got_public  = false;
+        let mut got_private = false;
+        for _ in 0..2 {
+            let mut buf = [0u8; 1024];
+            let (len, _) = sg_socket.recv_from(&mut buf).expect("PullRequest expected");
+            assert_eq!(buf[0], SYNC_PULL_REQUEST_OP);
+
+            let plaintext = {
+                let mut node = super::super::data_models::Node::new();
+                node.owner.active_connections.insert(sg_conn.id, ActiveConnection {
+                    id: sg_conn.id, timeout: sg_conn.timeout,
+                    key_pair: sg_conn.key_pair.clone(),
+                    peer_public_key: sg_conn.peer_public_key,
+                    peer_active_connection_id: sg_conn.peer_active_connection_id,
+                    device_uuid: sg_conn.device_uuid,
+                    peer_addr: sg_conn.peer_addr,
+                });
+                decrypt_packet_body(&node, &buf[1..len]).unwrap()
+            };
+            let mut pos = 0;
+            let scope = read_scope(&plaintext, &mut pos).unwrap();
+            match scope {
+                Scope::Public  => got_public = true,
+                Scope::Private => got_private = true,
+            }
+        }
+        assert!(got_public  && got_private, "expected both Public and Private pulls");
+    }
+
+    #[test]
+    fn sync_pull_local_writer_is_noop() {
+        // Promote local to SG so find_writer_sg returns Local. sync_pull must
+        // not attempt to send anything.
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 1);
+
+        // No connections to capture on; just assert sync_pull doesn't panic.
+        sync_pull(&t.ctx);
+        // Reaching here means no panic; nothing observable to assert further.
+    }
+
+    #[test]
+    fn sync_pull_unreachable_is_noop() {
+        // DG with no own SGs at all.
+        let t = TestCtx::new();
+        sync_pull(&t.ctx);
+    }
+
+    #[test]
+    fn sync_pull_response_no_updates_pins_version_without_changing_state() {
+        let dg = TestCtx::new();
+        let (sg_conn, _) = dg_setup_with_writer_capture(&dg);
+
+        // Capture pre-state to compare.
+        let pre_devices_len = dg.ctx.node.read().unwrap().owner.user.devices.len();
+
+        let pinned = SyncVersion { writer_sg_uuid: sg_conn.device_uuid, epoch: 7, seq: 3 };
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        body.push(PULL_RESULT_NO_UPDATES);
+        write_sync_version(&mut body, &pinned);
+        let pkt = build_encrypted_packet(SYNC_PULL_RESPONSE_OP, &sg_conn, &body);
+
+        sync_pull_response("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &dg.ctx);
+
+        let node = dg.ctx.node.read().unwrap();
+        assert_eq!(node.owner.public_version, pinned);
+        assert_eq!(node.owner.user.devices.len(), pre_devices_len);
     }
 
     // ── Host resolution ───────────────────────────────────────────────────────
@@ -5903,5 +7955,66 @@ mod tests {
         let res = start_bootstrap("my-laptop", "not-a-real-code", DeviceGrade::DG, None, &t.ctx);
         assert!(res.is_err());
         assert!(t.ctx.node.read().unwrap().owner.pending_bootstrap.is_none());
+    }
+
+    // ── Sync v1 wire-format helpers ───────────────────────────────────────────
+
+    #[test]
+    fn sync_version_roundtrips_through_wire_format() {
+        let v = SyncVersion {
+            writer_sg_uuid: [0xAB; 16],
+            epoch: 0xCAFEBABE,
+            seq:   0x0102_0304_0506_0708,
+        };
+        let mut buf = Vec::new();
+        write_sync_version(&mut buf, &v);
+        assert_eq!(buf.len(), SYNC_VERSION_WIRE_LEN);
+
+        let mut pos = 0usize;
+        let restored = read_sync_version(&buf, &mut pos).expect("read version");
+        assert_eq!(pos, SYNC_VERSION_WIRE_LEN);
+        assert_eq!(restored, v);
+    }
+
+    #[test]
+    fn sync_version_zero_roundtrips() {
+        let v = SyncVersion::zero();
+        let mut buf = Vec::new();
+        write_sync_version(&mut buf, &v);
+        let mut pos = 0usize;
+        let restored = read_sync_version(&buf, &mut pos).expect("read zero");
+        assert_eq!(restored, v);
+        assert!(restored.is_initial());
+    }
+
+    #[test]
+    fn sync_version_truncated_returns_none() {
+        // Write a full version, then truncate by one byte and confirm read fails.
+        let v = SyncVersion { writer_sg_uuid: [1; 16], epoch: 7, seq: 9 };
+        let mut buf = Vec::new();
+        write_sync_version(&mut buf, &v);
+        buf.pop();
+        let mut pos = 0usize;
+        assert!(read_sync_version(&buf, &mut pos).is_none());
+    }
+
+    #[test]
+    fn scope_roundtrips_both_variants() {
+        for scope in [Scope::Private, Scope::Public] {
+            let mut buf = Vec::new();
+            write_scope(&mut buf, scope);
+            assert_eq!(buf.len(), 1);
+            let mut pos = 0usize;
+            let restored = read_scope(&buf, &mut pos).expect("read scope");
+            assert_eq!(restored, scope);
+            assert_eq!(pos, 1);
+        }
+    }
+
+    #[test]
+    fn read_scope_rejects_unknown_byte() {
+        let buf = [0x99u8];
+        let mut pos = 0usize;
+        assert!(read_scope(&buf, &mut pos).is_none());
     }
 }

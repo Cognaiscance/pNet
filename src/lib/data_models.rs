@@ -149,6 +149,77 @@ mod serde_system_time {
 
 // ── Data model structs ────────────────────────────────────────────────────────
 
+/// Identifies a scope of synchronized state. Each scope has its own version
+/// counter on `Owner` so changes in one don't bump the other (e.g. rotating an
+/// app token mutates Private without bumping Public, sparing contacts a pull).
+///
+/// **Private** — visible only to the user's own devices. Application
+/// `host`/`token`, invitations, the long-term keypair, and anything else that
+/// must never leave the user's device set.
+///
+/// **Public** — also visible to the user's contacts. User `alias`/`uuid`,
+/// device `uuid`/`grade`/`sg_rank`/`hosts`, and application `id`/`alias`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Private,
+    Public,
+}
+
+/// Version metadata for a synchronized scope.
+///
+/// `writer_sg_uuid` identifies which SG accepted the most recent write.
+/// `(epoch, seq)` is a total order *within* a single writer. When a different
+/// SG takes over as writer (failover, or a partition during which both sides
+/// accepted writes), the new writer increments `epoch` and resets `seq` so its
+/// stream is distinguishable from the prior writer's.
+///
+/// The zero value (`writer_sg_uuid == [0; 16]`, `epoch == 0`, `seq == 0`)
+/// is the sentinel for "no version yet" — used at first boot before any
+/// write has been accepted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncVersion {
+    #[serde(with = "serde_bytes_16", default)]
+    pub writer_sg_uuid: Uuid,
+    #[serde(default)]
+    pub epoch: u32,
+    #[serde(default)]
+    pub seq:   u64,
+}
+
+impl SyncVersion {
+    /// Sentinel "no version yet" — used at first boot.
+    pub const fn zero() -> Self {
+        Self { writer_sg_uuid: [0u8; 16], epoch: 0, seq: 0 }
+    }
+
+    pub fn is_initial(&self) -> bool {
+        self.writer_sg_uuid == [0u8; 16]
+    }
+
+    /// Advance the version for a write accepted by `writer_uuid`. If the
+    /// writer differs from the current `writer_sg_uuid`, this is a writer
+    /// transition: increment `epoch` and reset `seq` to 1. Otherwise just
+    /// increment `seq`.
+    pub fn bump(&mut self, writer_uuid: Uuid) {
+        if self.writer_sg_uuid != writer_uuid {
+            self.writer_sg_uuid = writer_uuid;
+            self.epoch = self.epoch.saturating_add(1);
+            self.seq   = 1;
+        } else {
+            self.seq = self.seq.saturating_add(1);
+        }
+    }
+
+    /// Total order *within a single writer*. Returns `None` when the two
+    /// versions came from different writers — that's the partition case,
+    /// resolved by the reconciliation rules in `descriptions/data sync.md`
+    /// rather than by simple comparison.
+    pub fn cmp_same_writer(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        if self.writer_sg_uuid != other.writer_sg_uuid { return None; }
+        Some((self.epoch, self.seq).cmp(&(other.epoch, other.seq)))
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct KeyPair {
     #[serde(with = "serde_bytes_32")]
@@ -281,6 +352,17 @@ pub struct Owner {
     pub key_pair:            KeyPair,
     pub contact_invitations: Vec<Invitation>,
     pub device_invitations:  Vec<Invitation>,
+
+    /// Latest version of the user's **private** state held by this node.
+    /// On the writer SG this is authoritative; on other nodes it's the
+    /// last version successfully pulled. See `Scope` for what's in scope.
+    #[serde(default)]
+    pub private_version: SyncVersion,
+    /// Latest version of the user's **public** state held by this node.
+    /// Bumped independently of `private_version` so contact-visible changes
+    /// don't force a private-scope re-pull and vice versa.
+    #[serde(default)]
+    pub public_version:  SyncVersion,
     /// Ephemeral — not persisted; rebuilt as connections are established.
     #[serde(skip)]
     pub active_connections:  HashMap<u16, ActiveConnection>,
@@ -379,6 +461,25 @@ pub struct Node {
     pub sg_statuses: HashMap<(Uuid, String), SgStatus>,
 }
 
+impl Owner {
+    /// Bump the version counter for the given scope, recording `writer_uuid`
+    /// as the SG that accepted the write. Called by the writer SG immediately
+    /// after persisting an accepted write request.
+    pub fn bump_version(&mut self, scope: Scope, writer_uuid: Uuid) {
+        match scope {
+            Scope::Private => self.private_version.bump(writer_uuid),
+            Scope::Public  => self.public_version.bump(writer_uuid),
+        }
+    }
+
+    pub fn version(&self, scope: Scope) -> SyncVersion {
+        match scope {
+            Scope::Private => self.private_version,
+            Scope::Public  => self.public_version,
+        }
+    }
+}
+
 impl Node {
     /// Create a brand-new node with no contacts, no apps, and placeholder keys.
     /// Used on first run before the user has completed setup.
@@ -413,6 +514,8 @@ impl Node {
                 key_pair:            KeyPair { public_key: [0; 32], private_key: [0; 32] }, // TODO: generate real Curve25519 keys
                 contact_invitations:        Vec::new(),
                 device_invitations:         Vec::new(),
+                private_version:            SyncVersion::zero(),
+                public_version:             SyncVersion::zero(),
                 active_connections:         HashMap::new(),
                 pending_connections:        HashMap::new(),
                 pending_contact_exchange:   None,
@@ -425,5 +528,118 @@ impl Node {
                 pending_tunnel_connections: HashMap::new(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn writer_a() -> Uuid { [0xAA; 16] }
+    fn writer_b() -> Uuid { [0xBB; 16] }
+
+    #[test]
+    fn zero_is_initial_and_default_matches() {
+        let z = SyncVersion::zero();
+        assert!(z.is_initial());
+        assert_eq!(z, SyncVersion::default());
+    }
+
+    #[test]
+    fn bump_same_writer_increments_seq() {
+        let mut v = SyncVersion::zero();
+        v.bump(writer_a());
+        assert_eq!(v.writer_sg_uuid, writer_a());
+        assert_eq!(v.epoch, 1);
+        assert_eq!(v.seq,   1);
+        v.bump(writer_a());
+        assert_eq!(v.epoch, 1);
+        assert_eq!(v.seq,   2);
+    }
+
+    #[test]
+    fn bump_different_writer_increments_epoch_and_resets_seq() {
+        let mut v = SyncVersion::zero();
+        v.bump(writer_a()); // epoch 1, seq 1
+        v.bump(writer_a()); // epoch 1, seq 2
+        v.bump(writer_b()); // writer change → epoch 2, seq 1
+        assert_eq!(v.writer_sg_uuid, writer_b());
+        assert_eq!(v.epoch, 2);
+        assert_eq!(v.seq,   1);
+    }
+
+    #[test]
+    fn cmp_same_writer_orders_by_epoch_then_seq() {
+        use std::cmp::Ordering;
+        let a = SyncVersion { writer_sg_uuid: writer_a(), epoch: 1, seq: 5  };
+        let b = SyncVersion { writer_sg_uuid: writer_a(), epoch: 1, seq: 10 };
+        let c = SyncVersion { writer_sg_uuid: writer_a(), epoch: 2, seq: 1  };
+        assert_eq!(a.cmp_same_writer(&b), Some(Ordering::Less));
+        assert_eq!(b.cmp_same_writer(&a), Some(Ordering::Greater));
+        assert_eq!(b.cmp_same_writer(&c), Some(Ordering::Less));
+        assert_eq!(a.cmp_same_writer(&a), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn cmp_different_writer_returns_none() {
+        let a = SyncVersion { writer_sg_uuid: writer_a(), epoch: 1, seq: 5 };
+        let b = SyncVersion { writer_sg_uuid: writer_b(), epoch: 1, seq: 5 };
+        assert_eq!(a.cmp_same_writer(&b), None);
+    }
+
+    #[test]
+    fn owner_bump_routes_by_scope() {
+        let mut node = Node::new();
+        let w = writer_a();
+        node.owner.bump_version(Scope::Private, w);
+        assert_eq!(node.owner.private_version.seq, 1);
+        assert_eq!(node.owner.public_version.seq,  0); // untouched
+        node.owner.bump_version(Scope::Public, w);
+        assert_eq!(node.owner.private_version.seq, 1);
+        assert_eq!(node.owner.public_version.seq,  1);
+    }
+
+    #[test]
+    fn versions_roundtrip_through_toml() {
+        let mut node = Node::new();
+        node.owner.bump_version(Scope::Private, writer_a());
+        node.owner.bump_version(Scope::Public,  writer_a());
+        node.owner.bump_version(Scope::Public,  writer_a());
+
+        let s = toml::to_string(&node).expect("serialize");
+        let restored: Node = toml::from_str(&s).expect("deserialize");
+
+        assert_eq!(restored.owner.private_version.writer_sg_uuid, writer_a());
+        assert_eq!(restored.owner.private_version.epoch, 1);
+        assert_eq!(restored.owner.private_version.seq,   1);
+        assert_eq!(restored.owner.public_version.epoch,  1);
+        assert_eq!(restored.owner.public_version.seq,    2);
+    }
+
+    #[test]
+    fn missing_version_fields_default_to_zero() {
+        // Older node.toml files written before SyncVersion existed will lack
+        // the `private_version` and `public_version` tables. They must
+        // deserialize cleanly with the zero sentinel.
+        let legacy = r#"
+device_uuid = "00112233445566778899aabbccddeeff"
+
+[owner]
+contact_users       = []
+contact_invitations = []
+device_invitations  = []
+
+[owner.user]
+alias   = "Legacy"
+uuid    = "00112233445566778899aabbccddeeff"
+devices = []
+
+[owner.key_pair]
+public_key  = "0000000000000000000000000000000000000000000000000000000000000000"
+private_key = "0000000000000000000000000000000000000000000000000000000000000000"
+"#;
+        let restored: Node = toml::from_str(legacy).expect("deserialize legacy");
+        assert!(restored.owner.private_version.is_initial());
+        assert!(restored.owner.public_version.is_initial());
     }
 }

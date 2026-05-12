@@ -34,6 +34,13 @@ pub enum Action {
     ContactDataPullRequest { src: SocketAddr, buf: Vec<u8> },
     DeviceDataPush        { src: SocketAddr, buf: Vec<u8> },
     DeviceDataPullRequest { src: SocketAddr, buf: Vec<u8> },
+    // Sync v1 (descriptions/data sync.md). Replaces the push-everywhere
+    // ContactDataPush/DeviceDataPush flow once phases 3–7 land.
+    SyncWriteRequest      { src: SocketAddr, buf: Vec<u8> },
+    SyncWriteAck          { src: SocketAddr, buf: Vec<u8> },
+    SyncUpdateAvailable   { src: SocketAddr, buf: Vec<u8> },
+    SyncPullRequest       { src: SocketAddr, buf: Vec<u8> },
+    SyncPullResponse      { src: SocketAddr, buf: Vec<u8> },
     RelayPacket        { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
@@ -51,6 +58,9 @@ pub enum Action {
     CleanupTunnels,
     SyncContacts,
     SyncDevices,
+    /// Periodic pull from the elected writer SG for both scopes. Also fired
+    /// as a one-shot when an active connection to the writer SG is established.
+    SyncPull,
     SetupTunnel   { sender_uuid: super::data_models::Uuid, dest_uuid: super::data_models::Uuid },
 }
 
@@ -102,6 +112,11 @@ impl Action {
             Action::ContactDataPullRequest { src, buf } => handlers::contact_data_pull_request(src, buf, ctx),
             Action::DeviceDataPush         { src, buf } => handlers::device_data_push(src, buf, ctx),
             Action::DeviceDataPullRequest  { src, buf } => handlers::device_data_pull_request(src, buf, ctx),
+            Action::SyncWriteRequest       { src, buf } => handlers::sync_write_request(src, buf, ctx),
+            Action::SyncWriteAck           { src, buf } => handlers::sync_write_ack(src, buf, ctx),
+            Action::SyncUpdateAvailable    { src, buf } => handlers::sync_update_available(src, buf, ctx),
+            Action::SyncPullRequest        { src, buf } => handlers::sync_pull_request(src, buf, ctx),
+            Action::SyncPullResponse       { src, buf } => handlers::sync_pull_response(src, buf, ctx),
             Action::RelayPacket        { src, buf }   => handlers::relay_packet(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
             Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),
@@ -115,6 +130,7 @@ impl Action {
             Action::CleanupTunnels                   => handlers::cleanup_tunnels(ctx),
             Action::SyncContacts                     => handlers::sync_contacts(ctx),
             Action::SyncDevices                      => handlers::sync_devices(ctx),
+            Action::SyncPull                         => handlers::sync_pull(ctx),
             Action::SetupTunnel { sender_uuid, dest_uuid } => handlers::setup_tunnel(sender_uuid, dest_uuid, ctx),
         }
     }

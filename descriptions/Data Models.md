@@ -17,6 +17,20 @@ description: the local owner of this node; extends User with contacts and a long
 	* a list of Invitation structs
 * active_connections
 	* a list of ActiveConnection structs
+* private_version
+	* SyncVersion. Latest version of the user's **private** scope held by this node.
+	  See `descriptions/data sync.md` for the writer-SG model and scope split.
+* public_version
+	* SyncVersion. Latest version of the user's **public** scope (visible to contacts).
+
+# SyncVersion
+description: per-scope version metadata used by the sync v1 protocol; total order within a single writer
+* writer_sg_uuid
+	* UUID of the SG that accepted the most recent write for this scope. Zero on a fresh node.
+* epoch
+	* u32. Increments on writer-SG transitions (failover or partition recovery).
+* seq
+	* u64. Monotonic counter inside an epoch; resets to 0 on epoch change.
 
 # User
 description: holds information unique to a user
