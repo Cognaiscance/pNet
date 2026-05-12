@@ -7,8 +7,8 @@ use super::data_models::{
     ActiveConnection, ActiveTunnel, Application, Contact, Device, DeviceGrade, Invitation,
     KeyPair, PendingBootstrap, PendingConnection, PendingContactExchange, PendingDeviceAcceptance,
     PendingTunnel, PendingTunnelConnection, PublicKey, Scope, SgStatus, SyncVersion,
-    TunnelCounter, User, Uuid, CONNECTION_LIFETIME, RENEW_THRESHOLD, TUNNEL_COUNTER_WINDOW,
-    TUNNEL_THRESHOLD, generate_key_bytes, generate_uuid,
+    TunnelCounter, User, Uuid, CONNECTION_LIFETIME, PENDING_CONNECTION_TIMEOUT,
+    RENEW_THRESHOLD, TUNNEL_COUNTER_WINDOW, TUNNEL_THRESHOLD, generate_key_bytes, generate_uuid,
 };
 
 // ── Reply status bytes ────────────────────────────────────────────────────────
@@ -1349,10 +1349,13 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     pkt.extend_from_slice(&ciphertext);
     send(ctx, SocketAddr::V4(sg_addr), &pkt);
 
-    // Trigger connection maintenance now that we have peer data.
+    // Trigger connection maintenance now that we have peer data. Brief delay
+    // gives the SG time to process our DeviceRegistration before our
+    // ConnectRequest lands — they race on the SG's worker pool otherwise and
+    // a connect_request that wins is silently rejected as "unknown device".
     ctx.scheduler_tx.send(super::action_queue::ScheduleRequest {
         action: super::action_queue::Action::MaintainConnections,
-        delay:  Duration::ZERO,
+        delay:  Duration::from_millis(500),
     }).ok();
 }
 
@@ -3350,6 +3353,26 @@ fn record_sg_status(ctx: &WorkerContext, uuid: Uuid, host: String, rtt: Option<D
 pub fn maintain_connections(ctx: &WorkerContext) {
     let now = SystemTime::now();
 
+    // ── Evict PendingConnections whose ConnectAck never arrived ───────────────
+    // A silent rejection on the SG side (e.g. a ConnectRequest that lost the
+    // race with its own DeviceRegistration) leaves us stuck — clear the entry
+    // here so the peer falls out of `pending` below and gets a fresh attempt.
+    {
+        let mut node = ctx.node.write().unwrap();
+        let expired: Vec<u16> = node.owner.pending_connections.iter()
+            .filter(|(_, p)| now.duration_since(p.created_at)
+                .map(|d| d >= PENDING_CONNECTION_TIMEOUT)
+                .unwrap_or(false))
+            .map(|(k, _)| *k)
+            .collect();
+        for id in expired {
+            if let Some(p) = node.owner.pending_connections.remove(&id) {
+                println!("[poll_connections] evicting stale pending conn {id} to peer {:02x?}",
+                    &p.peer_device_uuid[..4]);
+            }
+        }
+    }
+
     // ── Collect desired peers and current state (read lock) ───────────────────
     let (need_conn, our_longterm_pk, our_longterm_sk, our_device_uuid) = {
         let node = ctx.node.read().unwrap();
@@ -3406,6 +3429,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
     };
 
     // ── For each peer that needs a connection, allocate state and send ────────
+    let mut issued: u32 = 0;
     for (peer_uuid, peer_host, peer_longterm_pk) in need_conn {
         let result: Option<(u16, PublicKey)> = {
             let mut node = ctx.node.write().unwrap();
@@ -3429,6 +3453,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
                     our_key_pair:     key_pair,
                     peer_device_uuid: peer_uuid,
                     peer_longterm_pk,
+                    created_at:       now,
                 });
                 Some((conn_id, pk_copy))
             }
@@ -3449,6 +3474,17 @@ pub fn maintain_connections(ctx: &WorkerContext) {
 
         println!("[poll_connections] sending connect request to {peer_host} (peer {:02x?})", &peer_uuid[..4]);
         send(ctx, SocketAddr::V4(peer_host), &pkt);
+        issued += 1;
+    }
+
+    // If we just issued any ConnectRequests, schedule a follow-up pass shortly
+    // after PENDING_CONNECTION_TIMEOUT so silent failures are retried without
+    // waiting the full MAINTAIN_CONNECTIONS_INTERVAL (5 minutes).
+    if issued > 0 {
+        ctx.scheduler_tx.send(super::action_queue::ScheduleRequest {
+            action: super::action_queue::Action::MaintainConnections,
+            delay:  PENDING_CONNECTION_TIMEOUT + Duration::from_millis(500),
+        }).ok();
     }
 }
 
@@ -5435,6 +5471,7 @@ mod tests {
                 our_key_pair:     generate_x25519_keypair(),
                 peer_device_uuid: peer_uuid,
                 peer_longterm_pk: peer_kp.public_key,
+                created_at:       SystemTime::now(),
             });
         }
 
@@ -5468,6 +5505,7 @@ mod tests {
                 our_key_pair:     generate_x25519_keypair(),
                 peer_device_uuid: peer_uuid,
                 peer_longterm_pk: peer_kp.public_key,
+                created_at:       SystemTime::now(),
             });
         }
 

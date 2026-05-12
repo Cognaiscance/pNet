@@ -18,6 +18,12 @@ pub type Uuid       = [u8; 16];
 pub const RENEW_THRESHOLD:    Duration = Duration::from_secs(2 * 3600);  // 2 hours
 pub const CONNECTION_LIFETIME: Duration = Duration::from_secs(24 * 3600); // 24 hours
 
+/// A PendingConnection whose ConnectAck hasn't arrived in this window is
+/// treated as failed and dropped, so `maintain_connections` can re-issue.
+/// Covers silent SG-side rejections (e.g. a connect_request that lost the
+/// race with its own device_registration) and other lost-packet scenarios.
+pub const PENDING_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Read 16 cryptographically random bytes from the OS.
 pub fn generate_uuid() -> Uuid {
     use std::io::Read;
@@ -249,6 +255,9 @@ pub struct PendingConnection {
     pub peer_device_uuid: Uuid,
     /// Long-term public key of the peer's user — used to verify the ConnectAck signature.
     pub peer_longterm_pk: PublicKey,
+    /// When this PendingConnection was created. Used by `maintain_connections`
+    /// to evict entries whose ConnectAck never arrived.
+    pub created_at:       SystemTime,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
