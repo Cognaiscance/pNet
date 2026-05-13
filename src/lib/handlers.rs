@@ -262,8 +262,14 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         new_port = Some(u16::from_be_bytes([buf[pos], buf[pos + 1]]));
     }
 
-    // Update node.
-    let found = {
+    // Update node. Capture (device_uuid, app_id, old_alias) so an
+    // unsuccessful sync v1 publish can roll back to the prior alias.
+    // Port/host is private-scope — local-only, no sync v1 traffic.
+    enum Outcome {
+        NotFound,
+        Updated { device_uuid: Uuid, app_id: u16, old_alias: Option<String> },
+    }
+    let outcome = {
         let mut node = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
         let device = node
@@ -275,27 +281,66 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             .expect("local device not found in node");
 
         if let Some(app) = device.applications.iter_mut().find(|a| a.token == token) {
+            let app_id = app.id;
+            let mut old_alias = None;
             if let Some(alias) = new_alias {
-                app.alias = alias;
+                if app.alias != alias {
+                    old_alias = Some(std::mem::replace(&mut app.alias, alias));
+                }
             }
             if let Some(port) = new_port {
                 if let Some(ip) = ipv4_from(src) {
                     app.host = SocketAddrV4::new(ip, port);
                 }
             }
-            true
+            Outcome::Updated { device_uuid, app_id, old_alias }
         } else {
-            false
+            Outcome::NotFound
         }
         // write lock released here
     };
 
-    if found {
-        ctx.save_node();
-        sync_devices(ctx);
-        send(ctx, src, &[OK]);
-    } else {
-        send_error(ctx, src, ERR_TOKEN_UNKNOWN);
+    match outcome {
+        Outcome::NotFound => send_error(ctx, src, ERR_TOKEN_UNKNOWN),
+        Outcome::Updated { device_uuid, app_id, old_alias } => {
+            ctx.save_node();
+
+            // Publish the alias change via sync v1 only if the alias actually
+            // changed. Port/host is private — never goes over the wire.
+            if let Some(prior_alias) = old_alias {
+                let new_alias = {
+                    let node = ctx.node.read().unwrap();
+                    node.owner.user.devices.iter()
+                        .find(|d| d.uuid == device_uuid)
+                        .and_then(|d| d.applications.iter().find(|a| a.id == app_id))
+                        .map(|a| a.alias.clone())
+                        .unwrap_or_default()
+                };
+                if let Err(e) = request_change(Change::UpdateApplicationAlias {
+                    device_uuid,
+                    app_id,
+                    new_alias,
+                }, ctx) {
+                    // Roll back the alias only; port/host change (if any) was
+                    // private-scope and stays.
+                    {
+                        let mut node = ctx.node.write().unwrap();
+                        if let Some(dev) = node.owner.user.devices.iter_mut()
+                            .find(|d| d.uuid == device_uuid)
+                        {
+                            if let Some(app) = dev.applications.iter_mut().find(|a| a.id == app_id) {
+                                app.alias = prior_alias;
+                            }
+                        }
+                    }
+                    ctx.save_node();
+                    eprintln!("[app_update] alias rollback for app {app_id}: {e:?}");
+                    return send_error(ctx, src, ERR_NO_WRITER);
+                }
+            }
+
+            send(ctx, src, &[OK]);
+        }
     }
 }
 
@@ -705,10 +750,9 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     pkt[37..101].copy_from_slice(&sig);
     send(ctx, src, &pkt);
 
-    // Push fresh device data to all connected own devices now that this one
-    // has just joined.  Safe to call even if the connection list is small;
-    // sync_devices guards against non-SG callers internally.
-    sync_devices(ctx);
+    // No intra-user push needed on a new DG connection: the writer SG has
+    // already published any prior state via sync v1 `SyncUpdateAvailable`,
+    // and the joining DG pulls on its side (see `connect_ack`).
     push_data_to_contacts(ctx);
 }
 
@@ -765,9 +809,6 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     });
     drop(node);
 
-    // Pull fresh device data from the SG now that the connection is live.
-    // This corrects any stale app counts that persisted from a previous session.
-    sync_devices(ctx);
     push_data_to_contacts(ctx);
     // Sync v1: if the freshly-connected peer is our writer SG, immediately
     // catch up on any `SyncUpdateAvailable` notifications missed while
@@ -1465,16 +1506,46 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     };
 
-    {
+    let device_uuid = device.uuid;
+    let device_alias = device.alias.clone();
+    let device_grade = device.grade;
+    let device_sg_rank = device.sg_rank;
+    let device_hosts = device.hosts.clone();
+
+    let inserted = {
         let mut node = ctx.node.write().unwrap();
         if !node.owner.user.devices.iter().any(|d| d.uuid == device.uuid) {
             println!("[device_registration] new device '{}' registered from {src}", device.alias);
             node.owner.user.devices.push(device);
+            true
+        } else {
+            false
+        }
+    };
+    ctx.save_node();
+
+    if inserted {
+        // Sync v1: publish the new device to peer DGs via the writer SG.
+        // Rolls back the local add if no writer is reachable, mirroring
+        // app_register's originator pattern.
+        if let Err(e) = request_change(Change::AddDevice {
+            uuid:    device_uuid,
+            alias:   device_alias.clone(),
+            grade:   device_grade,
+            sg_rank: device_sg_rank,
+            hosts:   device_hosts,
+        }, ctx) {
+            {
+                let mut node = ctx.node.write().unwrap();
+                node.owner.user.devices.retain(|d| d.uuid != device_uuid);
+            }
+            ctx.save_node();
+            eprintln!("[device_registration] rejecting device '{device_alias}': {e:?}");
+            return;
         }
     }
-    ctx.save_node();
+
     push_data_to_contacts(ctx);
-    push_data_to_devices(ctx);
 }
 
 // ── Contact exchange payload serialization ────────────────────────────────────
@@ -2281,8 +2352,10 @@ fn read_sync_version(data: &[u8], pos: &mut usize) -> Option<SyncVersion> {
 // the right counter(s) on accept. Wire `change_kind` is a single byte — the
 // payload after it is variant-specific.
 
-const CHANGE_KIND_ADD_APPLICATION:    u8 = 0x01;
-const CHANGE_KIND_REMOVE_APPLICATION: u8 = 0x02;
+const CHANGE_KIND_ADD_APPLICATION:        u8 = 0x01;
+const CHANGE_KIND_REMOVE_APPLICATION:     u8 = 0x02;
+const CHANGE_KIND_ADD_DEVICE:             u8 = 0x03;
+const CHANGE_KIND_UPDATE_APPLICATION_ALIAS: u8 = 0x04;
 
 /// State mutations that flow through the writer SG.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2303,6 +2376,23 @@ pub enum Change {
         device_uuid: Uuid,
         app_id:      u16,
     },
+    /// Public-scope: add a device (no apps) to the user's device list.
+    /// Issued by the SG that accepts a new device via the invitation flow.
+    /// Idempotent on `uuid`. Apps arrive later via `AddApplication`.
+    AddDevice {
+        uuid:    Uuid,
+        alias:   String,
+        grade:   DeviceGrade,
+        sg_rank: Option<u32>,
+        hosts:   Vec<String>,
+    },
+    /// Public-scope: rename app `app_id` on `device_uuid`. No-op if the
+    /// alias already matches or the app doesn't exist.
+    UpdateApplicationAlias {
+        device_uuid: Uuid,
+        app_id:      u16,
+        new_alias:   String,
+    },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
@@ -2312,8 +2402,10 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
     match c {
         // Only the public fields (id+alias) are recorded at the writer; the
         // originating DG's private fields stay local.
-        Change::AddApplication { .. }    => &[Scope::Public],
-        Change::RemoveApplication { .. } => &[Scope::Public],
+        Change::AddApplication { .. }          => &[Scope::Public],
+        Change::RemoveApplication { .. }       => &[Scope::Public],
+        Change::AddDevice { .. }               => &[Scope::Public],
+        Change::UpdateApplicationAlias { .. }  => &[Scope::Public],
     }
 }
 
@@ -2330,6 +2422,26 @@ fn serialize_change(c: &Change) -> Vec<u8> {
             buf.push(CHANGE_KIND_REMOVE_APPLICATION);
             buf.extend_from_slice(device_uuid);
             buf.extend_from_slice(&app_id.to_be_bytes());
+        }
+        Change::AddDevice { uuid, alias, grade, sg_rank, hosts } => {
+            buf.push(CHANGE_KIND_ADD_DEVICE);
+            // Reuse push_device's layout by constructing a temporary Device.
+            // `applications` is empty by design — apps arrive via AddApplication.
+            let temp = Device {
+                uuid:         *uuid,
+                alias:        alias.clone(),
+                grade:        *grade,
+                sg_rank:      *sg_rank,
+                hosts:        hosts.clone(),
+                applications: Vec::new(),
+            };
+            push_device(&mut buf, &temp);
+        }
+        Change::UpdateApplicationAlias { device_uuid, app_id, new_alias } => {
+            buf.push(CHANGE_KIND_UPDATE_APPLICATION_ALIAS);
+            buf.extend_from_slice(device_uuid);
+            buf.extend_from_slice(&app_id.to_be_bytes());
+            push_str(&mut buf, new_alias);
         }
     }
     buf
@@ -2352,6 +2464,23 @@ fn deserialize_change(data: &[u8]) -> Option<Change> {
             let id_bytes:  [u8; 2] = read_arr(data, &mut pos)?;
             let app_id    = u16::from_be_bytes(id_bytes);
             Some(Change::RemoveApplication { device_uuid, app_id })
+        }
+        CHANGE_KIND_ADD_DEVICE => {
+            let d = read_device(data, &mut pos)?;
+            Some(Change::AddDevice {
+                uuid:    d.uuid,
+                alias:   d.alias,
+                grade:   d.grade,
+                sg_rank: d.sg_rank,
+                hosts:   d.hosts,
+            })
+        }
+        CHANGE_KIND_UPDATE_APPLICATION_ALIAS => {
+            let device_uuid: Uuid = read_arr(data, &mut pos)?;
+            let id_bytes:  [u8; 2] = read_arr(data, &mut pos)?;
+            let app_id    = u16::from_be_bytes(id_bytes);
+            let new_alias = read_str(data, &mut pos)?;
+            Some(Change::UpdateApplicationAlias { device_uuid, app_id, new_alias })
         }
         _ => None,
     }
@@ -2413,6 +2542,35 @@ fn apply_change_locally(
             let before = dev.applications.len();
             dev.applications.retain(|a| a.id != *app_id);
             before != dev.applications.len()
+        }
+        Change::AddDevice { uuid, alias, grade, sg_rank, hosts } => {
+            if node.owner.user.devices.iter().any(|d| d.uuid == *uuid) {
+                false
+            } else {
+                node.owner.user.devices.push(Device {
+                    uuid:         *uuid,
+                    alias:        alias.clone(),
+                    grade:        *grade,
+                    sg_rank:      *sg_rank,
+                    hosts:        hosts.clone(),
+                    applications: Vec::new(),
+                });
+                true
+            }
+        }
+        Change::UpdateApplicationAlias { device_uuid, app_id, new_alias } => {
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == *device_uuid)
+                .ok_or_else(|| WriteError::Validation(format!(
+                    "unknown device_uuid {device_uuid:?}"
+                )))?;
+            match dev.applications.iter_mut().find(|a| a.id == *app_id) {
+                Some(app) if app.alias != *new_alias => {
+                    app.alias = new_alias.clone();
+                    true
+                }
+                _ => false,
+            }
         }
     };
 
@@ -4194,7 +4352,10 @@ pub fn ui_request(
         ("GET",  "/contacts")      => respond_html(&stream, 200, &render_contacts(ctx)),
         ("GET",  "/devices")       => respond_html(&stream, 200, &render_devices(ctx)),
         ("POST", "/devices/sync")  => {
-            sync_devices(ctx);
+            // Manual refresh: pull the latest public/private state from the
+            // writer SG. No-op when this node is the writer or has no
+            // reachable own SG.
+            sync_pull(ctx);
             respond_redirect(&stream, "/devices");
         }
         ("GET",  "/invitations")   => respond_html(&stream, 200, &render_invitations(ctx, &query)),
@@ -5357,6 +5518,9 @@ mod tests {
     #[test]
     fn app_update_alias() {
         let t = TestCtx::new();
+        // Alias is public-scope under sync v1, so the change must route to a
+        // writer SG. Promoting the local device to SG makes it the writer.
+        promote_local_to_sg(&t, 1);
         let token = register_and_get_token(&t, "original", 9001);
 
         app_update(t.app_addr(), update_packet(&token, Some("renamed"), None), &t.ctx);
@@ -6124,6 +6288,158 @@ mod tests {
         ).expect("idempotent remove ok");
         let pub_after = t.ctx.node.read().unwrap().owner.public_version;
         assert_eq!(pub_before, pub_after, "no-op remove must not bump");
+    }
+
+    #[test]
+    fn change_add_device_roundtrips() {
+        let dev_uuid = generate_uuid();
+        let original = Change::AddDevice {
+            uuid:    dev_uuid,
+            alias:   "laptop".to_string(),
+            grade:   DeviceGrade::DG,
+            sg_rank: None,
+            hosts:   vec!["10.0.0.5".to_string()],
+        };
+        let bytes = serialize_change(&original);
+        assert_eq!(bytes[0], CHANGE_KIND_ADD_DEVICE);
+        let parsed = deserialize_change(&bytes).expect("parse");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn apply_add_device_appends_and_bumps_public() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+        let writer = local;
+        let new_uuid = generate_uuid();
+
+        let change = Change::AddDevice {
+            uuid:    new_uuid,
+            alias:   "phone".to_string(),
+            grade:   DeviceGrade::DG,
+            sg_rank: None,
+            hosts:   Vec::new(),
+        };
+        let (priv_v, pub_v) = apply_change_locally(&change, writer, &t.ctx).expect("apply");
+
+        assert!(priv_v.is_initial());
+        assert_eq!(pub_v.writer_sg_uuid, writer);
+        assert_eq!(pub_v.epoch, 1);
+        assert_eq!(pub_v.seq,   1);
+
+        let node = t.ctx.node.read().unwrap();
+        assert!(node.owner.user.devices.iter().any(|d| d.uuid == new_uuid));
+    }
+
+    #[test]
+    fn apply_add_device_is_idempotent() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+        let writer = local;
+        let new_uuid = generate_uuid();
+
+        let change = Change::AddDevice {
+            uuid:    new_uuid,
+            alias:   "phone".to_string(),
+            grade:   DeviceGrade::DG,
+            sg_rank: None,
+            hosts:   Vec::new(),
+        };
+        apply_change_locally(&change, writer, &t.ctx).expect("first apply");
+        let pub_after_first = t.ctx.node.read().unwrap().owner.public_version;
+
+        apply_change_locally(&change, writer, &t.ctx).expect("second apply");
+        let pub_after_second = t.ctx.node.read().unwrap().owner.public_version;
+        assert_eq!(pub_after_first, pub_after_second, "no-op re-add must not bump");
+
+        let node = t.ctx.node.read().unwrap();
+        let count = node.owner.user.devices.iter().filter(|d| d.uuid == new_uuid).count();
+        assert_eq!(count, 1, "device must not be duplicated");
+    }
+
+    #[test]
+    fn change_update_application_alias_roundtrips() {
+        let dev_uuid = generate_uuid();
+        let original = Change::UpdateApplicationAlias {
+            device_uuid: dev_uuid,
+            app_id:      0xBEEF,
+            new_alias:   "renamed".to_string(),
+        };
+        let bytes = serialize_change(&original);
+        assert_eq!(bytes[0], CHANGE_KIND_UPDATE_APPLICATION_ALIAS);
+        let parsed = deserialize_change(&bytes).expect("parse");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn apply_update_application_alias_renames_and_bumps_public() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+        let writer = local;
+
+        apply_change_locally(
+            &Change::AddApplication {
+                device_uuid: local, app_id: 5, app_alias: "old".into(),
+            },
+            writer, &t.ctx,
+        ).expect("seed");
+        let pub_after_add = t.ctx.node.read().unwrap().owner.public_version;
+
+        let (_, pub_v) = apply_change_locally(
+            &Change::UpdateApplicationAlias {
+                device_uuid: local, app_id: 5, new_alias: "new".into(),
+            },
+            writer, &t.ctx,
+        ).expect("rename");
+
+        assert_eq!(pub_v.epoch, pub_after_add.epoch);
+        assert_eq!(pub_v.seq,   pub_after_add.seq + 1);
+
+        let node = t.ctx.node.read().unwrap();
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
+        let app = dev.applications.iter().find(|a| a.id == 5).unwrap();
+        assert_eq!(app.alias, "new");
+    }
+
+    #[test]
+    fn apply_update_application_alias_is_idempotent_when_unchanged() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+        let writer = local;
+
+        apply_change_locally(
+            &Change::AddApplication {
+                device_uuid: local, app_id: 5, app_alias: "same".into(),
+            },
+            writer, &t.ctx,
+        ).expect("seed");
+        let pub_before = t.ctx.node.read().unwrap().owner.public_version;
+
+        apply_change_locally(
+            &Change::UpdateApplicationAlias {
+                device_uuid: local, app_id: 5, new_alias: "same".into(),
+            },
+            writer, &t.ctx,
+        ).expect("no-op rename");
+        let pub_after = t.ctx.node.read().unwrap().owner.public_version;
+        assert_eq!(pub_before, pub_after, "no-op rename must not bump");
+    }
+
+    #[test]
+    fn apply_update_application_alias_no_op_for_missing_app() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+        let writer = local;
+
+        let pub_before = t.ctx.node.read().unwrap().owner.public_version;
+        apply_change_locally(
+            &Change::UpdateApplicationAlias {
+                device_uuid: local, app_id: 999, new_alias: "nope".into(),
+            },
+            writer, &t.ctx,
+        ).expect("missing app is no-op, not error");
+        let pub_after = t.ctx.node.read().unwrap().owner.public_version;
+        assert_eq!(pub_before, pub_after);
     }
 
     // ── request_change driver ────────────────────────────────────────────────

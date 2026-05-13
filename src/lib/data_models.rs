@@ -272,7 +272,7 @@ pub struct Application {
     pub token:         Uuid,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeviceGrade {
     /// Server Grade — static IP or domain, acts as relay for the user's DGs.
     SG,
