@@ -413,6 +413,11 @@ pub struct Contact {
     pub user:       User,
     #[serde(with = "serde_bytes_32")]
     pub public_key: PublicKey,
+    /// Highest public-scope version we have applied for this contact via
+    /// cross-user sync v1. Used as the `last_seen` baseline on outbound
+    /// CrossUserPullRequest so the reply is `NoUpdates` when caught up.
+    #[serde(default)]
+    pub last_seen_public_version: SyncVersion,
 }
 
 /// SG side: maps a tunnel_id to the two active connection IDs on this relay SG.

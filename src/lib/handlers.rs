@@ -613,6 +613,14 @@ const SYNC_WRITE_ACK_OP:        u8 = 0x71;
 const SYNC_UPDATE_AVAILABLE_OP: u8 = 0x72;
 const SYNC_PULL_REQUEST_OP:     u8 = 0x73;
 const SYNC_PULL_RESPONSE_OP:    u8 = 0x74;
+// 0x75/0x76/0x77 — cross-user public-scope sync: writer SG → contacts' SGs
+// for UpdateAvailable, and the contact's SG → writer SG round trip for the
+// pull request/response. Body layouts mirror the intra-user variants, but
+// the receiver identifies the *sender's user* via the active connection's
+// contact mapping rather than treating the payload as local user state.
+const CROSS_USER_UPDATE_AVAILABLE_OP: u8 = 0x75;
+const CROSS_USER_PULL_REQUEST_OP:     u8 = 0x76;
+const CROSS_USER_PULL_RESPONSE_OP:    u8 = 0x77;
 const RELAY_PACKET_OP:            u8 = 0x40;
 const APP_PACKET_OP:              u8 = 0x41;
 const APP_PUSH_OP:                u8 = 0x04;
@@ -1288,6 +1296,7 @@ fn deserialize_bootstrap_payload(data: &[u8]) -> Option<BootstrapPayload> {
         contacts.push(Contact {
             user:       User { alias: c_alias, uuid: c_uuid, devices: c_devices },
             public_key: c_pk,
+            last_seen_public_version: SyncVersion::default(),
         });
     }
     Some(BootstrapPayload { user_alias, user_uuid, key_pair, devices, contacts })
@@ -1643,6 +1652,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             node.owner.contact_users.push(Contact {
                 user:       User { alias: data.alias, uuid: data.uuid, devices: data.devices },
                 public_key: data.public_key,
+                last_seen_public_version: SyncVersion::default(),
             });
         }
 
@@ -1713,6 +1723,7 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             node.owner.contact_users.push(Contact {
                 user:       User { alias: data.alias, uuid: data.uuid, devices: data.devices },
                 public_key: data.public_key,
+                last_seen_public_version: SyncVersion::default(),
             });
         }
         node.owner.pending_contact_exchange = None;
@@ -2309,6 +2320,9 @@ pub fn request_change(change: Change, ctx: &WorkerContext) -> Result<(), WriteEr
             ctx.save_node();
             let bumped: Vec<Scope> = scopes_to_bump.iter().copied().collect();
             notify_own_peers(&bumped, post_priv, post_pub, ctx);
+            if bumped.contains(&Scope::Public) {
+                notify_contacts(post_pub, ctx);
+            }
             Ok(())
         }
         WriterTarget::Remote(writer_uuid) => {
@@ -2365,6 +2379,39 @@ fn notify_own_peers(
                 let pkt = build_encrypted_packet(SYNC_UPDATE_AVAILABLE_OP, conn, &body);
                 out.push((pkt, conn.peer_addr));
             }
+        }
+        out
+    };
+    for (pkt, dest) in packets {
+        send(ctx, dest, &pkt);
+    }
+}
+
+/// Cross-user fan-out: send a `CrossUserUpdateAvailable(public, version)` to
+/// the top-ranked reachable SG of every contact. Called from the writer-SG
+/// path after a public-scope bump so contacts' SGs can pull the refreshed
+/// public state. Silently skips contacts with no active connection — they
+/// will catch up on their next periodic pull.
+fn notify_contacts(public: SyncVersion, ctx: &WorkerContext) {
+    let packets: Vec<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        let mut out = Vec::new();
+        for contact in &node.owner.contact_users {
+            let mut sgs: Vec<&Device> = contact.user.devices.iter()
+                .filter(|d| matches!(d.grade, DeviceGrade::SG))
+                .filter(|d| node.owner.active_connections.values().any(|c| c.device_uuid == d.uuid))
+                .collect();
+            sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
+            let Some(sg) = sgs.first() else { continue };
+            let Some(conn) = node.owner.active_connections.values()
+                .find(|c| c.device_uuid == sg.uuid)
+            else { continue };
+
+            let mut body = Vec::with_capacity(1 + SYNC_VERSION_WIRE_LEN);
+            write_scope(&mut body, Scope::Public);
+            write_sync_version(&mut body, &public);
+            let pkt = build_encrypted_packet(CROSS_USER_UPDATE_AVAILABLE_OP, conn, &body);
+            out.push((pkt, conn.peer_addr));
         }
         out
     };
@@ -2679,6 +2726,7 @@ fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
             node.owner.contact_users.push(Contact {
                 public_key: c.public_key,
                 user: User { alias: c.alias, uuid: c.uuid, devices: devs },
+                last_seen_public_version: SyncVersion::default(),
             });
         }
     }
@@ -2800,6 +2848,9 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // path used in phase 4.
     if !bumped.is_empty() {
         notify_own_peers(&bumped, private_v, public_v, ctx);
+        if bumped.contains(&Scope::Public) {
+            notify_contacts(public_v, ctx);
+        }
     }
 }
 
@@ -3035,6 +3086,275 @@ pub fn sync_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
         other => {
             eprintln!("[sync_pull_response] unknown result {other} from {src}");
+        }
+    }
+}
+
+// ── Cross-user sync v1 (ops 0x75 / 0x76 / 0x77) ──────────────────────────────
+//
+// Carries public-scope state across user boundaries. The writer SG for user A
+// notifies each contact's top-ranked reachable SG when A's public_version
+// bumps; the contact's SG pulls A's public state and caches it as the
+// matching entry in `contact_users`. The receiver, if it is the local
+// user's writer SG, also bumps its own public_version so the user's own DGs
+// pull the refreshed contact list via `apply_public_state`.
+//
+// Encrypted body layouts:
+//   0x75 CrossUserUpdateAvailable: [scope:1=public][version:28]
+//   0x76 CrossUserPullRequest:     [scope:1=public][last_seen_version:28]
+//   0x77 CrossUserPullResponse:    [scope:1=public][result:1][version:28][state:var]
+//
+// `state` (FullState only) is the sender's public payload — same shape as
+// `serialize_contact_data`: user_uuid, devices+approved apps. The sender
+// is identified by the active connection's contact mapping, so the payload
+// is parsed without trusting the embedded user_uuid for routing.
+
+pub fn cross_user_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 2 {
+        eprintln!("[cross_user_update_available] header too short from {src}");
+        return;
+    }
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[cross_user_update_available] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+
+    let mut pos = 0usize;
+    let Some(scope) = read_scope(&plaintext, &mut pos) else {
+        eprintln!("[cross_user_update_available] bad scope from {src}");
+        return;
+    };
+    if !matches!(scope, Scope::Public) {
+        eprintln!("[cross_user_update_available] non-public scope ignored from {src}");
+        return;
+    }
+    let Some(announced) = read_sync_version(&plaintext, &mut pos) else {
+        eprintln!("[cross_user_update_available] truncated version from {src}");
+        return;
+    };
+
+    let (last_seen, conn_present) = {
+        let node = ctx.node.read().unwrap();
+        let Some(conn) = node.owner.active_connections.get(&conn_id) else {
+            return;
+        };
+        let peer_uuid = conn.device_uuid;
+        let contact = node.owner.contact_users.iter()
+            .find(|c| c.user.devices.iter().any(|d| d.uuid == peer_uuid));
+        match contact {
+            Some(c) => (c.last_seen_public_version, true),
+            None    => (SyncVersion::zero(), false),
+        }
+    };
+    if !conn_present {
+        eprintln!("[cross_user_update_available] no contact owns conn {conn_id} from {src}");
+        return;
+    }
+
+    use std::cmp::Ordering;
+    let needs_pull = match announced.cmp_same_writer(&last_seen) {
+        Some(Ordering::Greater) => true,
+        Some(_)                 => false,
+        None                    => true, // cross-writer: pull and adopt peer's state
+    };
+    if needs_pull {
+        let mut body = Vec::with_capacity(1 + SYNC_VERSION_WIRE_LEN);
+        write_scope(&mut body, scope);
+        write_sync_version(&mut body, &last_seen);
+
+        let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+            let node = ctx.node.read().unwrap();
+            node.owner.active_connections.get(&conn_id)
+                .map(|conn| (
+                    build_encrypted_packet(CROSS_USER_PULL_REQUEST_OP, conn, &body),
+                    conn.peer_addr,
+                ))
+        };
+        let Some((pkt, addr)) = pkt_and_addr else { return };
+        send(ctx, addr, &pkt);
+    }
+}
+
+pub fn cross_user_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 2 {
+        eprintln!("[cross_user_pull_request] header too short from {src}");
+        return;
+    }
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[cross_user_pull_request] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+
+    let mut pos = 0usize;
+    let Some(scope) = read_scope(&plaintext, &mut pos) else {
+        eprintln!("[cross_user_pull_request] bad scope from {src}");
+        return;
+    };
+    if !matches!(scope, Scope::Public) {
+        eprintln!("[cross_user_pull_request] non-public scope ignored from {src}");
+        return;
+    }
+    let Some(last_seen) = read_sync_version(&plaintext, &mut pos) else {
+        eprintln!("[cross_user_pull_request] truncated version from {src}");
+        return;
+    };
+
+    let (current_v, state_blob) = {
+        let node = ctx.node.read().unwrap();
+        (node.owner.public_version, serialize_contact_data(&node))
+    };
+
+    use std::cmp::Ordering;
+    let send_full = match last_seen.cmp_same_writer(&current_v) {
+        Some(Ordering::Equal) => false,
+        Some(_) | None        => true,
+    };
+
+    let mut body = Vec::new();
+    write_scope(&mut body, scope);
+    if send_full {
+        body.push(PULL_RESULT_FULL_STATE);
+        write_sync_version(&mut body, &current_v);
+        body.extend_from_slice(&state_blob);
+    } else {
+        body.push(PULL_RESULT_NO_UPDATES);
+        write_sync_version(&mut body, &current_v);
+    }
+
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.get(&conn_id)
+            .map(|conn| (
+                build_encrypted_packet(CROSS_USER_PULL_RESPONSE_OP, conn, &body),
+                conn.peer_addr,
+            ))
+    };
+    let Some((pkt, addr)) = pkt_and_addr else {
+        eprintln!("[cross_user_pull_request] no connection {conn_id} from {src}");
+        return;
+    };
+    send(ctx, addr, &pkt);
+}
+
+pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 2 {
+        eprintln!("[cross_user_pull_response] header too short from {src}");
+        return;
+    }
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[cross_user_pull_response] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+
+    let mut pos = 0usize;
+    let Some(scope) = read_scope(&plaintext, &mut pos) else {
+        eprintln!("[cross_user_pull_response] bad scope from {src}");
+        return;
+    };
+    if !matches!(scope, Scope::Public) {
+        eprintln!("[cross_user_pull_response] non-public scope ignored from {src}");
+        return;
+    }
+    let Some(&result) = plaintext.get(pos) else {
+        eprintln!("[cross_user_pull_response] missing result from {src}");
+        return;
+    };
+    pos += 1;
+    let Some(new_version) = read_sync_version(&plaintext, &mut pos) else {
+        eprintln!("[cross_user_pull_response] truncated version from {src}");
+        return;
+    };
+
+    let contact_user_uuid = {
+        let node = ctx.node.read().unwrap();
+        let Some(conn) = node.owner.active_connections.get(&conn_id) else {
+            eprintln!("[cross_user_pull_response] no connection {conn_id} from {src}");
+            return;
+        };
+        let peer_uuid = conn.device_uuid;
+        match node.owner.contact_users.iter()
+            .find(|c| c.user.devices.iter().any(|d| d.uuid == peer_uuid))
+        {
+            Some(c) => c.user.uuid,
+            None    => {
+                eprintln!("[cross_user_pull_response] conn {conn_id} not a contact from {src}");
+                return;
+            }
+        }
+    };
+
+    match result {
+        PULL_RESULT_NO_UPDATES => {
+            let mut node = ctx.node.write().unwrap();
+            if let Some(c) = node.owner.contact_users.iter_mut()
+                .find(|c| c.user.uuid == contact_user_uuid)
+            {
+                c.last_seen_public_version = new_version;
+            }
+            drop(node);
+            ctx.save_node();
+        }
+        PULL_RESULT_FULL_STATE => {
+            let state_blob = &plaintext[pos..];
+            let Some(data) = deserialize_contact_data(state_blob) else {
+                eprintln!("[cross_user_pull_response] failed to parse state from {src}");
+                return;
+            };
+            apply_contact_data(data, ctx);
+            {
+                let mut node = ctx.node.write().unwrap();
+                if let Some(c) = node.owner.contact_users.iter_mut()
+                    .find(|c| c.user.uuid == contact_user_uuid)
+                {
+                    c.last_seen_public_version = new_version;
+                }
+            }
+            ctx.save_node();
+
+            // If this node is the local user's writer SG, bump own
+            // public_version and notify own DGs so they pull the refreshed
+            // contact list via apply_public_state. Mirrors contact_data_push.
+            let (is_writer, writer_uuid) = {
+                let node = ctx.node.read().unwrap();
+                let target = find_writer_sg(&node);
+                (matches!(target, WriterTarget::Local), node.device_uuid)
+            };
+            if is_writer {
+                let (post_priv, post_pub) = {
+                    let mut node = ctx.node.write().unwrap();
+                    node.owner.bump_version(Scope::Public, writer_uuid);
+                    (node.owner.private_version, node.owner.public_version)
+                };
+                ctx.save_node();
+                notify_own_peers(&[Scope::Public], post_priv, post_pub, ctx);
+            }
+        }
+        other => {
+            eprintln!("[cross_user_pull_response] unknown result {other} from {src}");
         }
     }
 }
@@ -5361,6 +5681,7 @@ mod tests {
                     applications:    Vec::new(),
                 }],
             },
+            last_seen_public_version: SyncVersion::default(),
         });
         (device_uuid, kp)
     }
@@ -5566,6 +5887,7 @@ mod tests {
                         },
                     ],
                 },
+                last_seen_public_version: SyncVersion::default(),
             });
         }
 
@@ -7166,6 +7488,7 @@ mod tests {
                         applications:    Vec::new(),
                     }],
                 },
+                last_seen_public_version: SyncVersion::default(),
             });
         }
 
@@ -7618,6 +7941,7 @@ mod tests {
                         applications:    Vec::new(),
                     }],
                 },
+                last_seen_public_version: SyncVersion::default(),
             });
 
             // Active connection to the contact's SG.
@@ -7820,6 +8144,7 @@ mod tests {
                         applications:    Vec::new(),
                     }],
                 },
+                last_seen_public_version: SyncVersion::default(),
             });
             node.owner.active_connections.insert(1, ActiveConnection {
                 id:                        1,
@@ -8042,5 +8367,208 @@ mod tests {
         let buf = [0x99u8];
         let mut pos = 0usize;
         assert!(read_scope(&buf, &mut pos).is_none());
+    }
+
+    // ── Cross-user sync v1 (ops 0x75 / 0x76 / 0x77) ──────────────────────────
+
+    /// Set up the local node as an SG with one contact + active connection,
+    /// binding a UDP socket at the contact's SG address so outbound packets
+    /// can be captured.
+    fn setup_writer_sg_with_contact_capture(t: &TestCtx) -> (u16, Uuid, ActiveConnection, UdpSocket) {
+        let contact_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        contact_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let contact_addr = contact_socket.local_addr().unwrap();
+        let contact_v4: std::net::SocketAddrV4 = match contact_addr {
+            SocketAddr::V4(v4) => v4,
+            SocketAddr::V6(_)  => panic!("expected ipv4"),
+        };
+        let contact_user_uuid = generate_uuid();
+        let contact_sg_uuid   = generate_uuid();
+        let (conn_id, sender_conn) = setup_sg_node_with_contact_conn(
+            t, contact_user_uuid, contact_sg_uuid, contact_v4,
+        );
+        (conn_id, contact_user_uuid, sender_conn, contact_socket)
+    }
+
+    #[test]
+    fn cross_user_update_available_triggers_pull_when_announced_is_newer() {
+        let t = TestCtx::new();
+        let (_, _, sender_conn, contact_socket) = setup_writer_sg_with_contact_capture(&t);
+
+        let announced = SyncVersion {
+            writer_sg_uuid: generate_uuid(), epoch: 1, seq: 3,
+        };
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        write_sync_version(&mut body, &announced);
+        let pkt = build_encrypted_packet(CROSS_USER_UPDATE_AVAILABLE_OP, &sender_conn, &body);
+
+        cross_user_update_available("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 1024];
+        let (len, _) = contact_socket.recv_from(&mut buf).expect("CrossUserPullRequest expected");
+        assert_eq!(buf[0], CROSS_USER_PULL_REQUEST_OP);
+        assert!(len > 1);
+    }
+
+    #[test]
+    fn cross_user_update_available_skips_pull_when_caught_up() {
+        let t = TestCtx::new();
+        let (_, contact_user_uuid, sender_conn, contact_socket) =
+            setup_writer_sg_with_contact_capture(&t);
+
+        let v = SyncVersion {
+            writer_sg_uuid: generate_uuid(), epoch: 1, seq: 3,
+        };
+        // Pin the contact's last_seen to the same version the peer will announce.
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let c = node.owner.contact_users.iter_mut()
+                .find(|c| c.user.uuid == contact_user_uuid).unwrap();
+            c.last_seen_public_version = v;
+        }
+
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        write_sync_version(&mut body, &v);
+        let pkt = build_encrypted_packet(CROSS_USER_UPDATE_AVAILABLE_OP, &sender_conn, &body);
+
+        cross_user_update_available("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 1024];
+        assert!(contact_socket.recv_from(&mut buf).is_err(), "no pull request expected");
+    }
+
+    #[test]
+    fn cross_user_pull_request_returns_no_updates_when_peer_is_caught_up() {
+        let t = TestCtx::new();
+        let (_, _, sender_conn, contact_socket) = setup_writer_sg_with_contact_capture(&t);
+
+        // Bump our public_version so it's non-initial, then have the peer
+        // claim the same version.
+        let writer_uuid = t.ctx.node.read().unwrap().device_uuid;
+        t.ctx.node.write().unwrap().owner.bump_version(Scope::Public, writer_uuid);
+        let v = t.ctx.node.read().unwrap().owner.public_version;
+
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        write_sync_version(&mut body, &v);
+        let pkt = build_encrypted_packet(CROSS_USER_PULL_REQUEST_OP, &sender_conn, &body);
+
+        cross_user_pull_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 4096];
+        let (len, _) = contact_socket.recv_from(&mut buf).expect("response expected");
+        assert_eq!(buf[0], CROSS_USER_PULL_RESPONSE_OP);
+
+        // Decrypt to confirm NoUpdates result.
+        let plaintext = {
+            let mut node = super::super::data_models::Node::new();
+            node.owner.active_connections.insert(sender_conn.id, ActiveConnection {
+                id: sender_conn.id, timeout: sender_conn.timeout,
+                key_pair: sender_conn.key_pair.clone(),
+                peer_public_key: sender_conn.peer_public_key,
+                peer_active_connection_id: sender_conn.peer_active_connection_id,
+                device_uuid: sender_conn.device_uuid,
+                peer_addr: sender_conn.peer_addr,
+            });
+            decrypt_packet_body(&node, &buf[1..len]).unwrap()
+        };
+        let mut pos = 0usize;
+        let scope = read_scope(&plaintext, &mut pos).unwrap();
+        assert_eq!(scope, Scope::Public);
+        let result = plaintext[pos]; pos += 1;
+        assert_eq!(result, PULL_RESULT_NO_UPDATES);
+    }
+
+    #[test]
+    fn cross_user_pull_response_full_state_updates_contact_and_bumps_local() {
+        let t = TestCtx::new();
+        let (_, contact_user_uuid, sender_conn, _) = setup_writer_sg_with_contact_capture(&t);
+        let new_device_uuid = generate_uuid();
+
+        // Build a CrossUserPullResponse(FullState) payload from the contact.
+        // State blob is in serialize_contact_data's shape: user_uuid + devices.
+        let mut state = Vec::new();
+        state.extend_from_slice(&contact_user_uuid);
+        state.push(1u8); // one device
+        push_device(&mut state, &Device {
+            uuid:         new_device_uuid,
+            alias:        "new-dev".into(),
+            grade:        DeviceGrade::DG,
+            sg_rank:      None,
+            hosts:        Vec::new(),
+            applications: Vec::new(),
+        });
+        state.push(0u8); // zero apps
+
+        let new_v = SyncVersion {
+            writer_sg_uuid: generate_uuid(), epoch: 2, seq: 4,
+        };
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        body.push(PULL_RESULT_FULL_STATE);
+        write_sync_version(&mut body, &new_v);
+        body.extend_from_slice(&state);
+        let pkt = build_encrypted_packet(CROSS_USER_PULL_RESPONSE_OP, &sender_conn, &body);
+
+        let pub_before = t.ctx.node.read().unwrap().owner.public_version;
+        cross_user_pull_response("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let node = t.ctx.node.read().unwrap();
+
+        // Contact's devices updated to the new state.
+        let contact = node.owner.contact_users.iter()
+            .find(|c| c.user.uuid == contact_user_uuid).unwrap();
+        assert_eq!(contact.user.devices.len(), 1);
+        assert_eq!(contact.user.devices[0].uuid, new_device_uuid);
+        // last_seen advanced.
+        assert_eq!(contact.last_seen_public_version, new_v);
+        // Local writer SG bumped own public_version (so own DGs pull the
+        // refreshed contact list via apply_public_state).
+        assert!(node.owner.public_version.cmp_same_writer(&pub_before)
+                    .map(|o| o.is_gt()).unwrap_or(true),
+                "writer SG must bump own public_version after applying cross-user state");
+    }
+
+    #[test]
+    fn cross_user_pull_response_no_updates_pins_contact_version_only() {
+        let t = TestCtx::new();
+        let (_, contact_user_uuid, sender_conn, _) = setup_writer_sg_with_contact_capture(&t);
+
+        let new_v = SyncVersion {
+            writer_sg_uuid: generate_uuid(), epoch: 1, seq: 7,
+        };
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        body.push(PULL_RESULT_NO_UPDATES);
+        write_sync_version(&mut body, &new_v);
+        let pkt = build_encrypted_packet(CROSS_USER_PULL_RESPONSE_OP, &sender_conn, &body);
+
+        let pub_before = t.ctx.node.read().unwrap().owner.public_version;
+        cross_user_pull_response("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let node = t.ctx.node.read().unwrap();
+        let contact = node.owner.contact_users.iter()
+            .find(|c| c.user.uuid == contact_user_uuid).unwrap();
+        assert_eq!(contact.last_seen_public_version, new_v);
+        // NoUpdates must NOT bump our own public_version.
+        assert_eq!(node.owner.public_version, pub_before);
+    }
+
+    #[test]
+    fn notify_contacts_sends_cross_user_update_to_top_ranked_contact_sg() {
+        let t = TestCtx::new();
+        let (_, _, _, contact_socket) = setup_writer_sg_with_contact_capture(&t);
+
+        let v = SyncVersion {
+            writer_sg_uuid: generate_uuid(), epoch: 3, seq: 1,
+        };
+        notify_contacts(v, &t.ctx);
+
+        let mut buf = [0u8; 1024];
+        let (len, _) = contact_socket.recv_from(&mut buf).expect("notify expected");
+        assert_eq!(buf[0], CROSS_USER_UPDATE_AVAILABLE_OP);
+        assert!(len > 1);
     }
 }
