@@ -12,7 +12,6 @@ const MAINTAIN_CONNECTIONS_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Must be safely under the typical 30-second UDP NAT mapping timeout.
 const KEEPALIVE_DG_INTERVAL:         Duration = Duration::from_secs(20);
 const CLEANUP_TUNNELS_INTERVAL:      Duration = Duration::from_secs(5 * 60);
-const SYNC_CONTACTS_INTERVAL:        Duration = Duration::from_secs(24 * 3600);
 /// How often to pull state from the elected writer SG. The design says
 /// "every few hours" — 30 min is a starting point that catches dropped
 /// `UpdateAvailable` notifications quickly without burning bandwidth.
@@ -42,7 +41,6 @@ impl SchedulerThread {
             let mut last_maintain        = Instant::now();
             let mut last_keepalive       = Instant::now();
             let mut last_cleanup_tunnels = Instant::now();
-            let mut last_sync_contacts   = Instant::now();
             let mut last_sync_pull       = Instant::now();
             let mut pending: Vec<(Instant, Action)> = Vec::new();
 
@@ -74,10 +72,6 @@ impl SchedulerThread {
                 if now.duration_since(last_cleanup_tunnels) >= CLEANUP_TUNNELS_INTERVAL {
                     to_enqueue.push(Action::CleanupTunnels);
                     last_cleanup_tunnels = now;
-                }
-                if now.duration_since(last_sync_contacts) >= SYNC_CONTACTS_INTERVAL {
-                    to_enqueue.push(Action::SyncContacts);
-                    last_sync_contacts = now;
                 }
                 if now.duration_since(last_sync_pull) >= SYNC_PULL_INTERVAL {
                     to_enqueue.push(Action::SyncPull);

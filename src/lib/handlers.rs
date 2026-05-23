@@ -205,11 +205,6 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
 
     ctx.save_node();
-    // Cross-user propagation still rides the legacy contact path; sync v1's
-    // intra-user fan-out happens inside the `request_change` call above.
-    if auto_approve {
-        push_data_to_contacts(ctx);
-    }
 
     // Reply: [OK][token: 16 bytes]
     let mut reply = [0u8; 17];
@@ -602,8 +597,6 @@ const BOOTSTRAP_RESPONSE_OP: u8 = 0x31;
 const DEVICE_REGISTER_OP:    u8 = 0x32;
 const CONTACT_REQUEST_OP:         u8 = 0x33;
 const CONTACT_RESPONSE_OP:        u8 = 0x34;
-const CONTACT_DATA_PUSH_OP:       u8 = 0x60;
-const CONTACT_DATA_PULL_REQ_OP:   u8 = 0x61;
 // Sync v1 ops (see descriptions/data sync.md).
 // 0x70/0x71 — DG/SG→writer write request and writer→originator ack.
 // 0x72      — writer→peers "you have a stale version, pull when ready".
@@ -756,10 +749,9 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     pkt[37..101].copy_from_slice(&sig);
     send(ctx, src, &pkt);
 
-    // No intra-user push needed on a new DG connection: the writer SG has
-    // already published any prior state via sync v1 `SyncUpdateAvailable`,
-    // and the joining DG pulls on its side (see `connect_ack`).
-    push_data_to_contacts(ctx);
+    // No push needed on a new DG connection: state hasn't changed. The
+    // writer SG already published any prior state via sync v1
+    // SyncUpdateAvailable, and the joining DG pulls on its side.
 }
 
 /// Op 0x21 — Acknowledgement from a peer node in response to our ConnectRequest.
@@ -815,7 +807,6 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     });
     drop(node);
 
-    push_data_to_contacts(ctx);
     // Sync v1: if the freshly-connected peer is our writer SG, immediately
     // catch up on any `SyncUpdateAvailable` notifications missed while
     // disconnected. `sync_pull` is a no-op when the writer is `Local` or no
@@ -1551,8 +1542,6 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         }
     }
-
-    push_data_to_contacts(ctx);
 }
 
 // ── Contact exchange payload serialization ────────────────────────────────────
@@ -1661,7 +1650,9 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     };
 
     ctx.save_node();
-    push_data_to_contacts(ctx);
+    // contact_request added a new contact to contact_users — that's a
+    // public-scope mutation. Fan out via sync v1 if we are the writer SG.
+    bump_public_and_fan_out_if_writer(ctx);
 
     // Encrypt and send ContactResponse.
     let (ciphertext, resp_nonce) = xchacha20_encrypt(&shared_secret, &response_payload);
@@ -1730,7 +1721,9 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
 
     ctx.save_node();
-    push_data_to_contacts(ctx);
+    // contact_response added a new contact to contact_users — that's a
+    // public-scope mutation. Fan out via sync v1 if we are the writer SG.
+    bump_public_and_fan_out_if_writer(ctx);
 
     // Trigger connection maintenance — we have a new contact.
     ctx.scheduler_tx.send(super::action_queue::ScheduleRequest {
@@ -1739,20 +1732,17 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }).ok();
 }
 
-// ── Contact data sync ─────────────────────────────────────────────────────────
+// ── Contact data serialization (cross-user public-scope payload) ─────────────
 //
-// Keeps each user's device and app list up-to-date on all contacts' nodes.
+// Wire shape used for the FullState body of a CrossUserPullResponse (op 0x77).
+// Carries one user's public state from their writer SG to a contact's SG:
 //
-// Push payload format (encrypted body of ContactDataPush, op 0x60):
 //   [user_uuid: 16]
 //   [device_count: u8]
 //     each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8]
 //                  [host_count:u8][each host: u8+bytes]
 //       [app_count: u8]
 //         each approved app: [id: u16 BE][alias: u8+bytes]
-//
-// Pull request payload (encrypted body of ContactDataPullRequest, op 0x61):
-//   [user_uuid: 16]   — identifies the requesting user; connection provides auth
 
 fn serialize_contact_data(node: &super::data_models::Node) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -1798,43 +1788,6 @@ fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
     Some(ContactData { user_uuid, devices })
 }
 
-/// Send a ContactDataPush to the top-ranked reachable SG of every contact.
-/// Silently skips contacts with no active connection — the daily pull will catch them.
-fn push_data_to_contacts(ctx: &WorkerContext) {
-    let node = ctx.node.read().unwrap();
-    // Only SGs originate pushes — DGs don't have direct connections to contact SGs.
-    let local_uuid = node.device_uuid;
-    let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid);
-    if !local_device.map(|d| matches!(d.grade, DeviceGrade::SG)).unwrap_or(false) {
-        return;
-    }
-
-    let payload = serialize_contact_data(&node);
-
-    let mut packets: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
-    for contact in &node.owner.contact_users {
-        // Find the contact's top-ranked SG that we have an active connection to.
-        let mut sgs: Vec<&Device> = contact.user.devices.iter()
-            .filter(|d| matches!(d.grade, DeviceGrade::SG))
-            .filter(|d| node.owner.active_connections.values().any(|c| c.device_uuid == d.uuid))
-            .collect();
-        sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
-
-        let Some(sg) = sgs.first() else { continue };
-        let Some(conn) = node.owner.active_connections.values()
-            .find(|c| c.device_uuid == sg.uuid)
-        else { continue };
-
-        let pkt = build_encrypted_packet(CONTACT_DATA_PUSH_OP, conn, &payload);
-        println!("[push_data_to_contacts] pushing to {} at {}", contact.user.alias, conn.peer_addr);
-        packets.push((pkt, conn.peer_addr));
-    }
-    drop(node);
-
-    for (pkt, dest) in packets {
-        send(ctx, dest, &pkt);
-    }
-}
 
 /// Apply received contact data, updating the matching contact's device and app lists.
 fn apply_contact_data(data: ContactData, ctx: &WorkerContext) {
@@ -1859,119 +1812,6 @@ fn apply_contact_data(data: ContactData, ctx: &WorkerContext) {
     }).collect();
 }
 
-/// Op 0x60 — Contact data push (SG → contact's SG).
-///
-/// Encrypted body: [user_uuid:16][device_count:u8][ ...devices+apps... ]
-///
-/// Updates the sender's entry in the receiver's contact list.
-pub fn contact_data_push(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    println!("[contact_data_push] handling from {src} (len={})", buf.len());
-    let node = ctx.node.read().unwrap();
-    let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
-        eprintln!("[contact_data_push] decryption failed from {src}");
-        return;
-    };
-    drop(node);
-
-    let Some(data) = deserialize_contact_data(&plaintext) else {
-        eprintln!("[contact_data_push] deserialization failed from {src}");
-        return;
-    };
-
-    println!("[contact_data_push] received from {src}");
-    apply_contact_data(data, ctx);
-    ctx.save_node();
-
-    // Contact data is part of public scope: if this node is the writer SG,
-    // bump public_version and notify own DGs so they pull the fresh state
-    // via `apply_public_state`. Non-writer SGs only persist locally; their
-    // copy gets superseded once the writer's update propagates.
-    let (is_writer, writer_uuid) = {
-        let node = ctx.node.read().unwrap();
-        let target = find_writer_sg(&node);
-        (matches!(target, WriterTarget::Local), node.device_uuid)
-    };
-    if is_writer {
-        let (post_priv, post_pub) = {
-            let mut node = ctx.node.write().unwrap();
-            node.owner.bump_version(Scope::Public, writer_uuid);
-            (node.owner.private_version, node.owner.public_version)
-        };
-        ctx.save_node();
-        notify_own_peers(&[Scope::Public], post_priv, post_pub, ctx);
-    }
-}
-
-/// Op 0x61 — Contact data pull request (SG → contact's SG).
-///
-/// Encrypted body: [user_uuid: 16]
-///
-/// The receiver replies with a ContactDataPush containing its current data.
-pub fn contact_data_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let (plaintext, payload) = {
-        let node = ctx.node.read().unwrap();
-        let Some(pt) = decrypt_packet_body(&node, &buf) else {
-            eprintln!("[contact_data_pull_request] decryption failed from {src}");
-            return;
-        };
-        let payload = serialize_contact_data(&node);
-        (pt, payload)
-    };
-
-    if plaintext.len() < 16 {
-        eprintln!("[contact_data_pull_request] body too short from {src}");
-        return;
-    }
-
-    // Look up the connection the request arrived on so we can reply.
-    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
-    let reply_pkt = {
-        let node = ctx.node.read().unwrap();
-        let Some(conn) = node.owner.active_connections.get(&conn_id) else {
-            eprintln!("[contact_data_pull_request] no active connection for id {conn_id}");
-            return;
-        };
-        build_encrypted_packet(CONTACT_DATA_PUSH_OP, conn, &payload)
-    };
-
-    send(ctx, src, &reply_pkt);
-}
-
-/// Scheduled daily: send a ContactDataPullRequest to the top SG of every contact.
-pub fn sync_contacts(ctx: &WorkerContext) {
-    let node = ctx.node.read().unwrap();
-
-    // Only SGs run this — DGs don't have direct connections to contact SGs.
-    let local_uuid = node.device_uuid;
-    let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid);
-    if !local_device.map(|d| matches!(d.grade, DeviceGrade::SG)).unwrap_or(false) {
-        return;
-    }
-
-    let our_uuid = node.owner.user.uuid;
-    let mut packets: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
-
-    for contact in &node.owner.contact_users {
-        let mut sgs: Vec<&Device> = contact.user.devices.iter()
-            .filter(|d| matches!(d.grade, DeviceGrade::SG))
-            .filter(|d| node.owner.active_connections.values().any(|c| c.device_uuid == d.uuid))
-            .collect();
-        sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
-
-        let Some(sg) = sgs.first() else { continue };
-        let Some(conn) = node.owner.active_connections.values()
-            .find(|c| c.device_uuid == sg.uuid)
-        else { continue };
-
-        let pkt = build_encrypted_packet(CONTACT_DATA_PULL_REQ_OP, conn, &our_uuid);
-        packets.push((pkt, conn.peer_addr));
-    }
-    drop(node);
-
-    for (pkt, dest) in packets {
-        send(ctx, dest, &pkt);
-    }
-}
 
 // ── Sync v1 (ops 0x70 – 0x74) ────────────────────────────────────────────────
 //
@@ -2385,6 +2225,27 @@ fn notify_own_peers(
     for (pkt, dest) in packets {
         send(ctx, dest, &pkt);
     }
+}
+
+/// If this node is the local user's writer SG, bump `public_version`,
+/// notify own peers (DGs and other SGs), and fan out to contacts. Used
+/// when a writer SG accepts a state mutation outside the formal `Change`
+/// pipeline (contact-exchange handshake, cross-user pull-in).
+fn bump_public_and_fan_out_if_writer(ctx: &WorkerContext) {
+    let (is_writer, writer_uuid) = {
+        let node = ctx.node.read().unwrap();
+        let target = find_writer_sg(&node);
+        (matches!(target, WriterTarget::Local), node.device_uuid)
+    };
+    if !is_writer { return; }
+    let (post_priv, post_pub) = {
+        let mut node = ctx.node.write().unwrap();
+        node.owner.bump_version(Scope::Public, writer_uuid);
+        (node.owner.private_version, node.owner.public_version)
+    };
+    ctx.save_node();
+    notify_own_peers(&[Scope::Public], post_priv, post_pub, ctx);
+    notify_contacts(post_pub, ctx);
 }
 
 /// Cross-user fan-out: send a `CrossUserUpdateAvailable(public, version)` to
@@ -3336,22 +3197,10 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
             ctx.save_node();
 
             // If this node is the local user's writer SG, bump own
-            // public_version and notify own DGs so they pull the refreshed
-            // contact list via apply_public_state. Mirrors contact_data_push.
-            let (is_writer, writer_uuid) = {
-                let node = ctx.node.read().unwrap();
-                let target = find_writer_sg(&node);
-                (matches!(target, WriterTarget::Local), node.device_uuid)
-            };
-            if is_writer {
-                let (post_priv, post_pub) = {
-                    let mut node = ctx.node.write().unwrap();
-                    node.owner.bump_version(Scope::Public, writer_uuid);
-                    (node.owner.private_version, node.owner.public_version)
-                };
-                ctx.save_node();
-                notify_own_peers(&[Scope::Public], post_priv, post_pub, ctx);
-            }
+            // public_version and fan out so own DGs pull the refreshed
+            // contact list via apply_public_state and contacts notice the
+            // updated cross-user state.
+            bump_public_and_fan_out_if_writer(ctx);
         }
         other => {
             eprintln!("[cross_user_pull_response] unknown result {other} from {src}");
@@ -4712,9 +4561,6 @@ fn approve_app(body: &[u8], ctx: &WorkerContext) {
         }
     };
     ctx.save_node();
-    // Cross-user propagation still rides the legacy contact path; sync v1's
-    // intra-user fan-out happens inside the `request_change` call below.
-    push_data_to_contacts(ctx);
 
     // Publish id+alias to peers via the writer SG. Only fire when the app
     // actually existed and was approved — guards against a stray UI POST for
@@ -4747,9 +4593,6 @@ fn reject_app(body: &[u8], ctx: &WorkerContext) {
         return;
     }
     ctx.save_node();
-    // Cross-user propagation still rides the legacy contact path; sync v1's
-    // intra-user fan-out happens inside the `request_change` call below.
-    push_data_to_contacts(ctx);
 
     // Publish the removal via sync v1. The error is currently swallowed; a
     // follow-up will surface it the same way `app_register` does.
@@ -7970,202 +7813,6 @@ mod tests {
         (conn_id, sender_conn)
     }
 
-    #[test]
-    fn contact_data_push_updates_contact_devices() {
-        let t = TestCtx::new();
-        let contact_uuid    = generate_uuid();
-        let contact_sg_uuid = generate_uuid();
-        // contact_sg_host doesn't need to be reachable; we just check state changes.
-        let contact_sg_host: std::net::SocketAddrV4 = "127.0.0.1:19900".parse().unwrap();
-
-        let (_, sender_conn) = setup_sg_node_with_contact_conn(
-            &t, contact_uuid, contact_sg_uuid, contact_sg_host,
-        );
-
-        // Build a ContactDataPush payload: contact user has 1 device + 1 approved app.
-        let new_device_uuid = generate_uuid();
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&contact_uuid); // user_uuid
-        payload.push(1u8);                        // device_count
-        // device: uuid + alias + grade(SG=1) + sg_rank(1) + ip + port
-        push_device(&mut payload, &Device {
-            alias:           "chad-laptop".to_string(),
-            uuid:            new_device_uuid,
-            grade:           DeviceGrade::SG,
-            sg_rank:         Some(1),
-            hosts:           vec!["127.0.0.1:8888".into()],
-            applications:    Vec::new(),
-        });
-        payload.push(1u8);              // app_count
-        payload.extend_from_slice(&42u16.to_be_bytes()); // app id
-        push_str(&mut payload, "chad-app");
-
-        let pkt = build_encrypted_packet(CONTACT_DATA_PUSH_OP, &sender_conn, &payload);
-        contact_data_push(t.app_addr(), pkt[1..].to_vec(), &t.ctx);
-
-        // Contact's device list should now reflect the pushed data.
-        let node = t.ctx.node.read().unwrap();
-        let contact = node.owner.contact_users.iter()
-            .find(|c| c.user.uuid == contact_uuid)
-            .expect("contact not found");
-        assert_eq!(contact.user.devices.len(), 1);
-        assert_eq!(contact.user.devices[0].alias, "chad-laptop");
-        assert_eq!(contact.user.devices[0].applications.len(), 1);
-        assert_eq!(contact.user.devices[0].applications[0].id, 42);
-        assert_eq!(contact.user.devices[0].applications[0].alias, "chad-app");
-    }
-
-    #[test]
-    fn contact_data_push_ignores_unknown_user() {
-        let t = TestCtx::new();
-        let contact_uuid    = generate_uuid();
-        let contact_sg_uuid = generate_uuid();
-        let contact_sg_host: std::net::SocketAddrV4 = "127.0.0.1:19901".parse().unwrap();
-
-        let (_, sender_conn) = setup_sg_node_with_contact_conn(
-            &t, contact_uuid, contact_sg_uuid, contact_sg_host,
-        );
-
-        // Push data for a UUID that is not in our contacts.
-        let unknown_uuid = generate_uuid();
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&unknown_uuid);
-        payload.push(0u8); // 0 devices
-        let pkt = build_encrypted_packet(CONTACT_DATA_PUSH_OP, &sender_conn, &payload);
-        contact_data_push(t.app_addr(), pkt[1..].to_vec(), &t.ctx);
-
-        // Contact list should be unchanged.
-        let node = t.ctx.node.read().unwrap();
-        assert_eq!(node.owner.contact_users.len(), 1);
-        assert_eq!(node.owner.contact_users[0].user.uuid, contact_uuid);
-    }
-
-    #[test]
-    fn contact_data_pull_request_replies_with_push() {
-        let contact_sg_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        contact_sg_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        let contact_sg_addr: std::net::SocketAddrV4 =
-            contact_sg_socket.local_addr().unwrap().to_string().parse().unwrap();
-
-        let t = TestCtx::new();
-        let contact_uuid    = generate_uuid();
-        let contact_sg_uuid = generate_uuid();
-
-        let (conn_id, sender_conn) = setup_sg_node_with_contact_conn(
-            &t, contact_uuid, contact_sg_uuid, contact_sg_addr,
-        );
-
-        // Encrypt a pull request: body is just our user_uuid.
-        let our_uuid = t.ctx.node.read().unwrap().owner.user.uuid;
-        let pkt = build_encrypted_packet(CONTACT_DATA_PULL_REQ_OP, &sender_conn, &our_uuid);
-
-        // Handler receives from contact_sg_addr so the reply goes there.
-        contact_data_pull_request(
-            SocketAddr::V4(contact_sg_addr),
-            pkt[1..].to_vec(),
-            &t.ctx,
-        );
-
-        // Contact's SG socket should have received a ContactDataPush.
-        let mut buf = [0u8; 1024];
-        let (len, _) = contact_sg_socket.recv_from(&mut buf)
-            .expect("no ContactDataPush reply received");
-        assert_eq!(buf[0], CONTACT_DATA_PUSH_OP);
-
-        // The reply must decrypt correctly from the contact SG's perspective.
-        // The reply header carries sender_conn.id (42) as the connection ID,
-        // so decrypt_packet_body will look up that key in active_connections.
-        let sender_conn_id = sender_conn.id;
-        let mut reply_node = Node::new();
-        reply_node.owner.active_connections.insert(sender_conn_id, ActiveConnection {
-            id:                        sender_conn_id,
-            timeout:                   SystemTime::now() + Duration::from_secs(3600),
-            key_pair:                  sender_conn.key_pair,
-            peer_public_key:           sender_conn.peer_public_key,
-            peer_active_connection_id: sender_conn.peer_active_connection_id,
-            device_uuid:               sender_conn.device_uuid,
-        peer_addr:   "127.0.0.1:0".parse().unwrap(),
-        });
-        let plaintext = decrypt_packet_body(&reply_node, &buf[1..len])
-            .expect("reply decryption failed");
-
-        // Payload starts with this node's user UUID.
-        let reply_uuid: Uuid = plaintext[0..16].try_into().unwrap();
-        assert_eq!(reply_uuid, our_uuid);
-    }
-
-    #[test]
-    fn push_data_to_contacts_sends_to_active_sg_connections() {
-        let contact_sg_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        contact_sg_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        let contact_sg_addr: std::net::SocketAddrV4 =
-            contact_sg_socket.local_addr().unwrap().to_string().parse().unwrap();
-
-        let t = TestCtx::new();
-        let contact_uuid    = generate_uuid();
-        let contact_sg_uuid = generate_uuid();
-
-        setup_sg_node_with_contact_conn(&t, contact_uuid, contact_sg_uuid, contact_sg_addr);
-
-        push_data_to_contacts(&t.ctx);
-
-        let mut buf = [0u8; 512];
-        let (len, _) = contact_sg_socket.recv_from(&mut buf)
-            .expect("no ContactDataPush received");
-        assert_eq!(buf[0], CONTACT_DATA_PUSH_OP);
-        assert!(len > 1);
-    }
-
-    #[test]
-    fn push_data_to_contacts_skips_dg_nodes() {
-        // If this node is a DG, push_data_to_contacts should be a no-op.
-        let contact_sg_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        contact_sg_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        let contact_sg_addr: std::net::SocketAddrV4 =
-            contact_sg_socket.local_addr().unwrap().to_string().parse().unwrap();
-
-        let t = TestCtx::new();
-        // Node defaults to DG — do NOT call setup_sg_node_with_contact_conn
-        // (which upgrades to SG).  Add a contact manually.
-        {
-            let mut node = t.ctx.node.write().unwrap();
-            let contact_sg_uuid = generate_uuid();
-            node.owner.contact_users.push(Contact {
-                public_key: generate_key_bytes(),
-                user: User {
-                    alias:   "chad".to_string(),
-                    uuid:    generate_uuid(),
-                    devices: vec![Device {
-                        alias:           "chad-sg".to_string(),
-                        uuid:            contact_sg_uuid,
-                        grade:           DeviceGrade::SG,
-                        sg_rank:         Some(1),
-                        hosts:           vec![contact_sg_addr.to_string()],
-                        applications:    Vec::new(),
-                    }],
-                },
-                last_seen_public_version: SyncVersion::default(),
-            });
-            node.owner.active_connections.insert(1, ActiveConnection {
-                id:                        1,
-                timeout:                   SystemTime::now() + Duration::from_secs(3600),
-                key_pair:                  generate_x25519_keypair(),
-                peer_public_key:           generate_key_bytes(),
-                peer_active_connection_id: 10,
-                device_uuid:               contact_sg_uuid,
-            peer_addr:   "127.0.0.1:0".parse().unwrap(),
-            });
-        }
-
-        push_data_to_contacts(&t.ctx);
-
-        // No packet should arrive.
-        let mut buf = [0u8; 64];
-        assert!(
-            contact_sg_socket.recv_from(&mut buf).is_err(),
-            "DG should not push contact data"
-        );
-    }
 
     #[test]
     fn contact_data_roundtrip_serialization() {

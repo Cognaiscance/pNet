@@ -30,8 +30,6 @@ pub enum Action {
     DeviceRegistration { src: SocketAddr, buf: Vec<u8> },
     ContactRequest        { src: SocketAddr, buf: Vec<u8> },
     ContactResponse       { src: SocketAddr, buf: Vec<u8> },
-    ContactDataPush       { src: SocketAddr, buf: Vec<u8> },
-    ContactDataPullRequest { src: SocketAddr, buf: Vec<u8> },
     // Sync v1 (descriptions/data sync.md). Replaces the push-everywhere
     // ContactDataPush/DeviceDataPush flow once phases 3–7 land.
     SyncWriteRequest      { src: SocketAddr, buf: Vec<u8> },
@@ -57,7 +55,6 @@ pub enum Action {
     MaintainConnections,
     KeepAliveDG,
     CleanupTunnels,
-    SyncContacts,
     /// Periodic pull from the elected writer SG for both scopes. Also fired
     /// as a one-shot when an active connection to the writer SG is established.
     SyncPull,
@@ -108,8 +105,6 @@ impl Action {
             Action::DeviceRegistration { src, buf }   => handlers::device_registration(src, buf, ctx),
             Action::ContactRequest         { src, buf } => handlers::contact_request(src, buf, ctx),
             Action::ContactResponse        { src, buf } => handlers::contact_response(src, buf, ctx),
-            Action::ContactDataPush        { src, buf } => handlers::contact_data_push(src, buf, ctx),
-            Action::ContactDataPullRequest { src, buf } => handlers::contact_data_pull_request(src, buf, ctx),
             Action::SyncWriteRequest       { src, buf } => handlers::sync_write_request(src, buf, ctx),
             Action::SyncWriteAck           { src, buf } => handlers::sync_write_ack(src, buf, ctx),
             Action::SyncUpdateAvailable    { src, buf } => handlers::sync_update_available(src, buf, ctx),
@@ -129,7 +124,6 @@ impl Action {
             Action::MaintainConnections              => handlers::maintain_connections(ctx),
             Action::KeepAliveDG                      => handlers::keepalive_dg(ctx),
             Action::CleanupTunnels                   => handlers::cleanup_tunnels(ctx),
-            Action::SyncContacts                     => handlers::sync_contacts(ctx),
             Action::SyncPull                         => handlers::sync_pull(ctx),
             Action::SetupTunnel { sender_uuid, dest_uuid } => handlers::setup_tunnel(sender_uuid, dest_uuid, ctx),
         }

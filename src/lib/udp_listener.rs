@@ -85,8 +85,6 @@ impl UdpListener {
                     0x32 => Action::DeviceRegistration { src, buf: payload },
                     0x33 => Action::ContactRequest         { src, buf: payload },
                     0x34 => Action::ContactResponse        { src, buf: payload },
-                    0x60 => Action::ContactDataPush        { src, buf: payload },
-                    0x61 => Action::ContactDataPullRequest { src, buf: payload },
                     0x70 => Action::SyncWriteRequest       { src, buf: payload },
                     0x71 => Action::SyncWriteAck           { src, buf: payload },
                     0x72 => Action::SyncUpdateAvailable    { src, buf: payload },
