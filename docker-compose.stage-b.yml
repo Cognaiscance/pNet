@@ -1,0 +1,123 @@
+# Stage B test topology — two users (alice, bob) each with 1 SG and 1 DG,
+# with a pre-established contact relationship.
+#
+# Goal: exercise cross-user public-scope sync v1 (ops 0x75/0x76/0x77). After
+# bring-up, each side's probes should see the other user's devices and apps
+# under .contacts, and state mutations on one side should propagate to the
+# other within seconds via the writer-SG → contact's-SG → contact's-DGs path.
+#
+# Bring-up is *not* a single `compose up`: device invitations and the
+# contact-exchange handshake need orchestration. tests/stage-b/run.sh is
+# responsible for: starting sg-alice + sg-bob, minting one device invitation
+# per user, starting the DGs and probes, then minting a contact code on
+# sg-alice and redeeming it on sg-bob.
+#
+# `compose down -v` blows away the named volumes, so every run starts clean.
+
+networks:
+  net-pnet:
+
+volumes:
+  pnet-data-sg-alice:
+  pnet-data-dg-alice:
+  pnet-data-sg-bob:
+  pnet-data-dg-bob:
+
+services:
+  # ── pnet daemons ──────────────────────────────────────────────────────────
+
+  sg-alice:
+    build: .
+    networks: [net-pnet]
+    ports:
+      - "8811:8777/tcp"
+    environment:
+      - PNET_GRADE=sg
+      - PNET_USER_ALIAS=alice
+      - PNET_DEVICE_ALIAS=sg-alice
+      - PNET_SG_RANK=1
+      - PNET_HOSTS=sg-alice
+      - PNET_AUTO_APPROVE_APPS=1
+    volumes:
+      - pnet-data-sg-alice:/root/.pnet
+
+  dg-alice:
+    build: .
+    networks: [net-pnet]
+    environment:
+      - PNET_GRADE=dg
+      - PNET_DEVICE_ALIAS=dg-alice
+      - PNET_INVITATION_CODE=${INV_DG_ALICE:-}
+      - PNET_AUTO_APPROVE_APPS=1
+    volumes:
+      - pnet-data-dg-alice:/root/.pnet
+    depends_on: [sg-alice]
+
+  sg-bob:
+    build: .
+    networks: [net-pnet]
+    ports:
+      - "8812:8777/tcp"
+    environment:
+      - PNET_GRADE=sg
+      - PNET_USER_ALIAS=bob
+      - PNET_DEVICE_ALIAS=sg-bob
+      - PNET_SG_RANK=1
+      - PNET_HOSTS=sg-bob
+      - PNET_AUTO_APPROVE_APPS=1
+    volumes:
+      - pnet-data-sg-bob:/root/.pnet
+
+  dg-bob:
+    build: .
+    networks: [net-pnet]
+    environment:
+      - PNET_GRADE=dg
+      - PNET_DEVICE_ALIAS=dg-bob
+      - PNET_INVITATION_CODE=${INV_DG_BOB:-}
+      - PNET_AUTO_APPROVE_APPS=1
+    volumes:
+      - pnet-data-dg-bob:/root/.pnet
+    depends_on: [sg-bob]
+
+  # ── probes (one per pnet daemon) ──────────────────────────────────────────
+
+  probe-sg-alice:
+    build:
+      context: .
+      dockerfile: apps/pnet_test_probe/Dockerfile
+    networks: [net-pnet]
+    ports: ["3811:3000/tcp"]
+    environment:
+      - PNET_ADDR=sg-alice:7777
+    depends_on: [sg-alice]
+
+  probe-dg-alice:
+    build:
+      context: .
+      dockerfile: apps/pnet_test_probe/Dockerfile
+    networks: [net-pnet]
+    ports: ["3812:3000/tcp"]
+    environment:
+      - PNET_ADDR=dg-alice:7777
+    depends_on: [dg-alice]
+
+  probe-sg-bob:
+    build:
+      context: .
+      dockerfile: apps/pnet_test_probe/Dockerfile
+    networks: [net-pnet]
+    ports: ["3813:3000/tcp"]
+    environment:
+      - PNET_ADDR=sg-bob:7777
+    depends_on: [sg-bob]
+
+  probe-dg-bob:
+    build:
+      context: .
+      dockerfile: apps/pnet_test_probe/Dockerfile
+    networks: [net-pnet]
+    ports: ["3814:3000/tcp"]
+    environment:
+      - PNET_ADDR=dg-bob:7777
+    depends_on: [dg-bob]

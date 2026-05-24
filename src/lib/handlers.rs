@@ -812,6 +812,11 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // disconnected. `sync_pull` is a no-op when the writer is `Local` or no
     // writer is reachable, so it's safe to call unconditionally.
     sync_pull(ctx);
+    // If the freshly-connected peer is one of our contacts' devices, also
+    // fire a CrossUserPullRequest so we catch up on cross-user public state
+    // (e.g. contact's apps) that may have been published while the
+    // SG↔SG connection didn't yet exist. No-op for own-user peers.
+    cross_user_pull_on_reconnect(our_conn_id, ctx);
 }
 
 // ── Bootstrap crypto helpers ──────────────────────────────────────────────────
@@ -2278,6 +2283,32 @@ fn notify_contacts(public: SyncVersion, ctx: &WorkerContext) {
     };
     for (pkt, dest) in packets {
         send(ctx, dest, &pkt);
+    }
+}
+
+/// On-reconnect cross-user pull. Called from `connect_ack` immediately after a
+/// fresh active connection lands. If the peer device on this connection
+/// belongs to a contact, send a `CrossUserPullRequest(public, last_seen)` so
+/// we catch up on any updates published by that contact while disconnected.
+/// No-op if the peer isn't a contact device.
+fn cross_user_pull_on_reconnect(conn_id: u16, ctx: &WorkerContext) {
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        let Some(conn) = node.owner.active_connections.get(&conn_id) else { return };
+        let peer_uuid = conn.device_uuid;
+        let Some(contact) = node.owner.contact_users.iter()
+            .find(|c| c.user.devices.iter().any(|d| d.uuid == peer_uuid))
+        else { return };
+        let mut body = Vec::with_capacity(1 + SYNC_VERSION_WIRE_LEN);
+        write_scope(&mut body, Scope::Public);
+        write_sync_version(&mut body, &contact.last_seen_public_version);
+        Some((
+            build_encrypted_packet(CROSS_USER_PULL_REQUEST_OP, conn, &body),
+            conn.peer_addr,
+        ))
+    };
+    if let Some((pkt, addr)) = pkt_and_addr {
+        send(ctx, addr, &pkt);
     }
 }
 
