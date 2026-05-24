@@ -4220,19 +4220,19 @@ pub fn ui_request(
         }
         ("GET",  "/")                     => respond_redirect(&stream, "/dashboard"),
         ("GET",  "/dashboard")            => respond_html(&stream, 200, &render_dashboard(ctx)),
-        ("GET",  "/pending-apps")         => respond_html(&stream, 200, &render_pending_apps(ctx)),
+        ("GET",  "/pending-apps")         => respond_html(&stream, 200, &render_pending_apps(ctx, &query)),
         ("POST", "/pending-apps/approve") => {
-            approve_app(&body, ctx);
-            respond_redirect(&stream, "/pending-apps");
+            let target = redirect_with_error("/pending-apps", approve_app(&body, ctx));
+            respond_redirect(&stream, &target);
         }
         ("POST", "/pending-apps/reject")  => {
-            reject_app(&body, ctx);
-            respond_redirect(&stream, "/pending-apps");
+            let target = redirect_with_error("/pending-apps", reject_app(&body, ctx));
+            respond_redirect(&stream, &target);
         }
-        ("GET",  "/applications")  => respond_html(&stream, 200, &render_applications(ctx)),
+        ("GET",  "/applications")  => respond_html(&stream, 200, &render_applications(ctx, &query)),
         ("POST", "/applications/delete") => {
-            reject_app(&body, ctx);
-            respond_redirect(&stream, "/applications");
+            let target = redirect_with_error("/applications", reject_app(&body, ctx));
+            respond_redirect(&stream, &target);
         }
         ("GET",  "/contacts")      => respond_html(&stream, 200, &render_contacts(ctx)),
         ("GET",  "/devices")       => respond_html(&stream, 200, &render_devices(ctx)),
@@ -4293,6 +4293,15 @@ fn respond_redirect(stream: &std::net::TcpStream, location: &str) {
     );
     let mut s = stream;
     let _ = s.write_all(response.as_bytes());
+}
+
+/// Helper for POST routes: redirect to `base` on success, or to
+/// `base?error=<code>` when the action returned a UI error code.
+fn redirect_with_error(base: &str, err: Option<&'static str>) -> String {
+    match err {
+        Some(code) => format!("{base}?error={code}"),
+        None       => base.to_string(),
+    }
 }
 
 /// Extract a URL-encoded form field value from a POST body (e.g. `id=5`).
@@ -4391,7 +4400,20 @@ fn render_dashboard(ctx: &WorkerContext) -> String {
     layout("Dashboard", &body)
 }
 
-fn render_pending_apps(ctx: &WorkerContext) -> String {
+/// Render a red banner for the UI error codes emitted by approve_app /
+/// reject_app. Returns an empty string when there's no error to show.
+fn ui_error_banner(query: &str) -> String {
+    match query_param(query, "error") {
+        Some(code) if code == UI_ERR_PUBLISH_FAILED =>
+            "<div class='card' style='background:#fee;color:#900;border:1px solid #c66'>\
+                <strong>Could not publish change:</strong> no reachable writer SG. \
+                The local change has been rolled back; retry when an SG is online.\
+            </div>".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn render_pending_apps(ctx: &WorkerContext, query: &str) -> String {
     let node        = ctx.node.read().unwrap();
     let device_uuid = node.device_uuid;
     let device      = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
@@ -4426,21 +4448,22 @@ fn render_pending_apps(ctx: &WorkerContext) -> String {
         })
         .unwrap_or_default();
 
-    let body = if rows.is_empty() {
-        "<h1>Pending Apps</h1><p class='empty'>No pending applications.</p>".to_string()
+    let error_banner = ui_error_banner(query);
+    let table = if rows.is_empty() {
+        "<p class='empty'>No pending applications.</p>".to_string()
     } else {
         format!(
-            "<h1>Pending Apps</h1>\
-             <table>\
+            "<table>\
                <tr><th>Alias</th><th>Protocol</th><th>Host</th><th>Actions</th></tr>\
                {rows}\
              </table>"
         )
     };
+    let body = format!("<h1>Pending Apps</h1>{error_banner}{table}");
     layout("Pending Apps", &body)
 }
 
-fn render_applications(ctx: &WorkerContext) -> String {
+fn render_applications(ctx: &WorkerContext, query: &str) -> String {
     let node        = ctx.node.read().unwrap();
     let device_uuid = node.device_uuid;
     let device      = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
@@ -4464,17 +4487,18 @@ fn render_applications(ctx: &WorkerContext) -> String {
         })
         .unwrap_or_default();
 
-    let body = if rows.is_empty() {
-        "<h1>Applications</h1><p class='empty'>No approved applications.</p>".to_string()
+    let error_banner = ui_error_banner(query);
+    let table = if rows.is_empty() {
+        "<p class='empty'>No approved applications.</p>".to_string()
     } else {
         format!(
-            "<h1>Applications</h1>\
-             <table>\
+            "<table>\
                <tr><th>Alias</th><th>Protocol</th><th>Host</th><th></th></tr>\
                {rows}\
              </table>"
         )
     };
+    let body = format!("<h1>Applications</h1>{error_banner}{table}");
     layout("Applications", &body)
 }
 
@@ -4576,61 +4600,86 @@ fn render_devices(ctx: &WorkerContext) -> String {
 
 // ── App approval / rejection ──────────────────────────────────────────────────
 
-fn approve_app(body: &[u8], ctx: &WorkerContext) {
-    let Some(id_str) = form_field(body, "id") else { return };
-    let Ok(id) = id_str.parse::<u16>() else { return };
-    let approved_alias: Option<String> = {
+/// Error code surfaced to the UI via `?error=` when a UI-driven mutation
+/// reaches the sync v1 layer but cannot be published. The handler has
+/// already rolled the local mutation back, so the UI state matches reality.
+const UI_ERR_PUBLISH_FAILED: &str = "publish_failed";
+
+/// Returns `Some(UI_ERR_*)` if the change could not be published (and the
+/// local mutation was rolled back); `None` on success or for the silent
+/// no-op cases (bad form, unknown id).
+fn approve_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let id_str = form_field(body, "id")?;
+    let id = id_str.parse::<u16>().ok()?;
+    let (was_approved, app_alias) = {
         let mut node    = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
-        let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else { return };
-        match device.applications.iter_mut().find(|a| a.id == id) {
-            Some(app) => {
-                app.user_approved = true;
-                Some(app.alias.clone())
-            }
-            None => None,
-        }
+        let device = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid)?;
+        let app = device.applications.iter_mut().find(|a| a.id == id)?;
+        let was_approved = app.user_approved;
+        app.user_approved = true;
+        (was_approved, app.alias.clone())
     };
     ctx.save_node();
 
-    // Publish id+alias to peers via the writer SG. Only fire when the app
-    // actually existed and was approved — guards against a stray UI POST for
-    // an unknown id. The error is currently swallowed; a follow-up will
-    // surface a UI-visible failure on Unreachable / NOT_WRITER acks the same
-    // way `app_register` does.
-    if let Some(app_alias) = approved_alias {
-        let device_uuid = ctx.node.read().unwrap().device_uuid;
-        let _ = request_change(Change::AddApplication {
-            device_uuid,
-            app_id: id,
-            app_alias,
-        }, ctx);
-    }
-}
-
-fn reject_app(body: &[u8], ctx: &WorkerContext) {
-    let Some(id_str) = form_field(body, "id") else { return };
-    let Ok(id) = id_str.parse::<u16>() else { return };
-    let (device_uuid, existed) = {
-        let mut node    = ctx.node.write().unwrap();
-        let device_uuid = node.device_uuid;
-        let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid)
-            else { return };
-        let before = device.applications.len();
-        device.applications.retain(|a| a.id != id);
-        (device_uuid, before != device.applications.len())
-    };
-    if !existed {
-        return;
-    }
-    ctx.save_node();
-
-    // Publish the removal via sync v1. The error is currently swallowed; a
-    // follow-up will surface it the same way `app_register` does.
-    let _ = request_change(Change::RemoveApplication {
+    let device_uuid = ctx.node.read().unwrap().device_uuid;
+    if let Err(e) = request_change(Change::AddApplication {
         device_uuid,
         app_id: id,
-    }, ctx);
+        app_alias,
+    }, ctx) {
+        // Roll back the approval — but only if we actually flipped it.
+        // Re-approving an already-approved app is a no-op on Err.
+        if !was_approved {
+            let mut node = ctx.node.write().unwrap();
+            if let Some(device) = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == device_uuid)
+            {
+                if let Some(app) = device.applications.iter_mut().find(|a| a.id == id) {
+                    app.user_approved = false;
+                }
+            }
+            drop(node);
+            ctx.save_node();
+        }
+        eprintln!("[approve_app] publish failed for app {id}: {e:?}");
+        return Some(UI_ERR_PUBLISH_FAILED);
+    }
+    None
+}
+
+fn reject_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let id_str = form_field(body, "id")?;
+    let id = id_str.parse::<u16>().ok()?;
+    let (device_uuid, removed) = {
+        let mut node    = ctx.node.write().unwrap();
+        let device_uuid = node.device_uuid;
+        let device = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid)?;
+        let removed = device.applications.iter().position(|a| a.id == id)
+            .map(|pos| device.applications.remove(pos));
+        (device_uuid, removed)
+    };
+    let removed = removed?;       // unknown id → silent no-op
+    ctx.save_node();
+
+    if let Err(e) = request_change(Change::RemoveApplication {
+        device_uuid,
+        app_id: id,
+    }, ctx) {
+        // Roll back the removal — re-insert the cloned application.
+        {
+            let mut node = ctx.node.write().unwrap();
+            if let Some(device) = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == device_uuid)
+            {
+                device.applications.push(removed);
+            }
+        }
+        ctx.save_node();
+        eprintln!("[reject_app] publish failed for app {id}: {e:?}");
+        return Some(UI_ERR_PUBLISH_FAILED);
+    }
+    None
 }
 
 // ── Invitation generation and bootstrap initiation ───────────────────────────
@@ -8248,5 +8297,118 @@ mod tests {
         let (len, _) = contact_socket.recv_from(&mut buf).expect("notify expected");
         assert_eq!(buf[0], CROSS_USER_UPDATE_AVAILABLE_OP);
         assert!(len > 1);
+    }
+
+    // ── UI handlers: approve_app / reject_app error surfacing ───────────────
+
+    /// Seed a pending app (user_approved=false) on the local device and
+    /// return its id.
+    fn seed_pending_app(t: &TestCtx, alias: &str) -> u16 {
+        let mut node = t.ctx.node.write().unwrap();
+        let device_uuid = node.device_uuid;
+        let dev = node.owner.user.devices.iter_mut()
+            .find(|d| d.uuid == device_uuid).unwrap();
+        let id = (dev.applications.len() as u16) + 100;
+        dev.applications.push(Application {
+            id,
+            alias:         alias.to_string(),
+            protocol:      "udp".to_string(),
+            host:          "127.0.0.1:9000".parse().unwrap(),
+            user_approved: false,
+            token:         generate_uuid(),
+        });
+        id
+    }
+
+    /// Seed an approved app and return its id.
+    fn seed_approved_app(t: &TestCtx, alias: &str) -> u16 {
+        let id = seed_pending_app(t, alias);
+        let mut node = t.ctx.node.write().unwrap();
+        let device_uuid = node.device_uuid;
+        let dev = node.owner.user.devices.iter_mut()
+            .find(|d| d.uuid == device_uuid).unwrap();
+        dev.applications.iter_mut().find(|a| a.id == id).unwrap().user_approved = true;
+        id
+    }
+
+    #[test]
+    fn approve_app_success_publishes_and_returns_none() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 1);
+        let id = seed_pending_app(&t, "pending");
+
+        let body = format!("id={id}");
+        let res = approve_app(body.as_bytes(), &t.ctx);
+        assert_eq!(res, None);
+
+        let node = t.ctx.node.read().unwrap();
+        let device_uuid = node.device_uuid;
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
+        let app = dev.applications.iter().find(|a| a.id == id).unwrap();
+        assert!(app.user_approved, "approve should flip user_approved");
+        assert_eq!(node.owner.public_version.epoch, 1,
+                   "successful publish should bump public_version");
+    }
+
+    #[test]
+    fn approve_app_unreachable_rolls_back_and_returns_publish_failed() {
+        // Default TestCtx is a DG with no own SG — request_change Unreachable.
+        let t = TestCtx::new();
+        let id = seed_pending_app(&t, "pending");
+
+        let body = format!("id={id}");
+        let res = approve_app(body.as_bytes(), &t.ctx);
+        assert_eq!(res, Some(UI_ERR_PUBLISH_FAILED));
+
+        let node = t.ctx.node.read().unwrap();
+        let device_uuid = node.device_uuid;
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
+        let app = dev.applications.iter().find(|a| a.id == id).unwrap();
+        assert!(!app.user_approved, "rollback should restore user_approved=false");
+    }
+
+    #[test]
+    fn reject_app_success_publishes_and_returns_none() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 1);
+        let id = seed_approved_app(&t, "doomed");
+        // The seed itself isn't published via sync v1; bump public_version
+        // manually so the post-reject delta is unambiguous.
+        let writer_uuid = t.ctx.node.read().unwrap().device_uuid;
+        t.ctx.node.write().unwrap().owner.bump_version(Scope::Public, writer_uuid);
+        let pub_before = t.ctx.node.read().unwrap().owner.public_version;
+
+        let body = format!("id={id}");
+        let res = reject_app(body.as_bytes(), &t.ctx);
+        assert_eq!(res, None);
+
+        let node = t.ctx.node.read().unwrap();
+        let device_uuid = node.device_uuid;
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
+        assert!(dev.applications.iter().all(|a| a.id != id),
+                "reject should remove the app");
+        let pub_after = node.owner.public_version;
+        assert_eq!(pub_after.seq, pub_before.seq + 1,
+                   "successful publish should bump public_version");
+    }
+
+    #[test]
+    fn reject_app_unreachable_rolls_back_and_returns_publish_failed() {
+        // DG with no writer.
+        let t = TestCtx::new();
+        let id = seed_approved_app(&t, "doomed");
+        let original_alias = "doomed".to_string();
+
+        let body = format!("id={id}");
+        let res = reject_app(body.as_bytes(), &t.ctx);
+        assert_eq!(res, Some(UI_ERR_PUBLISH_FAILED));
+
+        let node = t.ctx.node.read().unwrap();
+        let device_uuid = node.device_uuid;
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
+        let app = dev.applications.iter().find(|a| a.id == id)
+            .expect("rollback should restore the app");
+        assert_eq!(app.alias, original_alias,
+                   "rollback should preserve the original alias");
     }
 }
