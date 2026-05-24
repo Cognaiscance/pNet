@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -611,6 +611,11 @@ const SYNC_PULL_RESPONSE_OP:    u8 = 0x74;
 const CROSS_USER_UPDATE_AVAILABLE_OP: u8 = 0x75;
 const CROSS_USER_PULL_REQUEST_OP:     u8 = 0x76;
 const CROSS_USER_PULL_RESPONSE_OP:    u8 = 0x77;
+// 0x7A/0x7B — sync v2 watermark exchange between own-user SGs. Sent on
+// SG↔SG reconnect to find the per-writer agreed-point used by the merge
+// protocol (0x78/0x79, landing in 7c.4).
+const WATERMARK_PROBE_REQUEST_OP:  u8 = 0x7A;
+const WATERMARK_PROBE_RESPONSE_OP: u8 = 0x7B;
 const RELAY_PACKET_OP:            u8 = 0x40;
 const APP_PACKET_OP:              u8 = 0x41;
 const APP_PUSH_OP:                u8 = 0x04;
@@ -3286,6 +3291,180 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
             eprintln!("[cross_user_pull_response] unknown result {other} from {src}");
         }
     }
+}
+
+// ── Sync v2 watermark exchange (ops 0x7A / 0x7B) ──────────────────────────────
+//
+// Sent SG↔SG between own-user SGs after a fresh active connection lands, to
+// find the per-writer agreed reconciliation point before any merge proposal
+// (0x78/0x79, landing in 7c.4). One round trip:
+//
+//   0x7A WatermarkProbeRequest:  [scope:1]
+//   0x7B WatermarkProbeResponse: [scope:1][entry_count:u16]
+//                                [(writer_sg_uuid:16, epoch:u32 BE, seq:u64 BE) × entry_count]
+//
+// The response body advertises the highest (epoch, seq) the sender has in
+// its write log for each writer_sg_uuid that appears there for `scope`.
+// After both sides exchange, each side takes the per-writer min of (our
+// log, peer report) — that pair is the watermark from which the merge log
+// replay would resume. v2-prerequisite only: this phase only stores the
+// result; nothing consumes it yet.
+
+/// Build the local writer-uuid → max version map for `scope` from the
+/// write log. Returns one entry per distinct writer_sg_uuid present.
+fn build_local_watermark_map(
+    node: &super::data_models::Node,
+    scope: Scope,
+) -> Vec<(Uuid, SyncVersion)> {
+    let mut out: Vec<(Uuid, SyncVersion)> = Vec::new();
+    for entry in &node.owner.write_log {
+        if entry.scope != scope { continue; }
+        let writer = entry.version.writer_sg_uuid;
+        match out.iter_mut().find(|(w, _)| *w == writer) {
+            Some((_, v)) => {
+                if (entry.version.epoch, entry.version.seq) > (v.epoch, v.seq) {
+                    *v = entry.version;
+                }
+            }
+            None => out.push((writer, entry.version)),
+        }
+    }
+    out
+}
+
+fn serialize_watermark_map(scope: Scope, map: &[(Uuid, SyncVersion)]) -> Vec<u8> {
+    let count = map.len().min(u16::MAX as usize) as u16;
+    let mut buf = Vec::with_capacity(1 + 2 + (count as usize) * (16 + 4 + 8));
+    write_scope(&mut buf, scope);
+    buf.extend_from_slice(&count.to_be_bytes());
+    for (writer, v) in map.iter().take(count as usize) {
+        buf.extend_from_slice(writer);
+        buf.extend_from_slice(&v.epoch.to_be_bytes());
+        buf.extend_from_slice(&v.seq.to_be_bytes());
+    }
+    buf
+}
+
+fn parse_watermark_map(data: &[u8]) -> Option<(Scope, Vec<(Uuid, SyncVersion)>)> {
+    let mut pos = 0usize;
+    let scope = read_scope(data, &mut pos)?;
+    let cnt_bytes: [u8; 2] = read_arr(data, &mut pos)?;
+    let cnt = u16::from_be_bytes(cnt_bytes) as usize;
+    let mut out = Vec::with_capacity(cnt);
+    for _ in 0..cnt {
+        let writer: Uuid = read_arr(data, &mut pos)?;
+        let e_bytes: [u8; 4] = read_arr(data, &mut pos)?;
+        let s_bytes: [u8; 8] = read_arr(data, &mut pos)?;
+        out.push((writer, SyncVersion {
+            writer_sg_uuid: writer,
+            epoch: u32::from_be_bytes(e_bytes),
+            seq:   u64::from_be_bytes(s_bytes),
+        }));
+    }
+    Some((scope, out))
+}
+
+pub fn watermark_probe_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 2 {
+        eprintln!("[watermark_probe_request] header too short from {src}");
+        return;
+    }
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[watermark_probe_request] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+
+    let mut pos = 0usize;
+    let Some(scope) = read_scope(&plaintext, &mut pos) else {
+        eprintln!("[watermark_probe_request] bad scope from {src}");
+        return;
+    };
+
+    let body = {
+        let node = ctx.node.read().unwrap();
+        let map = build_local_watermark_map(&node, scope);
+        serialize_watermark_map(scope, &map)
+    };
+
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.get(&conn_id)
+            .map(|conn| (
+                build_encrypted_packet(WATERMARK_PROBE_RESPONSE_OP, conn, &body),
+                conn.peer_addr,
+            ))
+    };
+    let Some((pkt, addr)) = pkt_and_addr else {
+        eprintln!("[watermark_probe_request] no connection {conn_id} to reply from {src}");
+        return;
+    };
+    send(ctx, addr, &pkt);
+}
+
+pub fn watermark_probe_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 2 {
+        eprintln!("[watermark_probe_response] header too short from {src}");
+        return;
+    }
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[watermark_probe_response] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+
+    let Some((scope, peer_map)) = parse_watermark_map(&plaintext) else {
+        eprintln!("[watermark_probe_response] malformed body from {src}");
+        return;
+    };
+
+    // Identify which peer device sent this so we can store the per-peer result.
+    let peer_uuid = {
+        let node = ctx.node.read().unwrap();
+        match node.owner.active_connections.get(&conn_id) {
+            Some(conn) => conn.device_uuid,
+            None => {
+                eprintln!("[watermark_probe_response] no connection {conn_id} from {src}");
+                return;
+            }
+        }
+    };
+
+    // Compute per-writer min(our_log, peer_report). Writers present on only
+    // one side use that side's version directly — the other side will adopt
+    // it via the merge proposal exchange.
+    let our_map = {
+        let node = ctx.node.read().unwrap();
+        build_local_watermark_map(&node, scope)
+    };
+    let mut merged: HashMap<Uuid, SyncVersion> = HashMap::new();
+    for (writer, v) in &our_map { merged.insert(*writer, *v); }
+    for (writer, peer_v) in &peer_map {
+        merged.entry(*writer)
+            .and_modify(|our_v| {
+                if (peer_v.epoch, peer_v.seq) < (our_v.epoch, our_v.seq) {
+                    *our_v = *peer_v;
+                }
+            })
+            .or_insert(*peer_v);
+    }
+
+    let mut node = ctx.node.write().unwrap();
+    node.owner.last_watermarks.insert(peer_uuid, merged);
 }
 
 // ── Scheduled action handlers ─────────────────────────────────────────────────
@@ -8585,5 +8764,142 @@ mod tests {
                    "stale entry should be pruned, only the fresh one survives");
         assert_ne!(node.owner.write_log[0].change_payload, vec![0xDE, 0xAD, 0xBE, 0xEF],
                    "the surviving entry must be the freshly appended one");
+    }
+
+    // ── Watermark probe (7c.3) ──────────────────────────────────────────────
+
+    /// Decrypt a probe-response packet captured on the peer side and parse
+    /// it into (scope, writer-map).
+    fn decode_probe_response(buf: &[u8], peer_conn: &ActiveConnection)
+        -> (Scope, Vec<(Uuid, SyncVersion)>)
+    {
+        let mut node = super::super::data_models::Node::new();
+        node.owner.active_connections.insert(peer_conn.id, ActiveConnection {
+            id: peer_conn.id, timeout: peer_conn.timeout,
+            key_pair: peer_conn.key_pair.clone(),
+            peer_public_key: peer_conn.peer_public_key,
+            peer_active_connection_id: peer_conn.peer_active_connection_id,
+            device_uuid: peer_conn.device_uuid,
+            peer_addr: peer_conn.peer_addr,
+        });
+        let plaintext = decrypt_packet_body(&node, &buf[1..]).expect("decrypt");
+        parse_watermark_map(&plaintext).expect("parse")
+    }
+
+    #[test]
+    fn watermark_probe_request_replies_with_empty_map_when_log_is_empty() {
+        let t = TestCtx::new();
+        let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        let pkt = build_encrypted_packet(WATERMARK_PROBE_REQUEST_OP, &dg_conn, &body);
+        watermark_probe_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut rx = [0u8; 2048];
+        let (len, _) = dg_socket.recv_from(&mut rx).expect("response expected");
+        assert_eq!(rx[0], WATERMARK_PROBE_RESPONSE_OP);
+        let (scope, map) = decode_probe_response(&rx[..len], &dg_conn);
+        assert_eq!(scope, Scope::Public);
+        assert!(map.is_empty(), "empty write log → empty watermark map");
+    }
+
+    #[test]
+    fn watermark_probe_request_reports_max_per_writer_in_log() {
+        let t = TestCtx::new();
+        let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+
+        // Seed two writers into the local write log.
+        let w1: Uuid = [0x11; 16];
+        let w2: Uuid = [0x22; 16];
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            // w1: bumps up to (epoch 1, seq 5)
+            for seq in 1..=5u64 {
+                node.owner.write_log.push(WriteLogEntry {
+                    version: SyncVersion { writer_sg_uuid: w1, epoch: 1, seq },
+                    scope:   Scope::Public,
+                    change_payload: vec![],
+                    committed_at: SystemTime::now(),
+                });
+            }
+            // w2: a single (epoch 3, seq 7)
+            node.owner.write_log.push(WriteLogEntry {
+                version: SyncVersion { writer_sg_uuid: w2, epoch: 3, seq: 7 },
+                scope:   Scope::Public,
+                change_payload: vec![],
+                committed_at: SystemTime::now(),
+            });
+            // A Private-scope entry that must be ignored for a Public probe.
+            node.owner.write_log.push(WriteLogEntry {
+                version: SyncVersion { writer_sg_uuid: w1, epoch: 99, seq: 99 },
+                scope:   Scope::Private,
+                change_payload: vec![],
+                committed_at: SystemTime::now(),
+            });
+        }
+
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        let pkt = build_encrypted_packet(WATERMARK_PROBE_REQUEST_OP, &dg_conn, &body);
+        watermark_probe_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut rx = [0u8; 2048];
+        let (len, _) = dg_socket.recv_from(&mut rx).expect("response expected");
+        let (scope, map) = decode_probe_response(&rx[..len], &dg_conn);
+        assert_eq!(scope, Scope::Public);
+        assert_eq!(map.len(), 2);
+        let v1 = map.iter().find(|(w, _)| *w == w1).expect("w1 present").1;
+        let v2 = map.iter().find(|(w, _)| *w == w2).expect("w2 present").1;
+        assert_eq!((v1.epoch, v1.seq), (1, 5),
+                   "w1 should be the max of its in-log entries");
+        assert_eq!((v2.epoch, v2.seq), (3, 7));
+    }
+
+    #[test]
+    fn watermark_probe_response_stores_per_writer_min_in_last_watermarks() {
+        let t = TestCtx::new();
+        let (_, dg_conn, _) = writer_setup_with_capture(&t);
+        let peer_uuid = dg_conn.device_uuid;
+
+        // Seed our log: w1 → (1, 10), w3 → (2, 3).
+        let w1: Uuid = [0x11; 16];
+        let w2: Uuid = [0x22; 16];
+        let w3: Uuid = [0x33; 16];
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.write_log.push(WriteLogEntry {
+                version: SyncVersion { writer_sg_uuid: w1, epoch: 1, seq: 10 },
+                scope:   Scope::Public, change_payload: vec![],
+                committed_at: SystemTime::now(),
+            });
+            node.owner.write_log.push(WriteLogEntry {
+                version: SyncVersion { writer_sg_uuid: w3, epoch: 2, seq: 3 },
+                scope:   Scope::Public, change_payload: vec![],
+                committed_at: SystemTime::now(),
+            });
+        }
+
+        // Peer reports: w1 → (1, 4)  [lower, we win],
+        //                w2 → (5, 1) [we don't have, adopt peer's],
+        //                w3 → (2, 9) [higher, peer wins].
+        let peer_map: Vec<(Uuid, SyncVersion)> = vec![
+            (w1, SyncVersion { writer_sg_uuid: w1, epoch: 1, seq: 4 }),
+            (w2, SyncVersion { writer_sg_uuid: w2, epoch: 5, seq: 1 }),
+            (w3, SyncVersion { writer_sg_uuid: w3, epoch: 2, seq: 9 }),
+        ];
+        let body = serialize_watermark_map(Scope::Public, &peer_map);
+        let pkt = build_encrypted_packet(WATERMARK_PROBE_RESPONSE_OP, &dg_conn, &body);
+        watermark_probe_response("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let node = t.ctx.node.read().unwrap();
+        let stored = node.owner.last_watermarks.get(&peer_uuid)
+            .expect("entry for peer");
+        // w1: min((1,10), (1,4)) = (1,4)
+        assert_eq!((stored[&w1].epoch, stored[&w1].seq), (1, 4));
+        // w2: peer-only, adopted
+        assert_eq!((stored[&w2].epoch, stored[&w2].seq), (5, 1));
+        // w3: min((2,3), (2,9)) = (2,3)
+        assert_eq!((stored[&w3].epoch, stored[&w3].seq), (2, 3));
     }
 }

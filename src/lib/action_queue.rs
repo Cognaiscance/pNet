@@ -40,6 +40,8 @@ pub enum Action {
     CrossUserUpdateAvailable { src: SocketAddr, buf: Vec<u8> },
     CrossUserPullRequest     { src: SocketAddr, buf: Vec<u8> },
     CrossUserPullResponse    { src: SocketAddr, buf: Vec<u8> },
+    WatermarkProbeRequest    { src: SocketAddr, buf: Vec<u8> },
+    WatermarkProbeResponse   { src: SocketAddr, buf: Vec<u8> },
     RelayPacket        { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
@@ -113,6 +115,8 @@ impl Action {
             Action::CrossUserUpdateAvailable { src, buf } => handlers::cross_user_update_available(src, buf, ctx),
             Action::CrossUserPullRequest     { src, buf } => handlers::cross_user_pull_request(src, buf, ctx),
             Action::CrossUserPullResponse    { src, buf } => handlers::cross_user_pull_response(src, buf, ctx),
+            Action::WatermarkProbeRequest    { src, buf } => handlers::watermark_probe_request(src, buf, ctx),
+            Action::WatermarkProbeResponse   { src, buf } => handlers::watermark_probe_response(src, buf, ctx),
             Action::RelayPacket        { src, buf }   => handlers::relay_packet(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
             Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),

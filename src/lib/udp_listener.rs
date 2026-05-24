@@ -93,6 +93,8 @@ impl UdpListener {
                     0x75 => Action::CrossUserUpdateAvailable { src, buf: payload },
                     0x76 => Action::CrossUserPullRequest     { src, buf: payload },
                     0x77 => Action::CrossUserPullResponse    { src, buf: payload },
+                    0x7A => Action::WatermarkProbeRequest    { src, buf: payload },
+                    0x7B => Action::WatermarkProbeResponse   { src, buf: payload },
                     0x40 => Action::RelayPacket        { src, buf: payload },
                     0x41 => Action::AppPacket          { src, buf: payload },
                     0x50 => Action::TunnelInit           { src, buf: payload },

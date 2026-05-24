@@ -412,6 +412,13 @@ pub struct Owner {
     /// Ephemeral — not persisted; rebuilt as connections are established.
     #[serde(skip)]
     pub active_connections:  HashMap<u16, ActiveConnection>,
+    /// Ephemeral — sync v2 per-peer-SG watermarks from the latest
+    /// `WatermarkProbe` exchange. Outer key: peer device uuid. Inner key:
+    /// writer_sg_uuid. Inner value: the version that's the min of (our log,
+    /// peer log) for that writer — the agreed reconciliation point.
+    /// Rebuilt on each probe round-trip.
+    #[serde(skip)]
+    pub last_watermarks: HashMap<Uuid, HashMap<Uuid, SyncVersion>>,
     /// Ephemeral — not persisted; cleared when ConnectAck arrives.
     #[serde(skip)]
     pub pending_connections: HashMap<u16, PendingConnection>,
@@ -569,6 +576,7 @@ impl Node {
                 public_version:             SyncVersion::zero(),
                 write_log:                  Vec::new(),
                 active_connections:         HashMap::new(),
+                last_watermarks:            HashMap::new(),
                 pending_connections:        HashMap::new(),
                 pending_contact_exchange:   None,
                 pending_bootstrap:          None,
