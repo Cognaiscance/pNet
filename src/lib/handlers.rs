@@ -158,13 +158,9 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             .find(|d| d.uuid == device_uuid)
             .expect("local device not found in node");
 
-        let next_id = device
-            .applications
-            .iter()
-            .map(|a| a.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        // App ids are UUIDs (see Application.id docs) — partition-safe by
+        // construction. Generate fresh; collision probability is negligible.
+        let next_id = generate_uuid();
 
         let token = generate_uuid();
         device.applications.push(Application {
@@ -262,7 +258,7 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // Port/host is private-scope — local-only, no sync v1 traffic.
     enum Outcome {
         NotFound,
-        Updated { device_uuid: Uuid, app_id: u16, old_alias: Option<String> },
+        Updated { device_uuid: Uuid, app_id: Uuid, old_alias: Option<String> },
     }
     let outcome = {
         let mut node = ctx.node.write().unwrap();
@@ -329,7 +325,7 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                         }
                     }
                     ctx.save_node();
-                    eprintln!("[app_update] alias rollback for app {app_id}: {e:?}");
+                    eprintln!("[app_update] alias rollback for app {}: {e:?}", uuid_hex(&app_id));
                     return send_error(ctx, src, ERR_NO_WRITER);
                 }
             }
@@ -396,7 +392,7 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let mut reply = vec![OK];
 
     // Requesting app's own data.
-    reply.extend_from_slice(&app.id.to_be_bytes());
+    reply.extend_from_slice(&app.id);
     push_str(&mut reply, &app.alias);
     reply.extend_from_slice(&app.host.ip().octets());
     reply.extend_from_slice(&app.host.port().to_be_bytes());
@@ -414,7 +410,7 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         push_device(&mut reply, d);
         reply.push(d.applications.len() as u8);
         for a in &d.applications {
-            reply.extend_from_slice(&a.id.to_be_bytes());
+            reply.extend_from_slice(&a.id);
             push_str(&mut reply, &a.alias);
             reply.extend_from_slice(&a.host.ip().octets());
             reply.extend_from_slice(&a.host.port().to_be_bytes());
@@ -435,7 +431,7 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 .collect();
             reply.push(approved.len() as u8);
             for a in approved {
-                reply.extend_from_slice(&a.id.to_be_bytes());
+                reply.extend_from_slice(&a.id);
                 push_str(&mut reply, &a.alias);
             }
         }
@@ -461,15 +457,15 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// Builds a RelayPacket (op 0x40) and sends it to the lowest-RTT reachable SG
 /// from the combined pool of the local user's SGs and the destination user's SGs.
 pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    const MIN_LEN: usize = 16 + 16 + 2;
+    const MIN_LEN: usize = 16 + 16 + 16;
     if buf.len() < MIN_LEN {
         return send_error(ctx, src, ERR_BAD_PACKET);
     }
 
     let token: Uuid            = buf[0..16].try_into().unwrap();
     let dest_device_uuid: Uuid = buf[16..32].try_into().unwrap();
-    let dest_app_id            = u16::from_be_bytes([buf[32], buf[33]]);
-    let payload                = &buf[34..];
+    let dest_app_id: Uuid      = buf[32..48].try_into().unwrap();
+    let payload                = &buf[48..];
 
     // Build packet and look up the SG address under a single read lock.
     let out: Option<(Vec<u8>, SocketAddr)> = {
@@ -505,10 +501,10 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             };
             let shared = x25519_shared(&dg_dg_conn.key_pair.private_key, &dg_dg_conn.peer_public_key);
 
-            // Plaintext format: [dest_app_id: u16][sender_app_id: u16][payload]
-            let mut plaintext = Vec::with_capacity(4 + payload.len());
-            plaintext.extend_from_slice(&dest_app_id.to_be_bytes());
-            plaintext.extend_from_slice(&sender_app_id.to_be_bytes());
+            // Plaintext format: [dest_app_id: 16][sender_app_id: 16][payload]
+            let mut plaintext = Vec::with_capacity(32 + payload.len());
+            plaintext.extend_from_slice(&dest_app_id);
+            plaintext.extend_from_slice(&sender_app_id);
             plaintext.extend_from_slice(payload);
 
             let (ciphertext, nonce) = xchacha20_encrypt(&shared, &plaintext);
@@ -544,9 +540,9 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             // connection to the destination DG.  Skip the relay and send an
             // AppPacket straight to the destination using the peer's actual
             // source address (not the potentially-stale d.host).
-            let mut app_body = Vec::with_capacity(4 + payload.len());
-            app_body.extend_from_slice(&dest_app_id.to_be_bytes());
-            app_body.extend_from_slice(&sender_app_id.to_be_bytes());
+            let mut app_body = Vec::with_capacity(32 + payload.len());
+            app_body.extend_from_slice(&dest_app_id);
+            app_body.extend_from_slice(&sender_app_id);
             app_body.extend_from_slice(payload);
 
             let pkt  = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
@@ -566,11 +562,11 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 return;
             };
 
-            // RelayPacket body: [dest_device_uuid: 16][dest_app_id: u16][sender_app_id: u16][payload]
-            let mut plaintext = Vec::with_capacity(20 + payload.len());
+            // RelayPacket body: [dest_device_uuid: 16][dest_app_id: 16][sender_app_id: 16][payload]
+            let mut plaintext = Vec::with_capacity(48 + payload.len());
             plaintext.extend_from_slice(&dest_device_uuid);
-            plaintext.extend_from_slice(&dest_app_id.to_be_bytes());
-            plaintext.extend_from_slice(&sender_app_id.to_be_bytes());
+            plaintext.extend_from_slice(&dest_app_id);
+            plaintext.extend_from_slice(&sender_app_id);
             plaintext.extend_from_slice(payload);
 
             let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
@@ -1192,6 +1188,23 @@ fn push_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(b);
 }
 
+/// 32-char lowercase hex of a 16-byte uuid. Used for log messages and as
+/// the wire form for HTML form values (app id buttons, etc.) since `Uuid`
+/// is a raw `[u8; 16]` with no Display impl.
+fn uuid_hex(uuid: &Uuid) -> String {
+    uuid.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Inverse of `uuid_hex`. Returns `None` for malformed input.
+fn uuid_from_hex(s: &str) -> Option<Uuid> {
+    if s.len() != 32 { return None; }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 fn read_str(data: &[u8], pos: &mut usize) -> Option<String> {
     let len = *data.get(*pos)? as usize;
     *pos += 1;
@@ -1761,7 +1774,7 @@ fn serialize_contact_data(node: &super::data_models::Node) -> Vec<u8> {
             .collect();
         buf.push(approved.len() as u8);
         for a in approved {
-            buf.extend_from_slice(&a.id.to_be_bytes());
+            buf.extend_from_slice(&a.id);
             push_str(&mut buf, &a.alias);
         }
     }
@@ -1770,7 +1783,7 @@ fn serialize_contact_data(node: &super::data_models::Node) -> Vec<u8> {
 
 struct ContactData {
     user_uuid: Uuid,
-    devices:   Vec<(Device, Vec<(u16, String)>)>, // (device, vec of (app_id, app_alias))
+    devices:   Vec<(Device, Vec<(Uuid, String)>)>, // (device, vec of (app_id, app_alias))
 }
 
 fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
@@ -1783,9 +1796,8 @@ fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
         let app_count = *data.get(pos)? as usize; pos += 1;
         let mut apps = Vec::new();
         for _ in 0..app_count {
-            let id_bytes: [u8; 2] = read_arr(data, &mut pos)?;
-            let id    = u16::from_be_bytes(id_bytes);
-            let alias = read_str(data, &mut pos)?;
+            let id: Uuid = read_arr(data, &mut pos)?;
+            let alias    = read_str(data, &mut pos)?;
             apps.push((id, alias));
         }
         devices.push((device, apps));
@@ -1904,10 +1916,11 @@ pub enum Change {
     /// Public-scope: add an app entry (id + alias) to the device identified
     /// by `device_uuid` in the user's device list. The originating DG keeps
     /// the private fields (token, host, protocol) locally — they are not
-    /// shared with the writer SG or peers.
+    /// shared with the writer SG or peers. `app_id` is a 16-byte UUID
+    /// (see Application.id docs).
     AddApplication {
         device_uuid: Uuid,
-        app_id:      u16,
+        app_id:      Uuid,
         app_alias:   String,
     },
     /// Public-scope: remove the app identified by `(device_uuid, app_id)`
@@ -1915,7 +1928,7 @@ pub enum Change {
     /// that's already absent is a no-op (no version bump).
     RemoveApplication {
         device_uuid: Uuid,
-        app_id:      u16,
+        app_id:      Uuid,
     },
     /// Public-scope: add a device (no apps) to the user's device list.
     /// Issued by the SG that accepts a new device via the invitation flow.
@@ -1931,7 +1944,7 @@ pub enum Change {
     /// alias already matches or the app doesn't exist.
     UpdateApplicationAlias {
         device_uuid: Uuid,
-        app_id:      u16,
+        app_id:      Uuid,
         new_alias:   String,
     },
 }
@@ -1956,13 +1969,13 @@ fn serialize_change(c: &Change) -> Vec<u8> {
         Change::AddApplication { device_uuid, app_id, app_alias } => {
             buf.push(CHANGE_KIND_ADD_APPLICATION);
             buf.extend_from_slice(device_uuid);
-            buf.extend_from_slice(&app_id.to_be_bytes());
+            buf.extend_from_slice(app_id);
             push_str(&mut buf, app_alias);
         }
         Change::RemoveApplication { device_uuid, app_id } => {
             buf.push(CHANGE_KIND_REMOVE_APPLICATION);
             buf.extend_from_slice(device_uuid);
-            buf.extend_from_slice(&app_id.to_be_bytes());
+            buf.extend_from_slice(app_id);
         }
         Change::AddDevice { uuid, alias, grade, sg_rank, hosts } => {
             buf.push(CHANGE_KIND_ADD_DEVICE);
@@ -1981,7 +1994,7 @@ fn serialize_change(c: &Change) -> Vec<u8> {
         Change::UpdateApplicationAlias { device_uuid, app_id, new_alias } => {
             buf.push(CHANGE_KIND_UPDATE_APPLICATION_ALIAS);
             buf.extend_from_slice(device_uuid);
-            buf.extend_from_slice(&app_id.to_be_bytes());
+            buf.extend_from_slice(app_id);
             push_str(&mut buf, new_alias);
         }
     }
@@ -1995,15 +2008,13 @@ fn deserialize_change(data: &[u8]) -> Option<Change> {
     match kind {
         CHANGE_KIND_ADD_APPLICATION => {
             let device_uuid: Uuid = read_arr(data, &mut pos)?;
-            let id_bytes:  [u8; 2] = read_arr(data, &mut pos)?;
-            let app_id    = u16::from_be_bytes(id_bytes);
-            let app_alias = read_str(data, &mut pos)?;
+            let app_id:      Uuid = read_arr(data, &mut pos)?;
+            let app_alias         = read_str(data, &mut pos)?;
             Some(Change::AddApplication { device_uuid, app_id, app_alias })
         }
         CHANGE_KIND_REMOVE_APPLICATION => {
             let device_uuid: Uuid = read_arr(data, &mut pos)?;
-            let id_bytes:  [u8; 2] = read_arr(data, &mut pos)?;
-            let app_id    = u16::from_be_bytes(id_bytes);
+            let app_id:      Uuid = read_arr(data, &mut pos)?;
             Some(Change::RemoveApplication { device_uuid, app_id })
         }
         CHANGE_KIND_ADD_DEVICE => {
@@ -2018,9 +2029,8 @@ fn deserialize_change(data: &[u8]) -> Option<Change> {
         }
         CHANGE_KIND_UPDATE_APPLICATION_ALIAS => {
             let device_uuid: Uuid = read_arr(data, &mut pos)?;
-            let id_bytes:  [u8; 2] = read_arr(data, &mut pos)?;
-            let app_id    = u16::from_be_bytes(id_bytes);
-            let new_alias = read_str(data, &mut pos)?;
+            let app_id:      Uuid = read_arr(data, &mut pos)?;
+            let new_alias         = read_str(data, &mut pos)?;
             Some(Change::UpdateApplicationAlias { device_uuid, app_id, new_alias })
         }
         _ => None,
@@ -2408,7 +2418,7 @@ fn serialize_public_state(node: &super::data_models::Node) -> Vec<u8> {
         push_device(&mut buf, d);
         buf.push(d.applications.len().min(u8::MAX as usize) as u8);
         for a in d.applications.iter().take(u8::MAX as usize) {
-            buf.extend_from_slice(&a.id.to_be_bytes());
+            buf.extend_from_slice(&a.id);
             push_str(&mut buf, &a.alias);
         }
     }
@@ -2423,7 +2433,7 @@ fn serialize_public_state(node: &super::data_models::Node) -> Vec<u8> {
             push_device(&mut buf, d);
             buf.push(d.applications.len().min(u8::MAX as usize) as u8);
             for a in d.applications.iter().take(u8::MAX as usize) {
-                buf.extend_from_slice(&a.id.to_be_bytes());
+                buf.extend_from_slice(&a.id);
                 push_str(&mut buf, &a.alias);
             }
         }
@@ -2466,7 +2476,7 @@ fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
     // half-apply.
     struct ParsedDevice {
         device: Device,
-        apps:   Vec<(u16, String)>,
+        apps:   Vec<(Uuid, String)>,
     }
     let mut devices: Vec<ParsedDevice> = Vec::with_capacity(dev_count as usize);
     for _ in 0..dev_count {
@@ -2475,9 +2485,9 @@ fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
         pos += 1;
         let mut apps = Vec::with_capacity(app_count as usize);
         for _ in 0..app_count {
-            let Some(id_bytes) = read_arr::<2>(state, &mut pos) else { return false; };
-            let Some(alias)    = read_str(state, &mut pos)       else { return false; };
-            apps.push((u16::from_be_bytes(id_bytes), alias));
+            let Some(id)    = read_arr::<16>(state, &mut pos) else { return false; };
+            let Some(alias) = read_str(state, &mut pos)        else { return false; };
+            apps.push((id, alias));
         }
         devices.push(ParsedDevice { device: d, apps });
     }
@@ -2505,9 +2515,9 @@ fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
             pos += 1;
             let mut apps = Vec::with_capacity(ac as usize);
             for _ in 0..ac {
-                let Some(id_bytes) = read_arr::<2>(state, &mut pos) else { return false; };
-                let Some(alias)    = read_str(state, &mut pos)       else { return false; };
-                apps.push((u16::from_be_bytes(id_bytes), alias));
+                let Some(id)    = read_arr::<16>(state, &mut pos) else { return false; };
+                let Some(alias) = read_str(state, &mut pos)        else { return false; };
+                apps.push((id, alias));
             }
             devs.push(ParsedDevice { device: d, apps });
         }
@@ -2549,7 +2559,7 @@ fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
             } else {
                 // Peer device: authoritative — drop apps the writer no longer
                 // reports, so RemoveApplication propagates.
-                let incoming_ids: HashSet<u16> = apps.iter().map(|(id, _)| *id).collect();
+                let incoming_ids: HashSet<Uuid> = apps.iter().map(|(id, _)| *id).collect();
                 existing.applications.retain(|a| incoming_ids.contains(&a.id));
                 for (id, alias) in apps {
                     if let Some(local_app) = existing.applications.iter_mut().find(|a| a.id == id) {
@@ -3275,14 +3285,14 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         };
 
         // Parse body.
-        if plaintext.len() < 20 {
+        if plaintext.len() < 48 {
             eprintln!("[relay_packet] plaintext too short from {src}");
             return;
         }
         let dest_device_uuid: Uuid = plaintext[0..16].try_into().unwrap();
-        let dest_app_id            = u16::from_be_bytes([plaintext[16], plaintext[17]]);
-        let sender_app_id          = u16::from_be_bytes([plaintext[18], plaintext[19]]);
-        let payload                = plaintext[20..].to_vec();
+        let dest_app_id:      Uuid = plaintext[16..32].try_into().unwrap();
+        let sender_app_id:    Uuid = plaintext[32..48].try_into().unwrap();
+        let payload                = plaintext[48..].to_vec();
 
         (node.device_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload)
     };
@@ -3299,12 +3309,12 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 .map(|a| a.host)
         };
         let Some(app_host) = app_host else {
-            eprintln!("[relay_packet] no approved local app with id {dest_app_id}");
+            eprintln!("[relay_packet] no approved local app with id {}", uuid_hex(&dest_app_id));
             return;
         };
-        let mut push = Vec::with_capacity(3 + payload.len());
+        let mut push = Vec::with_capacity(17 + payload.len());
         push.push(APP_PUSH_OP);
-        push.extend_from_slice(&sender_app_id.to_be_bytes());
+        push.extend_from_slice(&sender_app_id);
         push.extend_from_slice(&payload);
         send(ctx, SocketAddr::V4(app_host), &push);
         return;
@@ -3321,10 +3331,10 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         };
 
-        // AppPacket body: [dest_app_id: u16][sender_app_id: u16][payload]
-        let mut app_body = Vec::with_capacity(4 + payload.len());
-        app_body.extend_from_slice(&dest_app_id.to_be_bytes());
-        app_body.extend_from_slice(&sender_app_id.to_be_bytes());
+        // AppPacket body: [dest_app_id: 16][sender_app_id: 16][payload]
+        let mut app_body = Vec::with_capacity(32 + payload.len());
+        app_body.extend_from_slice(&dest_app_id);
+        app_body.extend_from_slice(&sender_app_id);
         app_body.extend_from_slice(&payload);
 
         let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
@@ -3403,13 +3413,13 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         };
 
-        if plaintext.len() < 4 {
+        if plaintext.len() < 32 {
             eprintln!("[app_packet] plaintext too short from {src}");
             return;
         }
-        let dest_app_id   = u16::from_be_bytes([plaintext[0], plaintext[1]]);
-        let sender_app_id = u16::from_be_bytes([plaintext[2], plaintext[3]]);
-        let payload       = &plaintext[4..];
+        let dest_app_id:   Uuid = plaintext[0..16].try_into().unwrap();
+        let sender_app_id: Uuid = plaintext[16..32].try_into().unwrap();
+        let payload             = &plaintext[32..];
 
         // Find the destination app on this node.
         let device_uuid = node.device_uuid;
@@ -3419,14 +3429,14 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 .find(|a| a.id == dest_app_id && a.user_approved))
             .map(|a| a.host)
         else {
-            eprintln!("[app_packet] no approved app with id {dest_app_id}");
+            eprintln!("[app_packet] no approved app with id {}", uuid_hex(&dest_app_id));
             return;
         };
 
-        // Build push packet: [0x04][sender_app_id: u16][payload]
-        let mut push = Vec::with_capacity(3 + payload.len());
+        // Build push packet: [0x04][sender_app_id: 16][payload]
+        let mut push = Vec::with_capacity(17 + payload.len());
         push.push(APP_PUSH_OP);
-        push.extend_from_slice(&sender_app_id.to_be_bytes());
+        push.extend_from_slice(&sender_app_id);
         push.extend_from_slice(payload);
 
         (push, app_host)
@@ -4010,14 +4020,14 @@ pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             eprintln!("[tunnel_delivery] decryption failed for tunnel {tunnel_id} from {src}");
             return;
         };
-        if plaintext.len() < 4 {
+        if plaintext.len() < 32 {
             eprintln!("[tunnel_delivery] plaintext too short for tunnel {tunnel_id}");
             return;
         }
 
-        let dest_app_id   = u16::from_be_bytes([plaintext[0], plaintext[1]]);
-        let sender_app_id = u16::from_be_bytes([plaintext[2], plaintext[3]]);
-        let payload       = &plaintext[4..];
+        let dest_app_id:   Uuid = plaintext[0..16].try_into().unwrap();
+        let sender_app_id: Uuid = plaintext[16..32].try_into().unwrap();
+        let payload             = &plaintext[32..];
 
         let device_uuid = node.device_uuid;
         let Some(app_host) = node.owner.user.devices.iter()
@@ -4025,13 +4035,13 @@ pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             .and_then(|d| d.applications.iter().find(|a| a.id == dest_app_id))
             .map(|a| a.host)
         else {
-            eprintln!("[tunnel_delivery] no app {dest_app_id} for tunnel {tunnel_id}");
+            eprintln!("[tunnel_delivery] no app {} for tunnel {tunnel_id}", uuid_hex(&dest_app_id));
             return;
         };
 
-        let mut push = Vec::with_capacity(3 + payload.len());
+        let mut push = Vec::with_capacity(17 + payload.len());
         push.push(APP_PUSH_OP);
-        push.extend_from_slice(&sender_app_id.to_be_bytes());
+        push.extend_from_slice(&sender_app_id);
         push.extend_from_slice(payload);
 
         (push, app_host)
@@ -4441,8 +4451,8 @@ fn render_pending_apps(ctx: &WorkerContext, query: &str) -> String {
                     html_escape(&a.alias),
                     html_escape(&a.protocol),
                     html_escape(&a.host.to_string()),
-                    a.id,
-                    a.id,
+                    uuid_hex(&a.id),
+                    uuid_hex(&a.id),
                 ))
                 .collect()
         })
@@ -4481,7 +4491,7 @@ fn render_applications(ctx: &WorkerContext, query: &str) -> String {
                     html_escape(&a.alias),
                     html_escape(&a.protocol),
                     html_escape(&a.host.to_string()),
-                    a.id,
+                    uuid_hex(&a.id),
                 ))
                 .collect()
         })
@@ -4610,7 +4620,7 @@ const UI_ERR_PUBLISH_FAILED: &str = "publish_failed";
 /// no-op cases (bad form, unknown id).
 fn approve_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     let id_str = form_field(body, "id")?;
-    let id = id_str.parse::<u16>().ok()?;
+    let id = uuid_from_hex(id_str)?;
     let (was_approved, app_alias) = {
         let mut node    = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
@@ -4642,7 +4652,7 @@ fn approve_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
             drop(node);
             ctx.save_node();
         }
-        eprintln!("[approve_app] publish failed for app {id}: {e:?}");
+        eprintln!("[approve_app] publish failed for app {}: {e:?}", uuid_hex(&id));
         return Some(UI_ERR_PUBLISH_FAILED);
     }
     None
@@ -4650,7 +4660,7 @@ fn approve_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
 
 fn reject_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     let id_str = form_field(body, "id")?;
-    let id = id_str.parse::<u16>().ok()?;
+    let id = uuid_from_hex(id_str)?;
     let (device_uuid, removed) = {
         let mut node    = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
@@ -4676,7 +4686,7 @@ fn reject_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
             }
         }
         ctx.save_node();
-        eprintln!("[reject_app] publish failed for app {id}: {e:?}");
+        eprintln!("[reject_app] publish failed for app {}: {e:?}", uuid_hex(&id));
         return Some(UI_ERR_PUBLISH_FAILED);
     }
     None
@@ -5512,9 +5522,8 @@ mod tests {
 
         let mut pos = 1usize;
 
-        // App's own data.
-        let app_id = u16::from_be_bytes([reply[pos], reply[pos + 1]]); pos += 2;
-        assert!(app_id > 0);
+        // App's own data — id is now a 16-byte UUID, not a u16.
+        pos += 16; // app uuid
         let alias = read_str(&reply, &mut pos).unwrap();
         assert_eq!(alias, "myapp");
         pos += 4 + 2; // host ip + port
@@ -5541,6 +5550,12 @@ mod tests {
         }
         let app_count = reply[pos] as usize; pos += 1;
         assert_eq!(app_count, 1); // the app we just registered
+        // Skip the one app entry to reach the contact count: [id:16][alias:1+N][ip:4][port:2][approved:1].
+        for _ in 0..app_count {
+            pos += 16; // app uuid
+            let _alias = read_str(&reply, &mut pos).unwrap();
+            pos += 4 + 2 + 1; // ip + port + approved
+        }
 
         // Contact count (none registered).
         let contact_count = reply[pos] as usize;
@@ -5937,6 +5952,16 @@ mod tests {
         uuid
     }
 
+    /// Build a deterministic Uuid from a small seed for test readability.
+    /// Distinct seeds produce distinct uuids — sufficient for comparison
+    /// assertions that previously used u16 app-id literals like `7` or
+    /// `0xCAFE`.
+    fn app_uuid(seed: u16) -> Uuid {
+        let mut u = [0u8; 16];
+        u[14..16].copy_from_slice(&seed.to_be_bytes());
+        u
+    }
+
     /// Promote the local device to SG with the given rank.
     fn promote_local_to_sg(t: &TestCtx, rank: u32) -> Uuid {
         let mut node = t.ctx.node.write().unwrap();
@@ -6054,7 +6079,7 @@ mod tests {
         let dev_uuid = generate_uuid();
         let original = Change::AddApplication {
             device_uuid: dev_uuid,
-            app_id:      0xCAFE,
+            app_id:      app_uuid(0xCAFE),
             app_alias:   "messenger".to_string(),
         };
         let bytes = serialize_change(&original);
@@ -6076,7 +6101,7 @@ mod tests {
         let dev_uuid = generate_uuid();
         let original = Change::AddApplication {
             device_uuid: dev_uuid,
-            app_id:      1,
+            app_id:      app_uuid(1),
             app_alias:   "foo".to_string(),
         };
         let mut bytes = serialize_change(&original);
@@ -6092,7 +6117,7 @@ mod tests {
 
         let change = Change::AddApplication {
             device_uuid: local,
-            app_id:      7,
+            app_id:      app_uuid(7),
             app_alias:   "myapp".to_string(),
         };
         let (priv_v, pub_v) = apply_change_locally(&change, writer, &t.ctx).expect("apply");
@@ -6107,7 +6132,7 @@ mod tests {
         let node = t.ctx.node.read().unwrap();
         let dev = node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
         assert_eq!(dev.applications.len(), 1);
-        assert_eq!(dev.applications[0].id, 7);
+        assert_eq!(dev.applications[0].id, app_uuid(7));
         assert_eq!(dev.applications[0].alias, "myapp");
         // Token/host stay zero on the writer's record by design.
         assert_eq!(dev.applications[0].token, [0u8; 16]);
@@ -6121,7 +6146,7 @@ mod tests {
 
         let change = Change::AddApplication {
             device_uuid: local,
-            app_id:      7,
+            app_id:      app_uuid(7),
             app_alias:   "myapp".to_string(),
         };
         apply_change_locally(&change, writer, &t.ctx).expect("first apply");
@@ -6146,7 +6171,7 @@ mod tests {
 
         let change = Change::AddApplication {
             device_uuid: bogus_uuid,
-            app_id:      1,
+            app_id:      app_uuid(1),
             app_alias:   "x".to_string(),
         };
         let res = apply_change_locally(&change, local, &t.ctx);
@@ -6162,7 +6187,7 @@ mod tests {
         let dev_uuid = generate_uuid();
         let original = Change::RemoveApplication {
             device_uuid: dev_uuid,
-            app_id:      0xCAFE,
+            app_id:      app_uuid(0xCAFE),
         };
         let bytes = serialize_change(&original);
         assert_eq!(bytes[0], CHANGE_KIND_REMOVE_APPLICATION);
@@ -6179,14 +6204,14 @@ mod tests {
         // Seed an app so there's something to remove.
         apply_change_locally(
             &Change::AddApplication {
-                device_uuid: local, app_id: 3, app_alias: "doomed".into(),
+                device_uuid: local, app_id: app_uuid(3), app_alias: "doomed".into(),
             },
             writer, &t.ctx,
         ).expect("seed");
         let pub_after_add = t.ctx.node.read().unwrap().owner.public_version;
 
         let (priv_v, pub_v) = apply_change_locally(
-            &Change::RemoveApplication { device_uuid: local, app_id: 3 },
+            &Change::RemoveApplication { device_uuid: local, app_id: app_uuid(3) },
             writer, &t.ctx,
         ).expect("remove");
 
@@ -6199,7 +6224,7 @@ mod tests {
         // App actually gone.
         let node = t.ctx.node.read().unwrap();
         let dev = node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
-        assert!(dev.applications.iter().all(|a| a.id != 3));
+        assert!(dev.applications.iter().all(|a| a.id != app_uuid(3)));
     }
 
     #[test]
@@ -6213,7 +6238,7 @@ mod tests {
 
         let pub_before = t.ctx.node.read().unwrap().owner.public_version;
         apply_change_locally(
-            &Change::RemoveApplication { device_uuid: local, app_id: 999 },
+            &Change::RemoveApplication { device_uuid: local, app_id: app_uuid(999) },
             writer, &t.ctx,
         ).expect("idempotent remove ok");
         let pub_after = t.ctx.node.read().unwrap().owner.public_version;
@@ -6292,7 +6317,7 @@ mod tests {
         let dev_uuid = generate_uuid();
         let original = Change::UpdateApplicationAlias {
             device_uuid: dev_uuid,
-            app_id:      0xBEEF,
+            app_id:      app_uuid(0xBEEF),
             new_alias:   "renamed".to_string(),
         };
         let bytes = serialize_change(&original);
@@ -6309,7 +6334,7 @@ mod tests {
 
         apply_change_locally(
             &Change::AddApplication {
-                device_uuid: local, app_id: 5, app_alias: "old".into(),
+                device_uuid: local, app_id: app_uuid(5), app_alias: "old".into(),
             },
             writer, &t.ctx,
         ).expect("seed");
@@ -6317,7 +6342,7 @@ mod tests {
 
         let (_, pub_v) = apply_change_locally(
             &Change::UpdateApplicationAlias {
-                device_uuid: local, app_id: 5, new_alias: "new".into(),
+                device_uuid: local, app_id: app_uuid(5), new_alias: "new".into(),
             },
             writer, &t.ctx,
         ).expect("rename");
@@ -6327,7 +6352,7 @@ mod tests {
 
         let node = t.ctx.node.read().unwrap();
         let dev = node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
-        let app = dev.applications.iter().find(|a| a.id == 5).unwrap();
+        let app = dev.applications.iter().find(|a| a.id == app_uuid(5)).unwrap();
         assert_eq!(app.alias, "new");
     }
 
@@ -6339,7 +6364,7 @@ mod tests {
 
         apply_change_locally(
             &Change::AddApplication {
-                device_uuid: local, app_id: 5, app_alias: "same".into(),
+                device_uuid: local, app_id: app_uuid(5), app_alias: "same".into(),
             },
             writer, &t.ctx,
         ).expect("seed");
@@ -6347,7 +6372,7 @@ mod tests {
 
         apply_change_locally(
             &Change::UpdateApplicationAlias {
-                device_uuid: local, app_id: 5, new_alias: "same".into(),
+                device_uuid: local, app_id: app_uuid(5), new_alias: "same".into(),
             },
             writer, &t.ctx,
         ).expect("no-op rename");
@@ -6364,7 +6389,7 @@ mod tests {
         let pub_before = t.ctx.node.read().unwrap().owner.public_version;
         apply_change_locally(
             &Change::UpdateApplicationAlias {
-                device_uuid: local, app_id: 999, new_alias: "nope".into(),
+                device_uuid: local, app_id: app_uuid(999), new_alias: "nope".into(),
             },
             writer, &t.ctx,
         ).expect("missing app is no-op, not error");
@@ -6381,7 +6406,7 @@ mod tests {
 
         let change = Change::AddApplication {
             device_uuid: local,
-            app_id:      9,
+            app_id:      app_uuid(9),
             app_alias:   "ui-app".to_string(),
         };
         request_change(change, &t.ctx).expect("request_change ok");
@@ -6399,7 +6424,7 @@ mod tests {
         let dev_uuid = t.ctx.node.read().unwrap().device_uuid;
         let change = Change::AddApplication {
             device_uuid: dev_uuid,
-            app_id:      1,
+            app_id:      app_uuid(1),
             app_alias:   "x".to_string(),
         };
         assert_eq!(request_change(change, &t.ctx), Err(WriteError::Unreachable));
@@ -6442,7 +6467,7 @@ mod tests {
 
         let change = Change::AddApplication {
             device_uuid: dg_uuid,
-            app_id:      3,
+            app_id:      app_uuid(3),
             app_alias:   "x".to_string(),
         };
         request_change(change, &t.ctx).expect("request_change ok");
@@ -6553,7 +6578,7 @@ mod tests {
 
         let change = Change::AddApplication {
             device_uuid: dg_uuid,
-            app_id:      42,
+            app_id:      app_uuid(42),
             app_alias:   "acked".to_string(),
         };
         let payload = serialize_change(&change);
@@ -6587,7 +6612,7 @@ mod tests {
 
         let change = Change::AddApplication {
             device_uuid: bogus,
-            app_id:      1,
+            app_id:      app_uuid(1),
             app_alias:   "nope".to_string(),
         };
         let payload = serialize_change(&change);
@@ -6625,7 +6650,7 @@ mod tests {
 
         let change = Change::AddApplication {
             device_uuid: dg_uuid,
-            app_id:      1,
+            app_id:      app_uuid(1),
             app_alias:   "nope".to_string(),
         };
         let payload = serialize_change(&change);
@@ -6663,8 +6688,8 @@ mod tests {
         // node, and verify both look the same in their public-scope view.
         let src = TestCtx::new();
         let local = promote_local_to_sg(&src, 1);
-        let app1 = Change::AddApplication { device_uuid: local, app_id: 11, app_alias: "a1".into() };
-        let app2 = Change::AddApplication { device_uuid: local, app_id: 22, app_alias: "a2".into() };
+        let app1 = Change::AddApplication { device_uuid: local, app_id: app_uuid(11), app_alias: "a1".into() };
+        let app2 = Change::AddApplication { device_uuid: local, app_id: app_uuid(22), app_alias: "a2".into() };
         apply_change_locally(&app1, local, &src.ctx).unwrap();
         apply_change_locally(&app2, local, &src.ctx).unwrap();
 
@@ -6683,9 +6708,11 @@ mod tests {
         let dst_dev = dst_node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
         assert_eq!(dst_dev.alias, src_dev.alias);
         assert_eq!(dst_dev.applications.len(), 2);
-        let mut ids: Vec<u16> = dst_dev.applications.iter().map(|a| a.id).collect();
+        let mut ids: Vec<Uuid> = dst_dev.applications.iter().map(|a| a.id).collect();
         ids.sort();
-        assert_eq!(ids, vec![11, 22]);
+        let mut expected = vec![app_uuid(11), app_uuid(22)];
+        expected.sort();
+        assert_eq!(ids, expected);
     }
 
     #[test]
@@ -6701,7 +6728,7 @@ mod tests {
             let dev = node.owner.user.devices.iter_mut()
                 .find(|d| d.uuid == local_uuid).unwrap();
             dev.applications.push(Application {
-                id: 7, alias: "old-alias".into(),
+                id: app_uuid(7), alias: "old-alias".into(),
                 protocol: "udp".into(), host: real_host,
                 user_approved: true, token: real_token,
             });
@@ -6727,7 +6754,7 @@ mod tests {
         blob.push(dev_clone.4.len() as u8);
         for h in &dev_clone.4 { push_str(&mut blob, h); }
         blob.push(1u8); // 1 app
-        blob.extend_from_slice(&7u16.to_be_bytes());
+        blob.extend_from_slice(&app_uuid(7));
         push_str(&mut blob, "new-alias");
         blob.push(0u8); // 0 contacts
 
@@ -6796,7 +6823,7 @@ mod tests {
                 sg_rank:      None,
                 hosts:        vec![],
                 applications: vec![Application {
-                    id: 5, alias: "stale".into(),
+                    id: app_uuid(5), alias: "stale".into(),
                     protocol: "".into(),
                     host: "0.0.0.0:0".parse().unwrap(),
                     user_approved: true, token: [0u8; 16],
@@ -6826,7 +6853,7 @@ mod tests {
             let dev = node.owner.user.devices.iter_mut()
                 .find(|d| d.uuid == local_uuid).unwrap();
             dev.applications.push(Application {
-                id: 9, alias: "in-flight".into(),
+                id: app_uuid(9), alias: "in-flight".into(),
                 protocol: "udp".into(),
                 host: "10.0.0.1:9999".parse().unwrap(),
                 user_approved: true, token: [0xCC; 16],
@@ -6839,7 +6866,7 @@ mod tests {
         let node = t.ctx.node.read().unwrap();
         let local = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid).unwrap();
         assert_eq!(local.applications.len(), 1, "in-flight local app must survive");
-        assert_eq!(local.applications[0].id, 9);
+        assert_eq!(local.applications[0].id, app_uuid(9));
     }
 
     #[test]
@@ -6854,7 +6881,7 @@ mod tests {
         let dg_uuid = dg_conn.device_uuid;
 
         let change = Change::AddApplication {
-            device_uuid: dg_uuid, app_id: 5, app_alias: "fan".into(),
+            device_uuid: dg_uuid, app_id: app_uuid(5), app_alias: "fan".into(),
         };
         let payload = serialize_change(&change);
         let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
@@ -6999,7 +7026,7 @@ mod tests {
         // Add an app so the public state is non-empty.
         let local_uuid = t.ctx.node.read().unwrap().device_uuid;
         apply_change_locally(&Change::AddApplication {
-            device_uuid: local_uuid, app_id: 1, app_alias: "ax".into(),
+            device_uuid: local_uuid, app_id: app_uuid(1), app_alias: "ax".into(),
         }, local_uuid, &t.ctx).unwrap();
 
         let mut body = Vec::new();
@@ -7041,7 +7068,7 @@ mod tests {
         let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
         let local_uuid = t.ctx.node.read().unwrap().device_uuid;
         apply_change_locally(&Change::AddApplication {
-            device_uuid: local_uuid, app_id: 1, app_alias: "ax".into(),
+            device_uuid: local_uuid, app_id: app_uuid(1), app_alias: "ax".into(),
         }, local_uuid, &t.ctx).unwrap();
         let current = t.ctx.node.read().unwrap().owner.public_version;
 
@@ -7081,7 +7108,7 @@ mod tests {
         let writer = TestCtx::new();
         let writer_local = promote_local_to_sg(&writer, 1);
         apply_change_locally(&Change::AddApplication {
-            device_uuid: writer_local, app_id: 99, app_alias: "ww".into(),
+            device_uuid: writer_local, app_id: app_uuid(99), app_alias: "ww".into(),
         }, writer_local, &writer.ctx).unwrap();
         let writer_pub_v = writer.ctx.node.read().unwrap().owner.public_version;
         let blob = serialize_public_state(&writer.ctx.node.read().unwrap());
@@ -7104,7 +7131,7 @@ mod tests {
         // Writer's device record is now in our state with the new app.
         let writer_dev = node.owner.user.devices.iter().find(|d| d.uuid == writer_local).unwrap();
         assert_eq!(writer_dev.applications.len(), 1);
-        assert_eq!(writer_dev.applications[0].id, 99);
+        assert_eq!(writer_dev.applications[0].id, app_uuid(99));
         assert_eq!(writer_dev.applications[0].alias, "ww");
     }
 
@@ -7123,7 +7150,7 @@ mod tests {
             let mut node = t.ctx.node.write().unwrap();
             let dev = node.owner.user.devices.iter_mut().find(|d| d.uuid == local).unwrap();
             dev.applications.push(Application {
-                id: 17, alias: "preadded".into(),
+                id: app_uuid(17), alias: "preadded".into(),
                 protocol: "udp".into(),
                 host: "127.0.0.1:9000".parse().unwrap(),
                 user_approved: true,
@@ -7135,7 +7162,7 @@ mod tests {
         // Call request_change for the SAME change. apply_change_locally
         // returns idempotent no-op, but request_change must still bump.
         request_change(Change::AddApplication {
-            device_uuid: local, app_id: 17, app_alias: "preadded".into(),
+            device_uuid: local, app_id: app_uuid(17), app_alias: "preadded".into(),
         }, &t.ctx).expect("request_change ok");
 
         let node = t.ctx.node.read().unwrap();
@@ -7146,7 +7173,7 @@ mod tests {
         // App's private fields preserved (apply_change_locally never wrote
         // over them since it was a no-op).
         let dev = node.owner.user.devices.iter().find(|d| d.uuid == local).unwrap();
-        let app = dev.applications.iter().find(|a| a.id == 17).unwrap();
+        let app = dev.applications.iter().find(|a| a.id == app_uuid(17)).unwrap();
         assert_eq!(app.token, [0xAB; 16]);
         assert_eq!(app.host, "127.0.0.1:9000".parse::<SocketAddrV4>().unwrap());
     }
@@ -7361,8 +7388,8 @@ mod tests {
         let dest_kp        = generate_x25519_keypair();
 
         let dest_device_uuid = generate_uuid();
-        let dest_app_id: u16 = 5;
-        let sender_app_id: u16 = 3;
+        let dest_app_id: Uuid = app_uuid(5);
+        let sender_app_id: Uuid = app_uuid(3);
 
         // The "destination" app socket — we'll receive the AppPacket here.
         let dest_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -7420,8 +7447,8 @@ mod tests {
         //                               = x25519_shared(sg_from_dg_sk, dg_sender_pk) — same
         let mut relay_body = Vec::new();
         relay_body.extend_from_slice(&dest_device_uuid);
-        relay_body.extend_from_slice(&dest_app_id.to_be_bytes());
-        relay_body.extend_from_slice(&sender_app_id.to_be_bytes());
+        relay_body.extend_from_slice(&dest_app_id);
+        relay_body.extend_from_slice(&sender_app_id);
         relay_body.extend_from_slice(b"payload");
 
         // Use dg_sender_kp to encrypt for SG's conn #1 (peer_active_conn_id = 1 on SG side).
@@ -7470,10 +7497,12 @@ mod tests {
         let node     = t2.ctx.node.read().unwrap();
         let decrypted = decrypt_packet_body(&node, &buf[1..len]).unwrap();
 
-        // Decrypted body: [dest_app_id: u16][sender_app_id: u16][payload]
-        assert_eq!(u16::from_be_bytes([decrypted[0], decrypted[1]]), dest_app_id);
-        assert_eq!(u16::from_be_bytes([decrypted[2], decrypted[3]]), sender_app_id);
-        assert_eq!(&decrypted[4..], b"payload");
+        // Decrypted body: [dest_app_id: 16][sender_app_id: 16][payload]
+        let dest_id_bytes:   [u8; 16] = decrypted[0..16].try_into().unwrap();
+        let sender_id_bytes: [u8; 16] = decrypted[16..32].try_into().unwrap();
+        assert_eq!(dest_id_bytes,   dest_app_id);
+        assert_eq!(sender_id_bytes, sender_app_id);
+        assert_eq!(&decrypted[32..], b"payload");
     }
 
     // ── app_packet delivers to local app ──────────────────────────────────────
@@ -7483,8 +7512,8 @@ mod tests {
         let t = TestCtx::new();
 
         // Set up: an approved app on the local device.
-        let app_id: u16     = 9;
-        let sender_app_id   = 3u16;
+        let app_id: Uuid    = app_uuid(9);
+        let sender_app_id   = app_uuid(3);
         let sg_kp           = generate_x25519_keypair();
         let local_kp        = generate_x25519_keypair();
 
@@ -7516,10 +7545,10 @@ mod tests {
             });
         }
 
-        // Build AppPacket body: [dest_app_id: u16][sender_app_id: u16][payload]
+        // Build AppPacket body: [dest_app_id: 16][sender_app_id: 16][payload]
         let mut body = Vec::new();
-        body.extend_from_slice(&app_id.to_be_bytes());
-        body.extend_from_slice(&sender_app_id.to_be_bytes());
+        body.extend_from_slice(&app_id);
+        body.extend_from_slice(&sender_app_id);
         body.extend_from_slice(b"hello app");
 
         // SG encrypts using its side of conn #5.
@@ -7540,8 +7569,9 @@ mod tests {
         // app_socket should receive the push.
         let push = t.recv_reply();
         assert_eq!(push[0], APP_PUSH_OP);
-        assert_eq!(u16::from_be_bytes([push[1], push[2]]), sender_app_id);
-        assert_eq!(&push[3..], b"hello app");
+        let sender_id_bytes: [u8; 16] = push[1..17].try_into().unwrap();
+        assert_eq!(sender_id_bytes, sender_app_id);
+        assert_eq!(&push[17..], b"hello app");
     }
 
     // ── Contact exchange (0x33 / 0x34) ───────────────────────────────────────
@@ -7903,7 +7933,7 @@ mod tests {
             let device_uuid = node.device_uuid;
             if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) {
                 dev.applications.push(Application {
-                    id:            7,
+                    id:            app_uuid(7),
                     alias:         "test-app".to_string(),
                     protocol:      "udp".to_string(),
                     host:          "127.0.0.1:5000".parse().unwrap(),
@@ -7911,7 +7941,7 @@ mod tests {
                     token:         generate_uuid(),
                 });
                 dev.applications.push(Application {
-                    id:            8,
+                    id:            app_uuid(8),
                     alias:         "pending-app".to_string(),
                     protocol:      "udp".to_string(),
                     host:          "127.0.0.1:5001".parse().unwrap(),
@@ -7934,7 +7964,7 @@ mod tests {
         let (_, apps) = &data.devices[0];
         // Only the approved app should be present.
         assert_eq!(apps.len(), 1);
-        assert_eq!(apps[0].0, 7);
+        assert_eq!(apps[0].0, app_uuid(7));
         assert_eq!(apps[0].1, "test-app");
     }
 
@@ -8303,12 +8333,12 @@ mod tests {
 
     /// Seed a pending app (user_approved=false) on the local device and
     /// return its id.
-    fn seed_pending_app(t: &TestCtx, alias: &str) -> u16 {
+    fn seed_pending_app(t: &TestCtx, alias: &str) -> Uuid {
         let mut node = t.ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
         let dev = node.owner.user.devices.iter_mut()
             .find(|d| d.uuid == device_uuid).unwrap();
-        let id = (dev.applications.len() as u16) + 100;
+        let id = generate_uuid();
         dev.applications.push(Application {
             id,
             alias:         alias.to_string(),
@@ -8321,7 +8351,7 @@ mod tests {
     }
 
     /// Seed an approved app and return its id.
-    fn seed_approved_app(t: &TestCtx, alias: &str) -> u16 {
+    fn seed_approved_app(t: &TestCtx, alias: &str) -> Uuid {
         let id = seed_pending_app(t, alias);
         let mut node = t.ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
@@ -8337,7 +8367,7 @@ mod tests {
         promote_local_to_sg(&t, 1);
         let id = seed_pending_app(&t, "pending");
 
-        let body = format!("id={id}");
+        let body = format!("id={}", uuid_hex(&id));
         let res = approve_app(body.as_bytes(), &t.ctx);
         assert_eq!(res, None);
 
@@ -8356,7 +8386,7 @@ mod tests {
         let t = TestCtx::new();
         let id = seed_pending_app(&t, "pending");
 
-        let body = format!("id={id}");
+        let body = format!("id={}", uuid_hex(&id));
         let res = approve_app(body.as_bytes(), &t.ctx);
         assert_eq!(res, Some(UI_ERR_PUBLISH_FAILED));
 
@@ -8378,7 +8408,7 @@ mod tests {
         t.ctx.node.write().unwrap().owner.bump_version(Scope::Public, writer_uuid);
         let pub_before = t.ctx.node.read().unwrap().owner.public_version;
 
-        let body = format!("id={id}");
+        let body = format!("id={}", uuid_hex(&id));
         let res = reject_app(body.as_bytes(), &t.ctx);
         assert_eq!(res, None);
 
@@ -8399,7 +8429,7 @@ mod tests {
         let id = seed_approved_app(&t, "doomed");
         let original_alias = "doomed".to_string();
 
-        let body = format!("id={id}");
+        let body = format!("id={}", uuid_hex(&id));
         let res = reject_app(body.as_bytes(), &t.ctx);
         assert_eq!(res, Some(UI_ERR_PUBLISH_FAILED));
 

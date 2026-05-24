@@ -40,7 +40,8 @@ const STATUS_OK:   u8 = 0x00;
 
 #[derive(Default, Serialize, Clone)]
 struct AppEntry {
-    id: u16,
+    /// 32-char lowercase hex of the 16-byte app uuid.
+    id_hex: String,
     alias: String,
     user_approved: bool,
 }
@@ -67,7 +68,7 @@ struct StatusView {
     registered: bool,
     approved: bool,
     token_hex: Option<String>,
-    app_id: Option<u16>,
+    app_id_hex: Option<String>,
     app_alias: Option<String>,
     owner_alias: Option<String>,
     owner_uuid_hex: Option<String>,
@@ -81,8 +82,8 @@ struct Inner {
     token: Option<[u8; 16]>,
     status: StatusView,
     events: Vec<Value>,
-    /// (device_uuid, app_id) → display label, used to enrich push events.
-    app_labels: HashMap<(Vec<u8>, u16), String>,
+    /// (device_uuid, app_uuid) → display label, used to enrich push events.
+    app_labels: HashMap<(Vec<u8>, [u8; 16]), String>,
 }
 
 struct AppState {
@@ -122,12 +123,6 @@ fn read_str(data: &[u8], pos: &mut usize) -> Option<String> {
     Some(s)
 }
 
-fn read_u16(data: &[u8], pos: &mut usize) -> Option<u16> {
-    let v = u16::from_be_bytes(data.get(*pos..*pos + 2)?.try_into().ok()?);
-    *pos += 2;
-    Some(v)
-}
-
 fn read_bytes<const N: usize>(data: &[u8], pos: &mut usize) -> Option<[u8; N]> {
     let arr: [u8; N] = data.get(*pos..*pos + N)?.try_into().ok()?;
     *pos += N;
@@ -156,11 +151,11 @@ fn build_get_data(token: &[u8; 16]) -> Vec<u8> {
     buf
 }
 
-fn build_send(token: &[u8; 16], dest_device_uuid: &[u8], dest_app_id: u16, payload: &[u8]) -> Vec<u8> {
+fn build_send(token: &[u8; 16], dest_device_uuid: &[u8], dest_app_id: &[u8; 16], payload: &[u8]) -> Vec<u8> {
     let mut buf = vec![OP_SEND];
     buf.extend_from_slice(token);
     buf.extend_from_slice(dest_device_uuid);
-    buf.extend_from_slice(&dest_app_id.to_be_bytes());
+    buf.extend_from_slice(dest_app_id);
     buf.extend_from_slice(payload);
     buf
 }
@@ -170,7 +165,7 @@ fn build_send(token: &[u8; 16], dest_device_uuid: &[u8], dest_app_id: u16, paylo
 fn parse_get_data(reply: &[u8], inner: &mut Inner) -> Option<()> {
     let mut pos = 1usize; // skip OK byte
 
-    let app_id = read_u16(reply, &mut pos)?;
+    let app_id = read_bytes::<16>(reply, &mut pos)?;
     let app_alias = read_str(reply, &mut pos)?;
     pos += 6; // ip + port
     let approved_byte = *reply.get(pos)?;
@@ -181,7 +176,7 @@ fn parse_get_data(reply: &[u8], inner: &mut Inner) -> Option<()> {
     let owner_alias = read_str(reply, &mut pos)?;
     let owner_uuid = read_bytes::<16>(reply, &mut pos)?;
 
-    let mut app_labels: HashMap<(Vec<u8>, u16), String> = HashMap::new();
+    let mut app_labels: HashMap<(Vec<u8>, [u8; 16]), String> = HashMap::new();
     let mut own_devices: Vec<DeviceEntry> = Vec::new();
 
     let dev_count = *reply.get(pos)?;
@@ -203,7 +198,7 @@ fn parse_get_data(reply: &[u8], inner: &mut Inner) -> Option<()> {
         pos += 1;
         let mut apps = Vec::with_capacity(app_count as usize);
         for _ in 0..app_count {
-            let aid = read_u16(reply, &mut pos)?;
+            let aid = read_bytes::<16>(reply, &mut pos)?;
             let aalias = read_str(reply, &mut pos)?;
             pos += 4 + 2; // ip + port
             let approved = *reply.get(pos)? != 0;
@@ -212,7 +207,7 @@ fn parse_get_data(reply: &[u8], inner: &mut Inner) -> Option<()> {
                 (dev_uuid.to_vec(), aid),
                 format!("{dev_alias}/{aalias}"),
             );
-            apps.push(AppEntry { id: aid, alias: aalias, user_approved: approved });
+            apps.push(AppEntry { id_hex: hex(&aid), alias: aalias, user_approved: approved });
         }
         own_devices.push(DeviceEntry {
             uuid_hex: hex(&dev_uuid),
@@ -250,14 +245,14 @@ fn parse_get_data(reply: &[u8], inner: &mut Inner) -> Option<()> {
             pos += 1;
             let mut apps = Vec::with_capacity(app_count as usize);
             for _ in 0..app_count {
-                let aid = read_u16(reply, &mut pos)?;
+                let aid = read_bytes::<16>(reply, &mut pos)?;
                 let aalias = read_str(reply, &mut pos)?;
                 // Contact apps: no ip/port/approved byte, only id+alias.
                 app_labels.insert(
                     (dev_uuid.to_vec(), aid),
                     format!("{calias}/{dev_alias}/{aalias}"),
                 );
-                apps.push(AppEntry { id: aid, alias: aalias, user_approved: true });
+                apps.push(AppEntry { id_hex: hex(&aid), alias: aalias, user_approved: true });
             }
             cdevs.push(DeviceEntry {
                 uuid_hex: hex(&dev_uuid),
@@ -275,7 +270,7 @@ fn parse_get_data(reply: &[u8], inner: &mut Inner) -> Option<()> {
         });
     }
 
-    inner.status.app_id = Some(app_id);
+    inner.status.app_id_hex = Some(hex(&app_id));
     inner.status.app_alias = Some(app_alias);
     inner.status.approved = approved_byte != 0;
     inner.status.owner_alias = Some(owner_alias);
@@ -294,7 +289,7 @@ fn resolve_target(
     contact_alias: Option<&str>,
     device_alias: &str,
     app_alias: &str,
-) -> Option<(Vec<u8>, u16)> {
+) -> Option<(Vec<u8>, [u8; 16])> {
     let devices: &[DeviceEntry] = if let Some(c) = contact_alias {
         match status.contacts.iter().find(|x| x.alias == c) {
             Some(con) => &con.devices,
@@ -305,7 +300,8 @@ fn resolve_target(
     };
     let dev = devices.iter().find(|d| d.alias == device_alias)?;
     let app = dev.apps.iter().find(|a| a.alias == app_alias)?;
-    Some((hex_decode(&dev.uuid_hex)?, app.id))
+    let app_id: [u8; 16] = hex_decode(&app.id_hex)?.try_into().ok()?;
+    Some((hex_decode(&dev.uuid_hex)?, app_id))
 }
 
 // ── Networking ───────────────────────────────────────────────────────────────
@@ -370,17 +366,17 @@ async fn push_receive_loop(state: Arc<AppState>) {
     loop {
         let Ok((len, _)) = state.push_socket.recv_from(&mut buf).await else { continue };
         let data = &buf[..len];
-        if data.len() < 3 || data[0] != OP_PUSH {
+        if data.len() < 17 || data[0] != OP_PUSH {
             continue;
         }
-        let sender_app_id = u16::from_be_bytes([data[1], data[2]]);
-        let payload = &data[3..];
+        let sender_app_id: [u8; 16] = data[1..17].try_into().unwrap();
+        let payload = &data[17..];
         let payload_b64 = base64::engine::general_purpose::STANDARD.encode(payload);
         let payload_str = std::str::from_utf8(payload).ok().map(|s| s.to_string());
         // The push packet does NOT carry the sender's device uuid, only app id.
-        // App ids are device-scoped, so we can only resolve a label if exactly
-        // one (device, app_id) pair in our cache matches; otherwise we leave
-        // sender_label null and the harness can disambiguate via timing.
+        // App ids are device-scoped (now UUIDs); a collision is astronomically
+        // unlikely but we still take "exactly one match" to keep the label
+        // logic conservative.
         let label = {
             let inner = state.inner.lock().unwrap();
             let mut matches: Vec<&String> = inner.app_labels.iter()
@@ -392,7 +388,7 @@ async fn push_receive_loop(state: Arc<AppState>) {
         log_event(&state.inner, json!({
             "ts": now_secs(),
             "kind": "push_received",
-            "sender_app_id": sender_app_id,
+            "sender_app_id_hex": hex(&sender_app_id),
             "sender_label": label,
             "payload_len": payload.len(),
             "payload_b64": payload_b64,
@@ -443,7 +439,7 @@ async fn handle_refresh(State(state): State<Arc<AppState>>) -> Json<Value> {
 struct SendRequest {
     // Explicit form (takes priority if both set):
     device_uuid_hex: Option<String>,
-    app_id: Option<u16>,
+    app_id_hex: Option<String>,
     // Alias form:
     contact_alias: Option<String>,
     device_alias: Option<String>,
@@ -473,11 +469,17 @@ async fn handle_send(
         return Json(json!({"ok": false, "error": "payload_b64 or payload_text required"}));
     };
 
-    let (dest_uuid, dest_app_id) = if let (Some(uuid_hex), Some(app_id)) = (req.device_uuid_hex.as_deref(), req.app_id) {
-        match hex_decode(uuid_hex) {
-            Some(v) if v.len() == 16 => (v, app_id),
+    let (dest_uuid, dest_app_id): (Vec<u8>, [u8; 16]) =
+        if let (Some(uuid_hex), Some(app_id_hex)) = (req.device_uuid_hex.as_deref(), req.app_id_hex.as_deref()) {
+        let dev_bytes = match hex_decode(uuid_hex) {
+            Some(v) if v.len() == 16 => v,
             _ => return Json(json!({"ok": false, "error": "bad device_uuid_hex"})),
-        }
+        };
+        let app_bytes: [u8; 16] = match hex_decode(app_id_hex).and_then(|v| v.try_into().ok()) {
+            Some(a) => a,
+            None    => return Json(json!({"ok": false, "error": "bad app_id_hex"})),
+        };
+        (dev_bytes, app_bytes)
     } else if let (Some(da), Some(aa)) = (req.device_alias.as_deref(), req.app_alias.as_deref()) {
         let inner = state.inner.lock().unwrap();
         match resolve_target(&inner.status, req.contact_alias.as_deref(), da, aa) {
@@ -493,18 +495,18 @@ async fn handle_send(
     } else {
         return Json(json!({
             "ok": false,
-            "error": "specify (device_uuid_hex+app_id) or (device_alias+app_alias)"
+            "error": "specify (device_uuid_hex+app_id_hex) or (device_alias+app_alias)"
         }));
     };
 
-    let pkt = build_send(&token, &dest_uuid, dest_app_id, &payload);
+    let pkt = build_send(&token, &dest_uuid, &dest_app_id, &payload);
     match state.ctrl_socket.send_to(&pkt, state.pnet_addr).await {
         Ok(_) => {
             log_event(&state.inner, json!({
                 "ts": now_secs(),
                 "kind": "send_sent",
                 "dest_device_uuid_hex": hex(&dest_uuid),
-                "dest_app_id": dest_app_id,
+                "dest_app_id_hex": hex(&dest_app_id),
                 "payload_len": payload.len(),
             }));
             Json(json!({"ok": true}))

@@ -71,7 +71,7 @@ probe_app_id_for() {
         .contacts | map(select(.alias == $c)) | first
         | .devices | map(select(.alias == $d)) | first
         | .apps | map(select(.alias == $a)) | first
-        | .id // empty
+        | .id_hex // empty
     ' <<< "$body"
 }
 
@@ -82,7 +82,7 @@ own_app_id_for() {
     jq -r --arg d "$dev_alias" --arg a "$app_alias" '
         .own_devices | map(select(.alias == $d)) | first
         | .apps | map(select(.alias == $a)) | first
-        | .id // empty
+        | .id_hex // empty
     ' <<< "$body"
 }
 

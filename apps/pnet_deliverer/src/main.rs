@@ -36,7 +36,8 @@ const STATUS_OK: u8 = 0x00;
 
 #[derive(Clone, Debug, Serialize)]
 struct AppInfo {
-    id: u16,
+    /// 32-char lowercase hex of the 16-byte app uuid.
+    id_hex: String,
     alias: String,
     approved: bool,
 }
@@ -44,7 +45,9 @@ struct AppInfo {
 #[derive(Clone, Debug, Serialize)]
 struct Destination {
     device_uuid: Vec<u8>,
-    app_id: u16,
+    app_id_hex: String,
+    #[serde(skip)]
+    app_id: [u8; 16],
     label: String,
 }
 
@@ -59,8 +62,8 @@ struct Inner {
     token: Option<[u8; 16]>,
     app_info: Option<AppInfo>,
     destinations: Vec<Destination>,
-    /// sender_app_id → display label
-    app_labels: HashMap<u16, String>,
+    /// sender_app_id (uuid) → display label
+    app_labels: HashMap<[u8; 16], String>,
     messages: Vec<Message>,
     last_fetch_ok: Option<u64>,
 }
@@ -87,12 +90,6 @@ fn read_str(data: &[u8], pos: &mut usize) -> Option<String> {
     let s = std::str::from_utf8(data.get(*pos..*pos + len)?).ok()?.to_string();
     *pos += len;
     Some(s)
-}
-
-fn read_u16(data: &[u8], pos: &mut usize) -> Option<u16> {
-    let v = u16::from_be_bytes(data.get(*pos..*pos + 2)?.try_into().ok()?);
-    *pos += 2;
-    Some(v)
 }
 
 fn read_bytes<const N: usize>(data: &[u8], pos: &mut usize) -> Option<[u8; N]> {
@@ -128,11 +125,11 @@ fn build_get_data(token: &[u8; 16]) -> Vec<u8> {
     buf
 }
 
-fn build_send(token: &[u8; 16], dest_device_uuid: &[u8], dest_app_id: u16, payload: &[u8]) -> Vec<u8> {
+fn build_send(token: &[u8; 16], dest_device_uuid: &[u8], dest_app_id: &[u8; 16], payload: &[u8]) -> Vec<u8> {
     let mut buf = vec![OP_SEND];
     buf.extend_from_slice(token);
     buf.extend_from_slice(dest_device_uuid);
-    buf.extend_from_slice(&dest_app_id.to_be_bytes());
+    buf.extend_from_slice(dest_app_id);
     buf.extend_from_slice(payload);
     buf
 }
@@ -142,7 +139,7 @@ fn parse_get_data(reply: &[u8], inner: &mut Inner) {
     let mut pos = 1usize; // skip OK byte
 
     // App's own data.
-    let Some(app_id) = read_u16(reply, &mut pos) else { return };
+    let Some(app_id) = read_bytes::<16>(reply, &mut pos) else { return };
     let Some(alias) = read_str(reply, &mut pos) else { return };
     pos += 6; // ip(4) + port(2)
     let Some(&approved_byte) = reply.get(pos) else { return };
@@ -151,7 +148,7 @@ fn parse_get_data(reply: &[u8], inner: &mut Inner) {
     let Some(local_device_uuid) = read_bytes::<16>(reply, &mut pos) else { return };
 
     inner.app_info = Some(AppInfo {
-        id: app_id,
+        id_hex: hex(&app_id),
         alias,
         approved: approved_byte != 0,
     });
@@ -161,7 +158,7 @@ fn parse_get_data(reply: &[u8], inner: &mut Inner) {
     pos += 16;
 
     let mut destinations: Vec<Destination> = Vec::new();
-    let mut app_labels: HashMap<u16, String> = HashMap::new();
+    let mut app_labels: HashMap<[u8; 16], String> = HashMap::new();
 
     // Own devices.
     let Some(&device_count) = reply.get(pos) else { return };
@@ -178,18 +175,17 @@ fn parse_get_data(reply: &[u8], inner: &mut Inner) {
         let Some(&app_count) = reply.get(pos) else { return };
         pos += 1;
         for _ in 0..app_count {
-            let Some(aid) = read_u16(reply, &mut pos) else { return };
+            let Some(aid) = read_bytes::<16>(reply, &mut pos) else { return };
             let Some(app_alias) = read_str(reply, &mut pos) else { return };
             pos += 4 + 2 + 1; // ip + port + user_approved
             let label = format!("{dev_alias} / {app_alias}");
             app_labels.insert(aid, label.clone());
             // Exclude only the specific app instance that is this deliverer
-            // (same device AND same app ID).  App IDs are device-scoped, so
-            // two devices can each have an app with id=1; comparing only the
-            // numeric ID would incorrectly drop apps on other devices.
+            // (same device AND same app uuid).
             if !(dev_uuid == local_device_uuid && aid == app_id) {
                 destinations.push(Destination {
                     device_uuid: dev_uuid.to_vec(),
+                    app_id_hex: hex(&aid),
                     app_id: aid,
                     label,
                 });
@@ -218,12 +214,13 @@ fn parse_get_data(reply: &[u8], inner: &mut Inner) {
             pos += 1;
             for _ in 0..app_count {
                 // Contact apps: only approved, no ip/port in response
-                let Some(aid) = read_u16(reply, &mut pos) else { return };
+                let Some(aid) = read_bytes::<16>(reply, &mut pos) else { return };
                 let Some(app_alias) = read_str(reply, &mut pos) else { return };
                 let label = format!("{contact_alias} / {dev_alias} / {app_alias}");
                 app_labels.insert(aid, label.clone());
                 destinations.push(Destination {
                     device_uuid: dev_uuid.to_vec(),
+                    app_id_hex: hex(&aid),
                     app_id: aid,
                     label,
                 });
@@ -310,17 +307,17 @@ async fn push_receive_loop(state: Arc<AppState>) {
         };
 
         let data = &buf[..len];
-        if data.len() < 3 || data[0] != OP_PUSH {
+        if data.len() < 17 || data[0] != OP_PUSH {
             continue;
         }
 
-        let sender_id = u16::from_be_bytes([data[1], data[2]]);
-        let text = String::from_utf8_lossy(&data[3..]).into_owned();
+        let sender_id: [u8; 16] = data[1..17].try_into().unwrap();
+        let text = String::from_utf8_lossy(&data[17..]).into_owned();
 
         let mut inner = state.inner.lock().unwrap();
         let sender = inner.app_labels.get(&sender_id)
             .cloned()
-            .unwrap_or_else(|| format!("app#{sender_id}"));
+            .unwrap_or_else(|| format!("app#{}", hex(&sender_id)));
         eprintln!("[recv] from {sender}: {text}");
         inner.messages.push(Message { sender, text, timestamp: now_secs() });
     }
@@ -379,7 +376,7 @@ async fn handle_send(
         (token, dest)
     };
 
-    let pkt = build_send(&token, &dest.device_uuid, dest.app_id, req.text.as_bytes());
+    let pkt = build_send(&token, &dest.device_uuid, &dest.app_id, req.text.as_bytes());
     match state.ctrl_socket.send_to(&pkt, state.pnet_addr).await {
         Ok(_) => Json(SendResponse { ok: true, error: None }),
         Err(e) => Json(SendResponse { ok: false, error: Some(e.to_string()) }),
@@ -604,7 +601,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           ? '<span class="badge ok">APPROVED</span>'
           : '<span class="badge warn">PENDING APPROVAL</span>';
         statusEl.className = 'status ' + (s.approved ? 'approved' : 'pending');
-        statusEl.innerHTML = `<strong>${escHtml(s.app_info.alias)}</strong> (id ${s.app_info.id}) ${badge}`;
+        statusEl.innerHTML = `<strong>${escHtml(s.app_info.alias)}</strong> (id ${s.app_info.id_hex.slice(0,8)}…) ${badge}`;
         if (!s.approved) {
           statusEl.innerHTML += '<br><small style="color:#888;margin-top:4px;display:block">Approve this app in the pnet admin UI, then click Refresh.</small>';
         }

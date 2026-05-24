@@ -262,7 +262,11 @@ pub struct PendingConnection {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Application {
-    pub id:            u16,
+    /// 16-byte UUID. Wide enough that two writers accepting AddApplication
+    /// during a network partition cannot collide on the same id, so v2's
+    /// partition reconciliation can union Adds without reassignment.
+    #[serde(with = "serde_bytes_16")]
+    pub id:            Uuid,
     pub alias:         String,
     pub protocol:      String,
     #[serde(with = "serde_socket_addr_v4")]
