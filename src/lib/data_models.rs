@@ -419,6 +419,11 @@ pub struct Owner {
     /// Rebuilt on each probe round-trip.
     #[serde(skip)]
     pub last_watermarks: HashMap<Uuid, HashMap<Uuid, SyncVersion>>,
+    /// Ephemeral — sync v2 inbound merge proposals from peer SGs awaiting
+    /// the actual merge step (7c.5/7c.6). Key: peer device uuid. Value:
+    /// the entries the peer reported as missing on our side.
+    #[serde(skip)]
+    pub received_merge_proposals: HashMap<Uuid, Vec<WriteLogEntry>>,
     /// Ephemeral — not persisted; cleared when ConnectAck arrives.
     #[serde(skip)]
     pub pending_connections: HashMap<u16, PendingConnection>,
@@ -577,6 +582,7 @@ impl Node {
                 write_log:                  Vec::new(),
                 active_connections:         HashMap::new(),
                 last_watermarks:            HashMap::new(),
+                received_merge_proposals:   HashMap::new(),
                 pending_connections:        HashMap::new(),
                 pending_contact_exchange:   None,
                 pending_bootstrap:          None,

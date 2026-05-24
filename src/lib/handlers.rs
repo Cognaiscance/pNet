@@ -613,9 +613,19 @@ const CROSS_USER_PULL_REQUEST_OP:     u8 = 0x76;
 const CROSS_USER_PULL_RESPONSE_OP:    u8 = 0x77;
 // 0x7A/0x7B — sync v2 watermark exchange between own-user SGs. Sent on
 // SG↔SG reconnect to find the per-writer agreed-point used by the merge
-// protocol (0x78/0x79, landing in 7c.4).
+// protocol (0x78/0x79).
 const WATERMARK_PROBE_REQUEST_OP:  u8 = 0x7A;
 const WATERMARK_PROBE_RESPONSE_OP: u8 = 0x7B;
+// 0x78/0x79 — sync v2 merge proposal exchange. After watermark discovery,
+// each side ships its write-log entries above the agreed per-writer
+// watermark; the receiver merges and acks. 7c.4 wires the receive-and-
+// store path; the actual merge logic lands in 7c.5/7c.6.
+const MERGE_PROPOSAL_OP: u8 = 0x78;
+const MERGE_ACK_OP:      u8 = 0x79;
+
+const MERGE_ACK_RESULT_APPLIED:            u8 = 0;
+const MERGE_ACK_RESULT_RETENTION_EXHAUSTED: u8 = 1;
+const MERGE_ACK_RESULT_MALFORMED:          u8 = 2;
 const RELAY_PACKET_OP:            u8 = 0x40;
 const APP_PACKET_OP:              u8 = 0x41;
 const APP_PUSH_OP:                u8 = 0x04;
@@ -3465,6 +3475,205 @@ pub fn watermark_probe_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
 
     let mut node = ctx.node.write().unwrap();
     node.owner.last_watermarks.insert(peer_uuid, merged);
+}
+
+// ── Sync v2 merge proposal exchange (ops 0x78 / 0x79) ────────────────────────
+//
+// After watermark discovery (0x7A/0x7B) settles the per-writer agreed point,
+// each SG ships the slice of its write log above that point so the peer can
+// merge. 7c.4 wires the receive-and-store path only — the actual merge
+// engine and the ack-driven state mutation land in 7c.5 / 7c.6.
+//
+//   0x78 MergeProposal: [scope:1][sender_version:28][entry_count:u16]
+//                       [entries...]
+//     each entry: [version:28][payload_len:u16][change_payload:var]
+//                 [committed_at_secs:u64 BE]
+//   0x79 MergeAck:      [scope:1][new_watermark:28][result:1]
+//     result: 0=applied, 1=retention-exhausted-fallback, 2=malformed
+//
+// `sender_version` in the proposal is the proposer's own post-bump version
+// at proposal time — a sanity stamp so the receiver can detect divergence
+// even before parsing entries. Per-writer filtering is done at the sender
+// using `Owner.last_watermarks[peer_uuid]` from 7c.3, so the body need not
+// re-ship a full watermark map.
+
+fn build_merge_proposal_body(
+    scope: Scope,
+    sender_version: SyncVersion,
+    entries: &[WriteLogEntry],
+) -> Vec<u8> {
+    let count = entries.len().min(u16::MAX as usize) as u16;
+    let mut buf = Vec::with_capacity(1 + SYNC_VERSION_WIRE_LEN + 2);
+    write_scope(&mut buf, scope);
+    write_sync_version(&mut buf, &sender_version);
+    buf.extend_from_slice(&count.to_be_bytes());
+    for e in entries.iter().take(count as usize) {
+        write_sync_version(&mut buf, &e.version);
+        let p_len = e.change_payload.len().min(u16::MAX as usize) as u16;
+        buf.extend_from_slice(&p_len.to_be_bytes());
+        buf.extend_from_slice(&e.change_payload[..p_len as usize]);
+        let secs = e.committed_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        buf.extend_from_slice(&secs.to_be_bytes());
+    }
+    buf
+}
+
+fn parse_merge_proposal_body(
+    data: &[u8],
+) -> Option<(Scope, SyncVersion, Vec<WriteLogEntry>)> {
+    let mut pos = 0usize;
+    let scope = read_scope(data, &mut pos)?;
+    let sender_version = read_sync_version(data, &mut pos)?;
+    let cnt_bytes: [u8; 2] = read_arr(data, &mut pos)?;
+    let cnt = u16::from_be_bytes(cnt_bytes) as usize;
+    let mut entries = Vec::with_capacity(cnt);
+    for _ in 0..cnt {
+        let version = read_sync_version(data, &mut pos)?;
+        let p_len_bytes: [u8; 2] = read_arr(data, &mut pos)?;
+        let p_len = u16::from_be_bytes(p_len_bytes) as usize;
+        let payload_slice = data.get(pos..pos + p_len)?;
+        let change_payload = payload_slice.to_vec();
+        pos += p_len;
+        let secs_bytes: [u8; 8] = read_arr(data, &mut pos)?;
+        let secs = u64::from_be_bytes(secs_bytes);
+        let committed_at = std::time::UNIX_EPOCH + Duration::from_secs(secs);
+        entries.push(WriteLogEntry {
+            version,
+            scope,
+            change_payload,
+            committed_at,
+        });
+    }
+    Some((scope, sender_version, entries))
+}
+
+fn build_merge_ack_body(scope: Scope, new_watermark: SyncVersion, result: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + SYNC_VERSION_WIRE_LEN + 1);
+    write_scope(&mut buf, scope);
+    write_sync_version(&mut buf, &new_watermark);
+    buf.push(result);
+    buf
+}
+
+fn parse_merge_ack_body(data: &[u8]) -> Option<(Scope, SyncVersion, u8)> {
+    let mut pos = 0usize;
+    let scope = read_scope(data, &mut pos)?;
+    let v     = read_sync_version(data, &mut pos)?;
+    let r     = *data.get(pos)?;
+    Some((scope, v, r))
+}
+
+/// Build the entries this node would ship to `peer_uuid` for `scope`: the
+/// log entries whose `(epoch, seq)` strictly exceeds the per-writer watermark
+/// established by the most recent WatermarkProbe exchange. Writers the peer
+/// reported but we don't have in `last_watermarks` are treated as "we know
+/// nothing about their slice for the peer," and we ship every entry of ours
+/// under those writers.
+fn build_merge_proposal_for_peer(
+    peer_uuid: Uuid,
+    scope: Scope,
+    ctx: &WorkerContext,
+) -> (SyncVersion, Vec<WriteLogEntry>) {
+    let node = ctx.node.read().unwrap();
+    let watermark_for = |writer: &Uuid| -> Option<SyncVersion> {
+        node.owner.last_watermarks
+            .get(&peer_uuid)
+            .and_then(|m| m.get(writer))
+            .copied()
+    };
+    let entries: Vec<WriteLogEntry> = node.owner.write_log.iter()
+        .filter(|e| e.scope == scope)
+        .filter(|e| match watermark_for(&e.version.writer_sg_uuid) {
+            Some(w) => (e.version.epoch, e.version.seq) > (w.epoch, w.seq),
+            None    => true,
+        })
+        .cloned()
+        .collect();
+    let sender_version = match scope {
+        Scope::Public  => node.owner.public_version,
+        Scope::Private => node.owner.private_version,
+    };
+    (sender_version, entries)
+}
+
+pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 2 {
+        eprintln!("[merge_proposal] header too short from {src}");
+        return;
+    }
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[merge_proposal] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+
+    let Some((scope, sender_version, entries)) = parse_merge_proposal_body(&plaintext) else {
+        eprintln!("[merge_proposal] malformed body from {src}");
+        return;
+    };
+
+    let peer_uuid = {
+        let node = ctx.node.read().unwrap();
+        match node.owner.active_connections.get(&conn_id) {
+            Some(conn) => conn.device_uuid,
+            None => {
+                eprintln!("[merge_proposal] no connection {conn_id} from {src}");
+                return;
+            }
+        }
+    };
+
+    println!(
+        "[merge_proposal] {} entries from peer {:02x?} (scope={scope:?}, sender_version epoch={}, seq={})",
+        entries.len(),
+        &peer_uuid[..4],
+        sender_version.epoch,
+        sender_version.seq,
+    );
+
+    let mut node = ctx.node.write().unwrap();
+    node.owner.received_merge_proposals.insert(peer_uuid, entries);
+}
+
+pub fn merge_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 2 {
+        eprintln!("[merge_ack] header too short from {src}");
+        return;
+    }
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[merge_ack] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+    let Some((scope, new_watermark, result)) = parse_merge_ack_body(&plaintext) else {
+        eprintln!("[merge_ack] malformed body from {src}");
+        return;
+    };
+    let result_str = match result {
+        MERGE_ACK_RESULT_APPLIED            => "applied",
+        MERGE_ACK_RESULT_RETENTION_EXHAUSTED => "retention_exhausted",
+        MERGE_ACK_RESULT_MALFORMED          => "malformed",
+        _ => "unknown",
+    };
+    println!(
+        "[merge_ack] result={result_str} scope={scope:?} new_watermark=(epoch={}, seq={})",
+        new_watermark.epoch, new_watermark.seq,
+    );
 }
 
 // ── Scheduled action handlers ─────────────────────────────────────────────────
@@ -8901,5 +9110,104 @@ mod tests {
         assert_eq!((stored[&w2].epoch, stored[&w2].seq), (5, 1));
         // w3: min((2,3), (2,9)) = (2,3)
         assert_eq!((stored[&w3].epoch, stored[&w3].seq), (2, 3));
+    }
+
+    // ── Merge proposal exchange (7c.4) ──────────────────────────────────────
+
+    fn sample_entry(writer: Uuid, epoch: u32, seq: u64, payload: &[u8]) -> WriteLogEntry {
+        WriteLogEntry {
+            version: SyncVersion { writer_sg_uuid: writer, epoch, seq },
+            scope:   Scope::Public,
+            change_payload: payload.to_vec(),
+            committed_at: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn merge_proposal_body_roundtrips() {
+        let sender_v = SyncVersion { writer_sg_uuid: [0xAA; 16], epoch: 2, seq: 17 };
+        let entries = vec![
+            sample_entry([0x11; 16], 1, 4, &[0xCA, 0xFE]),
+            sample_entry([0x22; 16], 3, 9, b"hello"),
+        ];
+        let body = build_merge_proposal_body(Scope::Public, sender_v, &entries);
+        let (scope, sender, parsed) =
+            parse_merge_proposal_body(&body).expect("parse");
+        assert_eq!(scope, Scope::Public);
+        assert_eq!(sender, sender_v);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].version, entries[0].version);
+        assert_eq!(parsed[0].change_payload, entries[0].change_payload);
+        assert_eq!(parsed[1].version, entries[1].version);
+        assert_eq!(parsed[1].change_payload, entries[1].change_payload);
+    }
+
+    #[test]
+    fn merge_ack_body_roundtrips() {
+        let v = SyncVersion { writer_sg_uuid: [0xBB; 16], epoch: 7, seq: 42 };
+        let body = build_merge_ack_body(Scope::Public, v, MERGE_ACK_RESULT_APPLIED);
+        let (scope, parsed_v, result) = parse_merge_ack_body(&body).expect("parse");
+        assert_eq!(scope, Scope::Public);
+        assert_eq!(parsed_v, v);
+        assert_eq!(result, MERGE_ACK_RESULT_APPLIED);
+    }
+
+    #[test]
+    fn merge_proposal_handler_stores_entries_under_peer_uuid() {
+        let t = TestCtx::new();
+        let (_, dg_conn, _) = writer_setup_with_capture(&t);
+        let peer_uuid = dg_conn.device_uuid;
+
+        let entries = vec![
+            sample_entry([0x11; 16], 1, 1, &[0x01]),
+            sample_entry([0x11; 16], 1, 2, &[0x02]),
+        ];
+        let body = build_merge_proposal_body(
+            Scope::Public,
+            SyncVersion { writer_sg_uuid: [0x11; 16], epoch: 1, seq: 2 },
+            &entries,
+        );
+        let pkt = build_encrypted_packet(MERGE_PROPOSAL_OP, &dg_conn, &body);
+        merge_proposal("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let node = t.ctx.node.read().unwrap();
+        let stored = node.owner.received_merge_proposals.get(&peer_uuid)
+            .expect("entry for peer");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].change_payload, vec![0x01]);
+        assert_eq!(stored[1].change_payload, vec![0x02]);
+    }
+
+    #[test]
+    fn build_merge_proposal_for_peer_filters_against_last_watermarks() {
+        // Seed our log with two writers and three entries. Peer's watermark
+        // map: w1 → (1, 1) [we ship anything strictly above], w2 absent
+        // [ship everything for w2].
+        let t = TestCtx::new();
+        let (_, dg_conn, _) = writer_setup_with_capture(&t);
+        let peer_uuid = dg_conn.device_uuid;
+        let w1: Uuid = [0x11; 16];
+        let w2: Uuid = [0x22; 16];
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.write_log.extend([
+                sample_entry(w1, 1, 1, &[0xAA]),  // == watermark → filtered out
+                sample_entry(w1, 1, 2, &[0xBB]),  // >  watermark → shipped
+                sample_entry(w2, 5, 1, &[0xCC]),  // no watermark → shipped
+            ]);
+            let mut wm = HashMap::new();
+            wm.insert(w1, SyncVersion { writer_sg_uuid: w1, epoch: 1, seq: 1 });
+            node.owner.last_watermarks.insert(peer_uuid, wm);
+        }
+
+        let (_sender_v, entries) =
+            build_merge_proposal_for_peer(peer_uuid, Scope::Public, &t.ctx);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.change_payload == vec![0xBB]),
+                "(w1, 1, 2) must be shipped");
+        assert!(entries.iter().any(|e| e.change_payload == vec![0xCC]),
+                "(w2, 5, 1) must be shipped (no watermark for w2)");
+        assert!(entries.iter().all(|e| e.change_payload != vec![0xAA]),
+                "(w1, 1, 1) must be filtered out — equal to watermark");
     }
 }

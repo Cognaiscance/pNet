@@ -42,6 +42,8 @@ pub enum Action {
     CrossUserPullResponse    { src: SocketAddr, buf: Vec<u8> },
     WatermarkProbeRequest    { src: SocketAddr, buf: Vec<u8> },
     WatermarkProbeResponse   { src: SocketAddr, buf: Vec<u8> },
+    MergeProposal            { src: SocketAddr, buf: Vec<u8> },
+    MergeAck                 { src: SocketAddr, buf: Vec<u8> },
     RelayPacket        { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
@@ -117,6 +119,8 @@ impl Action {
             Action::CrossUserPullResponse    { src, buf } => handlers::cross_user_pull_response(src, buf, ctx),
             Action::WatermarkProbeRequest    { src, buf } => handlers::watermark_probe_request(src, buf, ctx),
             Action::WatermarkProbeResponse   { src, buf } => handlers::watermark_probe_response(src, buf, ctx),
+            Action::MergeProposal            { src, buf } => handlers::merge_proposal(src, buf, ctx),
+            Action::MergeAck                 { src, buf } => handlers::merge_ack(src, buf, ctx),
             Action::RelayPacket        { src, buf }   => handlers::relay_packet(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
             Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),
