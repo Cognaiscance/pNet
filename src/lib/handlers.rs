@@ -7,7 +7,8 @@ use super::data_models::{
     ActiveConnection, ActiveTunnel, Application, Contact, Device, DeviceGrade, Invitation,
     KeyPair, PendingBootstrap, PendingConnection, PendingContactExchange, PendingDeviceAcceptance,
     PendingTunnel, PendingTunnelConnection, PublicKey, Scope, SgStatus, SyncVersion,
-    TunnelCounter, User, Uuid, CONNECTION_LIFETIME, PENDING_CONNECTION_TIMEOUT,
+    TunnelCounter, User, Uuid, WriteLogEntry, WRITE_LOG_RETENTION,
+    CONNECTION_LIFETIME, PENDING_CONNECTION_TIMEOUT,
     RENEW_THRESHOLD, TUNNEL_COUNTER_WINDOW, TUNNEL_THRESHOLD, generate_key_bytes, generate_uuid,
 };
 
@@ -2174,6 +2175,14 @@ pub fn request_change(change: Change, ctx: &WorkerContext) -> Result<(), WriteEr
             };
             ctx.save_node();
             let bumped: Vec<Scope> = scopes_to_bump.iter().copied().collect();
+            // One write-log entry per accepted Change. Record the post-bump
+            // version under the change's primary scope (current variants all
+            // touch a single scope; revisit if a multi-scope variant lands).
+            for &scope in &bumped {
+                let v = match scope { Scope::Private => post_priv, Scope::Public => post_pub };
+                append_to_write_log(&change, scope, v, ctx);
+            }
+            ctx.save_node();
             notify_own_peers(&bumped, post_priv, post_pub, ctx);
             if bumped.contains(&Scope::Public) {
                 notify_contacts(post_pub, ctx);
@@ -2266,6 +2275,29 @@ fn bump_public_and_fan_out_if_writer(ctx: &WorkerContext) {
 /// Cross-user fan-out: send a `CrossUserUpdateAvailable(public, version)` to
 /// the top-ranked reachable SG of every contact. Called from the writer-SG
 /// path after a public-scope bump so contacts' SGs can pull the refreshed
+/// Append an accepted Change to the writer SG's write log and prune entries
+/// older than `WRITE_LOG_RETENTION`. Called from every code path that
+/// commits a Change (i.e. that bumps a scope version on behalf of a Change),
+/// so the log captures exactly the events sync v2 needs to replay during
+/// partition reconciliation.
+///
+/// `version` is the post-bump version assigned to this Change for `scope`.
+fn append_to_write_log(change: &Change, scope: Scope, version: SyncVersion, ctx: &WorkerContext) {
+    let payload = serialize_change(change);
+    let now = SystemTime::now();
+    let cutoff = now.checked_sub(WRITE_LOG_RETENTION);
+    let mut node = ctx.node.write().unwrap();
+    node.owner.write_log.push(WriteLogEntry {
+        version,
+        scope,
+        change_payload: payload,
+        committed_at: now,
+    });
+    if let Some(cutoff) = cutoff {
+        node.owner.write_log.retain(|e| e.committed_at >= cutoff);
+    }
+}
+
 /// public state. Silently skips contacts with no active connection — they
 /// will catch up on their next periodic pull.
 fn notify_contacts(public: SyncVersion, ctx: &WorkerContext) {
@@ -2749,6 +2781,13 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // handler will trigger the confirming pull, replacing the simple ack-only
     // path used in phase 4.
     if !bumped.is_empty() {
+        // One write-log entry per accepted Change. `bumped` is non-empty
+        // exactly when apply_change_locally produced a real mutation.
+        for &scope in &bumped {
+            let v = match scope { Scope::Private => private_v, Scope::Public => public_v };
+            append_to_write_log(&change, scope, v, ctx);
+        }
+        ctx.save_node();
         notify_own_peers(&bumped, private_v, public_v, ctx);
         if bumped.contains(&Scope::Public) {
             notify_contacts(public_v, ctx);
@@ -8440,5 +8479,111 @@ mod tests {
             .expect("rollback should restore the app");
         assert_eq!(app.alias, original_alias,
                    "rollback should preserve the original alias");
+    }
+
+    // ── Write log (7c.2) ────────────────────────────────────────────────────
+
+    #[test]
+    fn request_change_local_path_appends_one_write_log_entry() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+
+        let change = Change::AddApplication {
+            device_uuid: local,
+            app_id:      app_uuid(42),
+            app_alias:   "logged".into(),
+        };
+        request_change(change.clone(), &t.ctx).expect("request_change ok");
+
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(node.owner.write_log.len(), 1);
+        let entry = &node.owner.write_log[0];
+        assert_eq!(entry.scope, Scope::Public);
+        assert_eq!(entry.version, node.owner.public_version);
+        let roundtripped = deserialize_change(&entry.change_payload)
+            .expect("change_payload should be deserializable");
+        assert_eq!(roundtripped, change);
+    }
+
+    #[test]
+    fn sync_write_request_accepted_change_appends_one_write_log_entry() {
+        let t = TestCtx::new();
+        let (_, dg_conn, _dg_socket) = writer_setup_with_capture(&t);
+        let dg_uuid = dg_conn.device_uuid;
+
+        let change = Change::AddApplication {
+            device_uuid: dg_uuid,
+            app_id:      app_uuid(77),
+            app_alias:   "from-dg".into(),
+        };
+        let payload = serialize_change(&change);
+        let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
+
+        sync_write_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(node.owner.write_log.len(), 1);
+        let entry = &node.owner.write_log[0];
+        assert_eq!(entry.scope, Scope::Public);
+        let roundtripped = deserialize_change(&entry.change_payload).expect("parse");
+        assert_eq!(roundtripped, change);
+    }
+
+    #[test]
+    fn sync_write_request_idempotent_retry_does_not_append_duplicate() {
+        let t = TestCtx::new();
+        let (_, dg_conn, _dg_socket) = writer_setup_with_capture(&t);
+        let dg_uuid = dg_conn.device_uuid;
+
+        let change = Change::AddApplication {
+            device_uuid: dg_uuid,
+            app_id:      app_uuid(7),
+            app_alias:   "once".into(),
+        };
+        let payload = serialize_change(&change);
+        let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
+
+        // First receive: applies, logs.
+        sync_write_request("127.0.0.1:1".parse().unwrap(), pkt.clone()[1..].to_vec(), &t.ctx);
+        assert_eq!(t.ctx.node.read().unwrap().owner.write_log.len(), 1);
+
+        // Second receive (identical packet): apply_change_locally is a no-op
+        // (app id already present), `bumped` is empty, so no log append.
+        sync_write_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+        assert_eq!(t.ctx.node.read().unwrap().owner.write_log.len(), 1,
+                   "idempotent retry must not append a duplicate entry");
+    }
+
+    #[test]
+    fn write_log_retention_prunes_entries_older_than_cutoff() {
+        let t = TestCtx::new();
+        let local = promote_local_to_sg(&t, 1);
+
+        // Seed an entry well past the retention cutoff.
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.write_log.push(WriteLogEntry {
+                version:        SyncVersion::zero(),
+                scope:          Scope::Public,
+                change_payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+                committed_at:   SystemTime::now()
+                    - WRITE_LOG_RETENTION
+                    - Duration::from_secs(60),
+            });
+        }
+
+        // Trigger an append via a real Change — pruning runs there.
+        let change = Change::AddApplication {
+            device_uuid: local,
+            app_id:      app_uuid(1),
+            app_alias:   "fresh".into(),
+        };
+        request_change(change, &t.ctx).expect("request_change ok");
+
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(node.owner.write_log.len(), 1,
+                   "stale entry should be pruned, only the fresh one survives");
+        assert_ne!(node.owner.write_log[0].change_payload, vec![0xDE, 0xAD, 0xBE, 0xEF],
+                   "the surviving entry must be the freshly appended one");
     }
 }

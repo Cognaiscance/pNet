@@ -165,7 +165,7 @@ mod serde_system_time {
 ///
 /// **Public** — also visible to the user's contacts. User `alias`/`uuid`,
 /// device `uuid`/`grade`/`sg_rank`/`hosts`, and application `id`/`alias`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scope {
     Private,
     Public,
@@ -225,6 +225,32 @@ impl SyncVersion {
         Some((self.epoch, self.seq).cmp(&(other.epoch, other.seq)))
     }
 }
+
+/// One entry in the writer SG's append-only log of accepted state changes
+/// (Add/Remove/Update of devices, apps, etc.). Persisted on `Owner.write_log`
+/// and exchanged with peer SGs during sync v2 partition reconciliation, so
+/// each side can replay the other side's changes since the last shared
+/// watermark.
+///
+/// The Change is stored as opaque serialized bytes (the output of
+/// `handlers::serialize_change`) so this module doesn't have to import the
+/// `Change` enum. Decode at read time via `handlers::deserialize_change`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WriteLogEntry {
+    pub version: SyncVersion,
+    pub scope:   Scope,
+    #[serde(default)]
+    pub change_payload: Vec<u8>,
+    #[serde(with = "serde_system_time")]
+    pub committed_at: SystemTime,
+}
+
+/// Hard cap on how long the writer SG retains write-log entries for
+/// reconciliation. An SG that has been offline longer than this can no
+/// longer be merged at the change-replay level — it must adopt the other
+/// side's full state via the existing `SyncPullResponse(FullState)` path.
+pub const WRITE_LOG_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 3600);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct KeyPair {
@@ -376,6 +402,13 @@ pub struct Owner {
     /// don't force a private-scope re-pull and vice versa.
     #[serde(default)]
     pub public_version:  SyncVersion,
+    /// Append-only log of accepted `Change` events on this node, retained
+    /// for `WRITE_LOG_RETENTION` so v2 partition reconciliation can replay
+    /// the writer's history to a returning peer SG. Empty on non-writer
+    /// nodes (they receive `WriteLogEntry`s during merge but don't persist
+    /// their own log).
+    #[serde(default)]
+    pub write_log: Vec<WriteLogEntry>,
     /// Ephemeral — not persisted; rebuilt as connections are established.
     #[serde(skip)]
     pub active_connections:  HashMap<u16, ActiveConnection>,
@@ -534,6 +567,7 @@ impl Node {
                 device_invitations:         Vec::new(),
                 private_version:            SyncVersion::zero(),
                 public_version:             SyncVersion::zero(),
+                write_log:                  Vec::new(),
                 active_connections:         HashMap::new(),
                 pending_connections:        HashMap::new(),
                 pending_contact_exchange:   None,
