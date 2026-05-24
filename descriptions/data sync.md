@@ -132,13 +132,98 @@ These rules are deliberately small. Most users on a small home pNet will never t
 
 ## Implementation phasing
 
-- **v1**: writer election, version metadata, notify-then-pull, periodic pull, scope split, sequential rejoin (rank 1 was simply down). Concurrent-partition reconciliation rules are documented but not yet implemented; on detection of concurrent epochs the SGs log and refuse to merge until manual intervention.
-- **v2**: implement the field-level merge rules and tombstone log so true partitions heal automatically.
+- **v1**: writer election, version metadata, notify-then-pull, periodic pull, scope split, sequential rejoin (rank 1 was simply down). Concurrent-partition reconciliation is *not* yet implemented; on detection of a cross-writer version the current code adopts the locally-reachable writer's state and silently discards the other side's writes. This is less safe than the documented v1 intent ("log and refuse"); v2 supersedes it.
+- **v2**: implement the field-level merge rules and tombstone log so true partitions heal automatically. Detailed below.
 
-The v1 cut covers the common failure modes (rank-1 outage, missed notifications, devices going offline) without writing the partition-merge code, which is rarely exercised on small networks.
+## v2: partition reconciliation
 
-## Open questions
+### Prerequisite — UUID app ids
 
-- Wire format for `WriteRequest`/`WriteAck`/`UpdateAvailable`/`PullRequest`/`PullResponse` — to be defined alongside the existing op codes in `pnet to pnet communication.md`.
-- How long an SG retains its write log for rejoin reconciliation. A bounded retention (e.g., 30 days) with a "fall back to full state transfer" path if a peer has been offline longer.
+Today `Application.id` is a `u16` assigned by the local pnet. Two SGs accepting `AddApplication` on the same device during a partition can collide on an id, and the doc's "writer with higher SG rank keeps the id and the other is reassigned at merge time" path drags every app, probe, and DG client through the reassignment.
+
+Phase **7c.0** widens `Application.id` to a `Uuid` everywhere — `Application`, every `Change` variant carrying the id, every app-facing op (`app_register`, `app_get_data`, `app_send_packet`, `OP_PUSH`), the probe, and the persisted state (`#[serde(default)]`-driven migration for existing nodes). Once ids are UUIDs, Add collisions cannot happen and the merge engine for Adds reduces to a pure union by id.
+
+### Write log
+
+Each SG records every accepted `Change` and every accepted removal as an entry in a chronological log persisted on `Owner`:
+
+```rust
+pub struct WriteLogEntry {
+    pub version:      SyncVersion,    // (writer_sg_uuid, epoch, seq)
+    pub scope:        Scope,           // Public initially; Private deferred
+    pub kind:         WriteLogKind,
+    pub committed_at: SystemTime,      // for retention pruning
+}
+
+pub enum WriteLogKind {
+    Change(Change),                                // existing Change enum
+    Tombstone { target: TombstoneTarget },         // removal marker
+}
+
+pub enum TombstoneTarget {
+    Application { device_uuid: Uuid, app_id: Uuid },
+    Device      { uuid: Uuid },
+    // Contact lands when Change::AddContact does.
+}
+```
+
+`#[serde(default)]` keeps existing snapshots loadable; new fields start empty. The log is appended at the same point versions are bumped (`apply_change_locally` + `sync_write_request`).
+
+### Watermark discovery
+
+When two SGs of the same user reconnect (detected in `connect_ack`), they exchange a per-writer map: `{writer_uuid → highest_seq_we_have}` for every writer that appears in either log. The per-writer watermark is the `min` of the two values; the overall reconciliation point is the resulting `(writer_sg_uuid, epoch, seq)` per writer.
+
+One round trip, payload size linear in the number of distinct writers (small — usually 1-2).
+
+Op `0x7A WatermarkProbe`:  request carries `[scope:1]`, response carries `[scope:1][entry_count:u16][(writer_uuid:16, epoch:4, seq:8) × entry_count]`.
+
+### Merge proposal exchange
+
+After watermark discovery, each side sends a `MergeProposal` (op `0x78`) containing every log entry whose version exceeds the watermark for its writer:
+
+```
+[scope:1][last_known_watermark:28][entry_count:u16][WriteLogEntry × entry_count]
+```
+
+The receiver runs the merge engine and replies with `MergeAck` (op `0x79`):
+```
+[scope:1][new_watermark:28][result:1]
+```
+where `result` is `0` (applied), `1` (retention-exhausted, falling back to full state transfer per the policy below), or `2` (malformed).
+
+### Merge engine
+
+Given two `Vec<WriteLogEntry>` lists, sort by `(epoch, seq, writer_uuid)`, walk in order:
+
+- **Add (`AddApplication`, `AddDevice`)**: union by id (UUID, after 7c.0). Idempotent.
+- **Tombstone (`TombstoneTarget`)**: removes the matching record from the merged state and suppresses any later Change whose `(epoch, seq)` ≤ the tombstone's. Tombstone wins regardless of which side has the higher epoch.
+- **Scalar update (`UpdateApplicationAlias`, future device/contact field updates)**: highest writer-rank wins; tiebreaker `(epoch, seq)`.
+
+Pure function — given inputs in, merged state + bumped watermark out. Heavy unit-test target.
+
+### Retention and full-state fallback
+
+Write log entries older than **30 days** (hard bound for v2; configurable later if telemetry warrants it) are pruned during merge. A returning SG whose `last_watermark` lies in another SG's pruned range cannot reliably merge — the other side has no record of the writes between watermarks.
+
+Policy on exhaustion: **the returning SG accepts the other side's full public state via `SyncPullResponse(FullState)` and discards its local-only writes**. This is a known data-loss path reserved for the degenerate case of an SG offline for more than a month while the rest of the cluster has stayed active. No operator intervention required; surfaced via the `partition_detected` flag on `Owner` and a banner in the admin UI for visibility.
+
+### Sub-phase breakdown
+
+| Phase | Scope |
+|---|---|
+| 7c.0 | Widen `Application.id` from u16 to UUID across the codebase + snapshot migration. |
+| 7c.1 | This design doc (you are here). |
+| 7c.2 | `WriteLogEntry` / `WriteLogKind` / `TombstoneTarget`, persistence, append in `apply_change_locally` + `sync_write_request`, retention pruning. |
+| 7c.3 | Watermark discovery — `0x7A WatermarkProbe` request + reply, store result. |
+| 7c.4 | Merge proposal exchange — `0x78` / `0x79` ops + payload serialization; receive but do not apply. |
+| 7c.5 | Merge engine — pure function with rule tests. |
+| 7c.6 | Wire merge engine into `connect_ack` between own-user SGs; apply merged state, bump version, `notify_own_peers`, clear `partition_detected`. First end-to-end run. |
+| 7c.7 | Stage C harness — docker-compose with two own SGs, partition/heal via network manipulation, assertion suite covering union / tombstone / scalar-conflict cases. |
+| 7c.8 | (Optional) `partition_detected` banner in admin UI + diagnostics page surfacing the watermark and any unmerged proposals. |
+
+7c.0 must precede 7c.2. 7c.2 and 7c.3 are independent. 7c.5 depends on 7c.2. 7c.6 depends on 7c.4 + 7c.5. Cross-user reconciliation deferred indefinitely.
+
+## Open questions (remaining)
+
 - Periodic pull interval — start with every few hours, tune from telemetry.
+- Wire format for `WriteRequest`/`WriteAck`/`UpdateAvailable`/`PullRequest`/`PullResponse` — defined inline with the existing op codes in `pnet to pnet communication.md`; cross-reference rather than duplicating here.
