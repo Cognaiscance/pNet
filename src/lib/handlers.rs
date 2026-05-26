@@ -3676,6 +3676,253 @@ pub fn merge_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     );
 }
 
+// ── Sync v2 merge engine (7c.5) ──────────────────────────────────────────────
+//
+// Pure function over two `Vec<WriteLogEntry>` lists. Produces:
+//   * `new_entries`     — peer entries we don't already have (append verbatim
+//                         to our `write_log` so their original writer/version
+//                         attribution survives onward propagation).
+//   * `changes_to_apply` — minimal `Change` sequence that, when each is run
+//                         through `apply_change_locally`, transforms current
+//                         local state into the merged target state.
+//
+// Conflict-resolution rules (from `descriptions/data sync.md` §"v2: merge
+// engine"):
+//   * Add (AddApplication, AddDevice): union by uuid. Idempotent.
+//   * Tombstone (RemoveApplication): wins globally for the (device, app_id)
+//     pair regardless of any conflicting Add's `(epoch, seq)`. UUIDs make
+//     re-add-after-remove safe because the new entity carries a fresh id.
+//   * Scalar update (UpdateApplicationAlias): highest writer-rank wins;
+//     tiebreaker `(epoch, seq)` then `writer_uuid`.
+//
+// 7c.6 wires this into `connect_ack`. Until then the engine has no callers —
+// it's exercised purely by the unit tests below.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutput {
+    /// Peer entries whose `(writer_sg_uuid, epoch, seq)` triple is absent
+    /// from `local_log`. Caller appends these to `Owner.write_log` so future
+    /// merge proposals can replay the peer's history under its original
+    /// attribution.
+    pub new_entries: Vec<WriteLogEntry>,
+    /// Changes the caller should drive through `apply_change_locally` to
+    /// bring local state in line with the merged target. Ordered so device
+    /// creations precede their app entries.
+    pub changes_to_apply: Vec<Change>,
+}
+
+/// Pure merge of `local_log` and `peer_log`. `writer_ranks` maps each known
+/// writer SG to its `sg_rank` (lower = higher priority); writers absent from
+/// the map are treated as lowest priority for tiebreaking scalar updates.
+pub fn merge_logs(
+    local_log: &[WriteLogEntry],
+    peer_log:  &[WriteLogEntry],
+    writer_ranks: &HashMap<Uuid, u32>,
+) -> MergeOutput {
+    let local_keys: HashSet<(Uuid, u32, u64)> = local_log.iter()
+        .map(|e| (e.version.writer_sg_uuid, e.version.epoch, e.version.seq))
+        .collect();
+
+    let new_entries: Vec<WriteLogEntry> = peer_log.iter()
+        .filter(|e| !local_keys.contains(&(
+            e.version.writer_sg_uuid, e.version.epoch, e.version.seq,
+        )))
+        .cloned()
+        .collect();
+
+    if new_entries.is_empty() {
+        return MergeOutput { new_entries, changes_to_apply: Vec::new() };
+    }
+
+    let current = compute_state(local_log.iter(), writer_ranks);
+    let target  = compute_state(
+        local_log.iter().chain(new_entries.iter()),
+        writer_ranks,
+    );
+
+    let changes_to_apply = diff_states(&current, &target);
+
+    MergeOutput { new_entries, changes_to_apply }
+}
+
+struct MergedState {
+    /// (device_uuid, app_id) → resolved app.
+    apps:    HashMap<(Uuid, Uuid), MergedApp>,
+    devices: HashMap<Uuid, MergedDevice>,
+    tombstones: HashSet<(Uuid, Uuid)>,
+}
+
+/// Per-app accumulator during the walk. `existed` becomes true once any
+/// non-tombstoned `AddApplication` is seen — the entity is only present in
+/// the final state when `existed`. `alias` and `alias_priority` track the
+/// highest-priority alias-setter across both Add and Update events, so the
+/// order of an Update vs its Add doesn't affect the resolved value.
+struct MergedApp {
+    existed: bool,
+    alias:   String,
+    alias_priority: EntryPriority,
+}
+
+#[derive(Clone)]
+struct MergedDevice {
+    alias:   String,
+    grade:   DeviceGrade,
+    sg_rank: Option<u32>,
+    hosts:   Vec<String>,
+}
+
+/// Comparison key for "who wins" on a scalar update. Tuple ordering gives
+/// higher writer-rank (smaller `sg_rank`) the win first, then later
+/// `(epoch, seq)`, then larger `writer_uuid` lexicographically.
+type EntryPriority = (std::cmp::Reverse<u32>, u32, u64, Uuid);
+
+fn entry_priority(version: &SyncVersion, ranks: &HashMap<Uuid, u32>) -> EntryPriority {
+    let rank = ranks.get(&version.writer_sg_uuid).copied().unwrap_or(u32::MAX);
+    (std::cmp::Reverse(rank), version.epoch, version.seq, version.writer_sg_uuid)
+}
+
+fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
+    log: I,
+    ranks: &HashMap<Uuid, u32>,
+) -> MergedState {
+    // Materialize so we can iterate twice (tombstones, then Add/Update).
+    let mut entries: Vec<&WriteLogEntry> = log.collect();
+    entries.sort_by_key(|e| (
+        e.version.epoch,
+        e.version.seq,
+        e.version.writer_sg_uuid,
+    ));
+
+    let mut state = MergedState {
+        apps: HashMap::new(),
+        devices: HashMap::new(),
+        tombstones: HashSet::new(),
+    };
+
+    // First pass: collect tombstones. Tombstone wins globally for its target,
+    // regardless of `(epoch, seq)` of any conflicting Add.
+    for e in &entries {
+        if let Some(Change::RemoveApplication { device_uuid, app_id }) =
+            deserialize_change(&e.change_payload)
+        {
+            state.tombstones.insert((device_uuid, app_id));
+        }
+    }
+
+    // Second pass: walk Adds, Updates, and AddDevice. AddApplication and
+    // UpdateApplicationAlias compete equally on alias priority — the winner
+    // doesn't depend on whether the Update arrived before or after the Add in
+    // `(epoch, seq)` order.
+    for e in &entries {
+        let Some(change) = deserialize_change(&e.change_payload) else { continue };
+        let prio = entry_priority(&e.version, ranks);
+        match change {
+            Change::RemoveApplication { .. } => { /* recorded above */ }
+            Change::AddApplication { device_uuid, app_id, app_alias } => {
+                if state.tombstones.contains(&(device_uuid, app_id)) { continue; }
+                upsert_alias(&mut state.apps, (device_uuid, app_id),
+                             app_alias, prio, true);
+            }
+            Change::UpdateApplicationAlias { device_uuid, app_id, new_alias } => {
+                if state.tombstones.contains(&(device_uuid, app_id)) { continue; }
+                upsert_alias(&mut state.apps, (device_uuid, app_id),
+                             new_alias, prio, false);
+            }
+            Change::AddDevice { uuid, alias, grade, sg_rank, hosts } => {
+                state.devices.entry(uuid).or_insert(MergedDevice {
+                    alias, grade, sg_rank, hosts,
+                });
+            }
+        }
+    }
+
+    // Drop apps that only ever appeared via an Update (no Add to establish
+    // their existence). This shouldn't happen with correct watermark
+    // filtering, but the guard keeps the diff sound.
+    state.apps.retain(|_, a| a.existed);
+
+    state
+}
+
+fn upsert_alias(
+    apps: &mut HashMap<(Uuid, Uuid), MergedApp>,
+    key:  (Uuid, Uuid),
+    alias: String,
+    prio:  EntryPriority,
+    sets_existence: bool,
+) {
+    match apps.get_mut(&key) {
+        Some(slot) => {
+            if sets_existence { slot.existed = true; }
+            if prio > slot.alias_priority {
+                slot.alias = alias;
+                slot.alias_priority = prio;
+            }
+        }
+        None => {
+            apps.insert(key, MergedApp {
+                existed: sets_existence,
+                alias,
+                alias_priority: prio,
+            });
+        }
+    }
+}
+
+fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
+    let mut out: Vec<Change> = Vec::new();
+
+    // Devices first — AddApplication validates the device exists.
+    let mut new_devices: Vec<(&Uuid, &MergedDevice)> = target.devices.iter()
+        .filter(|(u, _)| !current.devices.contains_key(*u))
+        .collect();
+    new_devices.sort_by_key(|(u, _)| **u);
+    for (uuid, dev) in new_devices {
+        out.push(Change::AddDevice {
+            uuid:    *uuid,
+            alias:   dev.alias.clone(),
+            grade:   dev.grade,
+            sg_rank: dev.sg_rank,
+            hosts:   dev.hosts.clone(),
+        });
+    }
+
+    // Apps in target: Add if missing locally, Update if alias differs.
+    let mut target_apps: Vec<(&(Uuid, Uuid), &MergedApp)> = target.apps.iter().collect();
+    target_apps.sort_by_key(|(k, _)| **k);
+    for ((d, id), app) in target_apps {
+        match current.apps.get(&(*d, *id)) {
+            None => out.push(Change::AddApplication {
+                device_uuid: *d,
+                app_id:      *id,
+                app_alias:   app.alias.clone(),
+            }),
+            Some(cur) if cur.alias != app.alias => {
+                out.push(Change::UpdateApplicationAlias {
+                    device_uuid: *d,
+                    app_id:      *id,
+                    new_alias:   app.alias.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Apps in current but absent from target: emit Remove. Driven either by
+    // an explicit peer tombstone or by the peer adopting a remove we didn't
+    // record (shouldn't happen, but the diff is symmetric).
+    let mut removed: Vec<(Uuid, Uuid)> = current.apps.keys()
+        .filter(|k| !target.apps.contains_key(k))
+        .copied()
+        .collect();
+    removed.sort();
+    for (d, id) in removed {
+        out.push(Change::RemoveApplication { device_uuid: d, app_id: id });
+    }
+
+    out
+}
+
 // ── Scheduled action handlers ─────────────────────────────────────────────────
 
 const SG_PING_TIMEOUT: Duration = Duration::from_secs(1);
@@ -9209,5 +9456,319 @@ mod tests {
                 "(w2, 5, 1) must be shipped (no watermark for w2)");
         assert!(entries.iter().all(|e| e.change_payload != vec![0xAA]),
                 "(w1, 1, 1) must be filtered out — equal to watermark");
+    }
+
+    // ── Merge engine (7c.5) ──────────────────────────────────────────────────
+
+    fn change_entry(writer: Uuid, epoch: u32, seq: u64, change: &Change) -> WriteLogEntry {
+        WriteLogEntry {
+            version: SyncVersion { writer_sg_uuid: writer, epoch, seq },
+            scope:   Scope::Public,
+            change_payload: serialize_change(change),
+            committed_at: SystemTime::now(),
+        }
+    }
+
+    fn merge_writer_a() -> Uuid { [0xA1; 16] }
+    fn merge_writer_b() -> Uuid { [0xB2; 16] }
+    fn merge_dev_a()    -> Uuid { [0xD0; 16] }
+    fn merge_dev_b()    -> Uuid { [0xD1; 16] }
+
+    #[test]
+    fn merge_logs_empty_inputs_produce_nothing() {
+        let ranks = HashMap::new();
+        let out = merge_logs(&[], &[], &ranks);
+        assert!(out.new_entries.is_empty());
+        assert!(out.changes_to_apply.is_empty());
+    }
+
+    #[test]
+    fn merge_logs_idempotent_when_peer_already_in_local() {
+        let wa = merge_writer_a();
+        let entry = change_entry(wa, 1, 1, &Change::AddDevice {
+            uuid:    merge_dev_a(),
+            alias:   "phone".into(),
+            grade:   DeviceGrade::DG,
+            sg_rank: None,
+            hosts:   Vec::new(),
+        });
+        let local = vec![entry.clone()];
+        let peer  = vec![entry];
+        let ranks = HashMap::new();
+        let out = merge_logs(&local, &peer, &ranks);
+        assert!(out.new_entries.is_empty(),
+                "peer entry already present locally — no new entries");
+        assert!(out.changes_to_apply.is_empty());
+    }
+
+    #[test]
+    fn merge_logs_unions_adds_from_both_sides() {
+        let wa = merge_writer_a();
+        let wb = merge_writer_b();
+        let local = vec![change_entry(wa, 1, 1, &Change::AddDevice {
+            uuid: merge_dev_a(), alias: "a".into(),
+            grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+        })];
+        let peer = vec![change_entry(wb, 1, 1, &Change::AddDevice {
+            uuid: merge_dev_b(), alias: "b".into(),
+            grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+        })];
+        let ranks = HashMap::new();
+        let out = merge_logs(&local, &peer, &ranks);
+        assert_eq!(out.new_entries.len(), 1);
+        assert_eq!(out.changes_to_apply.len(), 1);
+        assert!(matches!(out.changes_to_apply[0],
+            Change::AddDevice { ref alias, .. } if alias == "b"));
+    }
+
+    #[test]
+    fn merge_logs_peer_tombstone_removes_local_app() {
+        let wa = merge_writer_a();
+        let wb = merge_writer_b();
+        let app = app_uuid(101);
+        let local = vec![
+            change_entry(wa, 1, 1, &Change::AddDevice {
+                uuid: merge_dev_a(), alias: "phone".into(),
+                grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+            }),
+            change_entry(wa, 1, 2, &Change::AddApplication {
+                device_uuid: merge_dev_a(),
+                app_id:      app,
+                app_alias:   "chess".into(),
+            }),
+        ];
+        let peer = vec![change_entry(wb, 5, 1, &Change::RemoveApplication {
+            device_uuid: merge_dev_a(),
+            app_id:      app,
+        })];
+        let ranks = HashMap::new();
+        let out = merge_logs(&local, &peer, &ranks);
+        assert_eq!(out.new_entries.len(), 1);
+        assert_eq!(out.changes_to_apply, vec![Change::RemoveApplication {
+            device_uuid: merge_dev_a(),
+            app_id:      app,
+        }]);
+    }
+
+    #[test]
+    fn merge_logs_local_tombstone_keeps_peer_add_from_winning() {
+        // Mirror case: we have the Remove, peer proposes a (later by epoch/seq)
+        // Add. UUID-based ids make the Add for an already-removed id a
+        // protocol-violation, but the design still mandates "tombstone wins" —
+        // verify we don't resurrect the app.
+        let wa = merge_writer_a();
+        let wb = merge_writer_b();
+        let app = app_uuid(202);
+        let local = vec![
+            change_entry(wa, 1, 1, &Change::AddDevice {
+                uuid: merge_dev_a(), alias: "phone".into(),
+                grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+            }),
+            change_entry(wa, 1, 2, &Change::AddApplication {
+                device_uuid: merge_dev_a(), app_id: app,
+                app_alias: "chess".into(),
+            }),
+            change_entry(wa, 1, 3, &Change::RemoveApplication {
+                device_uuid: merge_dev_a(), app_id: app,
+            }),
+        ];
+        let peer = vec![change_entry(wb, 9, 9, &Change::AddApplication {
+            device_uuid: merge_dev_a(), app_id: app,
+            app_alias: "resurrected".into(),
+        })];
+        let ranks = HashMap::new();
+        let out = merge_logs(&local, &peer, &ranks);
+        assert_eq!(out.new_entries.len(), 1, "peer entry recorded in log");
+        assert!(out.changes_to_apply.is_empty(),
+                "tombstone wins — peer Add must not be applied");
+    }
+
+    #[test]
+    fn merge_logs_scalar_update_higher_rank_wins() {
+        let wa = merge_writer_a();   // rank 1 — top
+        let wb = merge_writer_b();   // rank 2
+        let app = app_uuid(303);
+        // Local: rank-1 writer set alias to "ours" at later (epoch, seq).
+        let local = vec![
+            change_entry(wa, 1, 1, &Change::AddDevice {
+                uuid: merge_dev_a(), alias: "phone".into(),
+                grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+            }),
+            change_entry(wa, 1, 2, &Change::AddApplication {
+                device_uuid: merge_dev_a(), app_id: app,
+                app_alias: "ours".into(),
+            }),
+        ];
+        // Peer: rank-2 writer ran an UpdateApplicationAlias to "theirs". Our
+        // higher rank should win even though peer's Update is "later" by
+        // (epoch, seq).
+        let peer = vec![change_entry(wb, 9, 9, &Change::UpdateApplicationAlias {
+            device_uuid: merge_dev_a(), app_id: app,
+            new_alias: "theirs".into(),
+        })];
+        let mut ranks = HashMap::new();
+        ranks.insert(wa, 1);
+        ranks.insert(wb, 2);
+        let out = merge_logs(&local, &peer, &ranks);
+        assert_eq!(out.new_entries.len(), 1, "peer entry recorded");
+        assert!(out.changes_to_apply.is_empty(),
+                "higher-rank local writer wins; no local state change");
+    }
+
+    #[test]
+    fn merge_logs_scalar_update_lower_rank_local_loses() {
+        let wa = merge_writer_a();   // rank 2
+        let wb = merge_writer_b();   // rank 1 — top
+        let app = app_uuid(404);
+        let local = vec![
+            change_entry(wa, 5, 5, &Change::AddDevice {
+                uuid: merge_dev_a(), alias: "phone".into(),
+                grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+            }),
+            change_entry(wa, 5, 6, &Change::AddApplication {
+                device_uuid: merge_dev_a(), app_id: app,
+                app_alias: "ours".into(),
+            }),
+        ];
+        let peer = vec![change_entry(wb, 1, 1, &Change::UpdateApplicationAlias {
+            device_uuid: merge_dev_a(), app_id: app,
+            new_alias: "theirs".into(),
+        })];
+        let mut ranks = HashMap::new();
+        ranks.insert(wa, 2);
+        ranks.insert(wb, 1);
+        let out = merge_logs(&local, &peer, &ranks);
+        assert_eq!(out.new_entries.len(), 1);
+        assert_eq!(out.changes_to_apply, vec![Change::UpdateApplicationAlias {
+            device_uuid: merge_dev_a(), app_id: app,
+            new_alias: "theirs".into(),
+        }]);
+    }
+
+    #[test]
+    fn merge_logs_scalar_update_same_rank_higher_version_wins() {
+        let wa = merge_writer_a();
+        let wb = merge_writer_b();
+        let app = app_uuid(505);
+        let local = vec![
+            change_entry(wa, 1, 1, &Change::AddDevice {
+                uuid: merge_dev_a(), alias: "phone".into(),
+                grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+            }),
+            change_entry(wa, 1, 2, &Change::AddApplication {
+                device_uuid: merge_dev_a(), app_id: app,
+                app_alias: "v1".into(),
+            }),
+            change_entry(wa, 1, 3, &Change::UpdateApplicationAlias {
+                device_uuid: merge_dev_a(), app_id: app,
+                new_alias: "v2-local".into(),
+            }),
+        ];
+        // Same rank, but peer's update has higher (epoch, seq).
+        let peer = vec![change_entry(wb, 1, 4, &Change::UpdateApplicationAlias {
+            device_uuid: merge_dev_a(), app_id: app,
+            new_alias: "v3-peer".into(),
+        })];
+        let mut ranks = HashMap::new();
+        ranks.insert(wa, 1);
+        ranks.insert(wb, 1);
+        let out = merge_logs(&local, &peer, &ranks);
+        assert_eq!(out.changes_to_apply, vec![Change::UpdateApplicationAlias {
+            device_uuid: merge_dev_a(), app_id: app,
+            new_alias: "v3-peer".into(),
+        }]);
+    }
+
+    #[test]
+    fn merge_logs_collapses_peer_add_then_update_into_single_add() {
+        // Brand-new device + app + rename on peer side; we have none of it.
+        // Diff should emit AddDevice, then AddApplication with the final
+        // (post-rename) alias — not Add + separate Update.
+        let wb = merge_writer_b();
+        let app = app_uuid(606);
+        let local = Vec::new();
+        let peer = vec![
+            change_entry(wb, 1, 1, &Change::AddDevice {
+                uuid: merge_dev_b(), alias: "tablet".into(),
+                grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+            }),
+            change_entry(wb, 1, 2, &Change::AddApplication {
+                device_uuid: merge_dev_b(), app_id: app,
+                app_alias: "original".into(),
+            }),
+            change_entry(wb, 1, 3, &Change::UpdateApplicationAlias {
+                device_uuid: merge_dev_b(), app_id: app,
+                new_alias: "final".into(),
+            }),
+        ];
+        let ranks = HashMap::new();
+        let out = merge_logs(&local, &peer, &ranks);
+        assert_eq!(out.new_entries.len(), 3);
+        assert_eq!(out.changes_to_apply.len(), 2);
+        assert!(matches!(&out.changes_to_apply[0],
+            Change::AddDevice { uuid, .. } if uuid == &merge_dev_b()));
+        match &out.changes_to_apply[1] {
+            Change::AddApplication { app_alias, .. } => {
+                assert_eq!(app_alias, "final",
+                    "peer Add+Update collapse to a single AddApplication with the post-Update alias");
+            }
+            other => panic!("expected AddApplication, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_logs_device_add_emitted_before_app_add() {
+        // Diff order matters because apply_change_locally for AddApplication
+        // validates that the device exists.
+        let wb = merge_writer_b();
+        let local = Vec::new();
+        let peer = vec![
+            change_entry(wb, 1, 2, &Change::AddApplication {
+                device_uuid: merge_dev_b(),
+                app_id: app_uuid(707),
+                app_alias: "x".into(),
+            }),
+            change_entry(wb, 1, 1, &Change::AddDevice {
+                uuid: merge_dev_b(), alias: "x-dev".into(),
+                grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+            }),
+        ];
+        let ranks = HashMap::new();
+        let out = merge_logs(&local, &peer, &ranks);
+        assert!(matches!(out.changes_to_apply[0], Change::AddDevice { .. }));
+        assert!(matches!(out.changes_to_apply[1], Change::AddApplication { .. }));
+    }
+
+    #[test]
+    fn merge_logs_peer_subset_already_known_emits_only_diff() {
+        // Peer ships [e1, e2] but we already have e1 (same version key).
+        // Only e2 lands in new_entries, and changes_to_apply reflects only e2.
+        let wa = merge_writer_a();
+        let wb = merge_writer_b();
+        let e1 = change_entry(wb, 1, 1, &Change::AddDevice {
+            uuid: merge_dev_b(), alias: "shared".into(),
+            grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+        });
+        let local = vec![
+            change_entry(wa, 1, 1, &Change::AddDevice {
+                uuid: merge_dev_a(), alias: "local-only".into(),
+                grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+            }),
+            e1.clone(),
+        ];
+        let peer = vec![
+            e1,
+            change_entry(wb, 1, 2, &Change::AddApplication {
+                device_uuid: merge_dev_b(),
+                app_id: app_uuid(808),
+                app_alias: "new-app".into(),
+            }),
+        ];
+        let ranks = HashMap::new();
+        let out = merge_logs(&local, &peer, &ranks);
+        assert_eq!(out.new_entries.len(), 1, "only the unseen entry is new");
+        assert_eq!(out.changes_to_apply.len(), 1);
+        assert!(matches!(&out.changes_to_apply[0],
+            Change::AddApplication { app_alias, .. } if app_alias == "new-app"));
     }
 }

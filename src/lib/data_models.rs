@@ -235,7 +235,7 @@ impl SyncVersion {
 /// The Change is stored as opaque serialized bytes (the output of
 /// `handlers::serialize_change`) so this module doesn't have to import the
 /// `Change` enum. Decode at read time via `handlers::deserialize_change`.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteLogEntry {
     pub version: SyncVersion,
     pub scope:   Scope,
