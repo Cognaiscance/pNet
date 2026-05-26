@@ -16,6 +16,12 @@ const CLEANUP_TUNNELS_INTERVAL:      Duration = Duration::from_secs(5 * 60);
 /// "every few hours" — 30 min is a starting point that catches dropped
 /// `UpdateAvailable` notifications quickly without burning bandwidth.
 const SYNC_PULL_INTERVAL:            Duration = Duration::from_secs(30 * 60);
+/// Sync v2 — fire a `WatermarkProbeRequest` to every connected own-user SG
+/// on this cadence, so partition reconciliation makes progress even when
+/// the underlying `active_connection` survives a transient partition.
+/// Empty-merge round-trips when nothing diverged are cheap (one packet
+/// pair). See `descriptions/data sync.md` §"v2: partition reconciliation".
+const PARTITION_RECONCILE_INTERVAL:  Duration = Duration::from_secs(60);
 
 pub struct SchedulerThread {
     handle: thread::JoinHandle<()>,
@@ -37,11 +43,12 @@ impl SchedulerThread {
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*queue;
 
-            let mut last_poll_sg         = Instant::now();
-            let mut last_maintain        = Instant::now();
-            let mut last_keepalive       = Instant::now();
-            let mut last_cleanup_tunnels = Instant::now();
-            let mut last_sync_pull       = Instant::now();
+            let mut last_poll_sg            = Instant::now();
+            let mut last_maintain           = Instant::now();
+            let mut last_keepalive          = Instant::now();
+            let mut last_cleanup_tunnels    = Instant::now();
+            let mut last_sync_pull          = Instant::now();
+            let mut last_partition_reconcile = Instant::now();
             let mut pending: Vec<(Instant, Action)> = Vec::new();
 
             while !stop.load(Ordering::Acquire) {
@@ -76,6 +83,10 @@ impl SchedulerThread {
                 if now.duration_since(last_sync_pull) >= SYNC_PULL_INTERVAL {
                     to_enqueue.push(Action::SyncPull);
                     last_sync_pull = now;
+                }
+                if now.duration_since(last_partition_reconcile) >= PARTITION_RECONCILE_INTERVAL {
+                    to_enqueue.push(Action::PartitionReconcile);
+                    last_partition_reconcile = now;
                 }
 
                 // One-shot pending jobs — drain those that are due.

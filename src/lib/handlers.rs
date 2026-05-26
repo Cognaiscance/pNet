@@ -2368,6 +2368,25 @@ fn is_own_user_sg(owner: &Owner, peer_uuid: Uuid) -> bool {
         .any(|d| d.uuid == peer_uuid && matches!(d.grade, DeviceGrade::SG))
 }
 
+/// Periodic merge tick. Fires the partition-reconcile kickoff against every
+/// active connection to an own-user SG, so reconciliation makes progress even
+/// when the underlying `active_connection` survives a transient partition
+/// (i.e. no fresh `connect_ack` to seed it). An empty merge — both sides
+/// already in sync — is one watermark round-trip and one empty proposal pair;
+/// the cost scales with own-user SG fan-out, which is small in practice.
+pub fn partition_reconcile_tick(ctx: &WorkerContext) {
+    let conn_ids: Vec<u16> = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.iter()
+            .filter(|(_, c)| is_own_user_sg(&node.owner, c.device_uuid))
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for id in conn_ids {
+        partition_reconcile_on_reconnect(id, ctx);
+    }
+}
+
 /// On-reconnect partition reconciliation kickoff. When a fresh active
 /// connection lands between two own-user SGs, this side sends a
 /// `WatermarkProbeRequest(Public)`. The responder will reply via
@@ -9727,6 +9746,25 @@ mod tests {
         let (_, _, result) = parse_merge_ack_body(&plaintext).expect("parse");
         assert_eq!(result, MERGE_ACK_RESULT_APPLIED);
         let _ = local_uuid; // silence unused warning if any
+    }
+
+    #[test]
+    fn partition_reconcile_tick_probes_only_own_user_sg_peers() {
+        // Peer set up as DG → no probe should fire.
+        let t = TestCtx::new();
+        let (_, peer_conn, peer_socket) = writer_setup_with_capture(&t);
+        partition_reconcile_tick(&t.ctx);
+        let mut buf = [0u8; 1024];
+        let dg_recv = peer_socket.recv_from(&mut buf);
+        assert!(dg_recv.is_err(),
+                "DG peer must not receive a watermark probe; got {dg_recv:?}");
+
+        // Promote to own-user SG and tick again — should now receive 0x7A.
+        promote_peer_to_sg(&t, peer_conn.device_uuid, 2);
+        partition_reconcile_tick(&t.ctx);
+        let (len, _) = peer_socket.recv_from(&mut buf).expect("probe sent");
+        assert!(len >= 1);
+        assert_eq!(buf[0], WATERMARK_PROBE_REQUEST_OP);
     }
 
     /// Drain packets from `socket` until one with op byte == `wanted_op` is

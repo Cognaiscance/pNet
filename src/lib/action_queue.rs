@@ -62,6 +62,11 @@ pub enum Action {
     /// Periodic pull from the elected writer SG for both scopes. Also fired
     /// as a one-shot when an active connection to the writer SG is established.
     SyncPull,
+    /// Sync v2 periodic merge tick. Fires `partition_reconcile_on_reconnect`
+    /// for every active connection to an own-user SG so partition reconciliation
+    /// progresses even when the underlying connection survives the partition
+    /// (i.e. no fresh `connect_ack` to trigger it).
+    PartitionReconcile,
     SetupTunnel   { sender_uuid: super::data_models::Uuid, dest_uuid: super::data_models::Uuid },
 }
 
@@ -133,6 +138,7 @@ impl Action {
             Action::KeepAliveDG                      => handlers::keepalive_dg(ctx),
             Action::CleanupTunnels                   => handlers::cleanup_tunnels(ctx),
             Action::SyncPull                         => handlers::sync_pull(ctx),
+            Action::PartitionReconcile               => handlers::partition_reconcile_tick(ctx),
             Action::SetupTunnel { sender_uuid, dest_uuid } => handlers::setup_tunnel(sender_uuid, dest_uuid, ctx),
         }
     }
