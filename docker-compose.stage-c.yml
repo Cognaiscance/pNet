@@ -1,0 +1,79 @@
+# Stage C test topology — single user (alice) with 2 SGs partitionable via
+# a controllable bridge network.
+#
+# Goal: exercise sync v2 partition reconciliation (ops 0x78/0x79/0x7A/0x7B
+# + the periodic merge tick) end-to-end. After bring-up both SGs see each
+# other and converge on the device-app graph; the harness then disconnects
+# one SG from the shared bridge to simulate a partition, mutates state on
+# each side via the admin UI, reconnects the bridge, and asserts both sides
+# converge to the merged target within a few periodic-tick cycles.
+#
+# Networks:
+#   net-side-1  — sg-alice-1 + probe-1 (sg-1's "local LAN")
+#   net-side-2  — sg-alice-2 + probe-2 (sg-2's "local LAN")
+#   net-shared  — both SGs (the WAN we partition). Disconnect sg-alice-2 from
+#                 this network to break SG↔SG reachability without affecting
+#                 either SG's local probe.
+#
+# Bring-up via tests/stage-c/run.sh; assertions in tests/stage-c/test.sh.
+
+networks:
+  net-side-1:
+  net-side-2:
+  net-shared:
+
+volumes:
+  pnet-data-sg-alice-1:
+  pnet-data-sg-alice-2:
+
+services:
+  sg-alice-1:
+    build: .
+    networks: [net-side-1, net-shared]
+    ports:
+      - "8821:8777/tcp"
+    environment:
+      - PNET_GRADE=sg
+      - PNET_USER_ALIAS=alice
+      - PNET_DEVICE_ALIAS=sg-alice-1
+      - PNET_SG_RANK=1
+      - PNET_HOSTS=sg-alice-1
+      - PNET_AUTO_APPROVE_APPS=1
+    volumes:
+      - pnet-data-sg-alice-1:/root/.pnet
+
+  sg-alice-2:
+    build: .
+    networks: [net-side-2, net-shared]
+    ports:
+      - "8822:8777/tcp"
+    environment:
+      - PNET_GRADE=sg
+      - PNET_DEVICE_ALIAS=sg-alice-2
+      - PNET_SG_RANK=2
+      - PNET_HOSTS=sg-alice-2
+      - PNET_INVITATION_CODE=${INV_SG2:-}
+      - PNET_AUTO_APPROVE_APPS=1
+    volumes:
+      - pnet-data-sg-alice-2:/root/.pnet
+    depends_on: [sg-alice-1]
+
+  probe-1:
+    build:
+      context: .
+      dockerfile: apps/pnet_test_probe/Dockerfile
+    networks: [net-side-1]
+    ports: ["3821:3000/tcp"]
+    environment:
+      - PNET_ADDR=sg-alice-1:7777
+    depends_on: [sg-alice-1]
+
+  probe-2:
+    build:
+      context: .
+      dockerfile: apps/pnet_test_probe/Dockerfile
+    networks: [net-side-2]
+    ports: ["3822:3000/tcp"]
+    environment:
+      - PNET_ADDR=sg-alice-2:7777
+    depends_on: [sg-alice-2]
