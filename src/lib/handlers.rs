@@ -5,9 +5,9 @@ use std::time::{Duration, Instant, SystemTime};
 use super::action_queue::WorkerContext;
 use super::data_models::{
     ActiveConnection, ActiveTunnel, Application, Contact, Device, DeviceGrade, Invitation,
-    KeyPair, PendingBootstrap, PendingConnection, PendingContactExchange, PendingDeviceAcceptance,
-    PendingTunnel, PendingTunnelConnection, PublicKey, Scope, SgStatus, SyncVersion,
-    TunnelCounter, User, Uuid, WriteLogEntry, WRITE_LOG_RETENTION,
+    KeyPair, Owner, PendingBootstrap, PendingConnection, PendingContactExchange,
+    PendingDeviceAcceptance, PendingTunnel, PendingTunnelConnection, PublicKey, Scope, SgStatus,
+    SyncVersion, TunnelCounter, User, Uuid, WriteLogEntry, WRITE_LOG_RETENTION,
     CONNECTION_LIFETIME, PENDING_CONNECTION_TIMEOUT,
     RENEW_THRESHOLD, TUNNEL_COUNTER_WINDOW, TUNNEL_THRESHOLD, generate_key_bytes, generate_uuid,
 };
@@ -764,6 +764,11 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // No push needed on a new DG connection: state hasn't changed. The
     // writer SG already published any prior state via sync v1
     // SyncUpdateAvailable, and the joining DG pulls on its side.
+
+    // Sync v2: mirror the initiator-side reconciliation kickoff. Either side
+    // can initiate the probe; running it from both ends just means both sides
+    // populate `last_watermarks` and ship their proposal in parallel.
+    partition_reconcile_on_reconnect(our_conn_id, ctx);
 }
 
 /// Op 0x21 — Acknowledgement from a peer node in response to our ConnectRequest.
@@ -829,6 +834,9 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // (e.g. contact's apps) that may have been published while the
     // SG↔SG connection didn't yet exist. No-op for own-user peers.
     cross_user_pull_on_reconnect(our_conn_id, ctx);
+    // Sync v2: if the peer is an own-user SG, kick off partition reconciliation
+    // (watermark probe → merge proposal exchange). No-op otherwise.
+    partition_reconcile_on_reconnect(our_conn_id, ctx);
 }
 
 // ── Bootstrap crypto helpers ──────────────────────────────────────────────────
@@ -2071,15 +2079,15 @@ pub enum WriteError {
 ///
 /// Returns the (private, public) versions after the operation (current values
 /// when no-op, post-bump values when applied).
-fn apply_change_locally(
-    change: &Change,
-    writer_uuid: Uuid,
-    ctx: &WorkerContext,
-) -> Result<(SyncVersion, SyncVersion), WriteError> {
-    let mut node = ctx.node.write().unwrap();
+/// Mutate `owner` per `change`. Returns `Ok(true)` if state changed, `Ok(false)`
+/// for an idempotent no-op (Add of an existing id, Remove of an absent id,
+/// Update to the current alias). Validation errors fire when a Change
+/// references a missing device. Pure state mutation — no version bump, no log
+/// append; callers stitch those on as appropriate.
+fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, WriteError> {
     let applied = match change {
         Change::AddApplication { device_uuid, app_id, app_alias } => {
-            let dev = node.owner.user.devices.iter_mut()
+            let dev = owner.user.devices.iter_mut()
                 .find(|d| d.uuid == *device_uuid)
                 .ok_or_else(|| WriteError::Validation(format!(
                     "unknown device_uuid {device_uuid:?}"
@@ -2101,7 +2109,7 @@ fn apply_change_locally(
             }
         }
         Change::RemoveApplication { device_uuid, app_id } => {
-            let dev = node.owner.user.devices.iter_mut()
+            let dev = owner.user.devices.iter_mut()
                 .find(|d| d.uuid == *device_uuid)
                 .ok_or_else(|| WriteError::Validation(format!(
                     "unknown device_uuid {device_uuid:?}"
@@ -2111,10 +2119,10 @@ fn apply_change_locally(
             before != dev.applications.len()
         }
         Change::AddDevice { uuid, alias, grade, sg_rank, hosts } => {
-            if node.owner.user.devices.iter().any(|d| d.uuid == *uuid) {
+            if owner.user.devices.iter().any(|d| d.uuid == *uuid) {
                 false
             } else {
-                node.owner.user.devices.push(Device {
+                owner.user.devices.push(Device {
                     uuid:         *uuid,
                     alias:        alias.clone(),
                     grade:        *grade,
@@ -2126,7 +2134,7 @@ fn apply_change_locally(
             }
         }
         Change::UpdateApplicationAlias { device_uuid, app_id, new_alias } => {
-            let dev = node.owner.user.devices.iter_mut()
+            let dev = owner.user.devices.iter_mut()
                 .find(|d| d.uuid == *device_uuid)
                 .ok_or_else(|| WriteError::Validation(format!(
                     "unknown device_uuid {device_uuid:?}"
@@ -2140,7 +2148,16 @@ fn apply_change_locally(
             }
         }
     };
+    Ok(applied)
+}
 
+fn apply_change_locally(
+    change: &Change,
+    writer_uuid: Uuid,
+    ctx: &WorkerContext,
+) -> Result<(SyncVersion, SyncVersion), WriteError> {
+    let mut node = ctx.node.write().unwrap();
+    let applied = apply_change_to_owner(&mut node.owner, change)?;
     if applied {
         for scope in change_scopes(change) {
             node.owner.bump_version(*scope, writer_uuid);
@@ -2340,6 +2357,38 @@ fn notify_contacts(public: SyncVersion, ctx: &WorkerContext) {
     };
     for (pkt, dest) in packets {
         send(ctx, dest, &pkt);
+    }
+}
+
+/// True if `peer_uuid` names an SG-grade device in the local user's own
+/// device list. Used to gate sync v2 partition reconciliation: probe + merge
+/// only flow between own-user SGs, not between SG↔DG or SG↔contact pairs.
+fn is_own_user_sg(owner: &Owner, peer_uuid: Uuid) -> bool {
+    owner.user.devices.iter()
+        .any(|d| d.uuid == peer_uuid && matches!(d.grade, DeviceGrade::SG))
+}
+
+/// On-reconnect partition reconciliation kickoff. When a fresh active
+/// connection lands between two own-user SGs, this side sends a
+/// `WatermarkProbeRequest(Public)`. The responder will reply via
+/// `watermark_probe_response`, which both stores the per-peer watermark *and*
+/// fires the matching `MergeProposal` back. No-op for any peer that isn't an
+/// own-user SG.
+fn partition_reconcile_on_reconnect(conn_id: u16, ctx: &WorkerContext) {
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        let Some(conn) = node.owner.active_connections.get(&conn_id) else { return };
+        let peer_uuid = conn.device_uuid;
+        if !is_own_user_sg(&node.owner, peer_uuid) { return; }
+        let mut body = Vec::with_capacity(1);
+        write_scope(&mut body, Scope::Public);
+        Some((
+            build_encrypted_packet(WATERMARK_PROBE_REQUEST_OP, conn, &body),
+            conn.peer_addr,
+        ))
+    };
+    if let Some((pkt, addr)) = pkt_and_addr {
+        send(ctx, addr, &pkt);
     }
 }
 
@@ -3473,8 +3522,33 @@ pub fn watermark_probe_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
             .or_insert(*peer_v);
     }
 
-    let mut node = ctx.node.write().unwrap();
-    node.owner.last_watermarks.insert(peer_uuid, merged);
+    {
+        let mut node = ctx.node.write().unwrap();
+        node.owner.last_watermarks.insert(peer_uuid, merged);
+    }
+
+    // Sync v2: only own-user SGs participate in partition reconciliation.
+    // For any other peer the probe shouldn't have been sent in the first
+    // place, but guard here too.
+    let send_proposal = {
+        let node = ctx.node.read().unwrap();
+        is_own_user_sg(&node.owner, peer_uuid)
+    };
+    if !send_proposal { return; }
+
+    let (sender_version, entries) =
+        build_merge_proposal_for_peer(peer_uuid, scope, ctx);
+    let body = build_merge_proposal_body(scope, sender_version, &entries);
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.get(&conn_id).map(|conn| (
+            build_encrypted_packet(MERGE_PROPOSAL_OP, conn, &body),
+            conn.peer_addr,
+        ))
+    };
+    if let Some((pkt, addr)) = pkt_and_addr {
+        send(ctx, addr, &pkt);
+    }
 }
 
 // ── Sync v2 merge proposal exchange (ops 0x78 / 0x79) ────────────────────────
@@ -3641,8 +3715,121 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         sender_version.seq,
     );
 
-    let mut node = ctx.node.write().unwrap();
-    node.owner.received_merge_proposals.insert(peer_uuid, entries);
+    // 7c.6: actually run the merge. Receiving a proposal from a non-own-user
+    // SG is a protocol violation — store nothing, ack malformed.
+    let is_own_sg = {
+        let node = ctx.node.read().unwrap();
+        is_own_user_sg(&node.owner, peer_uuid)
+    };
+    if !is_own_sg {
+        eprintln!("[merge_proposal] from non-own-user-SG peer {:02x?}; replying malformed",
+                  &peer_uuid[..4]);
+        send_merge_ack(conn_id, scope, SyncVersion::zero(),
+                       MERGE_ACK_RESULT_MALFORMED, ctx);
+        return;
+    }
+
+    // Cache the raw proposal for diagnostics; replaced on each round.
+    {
+        let mut node = ctx.node.write().unwrap();
+        node.owner.received_merge_proposals.insert(peer_uuid, entries.clone());
+    }
+
+    // Snapshot inputs for the pure merge function, drop the read lock before
+    // mutating.
+    let (local_log, writer_ranks, local_uuid) = {
+        let node = ctx.node.read().unwrap();
+        let local_log: Vec<WriteLogEntry> = node.owner.write_log.iter()
+            .filter(|e| e.scope == scope)
+            .cloned()
+            .collect();
+        let writer_ranks: HashMap<Uuid, u32> = node.owner.user.devices.iter()
+            .filter(|d| matches!(d.grade, DeviceGrade::SG))
+            .filter_map(|d| d.sg_rank.map(|r| (d.uuid, r)))
+            .collect();
+        (local_log, writer_ranks, node.device_uuid)
+    };
+
+    let merged = merge_logs(&local_log, &entries, &writer_ranks);
+
+    let mut any_state_change = false;
+    let new_version: SyncVersion = {
+        let mut node = ctx.node.write().unwrap();
+
+        // Append peer entries verbatim so onward propagation preserves their
+        // original (writer_uuid, epoch, seq) attribution.
+        for e in &merged.new_entries {
+            node.owner.write_log.push(e.clone());
+        }
+        // Prune retention on every append-batch.
+        if let Some(cutoff) = SystemTime::now().checked_sub(WRITE_LOG_RETENTION) {
+            node.owner.write_log.retain(|e| e.committed_at >= cutoff);
+        }
+
+        // Apply each merged Change directly to local state. `diff_states`
+        // emits AddDevice before AddApplication so device-existence checks
+        // pass; an idempotent Add or a Remove against a missing target is a
+        // no-op rather than an error.
+        for change in &merged.changes_to_apply {
+            match apply_change_to_owner(&mut node.owner, change) {
+                Ok(true)  => any_state_change = true,
+                Ok(false) => {}
+                Err(e) => eprintln!("[merge_proposal] applying {change:?} failed: {e:?}"),
+            }
+        }
+
+        // One bump per merge, not per Change. Uses the local SG's uuid: from
+        // this node's perspective, the merge IS the write that produced the
+        // new state, so DGs and own peers should see a fresh version under
+        // our writer and pull.
+        if any_state_change {
+            node.owner.bump_version(scope, local_uuid);
+        }
+
+        match scope {
+            Scope::Public  => node.owner.public_version,
+            Scope::Private => node.owner.private_version,
+        }
+    };
+
+    if !merged.new_entries.is_empty() || any_state_change {
+        ctx.save_node();
+    }
+
+    // Notify own peers + contacts so they pull the merged state. notify_own_peers
+    // is keyed on bumped scopes; only fire when state actually changed.
+    if any_state_change {
+        let (priv_v, pub_v) = {
+            let node = ctx.node.read().unwrap();
+            (node.owner.private_version, node.owner.public_version)
+        };
+        notify_own_peers(&[scope], priv_v, pub_v, ctx);
+        if matches!(scope, Scope::Public) {
+            notify_contacts(pub_v, ctx);
+        }
+    }
+
+    send_merge_ack(conn_id, scope, new_version, MERGE_ACK_RESULT_APPLIED, ctx);
+}
+
+fn send_merge_ack(
+    conn_id: u16,
+    scope:   Scope,
+    new_watermark: SyncVersion,
+    result:  u8,
+    ctx:     &WorkerContext,
+) {
+    let body = build_merge_ack_body(scope, new_watermark, result);
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.get(&conn_id).map(|conn| (
+            build_encrypted_packet(MERGE_ACK_OP, conn, &body),
+            conn.peer_addr,
+        ))
+    };
+    if let Some((pkt, addr)) = pkt_and_addr {
+        send(ctx, addr, &pkt);
+    }
 }
 
 pub fn merge_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
@@ -9399,30 +9586,178 @@ mod tests {
         assert_eq!(result, MERGE_ACK_RESULT_APPLIED);
     }
 
-    #[test]
-    fn merge_proposal_handler_stores_entries_under_peer_uuid() {
-        let t = TestCtx::new();
-        let (_, dg_conn, _) = writer_setup_with_capture(&t);
-        let peer_uuid = dg_conn.device_uuid;
+    /// Promote the connected peer (set up as DG by `writer_setup_with_capture`)
+    /// to SG with `rank`, so it satisfies `is_own_user_sg` for 7c.6 tests.
+    fn promote_peer_to_sg(t: &TestCtx, peer_uuid: Uuid, rank: u32) {
+        let mut node = t.ctx.node.write().unwrap();
+        if let Some(d) = node.owner.user.devices.iter_mut().find(|d| d.uuid == peer_uuid) {
+            d.grade   = DeviceGrade::SG;
+            d.sg_rank = Some(rank);
+        }
+    }
 
-        let entries = vec![
-            sample_entry([0x11; 16], 1, 1, &[0x01]),
-            sample_entry([0x11; 16], 1, 2, &[0x02]),
-        ];
+    #[test]
+    fn merge_proposal_rejects_non_own_user_sg_peer() {
+        // Peer is set up as a DG. The 7c.6 handler must refuse to merge and
+        // ack `malformed`.
+        let t = TestCtx::new();
+        let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+
         let body = build_merge_proposal_body(
             Scope::Public,
-            SyncVersion { writer_sg_uuid: [0x11; 16], epoch: 1, seq: 2 },
-            &entries,
+            SyncVersion { writer_sg_uuid: [0x11; 16], epoch: 1, seq: 1 },
+            &[],
         );
         let pkt = build_encrypted_packet(MERGE_PROPOSAL_OP, &dg_conn, &body);
         merge_proposal("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
 
+        let mut buf = [0u8; 1024];
+        let (len, _) = dg_socket.recv_from(&mut buf).expect("ack received");
+        assert_eq!(buf[0], MERGE_ACK_OP);
+        let plaintext = decrypt_packet_body_for(&dg_conn, &buf[1..len]);
+        let (_, _, result) = parse_merge_ack_body(&plaintext).expect("parse");
+        assert_eq!(result, MERGE_ACK_RESULT_MALFORMED);
+    }
+
+    #[test]
+    fn merge_proposal_applies_changes_appends_log_bumps_version_and_acks() {
+        let t = TestCtx::new();
+        let (_, peer_conn, peer_socket) = writer_setup_with_capture(&t);
+        let peer_uuid = peer_conn.device_uuid;
+        promote_peer_to_sg(&t, peer_uuid, 2);  // local stays rank 1.
+
+        let peer_writer = [0xC0; 16];
+        let added_device = [0xDE; 16];
+        let added_app    = app_uuid(909);
+
+        let entries = vec![
+            change_entry(peer_writer, 1, 1, &Change::AddDevice {
+                uuid: added_device, alias: "peer-dev".into(),
+                grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+            }),
+            change_entry(peer_writer, 1, 2, &Change::AddApplication {
+                device_uuid: added_device,
+                app_id:      added_app,
+                app_alias:   "remote-app".into(),
+            }),
+        ];
+
+        let pre_pub = t.ctx.node.read().unwrap().owner.public_version;
+
+        let body = build_merge_proposal_body(
+            Scope::Public,
+            SyncVersion { writer_sg_uuid: peer_writer, epoch: 1, seq: 2 },
+            &entries,
+        );
+        let pkt = build_encrypted_packet(MERGE_PROPOSAL_OP, &peer_conn, &body);
+        merge_proposal("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        // State + log + version all moved.
         let node = t.ctx.node.read().unwrap();
-        let stored = node.owner.received_merge_proposals.get(&peer_uuid)
-            .expect("entry for peer");
-        assert_eq!(stored.len(), 2);
-        assert_eq!(stored[0].change_payload, vec![0x01]);
-        assert_eq!(stored[1].change_payload, vec![0x02]);
+        assert!(node.owner.user.devices.iter().any(|d| d.uuid == added_device),
+                "AddDevice applied");
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == added_device).unwrap();
+        assert!(dev.applications.iter().any(|a| a.id == added_app && a.alias == "remote-app"),
+                "AddApplication applied");
+        assert_eq!(node.owner.write_log.len(), 2, "both peer entries appended");
+        assert!(
+            node.owner.public_version != pre_pub,
+            "public_version bumped after merge",
+        );
+        drop(node);
+
+        // MergeAck back to peer. (The merge also triggers notify_own_peers,
+        // which sends a SyncUpdateAvailable to this same peer because we
+        // promoted it to an own-user SG — drain until we find the ack.)
+        let ack_payload = recv_until_op(&peer_socket, MERGE_ACK_OP);
+        let plaintext = decrypt_packet_body_for(&peer_conn, &ack_payload);
+        let (scope, _wm, result) = parse_merge_ack_body(&plaintext).expect("parse");
+        assert_eq!(scope, Scope::Public);
+        assert_eq!(result, MERGE_ACK_RESULT_APPLIED);
+    }
+
+    #[test]
+    fn merge_proposal_no_op_when_peer_entries_already_known() {
+        // We already have all peer entries in our log; merge is a no-op for
+        // state. Version must NOT bump (no actual state change), but the
+        // ack still reports `applied`.
+        let t = TestCtx::new();
+        let (_, peer_conn, peer_socket) = writer_setup_with_capture(&t);
+        let peer_uuid = peer_conn.device_uuid;
+        promote_peer_to_sg(&t, peer_uuid, 2);
+
+        let peer_writer = [0xC1; 16];
+        // Pre-seed local with the same entry the peer will propose.
+        let local_uuid = t.ctx.node.read().unwrap().device_uuid;
+        let entry = change_entry(peer_writer, 1, 1, &Change::AddDevice {
+            uuid: [0xAB; 16], alias: "already-known".into(),
+            grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+        });
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.write_log.push(entry.clone());
+            node.owner.user.devices.push(Device {
+                uuid: [0xAB; 16], alias: "already-known".into(),
+                grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+                applications: Vec::new(),
+            });
+        }
+        let pre_pub = t.ctx.node.read().unwrap().owner.public_version;
+
+        let body = build_merge_proposal_body(
+            Scope::Public,
+            SyncVersion { writer_sg_uuid: peer_writer, epoch: 1, seq: 1 },
+            &[entry],
+        );
+        let pkt = build_encrypted_packet(MERGE_PROPOSAL_OP, &peer_conn, &body);
+        merge_proposal("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(node.owner.public_version, pre_pub,
+                   "no state change → no version bump");
+        // No new log entry — peer's was a duplicate of ours by version key.
+        assert_eq!(node.owner.write_log.len(), 1);
+        drop(node);
+
+        // Still acks applied (nothing failed; nothing needed doing).
+        let mut buf = [0u8; 1024];
+        let (len, _) = peer_socket.recv_from(&mut buf).expect("ack received");
+        assert_eq!(buf[0], MERGE_ACK_OP);
+        let plaintext = decrypt_packet_body_for(&peer_conn, &buf[1..len]);
+        let (_, _, result) = parse_merge_ack_body(&plaintext).expect("parse");
+        assert_eq!(result, MERGE_ACK_RESULT_APPLIED);
+        let _ = local_uuid; // silence unused warning if any
+    }
+
+    /// Drain packets from `socket` until one with op byte == `wanted_op` is
+    /// seen, returning the payload after the op byte. Used by tests that
+    /// expect a specific reply when prior fan-outs (e.g. SyncUpdateAvailable)
+    /// land on the same socket first.
+    fn recv_until_op(socket: &UdpSocket, wanted_op: u8) -> Vec<u8> {
+        let mut buf = [0u8; 2048];
+        for _ in 0..16 {
+            let (len, _) = socket.recv_from(&mut buf).expect("recv");
+            if buf[0] == wanted_op {
+                return buf[1..len].to_vec();
+            }
+        }
+        panic!("did not see op byte {wanted_op:#04x} after 16 packets");
+    }
+
+    /// Decrypt a packet body using a peer-side ActiveConnection. Mirrors
+    /// `parse_write_ack`'s pattern.
+    fn decrypt_packet_body_for(conn: &ActiveConnection, buf: &[u8]) -> Vec<u8> {
+        let mut node = super::super::data_models::Node::new();
+        node.owner.active_connections.insert(conn.id, ActiveConnection {
+            id: conn.id,
+            timeout: conn.timeout,
+            key_pair: conn.key_pair.clone(),
+            peer_public_key: conn.peer_public_key,
+            peer_active_connection_id: conn.peer_active_connection_id,
+            device_uuid: conn.device_uuid,
+            peer_addr: conn.peer_addr,
+        });
+        decrypt_packet_body(&node, buf).expect("decrypt")
     }
 
     #[test]
