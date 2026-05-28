@@ -5124,6 +5124,10 @@ pub fn ui_request(
             let target = redirect_with_error("/applications", reject_app(&body, ctx));
             respond_redirect(&stream, &target);
         }
+        ("POST", "/applications/rename") => {
+            let target = redirect_with_error("/applications", rename_app(&body, ctx));
+            respond_redirect(&stream, &target);
+        }
         ("GET",  "/contacts")      => respond_html(&stream, 200, &render_contacts(ctx)),
         ("GET",  "/devices")       => respond_html(&stream, 200, &render_devices(ctx)),
         ("POST", "/devices/sync")  => {
@@ -5364,14 +5368,20 @@ fn render_applications(ctx: &WorkerContext, query: &str) -> String {
                 .filter(|a| a.user_approved)
                 .map(|a| format!(
                     "<tr><td>{}</td><td>{}</td><td>{}</td>\
+                     <td><form method='post' action='/applications/rename' style='margin:0;display:flex;gap:.25rem'>\
+                       <input type='hidden' name='id' value='{id_hex}'>\
+                       <input type='text' name='alias' value='{alias}' required>\
+                       <button type='submit'>Rename</button>\
+                     </form></td>\
                      <td><form method='post' action='/applications/delete' style='margin:0'>\
-                       <input type='hidden' name='id' value='{}'>\
+                       <input type='hidden' name='id' value='{id_hex}'>\
                        <button type='submit'>Delete</button>\
                      </form></td></tr>",
                     html_escape(&a.alias),
                     html_escape(&a.protocol),
                     html_escape(&a.host.to_string()),
-                    uuid_hex(&a.id),
+                    id_hex = uuid_hex(&a.id),
+                    alias  = html_escape(&a.alias),
                 ))
                 .collect()
         })
@@ -5383,7 +5393,7 @@ fn render_applications(ctx: &WorkerContext, query: &str) -> String {
     } else {
         format!(
             "<table>\
-               <tr><th>Alias</th><th>Protocol</th><th>Host</th><th></th></tr>\
+               <tr><th>Alias</th><th>Protocol</th><th>Host</th><th>Rename</th><th></th></tr>\
                {rows}\
              </table>"
         )
@@ -5533,6 +5543,49 @@ fn approve_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
             ctx.save_node();
         }
         eprintln!("[approve_app] publish failed for app {}: {e:?}", uuid_hex(&id));
+        return Some(UI_ERR_PUBLISH_FAILED);
+    }
+    None
+}
+
+/// Admin UI alias rename. Mirrors `app_update`'s alias path but driven from the
+/// admin UI (no app token) — so the local device's own apps are the only ones
+/// renamable here. Same pre-mutate + sync v1 publish + rollback-on-Err shape as
+/// `approve_app` / `reject_app`.
+fn rename_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let id_str    = form_field(body, "id")?;
+    let id        = uuid_from_hex(id_str)?;
+    let new_alias = form_field(body, "alias").map(url_decode)?;
+    if new_alias.is_empty() { return None; }
+
+    let (device_uuid, prior_alias) = {
+        let mut node    = ctx.node.write().unwrap();
+        let device_uuid = node.device_uuid;
+        let device = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid)?;
+        let app    = device.applications.iter_mut().find(|a| a.id == id)?;
+        if app.alias == new_alias { return None; }       // no-op
+        let prior = std::mem::replace(&mut app.alias, new_alias.clone());
+        (device_uuid, prior)
+    };
+    ctx.save_node();
+
+    if let Err(e) = request_change(Change::UpdateApplicationAlias {
+        device_uuid,
+        app_id: id,
+        new_alias,
+    }, ctx) {
+        {
+            let mut node = ctx.node.write().unwrap();
+            if let Some(dev) = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == device_uuid)
+            {
+                if let Some(app) = dev.applications.iter_mut().find(|a| a.id == id) {
+                    app.alias = prior_alias;
+                }
+            }
+        }
+        ctx.save_node();
+        eprintln!("[rename_app] publish failed for app {}: {e:?}", uuid_hex(&id));
         return Some(UI_ERR_PUBLISH_FAILED);
     }
     None
@@ -9320,6 +9373,64 @@ mod tests {
             .expect("rollback should restore the app");
         assert_eq!(app.alias, original_alias,
                    "rollback should preserve the original alias");
+    }
+
+    #[test]
+    fn rename_app_success_publishes_and_returns_none() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 1);
+        let id = seed_approved_app(&t, "old");
+        let writer_uuid = t.ctx.node.read().unwrap().device_uuid;
+        t.ctx.node.write().unwrap().owner.bump_version(Scope::Public, writer_uuid);
+        let pub_before = t.ctx.node.read().unwrap().owner.public_version;
+
+        let body = format!("id={}&alias=new+name", uuid_hex(&id));
+        let res = rename_app(body.as_bytes(), &t.ctx);
+        assert_eq!(res, None);
+
+        let node = t.ctx.node.read().unwrap();
+        let device_uuid = node.device_uuid;
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
+        let app = dev.applications.iter().find(|a| a.id == id).unwrap();
+        assert_eq!(app.alias, "new name", "rename should apply the new alias");
+        assert_eq!(node.owner.public_version.seq, pub_before.seq + 1,
+                   "successful publish should bump public_version");
+    }
+
+    #[test]
+    fn rename_app_unreachable_rolls_back_and_returns_publish_failed() {
+        // DG with no writer.
+        let t = TestCtx::new();
+        let id = seed_approved_app(&t, "stays");
+
+        let body = format!("id={}&alias=attempted", uuid_hex(&id));
+        let res = rename_app(body.as_bytes(), &t.ctx);
+        assert_eq!(res, Some(UI_ERR_PUBLISH_FAILED));
+
+        let node = t.ctx.node.read().unwrap();
+        let device_uuid = node.device_uuid;
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
+        let app = dev.applications.iter().find(|a| a.id == id).unwrap();
+        assert_eq!(app.alias, "stays", "rollback should preserve the original alias");
+    }
+
+    #[test]
+    fn rename_app_no_op_when_alias_unchanged() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 1);
+        let id = seed_approved_app(&t, "same");
+        let pub_before = t.ctx.node.read().unwrap().owner.public_version;
+
+        let body = format!("id={}&alias=same", uuid_hex(&id));
+        let res = rename_app(body.as_bytes(), &t.ctx);
+        assert_eq!(res, None);
+
+        // No publish → no version bump, no write_log entry.
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(node.owner.public_version, pub_before,
+                   "no-op rename must not bump public_version");
+        assert!(node.owner.write_log.is_empty(),
+                "no-op rename must not append to write_log");
     }
 
     // ── Write log (7c.2) ────────────────────────────────────────────────────
