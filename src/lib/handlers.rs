@@ -5137,6 +5137,7 @@ pub fn ui_request(
             sync_pull(ctx);
             respond_redirect(&stream, "/devices");
         }
+        ("GET",  "/diagnostics")   => respond_html(&stream, 200, &render_diagnostics(ctx)),
         ("GET",  "/invitations")   => respond_html(&stream, 200, &render_invitations(ctx, &query)),
         ("POST", "/invitations/device") => {
             match generate_device_invitation(ctx) {
@@ -5158,7 +5159,7 @@ pub fn ui_request(
             initiate_contact_exchange(&body, ctx);
             respond_redirect(&stream, "/contacts");
         }
-        _ => respond_html(&stream, 404, &layout("Not Found", "<h1>404 — Not Found</h1>")),
+        _ => respond_html(&stream, 404, &layout(ctx, "Not Found", "<h1>404 — Not Found</h1>")),
     }
 }
 
@@ -5291,7 +5292,7 @@ fn render_dashboard(ctx: &WorkerContext) -> String {
            <div class=\"label\" style=\"margin-top:.5rem\">Advertised hosts</div><div>{hosts_line}</div>\
          </div>"
     );
-    layout("Dashboard", &body)
+    layout(ctx, "Dashboard", &body)
 }
 
 /// Render a red banner for the UI error codes emitted by approve_app /
@@ -5354,7 +5355,7 @@ fn render_pending_apps(ctx: &WorkerContext, query: &str) -> String {
         )
     };
     let body = format!("<h1>Pending Apps</h1>{error_banner}{table}");
-    layout("Pending Apps", &body)
+    layout(ctx, "Pending Apps", &body)
 }
 
 fn render_applications(ctx: &WorkerContext, query: &str) -> String {
@@ -5399,7 +5400,7 @@ fn render_applications(ctx: &WorkerContext, query: &str) -> String {
         )
     };
     let body = format!("<h1>Applications</h1>{error_banner}{table}");
-    layout("Applications", &body)
+    layout(ctx, "Applications", &body)
 }
 
 fn render_contacts(ctx: &WorkerContext) -> String {
@@ -5457,7 +5458,7 @@ fn render_contacts(ctx: &WorkerContext) -> String {
            </form>\
          </div>"
     );
-    layout("Contacts", &body)
+    layout(ctx, "Contacts", &body)
 }
 
 fn render_devices(ctx: &WorkerContext) -> String {
@@ -5495,7 +5496,153 @@ fn render_devices(ctx: &WorkerContext) -> String {
              </table>"
         )
     };
-    layout("Devices", &body)
+    layout(ctx, "Devices", &body)
+}
+
+// ── Sync v2 diagnostics ───────────────────────────────────────────────────────
+
+/// Render `/diagnostics` — surfaces the ephemeral state that drives sync v2
+/// partition reconciliation: per-peer reachability, last exchanged watermarks,
+/// and buffered inbound merge proposals. Read-only.
+fn render_diagnostics(ctx: &WorkerContext) -> String {
+    let node = ctx.node.read().unwrap();
+    let local_uuid = node.device_uuid;
+    let pv = node.owner.public_version;
+
+    let local_section = format!(
+        "<div class='card'>\
+           <h2 style='margin-top:0'>Local node</h2>\
+           <table>\
+             <tr><th>Device UUID</th><td><code>{local}</code></td></tr>\
+             <tr><th>Public version</th><td>writer=<code>{w}</code> epoch={e} seq={s}</td></tr>\
+             <tr><th>Write log</th><td>{n} entries (retention {ret}d)</td></tr>\
+           </table>\
+         </div>",
+        local = uuid_hex(&local_uuid),
+        w     = uuid_hex(&pv.writer_sg_uuid),
+        e     = pv.epoch,
+        s     = pv.seq,
+        n     = node.owner.write_log.len(),
+        ret   = WRITE_LOG_RETENTION.as_secs() / 86_400,
+    );
+
+    // Build an alias lookup so peer-uuid keys in the ephemeral maps render
+    // with human-readable names.
+    let alias_of = |uuid: &Uuid| -> String {
+        if uuid == &local_uuid { return "(this device)".to_string(); }
+        for d in &node.owner.user.devices {
+            if d.uuid == *uuid { return d.alias.clone(); }
+        }
+        for c in &node.owner.contact_users {
+            for d in &c.user.devices {
+                if d.uuid == *uuid { return format!("{}/{}", c.user.alias, d.alias); }
+            }
+        }
+        "(unknown)".to_string()
+    };
+
+    // Own-user SG peers + reachability.
+    let mut peer_rows = String::new();
+    for d in &node.owner.user.devices {
+        if !matches!(d.grade, DeviceGrade::SG) || d.uuid == local_uuid { continue; }
+        let host_lines: String = d.hosts.iter().map(|h| {
+            match node.sg_statuses.get(&(d.uuid, h.clone())) {
+                Some(s) => {
+                    let rtt = s.last_rtt.map(|r| format!("{}ms", r.as_millis()))
+                        .unwrap_or_else(|| "—".to_string());
+                    let status = if s.up { "<span style='color:#2d7a3b'>up</span>" }
+                                 else    { "<span style='color:#c0392b'>down</span>" };
+                    format!("<li><code>{}</code> — {status} (rtt {rtt})</li>", html_escape(h))
+                }
+                None => format!("<li><code>{}</code> — <span style='color:#888'>not yet polled</span></li>",
+                                html_escape(h)),
+            }
+        }).collect();
+        peer_rows.push_str(&format!(
+            "<tr><td>{alias}<br><code style='font-size:.75rem;color:#888'>{uuid}</code></td>\
+                 <td><ul style='margin:0;padding-left:1.2rem'>{host_lines}</ul></td></tr>",
+            alias = html_escape(&d.alias),
+            uuid  = uuid_hex(&d.uuid),
+        ));
+    }
+    let peers_section = if peer_rows.is_empty() {
+        "<div class='card'><h2 style='margin-top:0'>Own-user SG peers</h2>\
+         <p class='empty'>No other own-user SG peers.</p></div>".to_string()
+    } else {
+        format!(
+            "<div class='card'><h2 style='margin-top:0'>Own-user SG peers</h2>\
+             <table><tr><th>Peer</th><th>Hosts</th></tr>{peer_rows}</table></div>"
+        )
+    };
+
+    // Last watermarks: peer_uuid → writer_uuid → SyncVersion.
+    let mut wm_rows = String::new();
+    let mut peers_with_wm: Vec<&Uuid> = node.owner.last_watermarks.keys().collect();
+    peers_with_wm.sort_by_key(|u| uuid_hex(u));
+    for peer_uuid in peers_with_wm {
+        let writers = &node.owner.last_watermarks[peer_uuid];
+        let mut sub_rows: Vec<String> = writers.iter().map(|(wu, sv)| {
+            format!(
+                "<tr><td><code>{}</code><br><span style='font-size:.75rem;color:#888'>{}</span></td>\
+                     <td>epoch={} seq={}</td></tr>",
+                alias_of(wu), uuid_hex(wu), sv.epoch, sv.seq,
+            )
+        }).collect();
+        sub_rows.sort();
+        wm_rows.push_str(&format!(
+            "<tr><td>{alias}<br><code style='font-size:.75rem;color:#888'>{uuid}</code></td>\
+                 <td><table style='margin:0;box-shadow:none;background:transparent'>\
+                       <tr><th>Writer</th><th>Version</th></tr>{}</table></td></tr>",
+            sub_rows.concat(),
+            alias = html_escape(&alias_of(peer_uuid)),
+            uuid  = uuid_hex(peer_uuid),
+        ));
+    }
+    let wm_section = if wm_rows.is_empty() {
+        "<div class='card'><h2 style='margin-top:0'>Last watermarks</h2>\
+         <p class='empty'>No watermark exchanges yet.</p></div>".to_string()
+    } else {
+        format!(
+            "<div class='card'><h2 style='margin-top:0'>Last watermarks</h2>\
+             <p style='font-size:.85rem;color:#666;margin-top:0'>Per-peer, per-writer agreed reconciliation point. \
+                Rebuilt on every watermark-probe round-trip.</p>\
+             <table><tr><th>Peer</th><th>Per-writer min</th></tr>{wm_rows}</table></div>"
+        )
+    };
+
+    // Buffered inbound merge proposals.
+    let mut pp_rows = String::new();
+    let mut peers_with_pp: Vec<&Uuid> = node.owner.received_merge_proposals.keys().collect();
+    peers_with_pp.sort_by_key(|u| uuid_hex(u));
+    for peer_uuid in peers_with_pp {
+        let entries = &node.owner.received_merge_proposals[peer_uuid];
+        pp_rows.push_str(&format!(
+            "<tr><td>{alias}<br><code style='font-size:.75rem;color:#888'>{uuid}</code></td>\
+                 <td>{n} entr{plural}</td></tr>",
+            alias  = html_escape(&alias_of(peer_uuid)),
+            uuid   = uuid_hex(peer_uuid),
+            n      = entries.len(),
+            plural = if entries.len() == 1 { "y" } else { "ies" },
+        ));
+    }
+    let pp_section = if pp_rows.is_empty() {
+        "<div class='card'><h2 style='margin-top:0'>Buffered merge proposals</h2>\
+         <p class='empty'>No inbound merge proposals buffered.</p></div>".to_string()
+    } else {
+        format!(
+            "<div class='card'><h2 style='margin-top:0'>Buffered merge proposals</h2>\
+             <p style='font-size:.85rem;color:#666;margin-top:0'>Entries received from peers and waiting to be \
+                merged into the local log.</p>\
+             <table><tr><th>Peer</th><th>Buffered</th></tr>{pp_rows}</table></div>"
+        )
+    };
+
+    drop(node);
+
+    let body = format!(
+        "<h1>Diagnostics</h1>{local_section}{peers_section}{wm_section}{pp_section}"
+    );
+    layout(ctx, "Diagnostics", &body)
 }
 
 // ── App approval / rejection ──────────────────────────────────────────────────
@@ -5979,7 +6126,7 @@ fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
            </form>\
          </div>"
     );
-    layout("Invitations", &body)
+    layout(ctx, "Invitations", &body)
 }
 
 // ── Setup wizard ─────────────────────────────────────────────────────────────
@@ -6180,7 +6327,8 @@ form { display: inline; }
 .empty { color: #888; font-style: italic; }
 ";
 
-fn layout(title: &str, body: &str) -> String {
+fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
+    let banner = partition_banner(ctx);
     let mut html = String::with_capacity(4096);
     html.push_str("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>pNet \u{2014} ");
     html.push_str(title);
@@ -6195,10 +6343,51 @@ fn layout(title: &str, body: &str) -> String {
     html.push_str("  <a href=\"/contacts\">Contacts</a>\n");
     html.push_str("  <a href=\"/devices\">Devices</a>\n");
     html.push_str("  <a href=\"/invitations\">Invitations</a>\n");
+    html.push_str("  <a href=\"/diagnostics\">Diagnostics</a>\n");
     html.push_str("</nav>\n<main>\n");
+    html.push_str(&banner);
     html.push_str(body);
     html.push_str("\n</main>\n</body>\n</html>");
     html
+}
+
+/// Yellow banner shown on every admin page whenever any own-user SG peer is
+/// currently marked down by poll_sg. Surfaces partition state so a user
+/// looking at any tab knows convergence may be paused. Empty string when all
+/// own-user SG peers (if any) are reachable.
+fn partition_banner(ctx: &WorkerContext) -> String {
+    let node = ctx.node.read().unwrap();
+    let local_uuid = node.device_uuid;
+
+    let own_sg_uuids: Vec<(Uuid, &str)> = node.owner.user.devices.iter()
+        .filter(|d| matches!(d.grade, DeviceGrade::SG) && d.uuid != local_uuid)
+        .map(|d| (d.uuid, d.alias.as_str()))
+        .collect();
+    if own_sg_uuids.is_empty() { return String::new(); }
+
+    // A device is "down" iff *every* polled (uuid, host) entry for it is
+    // down. An unpolled device contributes no entries — treat as up so we
+    // don't falsely flag a freshly added peer before poll_sg's first round.
+    let mut down: Vec<&str> = Vec::new();
+    for (uuid, alias) in &own_sg_uuids {
+        let polled: Vec<bool> = node.sg_statuses.iter()
+            .filter(|((u, _), _)| u == uuid)
+            .map(|(_, s)| s.up)
+            .collect();
+        if !polled.is_empty() && polled.iter().all(|up| !*up) {
+            down.push(alias);
+        }
+    }
+    if down.is_empty() { return String::new(); }
+
+    let aliases = down.iter().map(|a| html_escape(a)).collect::<Vec<_>>().join(", ");
+    format!(
+        "<div class='card' style='background:#fff4d6;color:#7a5a00;border:1px solid #e0c060'>\
+            <strong>Partition detected:</strong> own-user SG peer(s) currently unreachable: {aliases}. \
+            Sync v2 will reconcile automatically when the peer comes back. \
+            See <a href='/diagnostics'>Diagnostics</a> for watermarks and pending proposals.\
+        </div>"
+    )
 }
 
 const SETUP_CSS: &str = "
@@ -9412,6 +9601,110 @@ mod tests {
         let dev = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
         let app = dev.applications.iter().find(|a| a.id == id).unwrap();
         assert_eq!(app.alias, "stays", "rollback should preserve the original alias");
+    }
+
+    // ── Partition banner + diagnostics (7c.8b) ──────────────────────────────
+
+    #[test]
+    fn partition_banner_empty_with_no_own_sg_peers() {
+        let t = TestCtx::new();
+        assert!(partition_banner(&t.ctx).is_empty());
+    }
+
+    #[test]
+    fn partition_banner_empty_when_peer_unpolled() {
+        let t = TestCtx::new();
+        let peer = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:        "sg-peer".to_string(),
+                uuid:         peer,
+                grade:        DeviceGrade::SG,
+                sg_rank:      Some(2),
+                hosts:        vec!["peer-host:7777".to_string()],
+                applications: Vec::new(),
+            });
+        }
+        assert!(partition_banner(&t.ctx).is_empty(),
+            "an unpolled peer should not falsely trigger the banner");
+    }
+
+    #[test]
+    fn partition_banner_fires_when_all_peer_hosts_down() {
+        let t = TestCtx::new();
+        let peer = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:        "sg-peer".to_string(),
+                uuid:         peer,
+                grade:        DeviceGrade::SG,
+                sg_rank:      Some(2),
+                hosts:        vec!["peer-host:7777".to_string()],
+                applications: Vec::new(),
+            });
+            node.sg_statuses.insert((peer, "peer-host:7777".to_string()), SgStatus {
+                last_rtt: None, up: false, last_polled: Instant::now(),
+            });
+        }
+        let banner = partition_banner(&t.ctx);
+        assert!(banner.contains("sg-peer"),
+            "banner should name the down peer; got: {banner}");
+        assert!(banner.contains("Partition detected"));
+    }
+
+    #[test]
+    fn partition_banner_silent_when_any_host_up() {
+        let t = TestCtx::new();
+        let peer = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:        "sg-peer".to_string(),
+                uuid:         peer,
+                grade:        DeviceGrade::SG,
+                sg_rank:      Some(2),
+                hosts:        vec!["host-a:7777".to_string(), "host-b:7777".to_string()],
+                applications: Vec::new(),
+            });
+            node.sg_statuses.insert((peer, "host-a:7777".to_string()), SgStatus {
+                last_rtt: None, up: false, last_polled: Instant::now(),
+            });
+            node.sg_statuses.insert((peer, "host-b:7777".to_string()), SgStatus {
+                last_rtt: Some(Duration::from_millis(8)), up: true, last_polled: Instant::now(),
+            });
+        }
+        assert!(partition_banner(&t.ctx).is_empty(),
+            "peer reachable via any host should not trigger the banner");
+    }
+
+    #[test]
+    fn render_diagnostics_smoke() {
+        let t = TestCtx::new();
+        let peer = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:        "sg-peer".to_string(),
+                uuid:         peer,
+                grade:        DeviceGrade::SG,
+                sg_rank:      Some(2),
+                hosts:        vec!["peer-host:7777".to_string()],
+                applications: Vec::new(),
+            });
+            let mut wm = HashMap::new();
+            wm.insert(peer, SyncVersion { writer_sg_uuid: peer, epoch: 3, seq: 17 });
+            node.owner.last_watermarks.insert(peer, wm);
+            node.owner.received_merge_proposals.insert(peer, Vec::new());
+        }
+        let html = render_diagnostics(&t.ctx);
+        assert!(html.contains("Diagnostics"));
+        assert!(html.contains("Local node"));
+        assert!(html.contains("sg-peer"));
+        assert!(html.contains("epoch=3"));
+        assert!(html.contains("seq=17"));
+        assert!(html.contains("Buffered merge proposals"));
     }
 
     #[test]
