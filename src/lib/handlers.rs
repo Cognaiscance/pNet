@@ -2655,21 +2655,25 @@ fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
             existing.sg_rank = p.sg_rank;
             existing.hosts   = p.hosts;
             if is_local {
-                // Local device: additive merge so in-flight request_change
-                // pre-mutates aren't clobbered.
+                // Local device: strictly additive. Only insert apps the peer
+                // reports that we don't have yet; never overwrite an existing
+                // local app's alias. The local node is the writer for its own
+                // device under sync v2's multi-writer model, so a peer's view
+                // of our apps may be stale and must not clobber ours. Any
+                // legitimate cross-SG alias change reaches us via the sync v2
+                // merge engine (apply_change_to_owner), not via this branch.
+                let existing_ids: HashSet<Uuid> = existing.applications.iter()
+                    .map(|a| a.id).collect();
                 for (id, alias) in apps {
-                    if let Some(local_app) = existing.applications.iter_mut().find(|a| a.id == id) {
-                        local_app.alias = alias;
-                    } else {
-                        existing.applications.push(Application {
-                            id,
-                            alias,
-                            protocol:      String::new(),
-                            host:          "0.0.0.0:0".parse().unwrap(),
-                            user_approved: true,
-                            token:         [0u8; 16],
-                        });
-                    }
+                    if existing_ids.contains(&id) { continue; }
+                    existing.applications.push(Application {
+                        id,
+                        alias,
+                        protocol:      String::new(),
+                        host:          "0.0.0.0:0".parse().unwrap(),
+                        user_approved: true,
+                        token:         [0u8; 16],
+                    });
                 }
             } else {
                 // Peer device: authoritative — drop apps the writer no longer
@@ -2948,6 +2952,29 @@ pub fn sync_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext)
         eprintln!("[sync_update_available] truncated version from {src}");
         return;
     };
+
+    // Sync v2 (7c.6+) is the sole authority for Public-scope propagation
+    // between two own-user SGs: the watermark probe + merge proposal
+    // exchange handles cross-writer reconciliation deterministically by
+    // rank. Sync v1's "cross-writer: pull and let the writer's state win"
+    // rule corrupts the multi-writer model — a stale pull overwrites
+    // `public_version` to the peer writer, the next bump flips the writer
+    // forward, and two writes can end up with duplicate (writer,epoch,seq)
+    // triples that block subsequent merge proposals. So: when *both* sides
+    // are own-user SGs, ignore the notification. DGs still pull from their
+    // writer SG; cross-user notifications still drive sync v1 as before.
+    let suppress = {
+        let node = ctx.node.read().unwrap();
+        let local_is_sg = node.owner.user.devices.iter()
+            .find(|d| d.uuid == node.device_uuid)
+            .map(|d| matches!(d.grade, DeviceGrade::SG))
+            .unwrap_or(false);
+        let peer_is_own_sg = node.owner.active_connections.get(&conn_id)
+            .map(|conn| is_own_user_sg(&node.owner, conn.device_uuid))
+            .unwrap_or(false);
+        local_is_sg && peer_is_own_sg
+    };
+    if suppress { return; }
 
     let local_v = {
         let node = ctx.node.read().unwrap();
@@ -3522,23 +3549,28 @@ pub fn watermark_probe_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
         }
     };
 
-    // Compute per-writer min(our_log, peer_report). Writers present on only
-    // one side use that side's version directly — the other side will adopt
-    // it via the merge proposal exchange.
+    // Compute per-writer min(our_log, peer_report) per descriptions/data sync.md
+    // §"Watermark discovery". A writer absent from one side has an implicit
+    // value of (0, 0) on that side, so the min is (0, 0) — meaning the agreed
+    // reconciliation point is "before everything", and the side that *does*
+    // have entries ships them all in the subsequent merge proposal.
     let our_map = {
         let node = ctx.node.read().unwrap();
         build_local_watermark_map(&node, scope)
     };
+    let peer_writers: HashSet<Uuid> = peer_map.iter().map(|(w, _)| *w).collect();
+    let our_writers:  HashSet<Uuid> = our_map.iter().map(|(w, _)| *w).collect();
     let mut merged: HashMap<Uuid, SyncVersion> = HashMap::new();
-    for (writer, v) in &our_map { merged.insert(*writer, *v); }
-    for (writer, peer_v) in &peer_map {
-        merged.entry(*writer)
-            .and_modify(|our_v| {
-                if (peer_v.epoch, peer_v.seq) < (our_v.epoch, our_v.seq) {
-                    *our_v = *peer_v;
-                }
-            })
-            .or_insert(*peer_v);
+    for writer in our_writers.iter().chain(peer_writers.iter()).copied().collect::<HashSet<_>>() {
+        let our_v  = our_map.iter().find(|(w, _)| *w == writer).map(|(_, v)| *v);
+        let peer_v = peer_map.iter().find(|(w, _)| *w == writer).map(|(_, v)| *v);
+        let merged_v = match (our_v, peer_v) {
+            (Some(o), Some(p)) => {
+                if (o.epoch, o.seq) <= (p.epoch, p.seq) { o } else { p }
+            }
+            _ => SyncVersion { writer_sg_uuid: writer, epoch: 0, seq: 0 },
+        };
+        merged.insert(writer, merged_v);
     }
 
     {
@@ -3960,13 +3992,19 @@ struct MergedState {
 
 /// Per-app accumulator during the walk. `existed` becomes true once any
 /// non-tombstoned `AddApplication` is seen — the entity is only present in
-/// the final state when `existed`. `alias` and `alias_priority` track the
-/// highest-priority alias-setter across both Add and Update events, so the
-/// order of an Update vs its Add doesn't affect the resolved value.
+/// the final state when `existed`. `alias_from_update` tracks whether the
+/// resolved alias came from an explicit `UpdateApplicationAlias`. An Update
+/// always overrides an Add's incidental alias (regardless of writer rank);
+/// among Updates the standard rank-priority decides, and among Adds (when
+/// no Update has been seen) the same rank-priority decides. This split is
+/// what makes bilateral partition recovery work: a later Update from a
+/// lower-rank writer must beat an earlier Add from a higher-rank writer
+/// when the Update is the explicit intent for that app's alias.
 struct MergedApp {
     existed: bool,
     alias:   String,
     alias_priority: EntryPriority,
+    alias_from_update: bool,
 }
 
 #[derive(Clone)]
@@ -4055,14 +4093,23 @@ fn upsert_alias(
     key:  (Uuid, Uuid),
     alias: String,
     prio:  EntryPriority,
-    sets_existence: bool,
+    sets_existence: bool,   // true = Add, false = Update
 ) {
+    let is_update = !sets_existence;
     match apps.get_mut(&key) {
         Some(slot) => {
             if sets_existence { slot.existed = true; }
-            if prio > slot.alias_priority {
+            // Updates always beat Adds for the alias slot, regardless of
+            // writer rank. Among same-kind entries, rank-priority decides.
+            let should_overwrite = match (is_update, slot.alias_from_update) {
+                (true,  false) => true,                     // Update over Add
+                (false, true)  => false,                    // Add can't override Update
+                _              => prio > slot.alias_priority,
+            };
+            if should_overwrite {
                 slot.alias = alias;
                 slot.alias_priority = prio;
+                slot.alias_from_update = is_update || slot.alias_from_update;
             }
         }
         None => {
@@ -4070,6 +4117,7 @@ fn upsert_alias(
                 existed: sets_existence,
                 alias,
                 alias_priority: prio,
+                alias_from_update: is_update,
             });
         }
     }
@@ -5696,9 +5744,11 @@ fn approve_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
 }
 
 /// Admin UI alias rename. Mirrors `app_update`'s alias path but driven from the
-/// admin UI (no app token) — so the local device's own apps are the only ones
-/// renamable here. Same pre-mutate + sync v1 publish + rollback-on-Err shape as
-/// `approve_app` / `reject_app`.
+/// admin UI (no app token). App ids are globally unique UUIDs (7c.0), so we
+/// look the app up across every own-user device — any own-user SG can publish
+/// a rename of any own-user app per the v2 reconciliation design. Same
+/// pre-mutate + sync v1 publish + rollback-on-Err shape as `approve_app` /
+/// `reject_app`.
 fn rename_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     let id_str    = form_field(body, "id")?;
     let id        = uuid_from_hex(id_str)?;
@@ -5706,13 +5756,17 @@ fn rename_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     if new_alias.is_empty() { return None; }
 
     let (device_uuid, prior_alias) = {
-        let mut node    = ctx.node.write().unwrap();
-        let device_uuid = node.device_uuid;
-        let device = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid)?;
-        let app    = device.applications.iter_mut().find(|a| a.id == id)?;
-        if app.alias == new_alias { return None; }       // no-op
-        let prior = std::mem::replace(&mut app.alias, new_alias.clone());
-        (device_uuid, prior)
+        let mut node = ctx.node.write().unwrap();
+        let mut found = None;
+        for device in node.owner.user.devices.iter_mut() {
+            if let Some(app) = device.applications.iter_mut().find(|a| a.id == id) {
+                if app.alias == new_alias { return None; }   // no-op
+                let prior = std::mem::replace(&mut app.alias, new_alias.clone());
+                found = Some((device.uuid, prior));
+                break;
+            }
+        }
+        found?
     };
     ctx.save_node();
 
@@ -7839,8 +7893,9 @@ mod tests {
 
     #[test]
     fn apply_public_state_preserves_local_app_token_and_host() {
-        // The originating DG holds a real token and host for an app it owns.
-        // When a Public-state pull lands, alias may update but token/host stay.
+        // The local node is the writer for its own device under sync v2 —
+        // a Public-state pull from a peer SG must NOT touch existing local
+        // apps (alias, token, host all stay). Only absent apps get added.
         let t = TestCtx::new();
         let local_uuid = t.ctx.node.read().unwrap().device_uuid;
         let real_host: SocketAddrV4 = "10.0.0.1:5555".parse().unwrap();
@@ -7886,7 +7941,7 @@ mod tests {
         let dev = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid).unwrap();
         assert_eq!(dev.applications.len(), 1);
         let app = &dev.applications[0];
-        assert_eq!(app.alias, "new-alias", "alias should update from wire");
+        assert_eq!(app.alias, "old-alias", "local alias must be preserved (sync v2 owns this)");
         assert_eq!(app.host, real_host,    "local host must be preserved");
         assert_eq!(app.token, real_token,  "local token must be preserved");
         assert_eq!(app.protocol, "udp",    "protocol stays local");
@@ -8115,6 +8170,33 @@ mod tests {
         let (len, _) = sg_socket.recv_from(&mut buf).expect("PullRequest expected");
         assert_eq!(buf[0], SYNC_PULL_REQUEST_OP);
         assert!(len > 1, "non-empty body");
+    }
+
+    #[test]
+    fn sync_update_available_skips_pull_when_both_sides_are_own_user_sgs() {
+        // Sync v2 (7c.6+) is the sole authority for Public-scope propagation
+        // between two own-user SGs — sync v1's cross-writer pull corrupts
+        // the multi-writer model. So a SyncUpdateAvailable from a peer that
+        // is also an own-user SG must NOT trigger send_pull_request.
+        let t = TestCtx::new();
+        let (sg_conn, sg_socket) = dg_setup_with_writer_capture(&t);
+        // Promote local to SG and the peer to also be an own-user SG.
+        promote_local_to_sg(&t, 1);
+        promote_peer_to_sg(&t, sg_conn.device_uuid, 2);
+
+        let announced = SyncVersion {
+            writer_sg_uuid: sg_conn.device_uuid, epoch: 2, seq: 5,
+        };
+        let mut body = Vec::new();
+        write_scope(&mut body, Scope::Public);
+        write_sync_version(&mut body, &announced);
+        let pkt = build_encrypted_packet(SYNC_UPDATE_AVAILABLE_OP, &sg_conn, &body);
+
+        sync_update_available("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 1024];
+        assert!(sg_socket.recv_from(&mut buf).is_err(),
+            "no PullRequest expected — sync v2 handles own-user-SG propagation");
     }
 
     #[test]
@@ -9603,6 +9685,48 @@ mod tests {
         assert_eq!(app.alias, "stays", "rollback should preserve the original alias");
     }
 
+    #[test]
+    fn rename_app_can_rename_peer_own_sg_device_app() {
+        // Per the v2 design, any own-user SG can publish a rename for any
+        // own-user app — not just apps on the local device. Required by the
+        // Stage C scalar-conflict scenario where the rank-2 SG renames the
+        // rank-1 SG's app while partitioned.
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 1);
+
+        // Add a second own-user SG device with one app on it.
+        let peer_uuid = generate_uuid();
+        let app_id    = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:   "sg-peer".to_string(),
+                uuid:    peer_uuid,
+                grade:   DeviceGrade::SG,
+                sg_rank: Some(2),
+                hosts:   vec!["peer-host:7777".to_string()],
+                applications: vec![Application {
+                    id:            app_id,
+                    alias:         "peer-app".to_string(),
+                    protocol:      "udp".to_string(),
+                    host:          "127.0.0.1:9001".parse().unwrap(),
+                    user_approved: true,
+                    token:         generate_uuid(),
+                }],
+            });
+        }
+
+        let body = format!("id={}&alias=renamed", uuid_hex(&app_id));
+        let res = rename_app(body.as_bytes(), &t.ctx);
+        assert_eq!(res, None);
+
+        let node = t.ctx.node.read().unwrap();
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == peer_uuid).unwrap();
+        let app = dev.applications.iter().find(|a| a.id == app_id).unwrap();
+        assert_eq!(app.alias, "renamed",
+                   "rename should apply on the peer SG device's app");
+    }
+
     // ── Partition banner + diagnostics (7c.8b) ──────────────────────────────
 
     #[test]
@@ -9947,8 +10071,20 @@ mod tests {
         }
 
         // Peer reports: w1 → (1, 4)  [lower, we win],
-        //                w2 → (5, 1) [we don't have, adopt peer's],
+        //                w2 → (5, 1) [peer-only, our implicit 0 means merged = (0,0)],
         //                w3 → (2, 9) [higher, peer wins].
+        // Also seed a w4 in OUR log only — peer's implicit 0 means merged
+        // should be (0,0) so our subsequent merge proposal ships all our w4
+        // entries (the bilateral-mutation case that 7c.8c exercises).
+        let w4: Uuid = [0x44; 16];
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.write_log.push(WriteLogEntry {
+                version: SyncVersion { writer_sg_uuid: w4, epoch: 7, seq: 1 },
+                scope:   Scope::Public, change_payload: vec![],
+                committed_at: SystemTime::now(),
+            });
+        }
         let peer_map: Vec<(Uuid, SyncVersion)> = vec![
             (w1, SyncVersion { writer_sg_uuid: w1, epoch: 1, seq: 4 }),
             (w2, SyncVersion { writer_sg_uuid: w2, epoch: 5, seq: 1 }),
@@ -9963,10 +10099,12 @@ mod tests {
             .expect("entry for peer");
         // w1: min((1,10), (1,4)) = (1,4)
         assert_eq!((stored[&w1].epoch, stored[&w1].seq), (1, 4));
-        // w2: peer-only, adopted
-        assert_eq!((stored[&w2].epoch, stored[&w2].seq), (5, 1));
+        // w2: peer-only — our implicit 0 → merged is (0,0)
+        assert_eq!((stored[&w2].epoch, stored[&w2].seq), (0, 0));
         // w3: min((2,3), (2,9)) = (2,3)
         assert_eq!((stored[&w3].epoch, stored[&w3].seq), (2, 3));
+        // w4: ours-only — peer's implicit 0 → merged is (0,0) so we ship our entries.
+        assert_eq!((stored[&w4].epoch, stored[&w4].seq), (0, 0));
     }
 
     // ── Merge proposal exchange (7c.4) ──────────────────────────────────────
@@ -10361,11 +10499,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_logs_scalar_update_higher_rank_wins() {
+    fn merge_logs_scalar_update_higher_rank_update_wins_over_lower_rank_update() {
         let wa = merge_writer_a();   // rank 1 — top
         let wb = merge_writer_b();   // rank 2
         let app = app_uuid(303);
-        // Local: rank-1 writer set alias to "ours" at later (epoch, seq).
+        // Local: rank-1 writer added the app, then renamed to "ours" via
+        // Update. Both Add and Update are from rank-1.
         let local = vec![
             change_entry(wa, 1, 1, &Change::AddDevice {
                 uuid: merge_dev_a(), alias: "phone".into(),
@@ -10373,12 +10512,15 @@ mod tests {
             }),
             change_entry(wa, 1, 2, &Change::AddApplication {
                 device_uuid: merge_dev_a(), app_id: app,
-                app_alias: "ours".into(),
+                app_alias: "initial".into(),
+            }),
+            change_entry(wa, 1, 3, &Change::UpdateApplicationAlias {
+                device_uuid: merge_dev_a(), app_id: app,
+                new_alias: "ours".into(),
             }),
         ];
-        // Peer: rank-2 writer ran an UpdateApplicationAlias to "theirs". Our
-        // higher rank should win even though peer's Update is "later" by
-        // (epoch, seq).
+        // Peer: rank-2 writer ran an Update at "later" (epoch, seq) but
+        // lower rank. Among Updates, higher rank wins → "ours" stays.
         let peer = vec![change_entry(wb, 9, 9, &Change::UpdateApplicationAlias {
             device_uuid: merge_dev_a(), app_id: app,
             new_alias: "theirs".into(),
@@ -10389,7 +10531,40 @@ mod tests {
         let out = merge_logs(&local, &peer, &ranks);
         assert_eq!(out.new_entries.len(), 1, "peer entry recorded");
         assert!(out.changes_to_apply.is_empty(),
-                "higher-rank local writer wins; no local state change");
+                "higher-rank Update wins over lower-rank Update; no local state change");
+    }
+
+    #[test]
+    fn merge_logs_update_beats_add_regardless_of_rank() {
+        // Bilateral partition recovery case: local high-rank writer Added
+        // the app pre-partition; peer low-rank writer Updated the alias
+        // during partition. The Update is the explicit alias change and
+        // must beat the Add's incidental alias regardless of rank.
+        let wa = merge_writer_a();   // rank 1 — top, did the Add
+        let wb = merge_writer_b();   // rank 2, did the Update
+        let app = app_uuid(909);
+        let local = vec![
+            change_entry(wa, 1, 1, &Change::AddDevice {
+                uuid: merge_dev_a(), alias: "phone".into(),
+                grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+            }),
+            change_entry(wa, 1, 2, &Change::AddApplication {
+                device_uuid: merge_dev_a(), app_id: app,
+                app_alias: "initial".into(),
+            }),
+        ];
+        let peer = vec![change_entry(wb, 2, 1, &Change::UpdateApplicationAlias {
+            device_uuid: merge_dev_a(), app_id: app,
+            new_alias: "renamed".into(),
+        })];
+        let mut ranks = HashMap::new();
+        ranks.insert(wa, 1);
+        ranks.insert(wb, 2);
+        let out = merge_logs(&local, &peer, &ranks);
+        assert_eq!(out.changes_to_apply, vec![Change::UpdateApplicationAlias {
+            device_uuid: merge_dev_a(), app_id: app,
+            new_alias: "renamed".into(),
+        }]);
     }
 
     #[test]

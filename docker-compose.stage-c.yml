@@ -1,19 +1,23 @@
 # Stage C test topology — single user (alice) with 2 SGs partitionable via
-# a controllable bridge network.
+# a pair of UDP relay sidecars.
 #
 # Goal: exercise sync v2 partition reconciliation (ops 0x78/0x79/0x7A/0x7B
-# + the periodic merge tick) end-to-end. After bring-up both SGs see each
-# other and converge on the device-app graph; the harness then disconnects
-# one SG from the shared bridge to simulate a partition, mutates state on
-# each side via the admin UI, reconnects the bridge, and asserts both sides
-# converge to the merged target within a few periodic-tick cycles.
+# + the periodic merge tick) end-to-end, including bilateral mutation
+# during partition (union + rank-based scalar conflict).
 #
 # Networks:
-#   net-side-1  — sg-alice-1 + probe-1 (sg-1's "local LAN")
-#   net-side-2  — sg-alice-2 + probe-2 (sg-2's "local LAN")
-#   net-shared  — both SGs (the WAN we partition). Disconnect sg-alice-2 from
-#                 this network to break SG↔SG reachability without affecting
-#                 either SG's local probe.
+#   net-side-1  — sg-alice-1 + probe-1 (sg-1's "local LAN", direct probe path)
+#   net-side-2  — sg-alice-2 + probe-2 (sg-2's "local LAN", direct probe path)
+#   net-shared  — both SGs *and* both UDP relays. SG↔SG traffic always flows
+#                 through the relays: each SG advertises its relay's hostname
+#                 via PNET_HOSTS, so peers address it via the relay.
+#
+# Partition mechanism (bilateral-safe): `podman pause` both proxy-sg-N
+# sidecars. Pausing freezes the socat fork children but preserves their UDP
+# socket bindings — so the SGs' `ActiveConnection.peer_addr` (which points at
+# a socat child's ephemeral port) stays valid across the partition, and
+# convergence after unpause flows through the 7c.6.5 periodic merge tick.
+# Both SGs remain running throughout, free to mutate state in parallel.
 #
 # Bring-up via tests/stage-c/run.sh; assertions in tests/stage-c/test.sh.
 
@@ -37,10 +41,11 @@ services:
       - PNET_USER_ALIAS=alice
       - PNET_DEVICE_ALIAS=sg-alice-1
       - PNET_SG_RANK=1
-      - PNET_HOSTS=sg-alice-1
+      - PNET_HOSTS=proxy-sg-1
       - PNET_AUTO_APPROVE_APPS=1
     volumes:
       - pnet-data-sg-alice-1:/root/.pnet
+    depends_on: [proxy-sg-1]
 
   sg-alice-2:
     build: .
@@ -51,12 +56,25 @@ services:
       - PNET_GRADE=sg
       - PNET_DEVICE_ALIAS=sg-alice-2
       - PNET_SG_RANK=2
-      - PNET_HOSTS=sg-alice-2
+      - PNET_HOSTS=proxy-sg-2
       - PNET_INVITATION_CODE=${INV_SG2:-}
       - PNET_AUTO_APPROVE_APPS=1
     volumes:
       - pnet-data-sg-alice-2:/root/.pnet
-    depends_on: [sg-alice-1]
+    depends_on: [sg-alice-1, proxy-sg-2]
+
+  # SG-side UDP relays. socat UDP-LISTEN,fork keeps a long-lived child per
+  # source address; -t 86400 keeps idle children alive across long quiet
+  # periods so peer_addr stays valid across partitions.
+  proxy-sg-1:
+    image: docker.io/alpine/socat:latest
+    networks: [net-shared]
+    command: -t 86400 UDP4-LISTEN:7777,fork,reuseaddr UDP4:sg-alice-1:7777
+
+  proxy-sg-2:
+    image: docker.io/alpine/socat:latest
+    networks: [net-shared]
+    command: -t 86400 UDP4-LISTEN:7777,fork,reuseaddr UDP4:sg-alice-2:7777
 
   probe-1:
     build:

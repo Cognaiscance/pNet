@@ -144,16 +144,20 @@ require jq
 require podman
 
 say "tearing down any prior stack..."
-# A previous test.sh that died between pause and unpause leaves sg-alice-2
-# paused; `compose down` refuses to clean a paused container, so undo first.
-podman unpause pnet-sg-alice-2-1 >/dev/null 2>&1 || true
+# A previous test.sh that died between pause and unpause leaves the proxies
+# (or, from the pre-7c.8c topology, sg-alice-2) paused; `compose down`
+# refuses to clean a paused container, so undo first.
+"${COMPOSE[@]}" unpause proxy-sg-1 proxy-sg-2 sg-alice-2 >/dev/null 2>&1 || true
 "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
 
 say "building images..."
 "${COMPOSE[@]}" build
 
+say "starting UDP relays..."
+"${COMPOSE[@]}" up -d --no-recreate proxy-sg-1 proxy-sg-2
+
 say "starting sg-alice-1 + probe-1..."
-"${COMPOSE[@]}" up -d sg-alice-1 probe-1
+"${COMPOSE[@]}" up -d --no-recreate sg-alice-1 probe-1
 
 say "waiting up to ${ADMIN_WAIT_SECS}s for sg-alice-1 admin HTTP..."
 wait_for_url "${SG1_ADMIN}/" "$ADMIN_WAIT_SECS"
@@ -163,7 +167,7 @@ INV_SG2=$(mint_device_invitation "$SG1_ADMIN")
 say "  INV_SG2 = ${INV_SG2:0:32}..."
 
 say "starting sg-alice-2 + probe-2..."
-INV_SG2="$INV_SG2" "${COMPOSE[@]}" up -d sg-alice-2 probe-2
+INV_SG2="$INV_SG2" "${COMPOSE[@]}" up -d --no-recreate sg-alice-2 probe-2
 
 say "waiting up to ${ADMIN_WAIT_SECS}s for sg-alice-2 admin HTTP..."
 wait_for_url "${SG2_ADMIN}/" "$ADMIN_WAIT_SECS"
