@@ -8,8 +8,22 @@ use std::time::Duration;
 use super::action_queue::{Action, PRIORITY_NORMAL};
 use super::thread_pool::SharedQueue;
 
+/// Default admin-UI HTTP port, overridable via `PNET_HTTP_PORT`.
+pub const DEFAULT_HTTP_PORT: u16 = 8777;
+
 pub struct HttpServer {
     handle: thread::JoinHandle<()>,
+}
+
+/// Admin-UI HTTP port: `PNET_HTTP_PORT` if set and parseable, else
+/// `DEFAULT_HTTP_PORT`. Mirrors `udp_listener::udp_port`. Lets two node
+/// instances coexist on one host (distinct `PNET_UDP_PORT` + `PNET_HTTP_PORT`
+/// + `HOME`).
+pub fn http_port() -> u16 {
+    std::env::var("PNET_HTTP_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_HTTP_PORT)
 }
 
 impl HttpServer {

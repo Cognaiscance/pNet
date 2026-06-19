@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use lib::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW};
 use lib::data_models::DeviceGrade;
 use lib::handlers::{apply_new_user_setup, parse_pnet_hosts, start_bootstrap};
-use lib::http_server::HttpServer;
+use lib::http_server::{http_port, HttpServer};
 use lib::persistence;
 use lib::scheduler::SchedulerThread;
 use lib::thread_pool::{SharedQueue, ThreadPool};
@@ -189,9 +189,10 @@ fn main() {
             .unwrap_or(false);
         if is_dg && !force_all { std::net::Ipv4Addr::LOCALHOST } else { std::net::Ipv4Addr::UNSPECIFIED }
     };
-    let http = HttpServer::start(http_bind, 8777, Arc::clone(&queue), Arc::clone(&stop));
+    let hport = http_port();
+    let http = HttpServer::start(http_bind, hport, Arc::clone(&queue), Arc::clone(&stop));
 
-    println!("[main] running. HTTP on {http_bind}:8777");
+    println!("[main] running. HTTP on {http_bind}:{hport}");
 
     // ── Wait for SIGINT / SIGTERM ─────────────────────────────────────────────
     ctrlc::set_handler({

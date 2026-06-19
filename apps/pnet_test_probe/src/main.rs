@@ -137,10 +137,10 @@ fn log_event(inner: &Mutex<Inner>, event: Value) {
 
 // ── Protocol builders ────────────────────────────────────────────────────────
 
-fn build_register(alias: &str) -> Vec<u8> {
+fn build_register(alias: &str, push_port: u16) -> Vec<u8> {
     let mut buf = vec![OP_REGISTER];
     push_str(&mut buf, alias);
-    buf.extend_from_slice(&PUSH_PORT.to_be_bytes());
+    buf.extend_from_slice(&push_port.to_be_bytes());
     push_str(&mut buf, APP_PROTOCOL);
     buf
 }
@@ -306,8 +306,8 @@ fn resolve_target(
 
 // ── Networking ───────────────────────────────────────────────────────────────
 
-async fn register(ctrl: &UdpSocket, pnet_addr: SocketAddr, alias: &str) -> Option<[u8; 16]> {
-    ctrl.send_to(&build_register(alias), pnet_addr).await.ok()?;
+async fn register(ctrl: &UdpSocket, pnet_addr: SocketAddr, alias: &str, push_port: u16) -> Option<[u8; 16]> {
+    ctrl.send_to(&build_register(alias, push_port), pnet_addr).await.ok()?;
     let mut buf = [0u8; 512];
     let (len, _) = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -522,6 +522,11 @@ async fn main() {
     let pnet_addr_str = std::env::var("PNET_ADDR").unwrap_or_else(|_| PNET_ADDR_DEFAULT.to_string());
     let probe_alias = std::env::var("PNET_PROBE_ALIAS").unwrap_or_else(|_| PROBE_ALIAS_DEFAULT.to_string());
     let http_bind = std::env::var("PNET_PROBE_HTTP_BIND").unwrap_or_else(|_| HTTP_BIND_DEFAULT.to_string());
+    // Push/ctrl ports are env-overridable so multiple probes can share one host.
+    let push_port: u16 = std::env::var("PNET_PROBE_PUSH_PORT").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(PUSH_PORT);
+    let ctrl_port: u16 = std::env::var("PNET_PROBE_CTRL_PORT").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(CTRL_PORT);
 
     let pnet_addr: SocketAddr = tokio::net::lookup_host(&pnet_addr_str).await
         .unwrap_or_else(|e| panic!("invalid PNET_ADDR {pnet_addr_str:?}: {e}"))
@@ -529,11 +534,11 @@ async fn main() {
         .unwrap_or_else(|| panic!("PNET_ADDR {pnet_addr_str:?} resolved to no addresses"));
 
     let push_socket = Arc::new(
-        UdpSocket::bind(format!("0.0.0.0:{PUSH_PORT}")).await
+        UdpSocket::bind(format!("0.0.0.0:{push_port}")).await
             .expect("failed to bind push UDP socket"),
     );
     let ctrl_socket = Arc::new(
-        UdpSocket::bind(format!("0.0.0.0:{CTRL_PORT}")).await
+        UdpSocket::bind(format!("0.0.0.0:{ctrl_port}")).await
             .expect("failed to bind ctrl UDP socket"),
     );
 
@@ -554,14 +559,14 @@ async fn main() {
         "kind": "startup",
         "pnet_addr": pnet_addr_str,
         "probe_alias": probe_alias,
-        "push_port": PUSH_PORT,
-        "ctrl_port": CTRL_PORT,
+        "push_port": push_port,
+        "ctrl_port": ctrl_port,
     }));
 
     // Register with retries — pnet may not have its UDP listener up immediately.
     let mut token: Option<[u8; 16]> = None;
     for attempt in 1..=10 {
-        match register(&state.ctrl_socket, pnet_addr, &probe_alias).await {
+        match register(&state.ctrl_socket, pnet_addr, &probe_alias, push_port).await {
             Some(t) => { token = Some(t); break; }
             None => {
                 log_event(&state.inner, json!({

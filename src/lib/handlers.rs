@@ -146,8 +146,10 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     let alias_for_log = alias.clone();
 
+    let host_addr = SocketAddrV4::new(ip, port);
+
     // Update node.
-    let (token, next_id, device_uuid) = {
+    let (token, next_id, device_uuid, is_new) = {
         let mut node = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
 
@@ -159,24 +161,36 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             .find(|d| d.uuid == device_uuid)
             .expect("local device not found in node");
 
-        // App ids are UUIDs (see Application.id docs) — partition-safe by
-        // construction. Generate fresh; collision probability is negligible.
-        let next_id = generate_uuid();
-
-        let token = generate_uuid();
-        device.applications.push(Application {
-            id: next_id,
-            alias,
-            protocol,
-            host: SocketAddrV4::new(ip, port),
-            user_approved: auto_approve,
-            token,
-        });
-        (token, next_id, device_uuid)
+        // Idempotent re-registration. OP_REGISTER is UDP and the app re-sends
+        // when its ACK is lost (and on restart from the same endpoint); without
+        // this each retry would spawn a duplicate app, since ids are UUIDs
+        // minted per call. Key on (alias, host): the same app at the same
+        // endpoint is one logical app — reuse its id+token.
+        if let Some(existing) = device
+            .applications
+            .iter()
+            .find(|a| a.alias == alias && a.host == host_addr)
+        {
+            (existing.token, existing.id, device_uuid, false)
+        } else {
+            // App ids are UUIDs (see Application.id docs) — partition-safe by
+            // construction. Generate fresh; collision probability is negligible.
+            let next_id = generate_uuid();
+            let token = generate_uuid();
+            device.applications.push(Application {
+                id: next_id,
+                alias,
+                protocol,
+                host: host_addr,
+                user_approved: auto_approve,
+                token,
+            });
+            (token, next_id, device_uuid, true)
+        }
         // write lock released here
     };
 
-    if auto_approve {
+    if auto_approve && is_new {
         // Sync v1: publish id+alias to peers via the writer SG. A DG without
         // a reachable writer SG cannot publish state changes — roll back the
         // local app and reject the registration. The caller is responsible
@@ -1648,7 +1662,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let nonce:           [u8; 24]  = buf[48..72].try_into().unwrap();
     let ciphertext:      &[u8]     = &buf[72..];
 
-    let (shared_secret, response_payload) = {
+    let (shared_secret, response_payload, new_contact_uuid) = {
         let mut node = ctx.node.write().unwrap();
         let now = SystemTime::now();
 
@@ -1678,6 +1692,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         };
 
         // Add requester as a contact if not already present.
+        let contact_uuid = data.uuid;
         if !node.owner.contact_users.iter().any(|c| c.user.uuid == data.uuid) {
             eprintln!("[contact_request] adding contact '{}' from {src}", data.alias);
             node.owner.contact_users.push(Contact {
@@ -1688,13 +1703,17 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
 
         let response_payload = serialize_contact_payload(&node);
-        (shared_secret, response_payload)
+        (shared_secret, response_payload, contact_uuid)
     };
 
     ctx.save_node();
     // contact_request added a new contact to contact_users — that's a
     // public-scope mutation. Fan out via sync v1 if we are the writer SG.
     bump_public_and_fan_out_if_writer(ctx);
+    // Catch up on the new contact's public state now, in case the SG↔SG
+    // connection already exists (its connect_ack pull may have run before this
+    // contact was registered).
+    cross_user_pull_for_contact(new_contact_uuid, ctx);
 
     // Encrypt and send ContactResponse.
     let (ciphertext, resp_nonce) = xchacha20_encrypt(&shared_secret, &response_payload);
@@ -1749,6 +1768,7 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     };
 
+    let new_contact_uuid = data.uuid;
     {
         let mut node = ctx.node.write().unwrap();
         if !node.owner.contact_users.iter().any(|c| c.user.uuid == data.uuid) {
@@ -1766,6 +1786,10 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // contact_response added a new contact to contact_users — that's a
     // public-scope mutation. Fan out via sync v1 if we are the writer SG.
     bump_public_and_fan_out_if_writer(ctx);
+    // Catch up on the new contact's public state now, in case the SG↔SG
+    // connection already exists (its connect_ack pull may have run before this
+    // contact was registered).
+    cross_user_pull_for_contact(new_contact_uuid, ctx);
 
     // Trigger connection maintenance — we have a new contact.
     ctx.scheduler_tx.send(super::action_queue::ScheduleRequest {
@@ -2434,6 +2458,28 @@ fn cross_user_pull_on_reconnect(conn_id: u16, ctx: &WorkerContext) {
     };
     if let Some((pkt, addr)) = pkt_and_addr {
         send(ctx, addr, &pkt);
+    }
+}
+
+/// Fire a cross-user pull for a freshly-added contact over any active
+/// connection we already hold to one of its devices. Closes the ordering race
+/// where the SG↔SG connection's `connect_ack` (which normally drives the pull)
+/// fired *before* the contact was registered — in that case the connect_ack
+/// pull no-ops and nothing else retries. Called from the contact handlers.
+fn cross_user_pull_for_contact(contact_uuid: Uuid, ctx: &WorkerContext) {
+    let conn_ids: Vec<u16> = {
+        let node = ctx.node.read().unwrap();
+        let Some(contact) = node.owner.contact_users.iter()
+            .find(|c| c.user.uuid == contact_uuid)
+        else { return };
+        let dev_uuids: Vec<Uuid> = contact.user.devices.iter().map(|d| d.uuid).collect();
+        node.owner.active_connections.values()
+            .filter(|c| dev_uuids.contains(&c.device_uuid))
+            .map(|c| c.id)
+            .collect()
+    };
+    for cid in conn_ids {
+        cross_user_pull_on_reconnect(cid, ctx);
     }
 }
 
@@ -6583,6 +6629,25 @@ mod tests {
         let device = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
         assert_eq!(device.applications.len(), 2);
         assert_ne!(device.applications[0].id, device.applications[1].id);
+    }
+
+    #[test]
+    fn app_register_is_idempotent_on_repeat() {
+        // OP_REGISTER is UDP; an app re-sends when its ACK is lost. A repeat of
+        // the same (alias, host) must reuse the app, not spawn a duplicate.
+        let t = TestCtx::new();
+        app_register(t.app_addr(), register_packet("probe", 9001, "udp"), &t.ctx);
+        let reply1 = t.recv_reply();
+        app_register(t.app_addr(), register_packet("probe", 9001, "udp"), &t.ctx);
+        let reply2 = t.recv_reply();
+
+        assert_eq!(&reply1[1..17], &reply2[1..17], "retry must return the same token");
+
+        let node = t.ctx.node.read().unwrap();
+        let device_uuid = node.device_uuid;
+        let device = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
+        let probes = device.applications.iter().filter(|a| a.alias == "probe").count();
+        assert_eq!(probes, 1, "re-registration must not create a duplicate app");
     }
 
     #[test]
