@@ -3898,12 +3898,23 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             }
         }
 
-        // One bump per merge, not per Change. Uses the local SG's uuid: from
-        // this node's perspective, the merge IS the write that produced the
-        // new state, so DGs and own peers should see a fresh version under
-        // our writer and pull.
+        // One bump per merge, not per Change — the merge IS the write that
+        // produced the new state, so DGs and own peers see a fresh version and
+        // pull. Stamp it under the deterministically-elected writer (the
+        // highest-rank reachable own SG, via the rank walk — NOT the
+        // known-writer fast path, which may still carry a self-elected uuid
+        // from the partition) rather than `local_uuid`. Otherwise both sides of
+        // a bilateral heal stamp themselves, leaving the cluster with two SGs
+        // each claiming to be the writer; routing then disagrees until the next
+        // poll re-elects. Electing rank-1 here makes both survivors converge on
+        // the same writer_sg_uuid and repairs this node's fast path in one step.
         if any_state_change {
-            node.owner.bump_version(scope, local_uuid);
+            let writer_uuid = match find_pull_source(&node) {
+                WriterTarget::Local       => local_uuid,
+                WriterTarget::Remote(u)   => u,
+                WriterTarget::Unreachable => local_uuid,
+            };
+            node.owner.bump_version(scope, writer_uuid);
         }
 
         match scope {
@@ -10376,6 +10387,51 @@ mod tests {
         let (_, _, result) = parse_merge_ack_body(&plaintext).expect("parse");
         assert_eq!(result, MERGE_ACK_RESULT_APPLIED);
         let _ = local_uuid; // silence unused warning if any
+    }
+
+    #[test]
+    fn merge_bump_stamps_elected_rank1_writer_not_local() {
+        // Gap 2 (writer-identity pollution): a rank-2 SG (zeus, local) that
+        // self-elected and wrote during a partition heals against its rank-1
+        // SG (golden, the reachable peer). When zeus applies golden's merge,
+        // the resulting head must be stamped under golden (the elected rank-1
+        // writer), NOT under zeus — otherwise both survivors claim writer and
+        // routing disagrees until the next poll. Pre-fix this asserted local.
+        let t = TestCtx::new();
+        let (_, peer_conn, _peer_socket) = writer_setup_with_capture(&t);
+        let golden_uuid = peer_conn.device_uuid;     // reachable peer (active conn)
+        promote_local_to_sg(&t, 2);                  // zeus, rank 2
+        promote_peer_to_sg(&t, golden_uuid, 1);      // golden, rank 1
+        let local_uuid = t.ctx.node.read().unwrap().device_uuid;
+        {
+            // Simulate zeus having self-elected + written during the partition:
+            // its head currently points at itself.
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.public_version =
+                SyncVersion { writer_sg_uuid: local_uuid, epoch: 2, seq: 3 };
+        }
+
+        // golden proposes a state-changing entry under its own writer uuid.
+        let added_device = [0xDE; 16];
+        let entries = vec![change_entry(golden_uuid, 1, 1, &Change::AddDevice {
+            uuid: added_device, alias: "golden-dev".into(),
+            grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
+        })];
+        let body = build_merge_proposal_body(
+            Scope::Public,
+            SyncVersion { writer_sg_uuid: golden_uuid, epoch: 1, seq: 1 },
+            &entries,
+        );
+        let pkt = build_encrypted_packet(MERGE_PROPOSAL_OP, &peer_conn, &body);
+        merge_proposal("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let node = t.ctx.node.read().unwrap();
+        assert!(node.owner.user.devices.iter().any(|d| d.uuid == added_device),
+            "merge applied golden's change");
+        assert_eq!(node.owner.public_version.writer_sg_uuid, golden_uuid,
+            "head must be stamped under the elected rank-1 writer (golden), not local");
+        assert_ne!(node.owner.public_version.writer_sg_uuid, local_uuid,
+            "must no longer claim self as writer after healing to a rank-1 SG");
     }
 
     #[test]

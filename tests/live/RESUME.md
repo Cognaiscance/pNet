@@ -67,9 +67,11 @@ session — re-authorize if prompted.)
    the window to ~1 ping timeout. **Re-run the bilateral nft partition (golden
    rank1 + zeus rank2, both rename their own app during the cut) and confirm heal
    now converges BOTH directions.**
-   - Related latent issue (not yet fixed): `merge_proposal` stamps
-     `writer_sg_uuid=local_uuid` on heal (handlers.rs ~3882), so both SGs claim
-     writer post-heal. Deferred as its own follow-up.
+   - ~~Related latent issue: `merge_proposal` stamps `writer_sg_uuid=local_uuid`
+     on heal, so both SGs claim writer post-heal.~~ FIXED 2026-06-19 (7c.12): the
+     merge bump now stamps the elected rank-1 writer (`find_pull_source` rank
+     walk) so both survivors converge on the same writer_sg_uuid. Test:
+     `merge_bump_stamps_elected_rank1_writer_not_local`.
 2. **Gap #2** — contact public-state not propagated to non-writer own SGs.
 3. **SIGTERM hang** — graceful shutdown never completes.
 4. **P4 WAN DG join** — not yet run (needs the n64 public anchor).
