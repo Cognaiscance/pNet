@@ -2196,6 +2196,30 @@ fn apply_change_locally(
     Ok((private, public))
 }
 
+/// `find_writer_sg` with an on-demand failover probe on the `Unreachable`
+/// path. The periodic `poll_sg` (every `POLL_SG_INTERVAL`, currently 30s) is
+/// what marks a partitioned higher-rank writer down so a lower-rank SG can
+/// elect itself. Between partition onset and the next poll tick, a rank-N SG's
+/// write would hit `Unreachable` and be lost (terminal — no retry/queue). To
+/// close that window, re-poll synchronously the moment a write can't find a
+/// writer and re-evaluate: a real partition → the writer's ping times out
+/// (~`SG_PING_TIMEOUT`) → it's marked down → we self-elect; a transient blip
+/// where the writer is actually up → its pong arrives → we route remotely and
+/// avoid a spurious split-brain. The probe fires only on `Unreachable`, so the
+/// healthy `Local`/`Remote` write paths pay no extra cost.
+fn find_writer_sg_probing(ctx: &WorkerContext) -> WriterTarget {
+    let first = {
+        let node = ctx.node.read().unwrap();
+        find_writer_sg(&node)
+    };
+    if !matches!(first, WriterTarget::Unreachable) {
+        return first;
+    }
+    poll_sg(ctx);
+    let node = ctx.node.read().unwrap();
+    find_writer_sg(&node)
+}
+
 /// Drive a state change through the writer-SG model. Used by any node that
 /// wants to mutate state (UI, app-approval flow in phase 7, etc.):
 ///
@@ -2204,12 +2228,11 @@ fn apply_change_locally(
 ///   and return `Ok(())` immediately. The matching ack arrives later via
 ///   `sync_write_ack`. Phase 5 will turn the ack into "trigger a pull to
 ///   refresh local state and clear pending UI."
-/// - `WriterTarget::Unreachable` — return `Err(Unreachable)`.
+/// - `WriterTarget::Unreachable` — return `Err(Unreachable)`. An on-demand
+///   poll (`find_writer_sg_probing`) is attempted first so a partitioned
+///   rank-N SG can fail over without waiting for the periodic poll tick.
 pub fn request_change(change: Change, ctx: &WorkerContext) -> Result<(), WriteError> {
-    let target = {
-        let node = ctx.node.read().unwrap();
-        find_writer_sg(&node)
-    };
+    let target = find_writer_sg_probing(ctx);
     match target {
         WriterTarget::Local => {
             let local_uuid = ctx.node.read().unwrap().device_uuid;
@@ -10372,6 +10395,49 @@ mod tests {
         let (len, _) = peer_socket.recv_from(&mut buf).expect("probe sent");
         assert!(len >= 1);
         assert_eq!(buf[0], WATERMARK_PROBE_REQUEST_OP);
+    }
+
+    #[test]
+    fn request_change_rank2_sg_self_elects_via_on_demand_probe_during_partition() {
+        // P5 lost-write bug: a rank-2 SG (zeus) whose rank-1 writer (golden)
+        // is partitioned away but NOT yet polled-down must still be able to
+        // write. `find_writer_sg` alone returns Unreachable (no status yet);
+        // the write path's on-demand probe re-polls (golden's ping to a dead
+        // host times out / refuses → recorded down), then re-elects zeus. The
+        // change applies, bumps under zeus's own uuid, and lands in the write
+        // log so partition reconciliation can propose it back to golden on heal.
+        let t = TestCtx::new();
+        let local_uuid = promote_local_to_sg(&t, 2);
+        let app_id = app_uuid(77);
+        // golden: rank-1, partitioned (no conn), and unpolled (no sg_status).
+        // Its advertised host has no listener, so the on-demand ping fails.
+        let golden = add_peer_sg(&t, 1, /*conn*/ false, /*polled_up*/ None);
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == local_uuid).unwrap();
+            dev.applications.push(Application {
+                id: app_id, alias: "before".into(), protocol: "udp".into(),
+                host: "127.0.0.1:7001".parse().unwrap(),
+                user_approved: true, token: [0u8; 16],
+            });
+            // Pre-partition, the network told us golden was the writer.
+            node.owner.public_version =
+                SyncVersion { writer_sg_uuid: golden, epoch: 1, seq: 5 };
+        }
+
+        request_change(Change::UpdateApplicationAlias {
+            device_uuid: local_uuid, app_id, new_alias: "after".into(),
+        }, &t.ctx).expect("rank-2 SG should self-elect via probe and accept the write");
+
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(node.owner.public_version.writer_sg_uuid, local_uuid,
+            "write must be stamped under the self-elected writer");
+        assert_eq!(node.owner.write_log.len(), 1, "self-write must be logged");
+        assert_eq!(node.owner.write_log[0].version.writer_sg_uuid, local_uuid,
+            "log entry under own uuid so heal can propose it to the rank-1 SG");
+        let dev = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid).unwrap();
+        assert_eq!(dev.applications[0].alias, "after", "rename applied locally");
     }
 
     /// Drain packets from `socket` until one with op byte == `wanted_op` is

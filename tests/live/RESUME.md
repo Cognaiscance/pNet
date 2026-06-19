@@ -57,10 +57,21 @@ session — re-authorize if prompted.)
   fallback) — that's why mixed LAN+WAN can't share one node.
 
 ## Open work (next session)
-1. **P5 write-log bug** — rank-2 SG's during-partition write isn't appended to
-   its write log → bilateral heal converges one direction only. (Highest impact.)
+1. ~~**P5 write-log bug**~~ — FIXED in code 2026-06-19 (commit 7c.11), pending
+   live re-validation. Root cause was NOT a missing write-log append (that path
+   was fine); it was **writer-election timing**: a rank-2 SG could only self-elect
+   writer after the rank-1 was confirmed polled-down (up to POLL_SG_INTERVAL=30s),
+   and during that window its write hit `Unreachable` and was rolled back (lost),
+   so it had nothing to propose on heal. Fix: `find_writer_sg_probing` fires an
+   on-demand `poll_sg` on the Unreachable write path and re-evaluates, collapsing
+   the window to ~1 ping timeout. **Re-run the bilateral nft partition (golden
+   rank1 + zeus rank2, both rename their own app during the cut) and confirm heal
+   now converges BOTH directions.**
+   - Related latent issue (not yet fixed): `merge_proposal` stamps
+     `writer_sg_uuid=local_uuid` on heal (handlers.rs ~3882), so both SGs claim
+     writer post-heal. Deferred as its own follow-up.
 2. **Gap #2** — contact public-state not propagated to non-writer own SGs.
 3. **SIGTERM hang** — graceful shutdown never completes.
 4. **P4 WAN DG join** — not yet run (needs the n64 public anchor).
-5. Decide what to commit: the 4 fixes (PNET_HTTP_PORT, idempotent app_register,
-   configurable probe ports, cross-user pull on fresh contact) + `tests/live/`.
+5. ~~Decide what to commit~~ — DONE: 4 fixes committed as 7c.9 (`07d6fb3`),
+   `tests/live/` as 7c.10 (`fa50eb5`); both pushed to origin/develop.
