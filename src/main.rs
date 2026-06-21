@@ -223,6 +223,14 @@ fn main() {
     println!("[main] draining queue and stopping workers...");
     pool.join();
 
+    // Drop the last `WorkerContext` Arc before joining the writer. The writer
+    // thread exits only when every `writer_tx` clone is dropped (its recv()
+    // returns Err on channel close). `WorkerContext` holds one such clone; the
+    // workers' Arc clones are gone once `pool.join()` returns, but `main` still
+    // holds the original `ctx` here — so without this drop, `writer.join()`
+    // blocks forever and SIGTERM never completes a clean shutdown.
+    drop(ctx);
+
     println!("[main] stopping writer...");
     writer.join();
 
@@ -259,7 +267,13 @@ mod tests {
             writer_tx:    writer.sender(),
             scheduler_tx,
         });
-        let mut pool = ThreadPool::new(2, Arc::clone(&queue), Arc::clone(&stop), ctx);
+        // Retain `ctx` in this scope via Arc::clone, exactly as `main` does.
+        // This is what makes the test faithful: the lingering `WorkerContext`
+        // holds a `writer_tx` clone, so the shutdown sequence MUST drop `ctx`
+        // before `writer.join()` or the writer channel never closes and the
+        // join hangs (the SIGTERM hang). Moving `ctx` into the pool would hide
+        // the bug.
+        let mut pool = ThreadPool::new(2, Arc::clone(&queue), Arc::clone(&stop), Arc::clone(&ctx));
 
         let http = HttpServer::start(std::net::Ipv4Addr::LOCALHOST, 0, Arc::clone(&queue), Arc::clone(&stop));
 
@@ -269,10 +283,21 @@ mod tests {
             cvar.notify_all();
         }
 
-        udp.join();
-        http.join();
-        scheduler.join();
-        pool.join();
-        writer.join();
+        // Run shutdown in a watched thread: a regression here would otherwise
+        // hang the whole test binary, so bound it with a timeout and fail loudly.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            udp.join();
+            http.join();
+            scheduler.join();
+            pool.join();
+            drop(ctx); // release the last WorkerContext → closes the writer_tx clone
+            writer.join();
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown hung — writer.join blocked on a live writer_tx clone");
+        shutdown.join().unwrap();
     }
 }

@@ -50,7 +50,10 @@ session — re-authorize if prompted.)
 - golden now has `nftables` installed (for `partition.sh`). Partition bob's SGs:
   `bash partition.sh cut golden 192.168.1.116 7777` / `... heal golden`.
 - Kill nodes with the `[p]net-live/bin/pnet` bracket pattern (pkill self-match!).
-- pnet hangs on SIGTERM — always SIGKILL (`down.sh` does).
+- ~~pnet hangs on SIGTERM — always SIGKILL (`down.sh` does).~~ FIXED 2026-06-21
+  (7c.14): `main` now drops the `WorkerContext` Arc before `writer.join()`, so
+  the writer's `recv()` sees the channel close and exits. `down.sh` can use plain
+  SIGTERM now (still SIGKILLs as a backstop — fine to leave).
 - zeus has a pre-existing service on :3000 → its probe uses :3010.
 - Only n64 has public UDP forwarding (7777/7778 → pnet.thehomegarage.com); the
   others are LAN-only. pNet dials only the first advertised host (no LAN/public
@@ -83,7 +86,13 @@ session — re-authorize if prompted.)
    periodic cross-user pulls would storm the cluster — now a true no-op. Tests:
    `merge_proposal_upsert_contact_reaches_non_writer_sg`,
    `contact_request_duplicate_not_added_twice`.
-3. **SIGTERM hang** — graceful shutdown never completes.
+3. ~~**SIGTERM hang** — graceful shutdown never completes.~~ FIXED 2026-06-21
+   (7c.14): `writer.join()` blocked forever because `main` held the last
+   `writer_tx` clone (inside the retained `ctx` Arc), so the writer channel never
+   closed. `main` now `drop(ctx)`s after `pool.join()` and before `writer.join()`.
+   The integration test `full_startup_and_shutdown` was rewritten to faithfully
+   retain `ctx` like `main` and watchdog the shutdown (5s timeout) so the hang
+   can't regress silently.
 4. **P4 WAN DG join** — not yet run (needs the n64 public anchor).
 5. ~~Decide what to commit~~ — DONE: 4 fixes committed as 7c.9 (`07d6fb3`),
    `tests/live/` as 7c.10 (`fa50eb5`); both pushed to origin/develop.
