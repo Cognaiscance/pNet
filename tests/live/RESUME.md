@@ -72,7 +72,17 @@ session — re-authorize if prompted.)
      merge bump now stamps the elected rank-1 writer (`find_pull_source` rank
      walk) so both survivors converge on the same writer_sg_uuid. Test:
      `merge_bump_stamps_elected_rank1_writer_not_local`.
-2. **Gap #2** — contact public-state not propagated to non-writer own SGs.
+2. ~~**Gap #2** — contact public-state not propagated to non-writer own SGs.~~
+   FIXED 2026-06-21 (7c.13): contact mutations (`contact_request`,
+   `contact_response`, `cross_user_pull_response`) now route through a new
+   `Change::UpsertContact` + `request_change_idempotent`, so the writer logs them
+   and the merge channel reconciles them to rank-2+ own SGs (they gain the
+   contact's public_key + cached apps and can validate its connect_requests).
+   The idempotent variant also closed a latent over-bump: the originator
+   `Local` path force-bumped + logged + notified even on a no-op, so unchanged
+   periodic cross-user pulls would storm the cluster — now a true no-op. Tests:
+   `merge_proposal_upsert_contact_reaches_non_writer_sg`,
+   `contact_request_duplicate_not_added_twice`.
 3. **SIGTERM hang** — graceful shutdown never completes.
 4. **P4 WAN DG join** — not yet run (needs the n64 public anchor).
 5. ~~Decide what to commit~~ — DONE: 4 fixes committed as 7c.9 (`07d6fb3`),

@@ -1662,7 +1662,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let nonce:           [u8; 24]  = buf[48..72].try_into().unwrap();
     let ciphertext:      &[u8]     = &buf[72..];
 
-    let (shared_secret, response_payload, new_contact_uuid) = {
+    let (shared_secret, response_payload, contact_uuid, contact_change) = {
         let mut node = ctx.node.write().unwrap();
         let now = SystemTime::now();
 
@@ -1691,29 +1691,35 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         };
 
-        // Add requester as a contact if not already present.
+        // Build the contact upsert from the handshake payload. Don't mutate
+        // contact_users inline — route it through request_change below so the
+        // writer logs it and non-writer own SGs reconcile it via merge (Gap #2).
+        eprintln!("[contact_request] adding contact '{}' from {src}", data.alias);
         let contact_uuid = data.uuid;
-        if !node.owner.contact_users.iter().any(|c| c.user.uuid == data.uuid) {
-            eprintln!("[contact_request] adding contact '{}' from {src}", data.alias);
-            node.owner.contact_users.push(Contact {
-                user:       User { alias: data.alias, uuid: data.uuid, devices: data.devices },
-                public_key: data.public_key,
-                last_seen_public_version: SyncVersion::default(),
-            });
-        }
+        let contact_change = Change::UpsertContact {
+            uuid:       data.uuid,
+            alias:      data.alias,
+            public_key: data.public_key,
+            devices:    devices_to_cards(&data.devices),
+        };
 
         let response_payload = serialize_contact_payload(&node);
-        (shared_secret, response_payload, contact_uuid)
+        (shared_secret, response_payload, contact_uuid, contact_change)
     };
 
-    ctx.save_node();
-    // contact_request added a new contact to contact_users — that's a
-    // public-scope mutation. Fan out via sync v1 if we are the writer SG.
-    bump_public_and_fan_out_if_writer(ctx);
+    ctx.save_node(); // invitation was consumed above
+    // Route the contact add through the write log (Gap #2): on the writer this
+    // adds + logs + fans out; on a non-writer it forwards to the writer, which
+    // logs and merges it back. Either way every own SG converges on the
+    // contact, so all of them can validate its later connect_requests.
+    if let Err(WriteError::Unreachable) = request_change_idempotent(contact_change, ctx) {
+        eprintln!("[contact_request] no reachable writer SG; contact {contact_uuid:?} \
+                   not yet logged — own SGs will reconcile once a writer is online");
+    }
     // Catch up on the new contact's public state now, in case the SG↔SG
     // connection already exists (its connect_ack pull may have run before this
     // contact was registered).
-    cross_user_pull_for_contact(new_contact_uuid, ctx);
+    cross_user_pull_for_contact(contact_uuid, ctx);
 
     // Encrypt and send ContactResponse.
     let (ciphertext, resp_nonce) = xchacha20_encrypt(&shared_secret, &response_payload);
@@ -1768,28 +1774,31 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     };
 
-    let new_contact_uuid = data.uuid;
+    eprintln!("[contact_response] adding contact '{}' from {src}", data.alias);
+    let contact_uuid = data.uuid;
+    let contact_change = Change::UpsertContact {
+        uuid:       data.uuid,
+        alias:      data.alias,
+        public_key: data.public_key,
+        devices:    devices_to_cards(&data.devices),
+    };
     {
         let mut node = ctx.node.write().unwrap();
-        if !node.owner.contact_users.iter().any(|c| c.user.uuid == data.uuid) {
-            eprintln!("[contact_response] adding contact '{}' from {src}", data.alias);
-            node.owner.contact_users.push(Contact {
-                user:       User { alias: data.alias, uuid: data.uuid, devices: data.devices },
-                public_key: data.public_key,
-                last_seen_public_version: SyncVersion::default(),
-            });
-        }
         node.owner.pending_contact_exchange = None;
     }
 
-    ctx.save_node();
-    // contact_response added a new contact to contact_users — that's a
-    // public-scope mutation. Fan out via sync v1 if we are the writer SG.
-    bump_public_and_fan_out_if_writer(ctx);
+    ctx.save_node(); // pending exchange cleared above
+    // Route the contact add through the write log (Gap #2): on the writer this
+    // adds + logs + fans out; on a non-writer it forwards to the writer, which
+    // logs and merges it back. Either way every own SG converges on the contact.
+    if let Err(WriteError::Unreachable) = request_change_idempotent(contact_change, ctx) {
+        eprintln!("[contact_response] no reachable writer SG; contact {contact_uuid:?} \
+                   not yet logged — own SGs will reconcile once a writer is online");
+    }
     // Catch up on the new contact's public state now, in case the SG↔SG
     // connection already exists (its connect_ack pull may have run before this
     // contact was registered).
-    cross_user_pull_for_contact(new_contact_uuid, ctx);
+    cross_user_pull_for_contact(contact_uuid, ctx);
 
     // Trigger connection maintenance — we have a new contact.
     ctx.scheduler_tx.send(super::action_queue::ScheduleRequest {
@@ -1851,30 +1860,6 @@ fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
         devices.push((device, apps));
     }
     Some(ContactData { user_uuid, devices })
-}
-
-
-/// Apply received contact data, updating the matching contact's device and app lists.
-fn apply_contact_data(data: ContactData, ctx: &WorkerContext) {
-    let mut node = ctx.node.write().unwrap();
-    let Some(contact) = node.owner.contact_users.iter_mut()
-        .find(|c| c.user.uuid == data.user_uuid)
-    else {
-        eprintln!("[contact_data] received data for unknown contact {:?}", data.user_uuid);
-        return;
-    };
-
-    contact.user.devices = data.devices.into_iter().map(|(mut dev, apps)| {
-        dev.applications = apps.into_iter().map(|(id, alias)| Application {
-            id,
-            alias,
-            protocol:      String::new(),
-            host:          "0.0.0.0:0".parse().unwrap(),
-            user_approved: true,
-            token:         [0u8; 16],
-        }).collect();
-        dev
-    }).collect();
 }
 
 
@@ -1957,6 +1942,22 @@ const CHANGE_KIND_ADD_APPLICATION:        u8 = 0x01;
 const CHANGE_KIND_REMOVE_APPLICATION:     u8 = 0x02;
 const CHANGE_KIND_ADD_DEVICE:             u8 = 0x03;
 const CHANGE_KIND_UPDATE_APPLICATION_ALIAS: u8 = 0x04;
+const CHANGE_KIND_UPSERT_CONTACT:         u8 = 0x05;
+
+/// Public snapshot of one of a contact's devices, carried inside
+/// `Change::UpsertContact`. Mirrors a device's public fields plus its app
+/// `(id, alias)` pairs — the only contact data visible at public scope. A
+/// dedicated comparable type (rather than `Device`, which isn't `Clone`/`Eq`)
+/// so `Change` stays `Clone + Eq` and the merge can diff contacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactDeviceCard {
+    pub uuid:    Uuid,
+    pub alias:   String,
+    pub grade:   DeviceGrade,
+    pub sg_rank: Option<u32>,
+    pub hosts:   Vec<String>,
+    pub apps:    Vec<(Uuid, String)>,
+}
 
 /// State mutations that flow through the writer SG.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1995,6 +1996,21 @@ pub enum Change {
         app_id:      Uuid,
         new_alias:   String,
     },
+    /// Public-scope: insert or replace a contact's cached public state
+    /// (identity + the public snapshot of its devices/apps). Issued by the
+    /// writer SG when a contact is added (contact handshake) or when its
+    /// cached state is refreshed via a cross-user pull. Routing it through the
+    /// write log is what lets non-writer own SGs reconcile the contact list —
+    /// SG↔SG public sync is merge-only, so a direct mutation would never reach
+    /// them (Gap #2). Idempotent: an upsert identical to the cached snapshot is
+    /// a no-op (no version bump). Carries the full snapshot, so the merge
+    /// resolves conflicts by last-writer-wins on the whole contact.
+    UpsertContact {
+        uuid:       Uuid,
+        alias:      String,
+        public_key: PublicKey,
+        devices:    Vec<ContactDeviceCard>,
+    },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
@@ -2008,6 +2024,7 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
         Change::RemoveApplication { .. }       => &[Scope::Public],
         Change::AddDevice { .. }               => &[Scope::Public],
         Change::UpdateApplicationAlias { .. }  => &[Scope::Public],
+        Change::UpsertContact { .. }           => &[Scope::Public],
     }
 }
 
@@ -2045,6 +2062,30 @@ fn serialize_change(c: &Change) -> Vec<u8> {
             buf.extend_from_slice(app_id);
             push_str(&mut buf, new_alias);
         }
+        Change::UpsertContact { uuid, alias, public_key, devices } => {
+            buf.push(CHANGE_KIND_UPSERT_CONTACT);
+            buf.extend_from_slice(uuid);
+            push_str(&mut buf, alias);
+            buf.extend_from_slice(public_key);
+            buf.push(devices.len().min(u8::MAX as usize) as u8);
+            for card in devices.iter().take(u8::MAX as usize) {
+                // Reuse push_device's layout via a temp Device (apps follow).
+                let temp = Device {
+                    uuid:         card.uuid,
+                    alias:        card.alias.clone(),
+                    grade:        card.grade,
+                    sg_rank:      card.sg_rank,
+                    hosts:        card.hosts.clone(),
+                    applications: Vec::new(),
+                };
+                push_device(&mut buf, &temp);
+                buf.push(card.apps.len().min(u8::MAX as usize) as u8);
+                for (id, app_alias) in card.apps.iter().take(u8::MAX as usize) {
+                    buf.extend_from_slice(id);
+                    push_str(&mut buf, app_alias);
+                }
+            }
+        }
     }
     buf
 }
@@ -2080,6 +2121,28 @@ fn deserialize_change(data: &[u8]) -> Option<Change> {
             let app_id:      Uuid = read_arr(data, &mut pos)?;
             let new_alias         = read_str(data, &mut pos)?;
             Some(Change::UpdateApplicationAlias { device_uuid, app_id, new_alias })
+        }
+        CHANGE_KIND_UPSERT_CONTACT => {
+            let uuid:       Uuid      = read_arr(data, &mut pos)?;
+            let alias                 = read_str(data, &mut pos)?;
+            let public_key: PublicKey = read_arr(data, &mut pos)?;
+            let dev_count = *data.get(pos)? as usize; pos += 1;
+            let mut devices = Vec::with_capacity(dev_count);
+            for _ in 0..dev_count {
+                let d = read_device(data, &mut pos)?;
+                let app_count = *data.get(pos)? as usize; pos += 1;
+                let mut apps = Vec::with_capacity(app_count);
+                for _ in 0..app_count {
+                    let id: Uuid = read_arr(data, &mut pos)?;
+                    let a        = read_str(data, &mut pos)?;
+                    apps.push((id, a));
+                }
+                devices.push(ContactDeviceCard {
+                    uuid: d.uuid, alias: d.alias, grade: d.grade,
+                    sg_rank: d.sg_rank, hosts: d.hosts, apps,
+                });
+            }
+            Some(Change::UpsertContact { uuid, alias, public_key, devices })
         }
         _ => None,
     }
@@ -2171,8 +2234,98 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
                 _ => false,
             }
         }
+        Change::UpsertContact { uuid, alias, public_key, devices } => {
+            let incoming = normalize_cards(devices);
+            match owner.contact_users.iter_mut().find(|c| c.user.uuid == *uuid) {
+                Some(existing) => {
+                    let unchanged = existing.user.alias == *alias
+                        && existing.public_key == *public_key
+                        && contact_cards(existing) == incoming;
+                    if unchanged {
+                        false
+                    } else {
+                        existing.user.alias   = alias.clone();
+                        existing.public_key   = *public_key;
+                        existing.user.devices = cards_to_devices(devices);
+                        true
+                    }
+                }
+                None => {
+                    owner.contact_users.push(Contact {
+                        user: User {
+                            alias:   alias.clone(),
+                            uuid:    *uuid,
+                            devices: cards_to_devices(devices),
+                        },
+                        public_key: *public_key,
+                        last_seen_public_version: SyncVersion::default(),
+                    });
+                    true
+                }
+            }
+        }
     };
     Ok(applied)
+}
+
+/// Build `Application` stubs (public fields only — private fields zeroed) from
+/// a card's `(app_id, alias)` pairs. Contact apps never carry private fields.
+fn card_apps_to_applications(apps: &[(Uuid, String)]) -> Vec<Application> {
+    apps.iter().map(|(id, alias)| Application {
+        id:            *id,
+        alias:         alias.clone(),
+        protocol:      String::new(),
+        host:          "0.0.0.0:0".parse().unwrap(),
+        user_approved: true,
+        token:         [0u8; 16],
+    }).collect()
+}
+
+/// Convert contact device cards into stored `Device`s.
+fn cards_to_devices(cards: &[ContactDeviceCard]) -> Vec<Device> {
+    cards.iter().map(|c| Device {
+        uuid:         c.uuid,
+        alias:        c.alias.clone(),
+        grade:        c.grade,
+        sg_rank:      c.sg_rank,
+        hosts:        c.hosts.clone(),
+        applications: card_apps_to_applications(&c.apps),
+    }).collect()
+}
+
+/// Cards for a set of stored devices, in a deterministic order (devices by
+/// uuid, apps by id) so card equality is order-independent.
+fn devices_to_cards(devices: &[Device]) -> Vec<ContactDeviceCard> {
+    let mut cards: Vec<ContactDeviceCard> = devices.iter().map(|d| {
+        let mut apps: Vec<(Uuid, String)> = d.applications.iter()
+            .map(|a| (a.id, a.alias.clone())).collect();
+        apps.sort();
+        ContactDeviceCard {
+            uuid: d.uuid, alias: d.alias.clone(), grade: d.grade,
+            sg_rank: d.sg_rank, hosts: d.hosts.clone(), apps,
+        }
+    }).collect();
+    cards.sort_by_key(|c| c.uuid);
+    cards
+}
+
+/// Normalized cards for a stored contact (see `devices_to_cards`).
+fn contact_cards(contact: &Contact) -> Vec<ContactDeviceCard> {
+    devices_to_cards(&contact.user.devices)
+}
+
+/// Re-sort incoming cards into the same canonical order as `contact_cards`.
+fn normalize_cards(cards: &[ContactDeviceCard]) -> Vec<ContactDeviceCard> {
+    let mut out: Vec<ContactDeviceCard> = cards.iter().map(|c| {
+        let mut apps = c.apps.clone();
+        apps.sort();
+        ContactDeviceCard {
+            uuid: c.uuid, alias: c.alias.clone(), grade: c.grade,
+            sg_rank: c.sg_rank, hosts: c.hosts.clone(), apps,
+        }
+    }).collect();
+    out.sort_by_key(|c| c.uuid);
+    out
 }
 
 fn apply_change_locally(
@@ -2232,48 +2385,103 @@ fn find_writer_sg_probing(ctx: &WorkerContext) -> WriterTarget {
 ///   poll (`find_writer_sg_probing`) is attempted first so a partitioned
 ///   rank-N SG can fail over without waiting for the periodic poll tick.
 pub fn request_change(change: Change, ctx: &WorkerContext) -> Result<(), WriteError> {
+    request_change_inner(change, ctx, /*force_bump_on_noop*/ true)
+}
+
+/// Like `request_change`, but on the `Local` path it only bumps + logs + fans
+/// out when `apply_change_locally` actually changed state. Use for originators
+/// that DON'T pre-mutate the local record and instead rely on the Change to do
+/// the mutation — currently the contact-upsert sites (Gap #2). With these
+/// semantics a duplicate `UpsertContact` (re-add, or an unchanged periodic
+/// cross-user pull) is a true no-op: no redundant write-log entry, no spurious
+/// version bump, no contact-notify storm.
+pub fn request_change_idempotent(change: Change, ctx: &WorkerContext) -> Result<(), WriteError> {
+    request_change_inner(change, ctx, /*force_bump_on_noop*/ false)
+}
+
+fn request_change_inner(
+    change: Change,
+    ctx: &WorkerContext,
+    force_bump_on_noop: bool,
+) -> Result<(), WriteError> {
     let target = find_writer_sg_probing(ctx);
     match target {
-        WriterTarget::Local => {
-            let local_uuid = ctx.node.read().unwrap().device_uuid;
-            apply_change_locally(&change, local_uuid, ctx)?;
-            // Originator semantics: advance the scope's version even when
-            // `apply_change_locally` was a data-level no-op. This is the
-            // common path when the originator pre-mutated the local record
-            // (e.g. `app_register` adding the app with token+host before
-            // calling `request_change` to publish id+alias). The receiver
-            // path (`sync_write_request`) keeps the stricter
-            // bump-only-on-actual-mutation rule for retry idempotency.
-            let scopes_to_bump = change_scopes(&change);
-            let (post_priv, post_pub) = {
-                let mut node = ctx.node.write().unwrap();
-                for &scope in scopes_to_bump {
-                    node.owner.bump_version(scope, local_uuid);
-                }
-                (node.owner.private_version, node.owner.public_version)
-            };
-            ctx.save_node();
-            let bumped: Vec<Scope> = scopes_to_bump.iter().copied().collect();
-            // One write-log entry per accepted Change. Record the post-bump
-            // version under the change's primary scope (current variants all
-            // touch a single scope; revisit if a multi-scope variant lands).
-            for &scope in &bumped {
-                let v = match scope { Scope::Private => post_priv, Scope::Public => post_pub };
-                append_to_write_log(&change, scope, v, ctx);
-            }
-            ctx.save_node();
-            notify_own_peers(&bumped, post_priv, post_pub, ctx);
-            if bumped.contains(&Scope::Public) {
-                notify_contacts(post_pub, ctx);
-            }
-            Ok(())
-        }
+        WriterTarget::Local => apply_local_change(change, ctx, force_bump_on_noop),
         WriterTarget::Remote(writer_uuid) => {
             send_sync_write_request(&change, writer_uuid, ctx);
             Ok(())
         }
         WriterTarget::Unreachable => Err(WriteError::Unreachable),
     }
+}
+
+/// Commit a Change on the elected-local writer: apply it, bump the touched
+/// scope versions, append one write-log entry per bumped scope, and notify own
+/// peers (+ contacts on a public bump).
+///
+/// `force_bump_on_noop` selects the originator contract:
+/// - `true`  — advance the version even when `apply_change_locally` was a
+///   data-level no-op. The common path when the originator pre-mutated the
+///   local record (e.g. `app_register` adds the app with token+host, then
+///   publishes id+alias — the apply sees it already present but the state did
+///   change). All non-contact callers use this.
+/// - `false` — bump + log + notify ONLY for scopes that actually changed
+///   (mirrors the receiver path `sync_write_request`). For originators that
+///   route the real mutation through the Change itself, so an idempotent re-run
+///   stays a true no-op.
+fn apply_local_change(
+    change: Change,
+    ctx: &WorkerContext,
+    force_bump_on_noop: bool,
+) -> Result<(), WriteError> {
+    let local_uuid = ctx.node.read().unwrap().device_uuid;
+    let (pre_priv, pre_pub) = {
+        let node = ctx.node.read().unwrap();
+        (node.owner.private_version, node.owner.public_version)
+    };
+    // Applies + bumps only the scopes that actually changed (no-op leaves
+    // versions untouched).
+    apply_change_locally(&change, local_uuid, ctx)?;
+
+    let bumped: Vec<Scope> = if force_bump_on_noop {
+        // Originator pre-mutation contract: advance every touched scope
+        // unconditionally (preserved verbatim — this is in addition to any bump
+        // apply_change_locally already did on an actual change).
+        let scopes_to_bump = change_scopes(&change);
+        let mut node = ctx.node.write().unwrap();
+        for &scope in scopes_to_bump {
+            node.owner.bump_version(scope, local_uuid);
+        }
+        scopes_to_bump.iter().copied().collect()
+    } else {
+        // Strict contract: only the scopes apply_change_locally actually moved.
+        let node = ctx.node.read().unwrap();
+        bumped_scopes(pre_priv, pre_pub, node.owner.private_version, node.owner.public_version)
+    };
+
+    // True no-op under the strict contract — nothing to persist, log, or notify.
+    if bumped.is_empty() {
+        return Ok(());
+    }
+
+    let (post_priv, post_pub) = {
+        let node = ctx.node.read().unwrap();
+        (node.owner.private_version, node.owner.public_version)
+    };
+    ctx.save_node();
+    // One write-log entry per accepted Change, recorded under the post-bump
+    // version for each touched scope (current variants all touch a single
+    // scope; revisit if a multi-scope variant lands).
+    for &scope in &bumped {
+        let v = match scope { Scope::Private => post_priv, Scope::Public => post_pub };
+        append_to_write_log(&change, scope, v, ctx);
+    }
+    ctx.save_node();
+    notify_own_peers(&bumped, post_priv, post_pub, ctx);
+    if bumped.contains(&Scope::Public) {
+        notify_contacts(post_pub, ctx);
+    }
+    Ok(())
 }
 
 /// Compare pre/post versions to determine which scopes were bumped by an
@@ -2328,27 +2536,6 @@ fn notify_own_peers(
     for (pkt, dest) in packets {
         send(ctx, dest, &pkt);
     }
-}
-
-/// If this node is the local user's writer SG, bump `public_version`,
-/// notify own peers (DGs and other SGs), and fan out to contacts. Used
-/// when a writer SG accepts a state mutation outside the formal `Change`
-/// pipeline (contact-exchange handshake, cross-user pull-in).
-fn bump_public_and_fan_out_if_writer(ctx: &WorkerContext) {
-    let (is_writer, writer_uuid) = {
-        let node = ctx.node.read().unwrap();
-        let target = find_writer_sg(&node);
-        (matches!(target, WriterTarget::Local), node.device_uuid)
-    };
-    if !is_writer { return; }
-    let (post_priv, post_pub) = {
-        let mut node = ctx.node.write().unwrap();
-        node.owner.bump_version(Scope::Public, writer_uuid);
-        (node.owner.private_version, node.owner.public_version)
-    };
-    ctx.save_node();
-    notify_own_peers(&[Scope::Public], post_priv, post_pub, ctx);
-    notify_contacts(post_pub, ctx);
 }
 
 /// Cross-user fan-out: send a `CrossUserUpdateAvailable(public, version)` to
@@ -3444,7 +3631,37 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
                 eprintln!("[cross_user_pull_response] failed to parse state from {src}");
                 return;
             };
-            apply_contact_data(data, ctx);
+            // Carry the contact's existing identity (alias + public_key); a
+            // cross-user pull only refreshes the device/app snapshot.
+            let identity = {
+                let node = ctx.node.read().unwrap();
+                node.owner.contact_users.iter()
+                    .find(|c| c.user.uuid == data.user_uuid)
+                    .map(|c| (c.user.alias.clone(), c.public_key))
+            };
+            if let Some((alias, public_key)) = identity {
+                let cards: Vec<ContactDeviceCard> = data.devices.iter().map(|(d, apps)| {
+                    ContactDeviceCard {
+                        uuid: d.uuid, alias: d.alias.clone(), grade: d.grade,
+                        sg_rank: d.sg_rank, hosts: d.hosts.clone(), apps: apps.clone(),
+                    }
+                }).collect();
+                // Route the refreshed snapshot through the write log (Gap #2):
+                // the writer logs it and merges it to non-writer own SGs.
+                // Idempotent — an unchanged snapshot is a no-op, so periodic
+                // pulls don't bump the version or spam the log.
+                if let Err(WriteError::Unreachable) = request_change_idempotent(Change::UpsertContact {
+                    uuid: data.user_uuid, alias, public_key, devices: cards,
+                }, ctx) {
+                    eprintln!("[cross_user_pull_response] no reachable writer SG; refreshed \
+                               snapshot for {:?} not logged this round", data.user_uuid);
+                }
+            } else {
+                eprintln!("[cross_user_pull_response] data for unknown contact {:?}",
+                    data.user_uuid);
+            }
+            // Pin the cross-user pull baseline regardless of whether the
+            // snapshot changed.
             {
                 let mut node = ctx.node.write().unwrap();
                 if let Some(c) = node.owner.contact_users.iter_mut()
@@ -3454,12 +3671,6 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
                 }
             }
             ctx.save_node();
-
-            // If this node is the local user's writer SG, bump own
-            // public_version and fan out so own DGs pull the refreshed
-            // contact list via apply_public_state and contacts notice the
-            // updated cross-user state.
-            bump_public_and_fan_out_if_writer(ctx);
         }
         other => {
             eprintln!("[cross_user_pull_response] unknown result {other} from {src}");
@@ -4068,6 +4279,19 @@ struct MergedState {
     apps:    HashMap<(Uuid, Uuid), MergedApp>,
     devices: HashMap<Uuid, MergedDevice>,
     tombstones: HashSet<(Uuid, Uuid)>,
+    /// contact_uuid → resolved contact snapshot. Whole-contact last-writer-wins
+    /// (each `UpsertContact` carries the full snapshot, so the highest-priority
+    /// entry's snapshot wins outright).
+    contacts: HashMap<Uuid, MergedContact>,
+}
+
+/// Per-contact accumulator: the winning snapshot plus the priority of the
+/// entry that set it.
+struct MergedContact {
+    alias:      String,
+    public_key: PublicKey,
+    devices:    Vec<ContactDeviceCard>,
+    priority:   EntryPriority,
 }
 
 /// Per-app accumulator during the walk. `existed` becomes true once any
@@ -4121,6 +4345,7 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
         apps: HashMap::new(),
         devices: HashMap::new(),
         tombstones: HashSet::new(),
+        contacts: HashMap::new(),
     };
 
     // First pass: collect tombstones. Tombstone wins globally for its target,
@@ -4156,6 +4381,22 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
                 state.devices.entry(uuid).or_insert(MergedDevice {
                     alias, grade, sg_rank, hosts,
                 });
+            }
+            Change::UpsertContact { uuid, alias, public_key, devices } => {
+                // Whole-contact last-writer-wins: the highest-priority upsert's
+                // snapshot replaces any lower-priority one outright.
+                let win = match state.contacts.get(&uuid) {
+                    Some(existing) => prio > existing.priority,
+                    None           => true,
+                };
+                if win {
+                    state.contacts.insert(uuid, MergedContact {
+                        alias,
+                        public_key,
+                        devices: normalize_cards(&devices),
+                        priority: prio,
+                    });
+                }
             }
         }
     }
@@ -4252,6 +4493,28 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
     removed.sort();
     for (d, id) in removed {
         out.push(Change::RemoveApplication { device_uuid: d, app_id: id });
+    }
+
+    // Contacts: emit an UpsertContact for any target contact that's new or
+    // whose snapshot differs from current. No contact removal Change exists
+    // yet, so contacts are never diffed out.
+    let mut target_contacts: Vec<(&Uuid, &MergedContact)> = target.contacts.iter().collect();
+    target_contacts.sort_by_key(|(u, _)| **u);
+    for (uuid, c) in target_contacts {
+        let differs = match current.contacts.get(uuid) {
+            None      => true,
+            Some(cur) => cur.alias != c.alias
+                || cur.public_key != c.public_key
+                || cur.devices != c.devices,
+        };
+        if differs {
+            out.push(Change::UpsertContact {
+                uuid:       *uuid,
+                alias:      c.alias.clone(),
+                public_key: c.public_key,
+                devices:    c.devices.clone(),
+            });
+        }
     }
 
     out
@@ -7249,6 +7512,14 @@ mod tests {
         local_uuid
     }
 
+    /// Count how many `UpsertContact` changes are in the owner's write log.
+    fn upsert_contact_log_count(node: &Node) -> usize {
+        node.owner.write_log.iter()
+            .filter_map(|e| deserialize_change(&e.change_payload))
+            .filter(|c| matches!(c, Change::UpsertContact { .. }))
+            .count()
+    }
+
     #[test]
     fn find_writer_dg_with_no_own_sgs_is_unreachable() {
         let t = TestCtx::new();
@@ -8925,6 +9196,11 @@ mod tests {
         let target    = TestCtx::new();
         let requester = TestCtx::new();
 
+        // The contact add now routes through request_change (Gap #2), so the
+        // target needs a writer. Promote its local device to a rank-1 SG so the
+        // upsert applies + logs locally.
+        promote_local_to_sg(&target, 1);
+
         // Complete setup so key_pair is non-zero.
         {
             let mut node = requester.ctx.node.write().unwrap();
@@ -8948,6 +9224,10 @@ mod tests {
         let node = target.ctx.node.read().unwrap();
         assert_eq!(node.owner.contact_users.len(), 1);
         assert_eq!(node.owner.contact_users[0].user.alias, "chad");
+
+        // The add must have been logged as exactly one UpsertContact (Gap #2).
+        assert_eq!(upsert_contact_log_count(&node), 1,
+            "contact add must append exactly one UpsertContact write-log entry");
 
         // Invitation must be consumed.
         assert!(node.owner.contact_invitations.is_empty());
@@ -9018,6 +9298,9 @@ mod tests {
         let target    = TestCtx::new();
         let requester = TestCtx::new();
 
+        // Contact add routes through request_change (Gap #2) — target needs a writer.
+        promote_local_to_sg(&target, 1);
+
         {
             let mut node = requester.ctx.node.write().unwrap();
             node.owner.key_pair       = generate_ed25519_keypair();
@@ -9050,11 +9333,17 @@ mod tests {
 
         let node = target.ctx.node.read().unwrap();
         assert_eq!(node.owner.contact_users.len(), 1, "duplicate contact must not be added");
+        // The duplicate upsert is an idempotent no-op — still exactly one log entry.
+        assert_eq!(upsert_contact_log_count(&node), 1,
+            "duplicate contact must not append a second UpsertContact write-log entry");
     }
 
     #[test]
     fn contact_response_valid_adds_contact_and_clears_pending() {
         let requester = TestCtx::new();
+
+        // Contact add routes through request_change (Gap #2) — requester needs a writer.
+        promote_local_to_sg(&requester, 1);
 
         // Set up the requester's side of a pending exchange.
         let inv_kp    = generate_x25519_keypair();
@@ -10334,6 +10623,65 @@ mod tests {
         let (scope, _wm, result) = parse_merge_ack_body(&plaintext).expect("parse");
         assert_eq!(scope, Scope::Public);
         assert_eq!(result, MERGE_ACK_RESULT_APPLIED);
+    }
+
+    /// Gap #2 end-to-end: a contact the writer SG logged as an `UpsertContact`
+    /// reaches a non-writer own SG through the merge channel. The receiver must
+    /// gain the contact in `contact_users` with its public_key and cached apps,
+    /// so it can validate that contact's later connect_requests.
+    #[test]
+    fn merge_proposal_upsert_contact_reaches_non_writer_sg() {
+        let t = TestCtx::new();
+        let (_, peer_conn, _peer_socket) = writer_setup_with_capture(&t);
+        let peer_uuid = peer_conn.device_uuid;
+        promote_peer_to_sg(&t, peer_uuid, 2);  // the proposing peer is a rank-2 own SG.
+
+        // The contact as the writer logged it: identity + one device carrying apps.
+        let writer        = [0xC0; 16];
+        let contact_uuid  = [0xCA; 16];
+        let contact_pk    = [0x77; 32];
+        let contact_dev   = [0xDE; 16];
+        let contact_app   = app_uuid(909);
+        let card = ContactDeviceCard {
+            uuid:    contact_dev,
+            alias:   "chad-phone".into(),
+            grade:   DeviceGrade::DG,
+            sg_rank: None,
+            hosts:   vec![],
+            apps:    vec![(contact_app, "chess".into())],
+        };
+        let entries = vec![change_entry(writer, 1, 1, &Change::UpsertContact {
+            uuid:       contact_uuid,
+            alias:      "chad".into(),
+            public_key: contact_pk,
+            devices:    vec![card],
+        })];
+
+        // Receiver has no such contact yet.
+        assert!(t.ctx.node.read().unwrap().owner.contact_users.is_empty());
+
+        let body = build_merge_proposal_body(
+            Scope::Public,
+            SyncVersion { writer_sg_uuid: writer, epoch: 1, seq: 1 },
+            &entries,
+        );
+        let pkt = build_encrypted_packet(MERGE_PROPOSAL_OP, &peer_conn, &body);
+        merge_proposal("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let node = t.ctx.node.read().unwrap();
+        let contact = node.owner.contact_users.iter()
+            .find(|c| c.user.uuid == contact_uuid)
+            .expect("UpsertContact must have created the contact via merge");
+        assert_eq!(contact.user.alias, "chad");
+        assert_eq!(contact.public_key, contact_pk,
+            "public_key must propagate so connect_requests validate (Gap #2)");
+        let dev = contact.user.devices.iter()
+            .find(|d| d.uuid == contact_dev)
+            .expect("contact device must propagate");
+        assert!(dev.applications.iter().any(|a| a.id == contact_app && a.alias == "chess"),
+            "cached contact apps must propagate");
+        // The peer's entry is recorded so this SG fans the contact onward.
+        assert_eq!(upsert_contact_log_count(&node), 1);
     }
 
     #[test]
