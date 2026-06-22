@@ -1,9 +1,22 @@
+use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-use super::data_models::Node;
+use super::data_models::{Node, Uuid};
 use super::writer::WriteRequest;
+
+/// Rendezvous slots for DG-side invitation requests. When a DG asks an SG to
+/// mint an invitation (op 0x35), the UI worker thread registers its request
+/// token here and parks on `cv`. The `generate_invitation_response` handler
+/// (op 0x36), running on another worker thread, fills the slot keyed by token
+/// and wakes the waiter. `Ok(code)` is the encoded invitation; `Err(())` is an
+/// SG-side failure; a slot left `None` past the timeout means no reply arrived.
+#[derive(Default)]
+pub struct PendingInvites {
+    pub slots: Mutex<HashMap<Uuid, Option<Result<String, ()>>>>,
+    pub cv:    Condvar,
+}
 
 pub const PRIORITY_HIGH:   u8 = 0;
 pub const PRIORITY_NORMAL: u8 = 1;
@@ -30,6 +43,9 @@ pub enum Action {
     DeviceRegistration { src: SocketAddr, buf: Vec<u8> },
     ContactRequest        { src: SocketAddr, buf: Vec<u8> },
     ContactResponse       { src: SocketAddr, buf: Vec<u8> },
+    // 0x35/0x36 — DG asks an SG to mint an invitation; SG replies with the code.
+    GenerateInvitationRequest  { src: SocketAddr, buf: Vec<u8> },
+    GenerateInvitationResponse { src: SocketAddr, buf: Vec<u8> },
     // Sync v1 (descriptions/data sync.md). Replaces the push-everywhere
     // ContactDataPush/DeviceDataPush flow once phases 3–7 land.
     SyncWriteRequest      { src: SocketAddr, buf: Vec<u8> },
@@ -82,6 +98,8 @@ pub struct WorkerContext {
     pub udp_socket:   Arc<UdpSocket>,
     pub writer_tx:    mpsc::SyncSender<WriteRequest>,
     pub scheduler_tx: mpsc::Sender<ScheduleRequest>,
+    /// Rendezvous for DG→SG invitation requests (op 0x35/0x36).
+    pub pending_invites: Arc<PendingInvites>,
 }
 
 impl WorkerContext {
@@ -114,6 +132,8 @@ impl Action {
             Action::DeviceRegistration { src, buf }   => handlers::device_registration(src, buf, ctx),
             Action::ContactRequest         { src, buf } => handlers::contact_request(src, buf, ctx),
             Action::ContactResponse        { src, buf } => handlers::contact_response(src, buf, ctx),
+            Action::GenerateInvitationRequest  { src, buf } => handlers::generate_invitation_request(src, buf, ctx),
+            Action::GenerateInvitationResponse { src, buf } => handlers::generate_invitation_response(src, buf, ctx),
             Action::SyncWriteRequest       { src, buf } => handlers::sync_write_request(src, buf, ctx),
             Action::SyncWriteAck           { src, buf } => handlers::sync_write_ack(src, buf, ctx),
             Action::SyncUpdateAvailable    { src, buf } => handlers::sync_update_available(src, buf, ctx),

@@ -64,9 +64,9 @@ Manage invitation tokens used to add new contacts or devices.
 #### Device invitation detail
 
 When the owner generates a device invitation, the node:
-1. Selects the target SG — itself if this device is an SG, otherwise the lowest-RTT up SG from `sg_statuses`.
-2. Creates an `Invitation` with a fresh ephemeral key pair and an expiry time.
-3. Stores it in `owner.device_invitations`. If this device is a DG, the invitation will be synced to the target SG by the future device-sync system before the new device tries to use it.
+1. Selects the target SG — always the **top-ranked online SG**: the lowest-`sg_rank` SG (with hosts) that is either this device itself or one it holds an active connection to. A more-preferred connected SG always wins, so even a lower-ranked SG defers to it; a device only targets itself when it is the top-ranked online SG (or no more-preferred SG is reachable). A DG with no connected SG has no target and the generation fails.
+2. Creates an `Invitation` with a fresh ephemeral key pair and an expiry time **on the target SG**, not necessarily on the generating device. If this device *is* the target SG, it mints the invitation locally. Otherwise — whether this device is a DG or a lower-ranked SG — it sends a `GenerateInvitationRequest` (op 0x35) to the target SG over the encrypted own-device channel; the SG mints + stores the invitation and returns the encoded code in a `GenerateInvitationResponse` (op 0x36). The generating device's UI thread blocks (≤5 s) on this round-trip. This guarantees the invitation already exists on the SG the code points to — the code cannot exist until the SG has stored it.
+3. Stores the invitation in `owner.device_invitations` on that SG. Invitations are device-local (never synced); having the top-ranked SG mint it is what closes the lookup gap when the new device bootstraps.
 4. Displays a shareable code: base64 of `invitation_id (16) || invitation_public_key (32) || host_len (1) || host_bytes (host_len) || port (2)`, where `host_bytes` is the first entry from the target SG's `hosts` list (hostname or IP, no port suffix). Variable-length, suitable for copy-paste or QR code.
 
 On the new, unconfigured device, the owner enters the invitation code. The node parses out the invitation ID, public key, and SG host, then begins the bootstrap exchange (see pnet to pnet communication.md — Device Bootstrap). After the exchange completes, the owner is prompted to set an alias and grade for the new device before it registers with the SG.

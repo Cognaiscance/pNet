@@ -96,7 +96,7 @@ Before a new device can participate in the network it must receive a copy of the
 - The user has at least one configured device and at least one SG.
 - An invitation was generated on any configured device (see Administration UI — Invitations). The invitation contains a short-lived ephemeral key pair and the address of a target SG.
 - The invitation's `id`, `public_key`, and a resolvable SG address are shared with the new device out-of-band (copy-paste or QR code). The device-invitation code encodes `invitation_id (16) || invitation_public_key (32) || host_len (1) || host_bytes (host_len) || port (2)` — variable length, where `host_bytes` is the first entry from the SG's `hosts` list (hostname or IP, no port suffix). The contact-invitation code uses the fixed-length form `invitation_id (16) || invitation_public_key (32) || ipv4 (4) || port (2)` — 54 bytes / 72 base64 characters; the full hostname list arrives later via ContactDataPush.
-- If the invitation was generated on a DG, it is synced to the SG before use (handled by the future device-sync system).
+- The invitation is always minted *on* the top-ranked online SG, never synced after the fact. Unless the generating device is itself that SG, it sends a `GenerateInvitationRequest` (op `0x35`) to it — this applies to DGs and to lower-ranked SGs alike — and the target SG creates and stores the `Invitation` locally, returning the encoded code via `GenerateInvitationResponse` (op `0x36`). The code therefore always points to an SG that already holds the matching invitation. Invitations are device-local state and are never replicated between SGs.
 
 ### BootstrapRequest — op `0x30`
 
@@ -160,6 +160,31 @@ Encrypted payload:
 - Device host (IP + port)
 
 The SG decrypts using the same shared secret, adds the new device to `owner.user.devices`, and the new device is now a full participant. Future changes are propagated via the device-sync system (not yet defined).
+
+### GenerateInvitationRequest / Response — ops `0x35` / `0x36`
+
+Used whenever the generating device is **not** the top-ranked online SG — i.e.
+a DG, or a lower-ranked SG. The device asks the top-ranked online SG to mint the
+invitation so the code points to an SG that already holds it (invitations are
+device-local and never synced). Both messages travel over an established
+own-device `ActiveConnection` and use the standard encrypted framing
+(`[op][peer_active_conn_id:2][nonce:24][ciphertext]`).
+
+Request (`0x35`, DG → SG) plaintext body:
+- Invitation kind: 1 byte (`0x00` device, `0x01` contact)
+- Request token: 16 bytes (random; echoed in the response so the parked DG UI thread can match it)
+
+Response (`0x36`, SG → DG) plaintext body:
+- Request token: 16 bytes (echoed)
+- Result: 1 byte (`0x00` ok, `0x01` mint failed — e.g. the SG has no `hosts`)
+- Encoded invitation code: variable (UTF-8; same base64 form the UI displays)
+
+On `0x35` the SG mints an `Invitation`, stores it in its own
+`device_invitations`/`contact_invitations`, encodes the code with its own
+`hosts`, and replies. The DG's UI thread blocks (≤5 s) waiting for `0x36`; a
+missing or failed reply is a terminal error (no retry/queue), surfaced as a UI
+error. If the generating device is itself the top-ranked online SG, it mints
+locally and these messages are not sent.
 
 ---
 

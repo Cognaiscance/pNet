@@ -101,6 +101,7 @@ mod tests {
             udp_socket:   Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
             writer_tx,
             scheduler_tx,
+            pending_invites: Default::default(),
         })
     }
 

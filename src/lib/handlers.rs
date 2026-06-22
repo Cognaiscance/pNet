@@ -608,6 +608,19 @@ const BOOTSTRAP_RESPONSE_OP: u8 = 0x31;
 const DEVICE_REGISTER_OP:    u8 = 0x32;
 const CONTACT_REQUEST_OP:         u8 = 0x33;
 const CONTACT_RESPONSE_OP:        u8 = 0x34;
+// 0x35/0x36 — a DG asks its top-ranked online SG to mint an invitation and
+// return the encoded code. Invitations are device-local (never synced), so the
+// SG that the code points to must be the one that stores it; having that SG
+// mint it guarantees the invitation exists before the code can be used.
+const GENERATE_INVITATION_REQUEST_OP:  u8 = 0x35;
+const GENERATE_INVITATION_RESPONSE_OP: u8 = 0x36;
+
+// Invitation kind byte in the 0x35 request / local mint path.
+const INVITE_TYPE_DEVICE:  u8 = 0x00;
+const INVITE_TYPE_CONTACT: u8 = 0x01;
+// Result byte in the 0x36 response.
+const INVITE_RESULT_OK:    u8 = 0x00;
+const INVITE_RESULT_ERROR: u8 = 0x01;
 // Sync v1 ops (see descriptions/data sync.md).
 // 0x70/0x71 — DG/SG→writer write request and writer→originator ack.
 // 0x72      — writer→peers "you have a stale version, pull when ready".
@@ -6171,41 +6184,56 @@ fn reject_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
 
 // ── Invitation generation and bootstrap initiation ───────────────────────────
 
-/// Select the SG hosts list to embed in an outbound invitation code.
-/// SG devices embed their own hosts; DG devices embed the lowest-RTT up SG's
-/// hosts.  Returns `None` (after logging) if no reachable SG is known.
-fn pick_invitation_hosts(ctx: &WorkerContext, label: &str) -> Option<Vec<String>> {
-    let node = ctx.node.read().unwrap();
+/// The local device's advertised `hosts`, embedded in codes minted here.
+fn local_device_hosts(node: &super::data_models::Node) -> Vec<String> {
+    let uuid = node.device_uuid;
+    node.owner.user.devices.iter()
+        .find(|d| d.uuid == uuid)
+        .map(|d| d.hosts.clone())
+        .unwrap_or_default()
+}
+
+/// The highest-ranked SG (lowest `sg_rank`) that can currently mint an outbound
+/// invitation: either the local node itself (when it is an SG with hosts) or an
+/// SG we hold an active connection to. Invitations are device-local and the code
+/// embeds the minting SG's hosts, so the chosen SG must be reachable right now.
+///
+/// Iterating in rank order means even a higher-ranked *local* SG defers to a
+/// lower-`sg_rank` (i.e. more preferred) SG when that peer is connected — only
+/// the top-ranked online SG mints locally. If no more-preferred SG is reachable,
+/// a local SG falls back to minting for itself. Returns the chosen SG's device
+/// UUID, or `None` when no SG qualifies (e.g. a DG with no connected SG).
+fn top_online_sg(node: &super::data_models::Node) -> Option<Uuid> {
     let local_uuid = node.device_uuid;
-    let local_device = node.owner.user.devices.iter().find(|d| d.uuid == local_uuid)?;
+    let mut sgs: Vec<&Device> = node.owner.user.devices.iter()
+        .filter(|d| matches!(d.grade, DeviceGrade::SG) && !d.hosts.is_empty())
+        .collect();
+    sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
+    sgs.into_iter()
+        .find(|d| d.uuid == local_uuid
+            || node.owner.active_connections.values().any(|c| c.device_uuid == d.uuid))
+        .map(|d| d.uuid)
+}
 
-    let hosts = if matches!(local_device.grade, DeviceGrade::SG) {
-        local_device.hosts.clone()
-    } else {
-        let mut best: Option<(Duration, Vec<String>)> = None;
-        for d in &node.owner.user.devices {
-            if !matches!(d.grade, DeviceGrade::SG) { continue; }
-            if d.hosts.is_empty() { continue; }
-            for ((uuid, _), s) in &node.sg_statuses {
-                if *uuid != d.uuid || !s.up { continue; }
-                let rtt = s.last_rtt.unwrap_or(Duration::MAX);
-                if best.as_ref().map_or(true, |(br, _)| rtt < *br) {
-                    best = Some((rtt, d.hosts.clone()));
-                }
-            }
-        }
-        best.map(|(_, h)| h).unwrap_or_default()
+/// Mint a fresh invitation and store it in the local device/contact vec
+/// according to `kind`. Returns `(id, public_key)` for embedding in the code.
+/// Caller is responsible for `ctx.save_node()`.
+fn store_new_invitation(kind: u8, ctx: &WorkerContext) -> (Uuid, PublicKey) {
+    let mut node = ctx.node.write().unwrap();
+    let kp = generate_x25519_keypair();
+    let pk = kp.public_key;
+    let id = generate_uuid();
+    let inv = Invitation {
+        id,
+        key_pair:   kp,
+        expires_at: SystemTime::now() + Duration::from_secs(24 * 3600),
     };
-
-    if hosts.is_empty() {
-        eprintln!(
-            "[{label}] no SG host configured — local device hosts: {:?}. \
-             Set PNET_HOSTS and restart.",
-            local_device.hosts,
-        );
-        return None;
+    if kind == INVITE_TYPE_CONTACT {
+        node.owner.contact_invitations.push(inv);
+    } else {
+        node.owner.device_invitations.push(inv);
     }
-    Some(hosts)
+    (id, pk)
 }
 
 /// Encode an invitation code with the full SG hosts list so the receiver can
@@ -6253,29 +6281,98 @@ fn decode_invitation_code(code_str: &str) -> Option<(Uuid, PublicKey, Vec<String
     Some((inv_id, inv_pk, hosts))
 }
 
-/// Generate a device invitation on the UI.  Picks the best SG (self if SG, else
-/// lowest-RTT up SG), creates an invitation, and returns the base64-encoded code.
-///
-/// Embeds the full `hosts` list of the chosen SG so the receiver can pick
-/// whichever entry resolves in its own network.
+/// Generate a device invitation for the UI. See `generate_invitation`.
 fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
-    let hosts = pick_invitation_hosts(ctx, "generate_device_invitation")?;
+    generate_invitation(INVITE_TYPE_DEVICE, ctx)
+}
 
-    let (inv_id, inv_pk) = {
-        let mut node = ctx.node.write().unwrap();
-        let kp    = generate_x25519_keypair();
-        let pk    = kp.public_key;
-        let id    = generate_uuid();
-        node.owner.device_invitations.push(Invitation {
-            id,
-            key_pair:   kp,
-            expires_at: SystemTime::now() + Duration::from_secs(24 * 3600),
-        });
-        (id, pk)
+/// Produce a shareable invitation code of `kind` (device or contact).
+///
+/// Invitations are device-local (never synced), so the code can only point to
+/// the SG that actually stores it. The minting SG is always the top-ranked
+/// online SG (`top_online_sg`). If that is the local node, it mints the
+/// invitation itself and embeds its own hosts. Otherwise — whether the local
+/// node is a DG or a lower-ranked SG — it asks that SG to mint and return the
+/// code, guaranteeing the invitation is present on the SG the code points to
+/// before the code exists.
+///
+/// Returns `None` on any terminal failure (no reachable SG, no hosts, or — for
+/// the delegated path — the SG not replying within the timeout). Consistent
+/// with the sync design rule that such failures are terminal, not retried.
+fn generate_invitation(kind: u8, ctx: &WorkerContext) -> Option<String> {
+    let (target, local_uuid, hosts) = {
+        let node = ctx.node.read().unwrap();
+        (top_online_sg(&node), node.device_uuid, local_device_hosts(&node))
     };
 
-    ctx.save_node();
-    Some(encode_invitation_code(&inv_id, &inv_pk, &hosts))
+    let Some(target) = target else {
+        eprintln!("[generate_invitation] no reachable SG to mint invitation");
+        return None;
+    };
+
+    if target == local_uuid {
+        // We are the top-ranked online SG: mint locally. `top_online_sg` only
+        // returns the local node when it is an SG with hosts, so `hosts` is
+        // non-empty here.
+        let (inv_id, inv_pk) = store_new_invitation(kind, ctx);
+        ctx.save_node();
+        Some(encode_invitation_code(&inv_id, &inv_pk, &hosts))
+    } else {
+        request_invitation_from_sg(kind, target, ctx)
+    }
+}
+
+/// Delegated path: ask `sg_uuid` (the top-ranked online SG) to mint an
+/// invitation, block until it replies (op 0x36) or a short timeout elapses,
+/// then return the encoded code. Used by DGs and by lower-ranked SGs.
+///
+/// The parked worker thread is woken by `generate_invitation_response` running
+/// on another worker. With `WORKER_COUNT > 1` this can't self-deadlock for a
+/// single request; only the pathological case of every worker parked at once
+/// would stall, and the timeout breaks even that.
+fn request_invitation_from_sg(kind: u8, sg_uuid: Uuid, ctx: &WorkerContext) -> Option<String> {
+    let token = generate_uuid();
+
+    // Build the 0x35 request to the chosen SG over its active connection.
+    // Body: [kind:1][token:16].
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.values()
+            .find(|c| c.device_uuid == sg_uuid)
+            .map(|conn| {
+                let mut body = Vec::with_capacity(1 + 16);
+                body.push(kind);
+                body.extend_from_slice(&token);
+                (build_encrypted_packet(GENERATE_INVITATION_REQUEST_OP, conn, &body), conn.peer_addr)
+            })
+    };
+    let Some((pkt, addr)) = pkt_and_addr else {
+        eprintln!("[request_invitation_from_sg] no reachable SG to mint invitation");
+        return None;
+    };
+
+    // Register the rendezvous slot BEFORE sending so a fast reply can't race us.
+    {
+        let mut slots = ctx.pending_invites.slots.lock().unwrap();
+        slots.insert(token, None);
+    }
+    send(ctx, addr, &pkt);
+
+    // Park until the slot is filled (Some(_)) or the timeout fires.
+    let timeout = Duration::from_secs(5);
+    let outcome = {
+        let slots = ctx.pending_invites.slots.lock().unwrap();
+        let (mut slots, _) = ctx.pending_invites.cv
+            .wait_timeout_while(slots, timeout, |s| matches!(s.get(&token), Some(None)))
+            .unwrap();
+        slots.remove(&token).flatten()
+    };
+
+    match outcome {
+        Some(Ok(code)) => Some(code),
+        Some(Err(())) => { eprintln!("[request_invitation_from_sg] SG reported mint failure"); None }
+        None => { eprintln!("[request_invitation_from_sg] timed out waiting for SG reply"); None }
+    }
 }
 
 /// Parse an invitation code entered via the UI and send a BootstrapRequest to the SG.
@@ -6344,29 +6441,111 @@ pub fn start_bootstrap(
     Ok(())
 }
 
-/// Generate a contact invitation code: stores the invitation in
-/// `contact_invitations` and returns the base64-encoded shareable code.
-///
-/// Embeds the full `hosts` list of the chosen SG so the receiver can pick
-/// whichever entry resolves in its own network.
+/// Generate a contact invitation code for the UI. See `generate_invitation`.
 fn generate_contact_invitation(ctx: &WorkerContext) -> Option<String> {
-    let hosts = pick_invitation_hosts(ctx, "generate_contact_invitation")?;
+    generate_invitation(INVITE_TYPE_CONTACT, ctx)
+}
 
-    let (inv_id, inv_pk) = {
-        let mut node = ctx.node.write().unwrap();
-        let kp = generate_x25519_keypair();
-        let pk = kp.public_key;
-        let id = generate_uuid();
-        node.owner.contact_invitations.push(Invitation {
-            id,
-            key_pair:   kp,
-            expires_at: SystemTime::now() + Duration::from_secs(24 * 3600),
-        });
-        (id, pk)
+/// SG side of the DG→SG invitation request (op 0x35). Mints an invitation,
+/// stores it locally, and replies (op 0x36) with the encoded code embedding
+/// this SG's own hosts. Request body: `[kind:1][token:16]`. Response body:
+/// `[token:16][result:1][code_utf8...]`.
+pub fn generate_invitation_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 2 {
+        eprintln!("[generate_invitation_request] header too short from {src}");
+        return;
+    }
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[generate_invitation_request] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+    if plaintext.len() < 1 + 16 {
+        eprintln!("[generate_invitation_request] body too short from {src}");
+        return;
+    }
+    let kind = plaintext[0];
+    let token: Uuid = plaintext[1..17].try_into().unwrap();
+
+    // Any SG can mint: invitations are device-local, so the requesting DG's
+    // code points here and this node will receive the BootstrapRequest.
+    let hosts = {
+        let node = ctx.node.read().unwrap();
+        local_device_hosts(&node)
+    };
+    let (result_byte, code) = if hosts.is_empty() {
+        eprintln!("[generate_invitation_request] this SG has no hosts configured — cannot mint");
+        (INVITE_RESULT_ERROR, String::new())
+    } else {
+        let (inv_id, inv_pk) = store_new_invitation(kind, ctx);
+        ctx.save_node();
+        (INVITE_RESULT_OK, encode_invitation_code(&inv_id, &inv_pk, &hosts))
     };
 
-    ctx.save_node();
-    Some(encode_invitation_code(&inv_id, &inv_pk, &hosts))
+    let mut body = Vec::with_capacity(16 + 1 + code.len());
+    body.extend_from_slice(&token);
+    body.push(result_byte);
+    body.extend_from_slice(code.as_bytes());
+
+    let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
+        let node = ctx.node.read().unwrap();
+        node.owner.active_connections.get(&conn_id)
+            .map(|conn| (
+                build_encrypted_packet(GENERATE_INVITATION_RESPONSE_OP, conn, &body),
+                conn.peer_addr,
+            ))
+    };
+    let Some((pkt, addr)) = pkt_and_addr else {
+        eprintln!("[generate_invitation_request] no connection {conn_id} to reply from {src}");
+        return;
+    };
+    send(ctx, addr, &pkt);
+}
+
+/// DG side of the invitation reply (op 0x36). Fills the rendezvous slot keyed
+/// by the echoed token and wakes the parked `request_invitation_from_sg` thread.
+pub fn generate_invitation_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let plaintext = {
+        let node = ctx.node.read().unwrap();
+        match decrypt_packet_body(&node, &buf) {
+            Some(pt) => pt,
+            None => {
+                eprintln!("[generate_invitation_response] decryption failed from {src}");
+                return;
+            }
+        }
+    };
+    if plaintext.len() < 17 {
+        eprintln!("[generate_invitation_response] body too short from {src}");
+        return;
+    }
+    let token: Uuid = plaintext[0..16].try_into().unwrap();
+    let outcome: Result<String, ()> = if plaintext[16] == INVITE_RESULT_OK {
+        match std::str::from_utf8(&plaintext[17..]) {
+            Ok(code) => Ok(code.to_string()),
+            Err(_) => {
+                eprintln!("[generate_invitation_response] non-utf8 code from {src}");
+                Err(())
+            }
+        }
+    } else {
+        Err(())
+    };
+
+    let mut slots = ctx.pending_invites.slots.lock().unwrap();
+    if let Some(entry) = slots.get_mut(&token) {
+        *entry = Some(outcome);
+        ctx.pending_invites.cv.notify_all();
+    } else {
+        eprintln!("[generate_invitation_response] no waiter for token (late/duplicate reply) from {src}");
+    }
 }
 
 /// Parse a contact invitation code and send a ContactRequest to the target's SG.
@@ -6856,7 +7035,7 @@ mod tests {
             let (writer_tx, _writer_rx) = mpsc::sync_channel(64);
             let (scheduler_tx, _sched_rx) = mpsc::channel();
 
-            let ctx = WorkerContext { node, udp_socket: pnet_socket, writer_tx, scheduler_tx };
+            let ctx = WorkerContext { node, udp_socket: pnet_socket, writer_tx, scheduler_tx, pending_invites: Default::default() };
             TestCtx { ctx, app_socket, _writer_rx, _sched_rx }
         }
 
@@ -8114,6 +8293,150 @@ mod tests {
         }
         let conn_id = dg_conn.peer_active_connection_id;
         (conn_id, dg_conn, dg_socket)
+    }
+
+    #[test]
+    fn top_online_sg_defers_to_connected_top_rank_sg() {
+        // Local node is a rank-2 SG; a rank-1 SG is connected. Even though the
+        // local node is itself an SG, the more-preferred connected SG must win.
+        let t = TestCtx::new();
+        let rank1_uuid = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let local_uuid = node.device_uuid;
+            let d = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == local_uuid).unwrap();
+            d.grade = DeviceGrade::SG;
+            d.sg_rank = Some(2);
+            d.hosts = vec!["sg2:7777".into()];
+            node.owner.user.devices.push(Device {
+                alias: "sg1".into(), uuid: rank1_uuid, grade: DeviceGrade::SG,
+                sg_rank: Some(1), hosts: vec!["sg1:7777".into()], applications: vec![],
+            });
+            node.owner.active_connections.insert(7, ActiveConnection {
+                id: 7, timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: generate_x25519_keypair(),
+                peer_public_key: generate_x25519_keypair().public_key,
+                peer_active_connection_id: 1, device_uuid: rank1_uuid,
+                peer_addr: "127.0.0.1:0".parse().unwrap(),
+            });
+        }
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(top_online_sg(&node), Some(rank1_uuid),
+            "a non-top SG must defer to the connected top-ranked SG");
+    }
+
+    #[test]
+    fn top_online_sg_falls_back_to_local_when_top_rank_offline() {
+        // Same topology, but the rank-1 SG has no active connection. The local
+        // rank-2 SG can still mint for itself rather than failing.
+        let t = TestCtx::new();
+        let rank1_uuid = generate_uuid();
+        let local_uuid = {
+            let mut node = t.ctx.node.write().unwrap();
+            let local_uuid = node.device_uuid;
+            let d = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == local_uuid).unwrap();
+            d.grade = DeviceGrade::SG;
+            d.sg_rank = Some(2);
+            d.hosts = vec!["sg2:7777".into()];
+            node.owner.user.devices.push(Device {
+                alias: "sg1".into(), uuid: rank1_uuid, grade: DeviceGrade::SG,
+                sg_rank: Some(1), hosts: vec!["sg1:7777".into()], applications: vec![],
+            });
+            local_uuid
+        };
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(top_online_sg(&node), Some(local_uuid),
+            "an unreachable top SG must not strand the local SG");
+    }
+
+    #[test]
+    fn generate_invitation_request_mints_locally_and_replies_with_code() {
+        // SG side of the DG→SG invitation flow: an SG receives a 0x35 request,
+        // must store a fresh invitation locally and reply (0x36) with a code
+        // that embeds the SG's own hosts and references the stored invitation.
+        let t = TestCtx::new();
+        let (_conn_id, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+
+        // The SG needs advertised hosts to embed in the code.
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let local_uuid = node.device_uuid;
+            let d = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == local_uuid).unwrap();
+            d.hosts = vec!["sg.example:7777".to_string()];
+        }
+
+        // Craft the 0x35 request exactly as a DG would: [kind][token].
+        let token = generate_uuid();
+        let mut body = vec![INVITE_TYPE_DEVICE];
+        body.extend_from_slice(&token);
+        let pkt = build_encrypted_packet(GENERATE_INVITATION_REQUEST_OP, &dg_conn, &body);
+        generate_invitation_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        // The SG must have stored exactly one device invitation.
+        let stored_id = {
+            let node = t.ctx.node.read().unwrap();
+            assert_eq!(node.owner.device_invitations.len(), 1,
+                "SG should store the minted invitation");
+            assert!(node.owner.contact_invitations.is_empty(),
+                "device kind must not touch contact_invitations");
+            node.owner.device_invitations[0].id
+        };
+
+        // The SG must have replied with a 0x36 carrying OK + a decodable code.
+        let mut buf = [0u8; 1024];
+        let (len, _) = dg_socket.recv_from(&mut buf).expect("expected a 0x36 reply");
+        assert_eq!(buf[0], GENERATE_INVITATION_RESPONSE_OP);
+
+        // Decrypt the reply using the DG-side connection.
+        let plaintext = {
+            let mut node = super::super::data_models::Node::new();
+            node.owner.active_connections.insert(dg_conn.id, ActiveConnection {
+                id: dg_conn.id, timeout: dg_conn.timeout,
+                key_pair: dg_conn.key_pair.clone(),
+                peer_public_key: dg_conn.peer_public_key,
+                peer_active_connection_id: dg_conn.peer_active_connection_id,
+                device_uuid: dg_conn.device_uuid,
+                peer_addr: dg_conn.peer_addr,
+            });
+            decrypt_packet_body(&node, &buf[1..len]).expect("decrypt reply")
+        };
+
+        // Body: [token:16][result:1][code...].
+        assert_eq!(&plaintext[0..16], &token[..], "token must be echoed for matching");
+        assert_eq!(plaintext[16], INVITE_RESULT_OK);
+        let code = std::str::from_utf8(&plaintext[17..]).unwrap();
+        let (inv_id, _pk, hosts) = decode_invitation_code(code).expect("code must decode");
+        assert_eq!(inv_id, stored_id, "code must reference the stored invitation");
+        assert_eq!(hosts, vec!["sg.example:7777".to_string()],
+            "code must embed the SG's own hosts");
+    }
+
+    #[test]
+    fn generate_invitation_response_fills_waiting_slot() {
+        // DG side: a 0x36 reply must fill the rendezvous slot keyed by token and
+        // make the encoded code available to the parked requester.
+        let t = TestCtx::new();
+        let (_conn_id, dg_conn, _dg_socket) = writer_setup_with_capture(&t);
+
+        let token = generate_uuid();
+        t.ctx.pending_invites.slots.lock().unwrap().insert(token, None);
+
+        // Encrypt the 0x36 reply from the DG-side connection; the local node
+        // holds the matching connection (inserted by writer_setup_with_capture)
+        // so decrypt_packet_body recovers it via the header conn id.
+        let mut reply_body = Vec::new();
+        reply_body.extend_from_slice(&token);
+        reply_body.push(INVITE_RESULT_OK);
+        reply_body.extend_from_slice(b"THECODE");
+        let pkt = build_encrypted_packet(GENERATE_INVITATION_RESPONSE_OP, &dg_conn, &reply_body);
+        generate_invitation_response("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let slots = t.ctx.pending_invites.slots.lock().unwrap();
+        assert_eq!(slots.get(&token), Some(&Some(Ok("THECODE".to_string()))),
+            "slot must hold the decoded code for the parked requester");
     }
 
     #[test]

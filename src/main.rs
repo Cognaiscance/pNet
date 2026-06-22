@@ -157,6 +157,7 @@ fn main() {
         udp_socket:   Arc::clone(&udp.socket),
         writer_tx:    writer.sender(),
         scheduler_tx,
+        pending_invites: Default::default(),
     });
 
     // ── 6a. Headless env-driven first-run setup, if requested ────────────────
@@ -266,6 +267,7 @@ mod tests {
             udp_socket:   Arc::clone(&udp.socket),
             writer_tx:    writer.sender(),
             scheduler_tx,
+            pending_invites: Default::default(),
         });
         // Retain `ctx` in this scope via Arc::clone, exactly as `main` does.
         // This is what makes the test faithful: the lingering `WorkerContext`
