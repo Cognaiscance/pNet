@@ -5368,17 +5368,23 @@ pub fn cleanup_tunnels(ctx: &WorkerContext) {
 
 /// Scheduled every 20 seconds on DG devices.
 ///
-/// Sends an encrypted keepalive packet (op `0x12`) to the highest-ranked
-/// reachable SG owned by this device's user.  Encrypting the keepalive with
-/// the DG↔SG shared key lets the SG detect a stale/unknown connection and
-/// reply with a conn-reset (op `0x13`) so the DG can reconnect immediately
-/// instead of waiting up to 24 hours for the connection to expire.
+/// Sends encrypted keepalive packets (op `0x12`) to **every** SG this DG holds
+/// an active connection to — its own SGs of any rank *and* each contact's SG.
 ///
-/// Only one SG receives the keepalive at a time: the top-ranked SG that is
-/// currently marked up by `poll_sg`. If the top-ranked SG is down, falls
-/// through to the next rank.
+/// A DG is reachable for inbound delivery only on NAT mappings it keeps warm.
+/// It holds connections to several SGs: its own SGs, plus every contact's SG
+/// (those deliver cross-user app packets straight to this DG via `relay_packet`).
+/// Keeping only one mapping warm — the top-ranked own SG, as this used to —
+/// means any *other* SG's sends to this DG are silently dropped by NAT once its
+/// idle mapping closes, and aren't refreshed until the next ~22h connection
+/// renewal. So fan the keepalive out to every connected SG at the keepalive
+/// cadence.
+///
+/// Encrypting each keepalive with that connection's DG↔SG shared key also lets
+/// the SG detect a stale/unknown connection and reply with a conn-reset
+/// (op `0x13`) so the DG reconnects immediately.
 pub fn keepalive_dg(ctx: &WorkerContext) {
-    let out: Option<(Vec<u8>, SocketAddr)> = {
+    let outs: Vec<(Vec<u8>, SocketAddr)> = {
         let node       = ctx.node.read().unwrap();
         let local_uuid = node.device_uuid;
 
@@ -5389,43 +5395,36 @@ pub fn keepalive_dg(ctx: &WorkerContext) {
             .unwrap_or(false);
         if !is_dg { return; }
 
-        // UUIDs of own SGs that have an active connection, sorted by rank ascending.
-        // None-rank SGs sort last (treat as u32::MAX).
-        let connected: HashSet<Uuid> = node.owner.active_connections.values()
-            .map(|c| c.device_uuid)
-            .collect();
+        // Is `uuid` an SG we know — one of our own, or any contact's?
+        let is_known_sg = |uuid: &Uuid| -> bool {
+            node.owner.user.devices.iter()
+                .any(|d| d.uuid == *uuid && matches!(d.grade, DeviceGrade::SG))
+            || node.owner.contact_users.iter().any(|c| c.user.devices.iter()
+                .any(|d| d.uuid == *uuid && matches!(d.grade, DeviceGrade::SG)))
+        };
 
-        let mut own_sgs: Vec<&super::data_models::Device> = node.owner.user.devices.iter()
-            .filter(|d| matches!(d.grade, DeviceGrade::SG) && connected.contains(&d.uuid))
-            .collect();
-        own_sgs.sort_by_key(|d| d.sg_rank.unwrap_or(u32::MAX));
-
-        // Pick the highest-ranked SG that poll_sg considers up (treat unpolled as up).
-        let Some(sg) = own_sgs.iter()
-            .find(|d| {
-                let mut any_entry = false;
-                let mut any_up = false;
-                for ((uuid, _), status) in &node.sg_statuses {
-                    if *uuid == d.uuid {
-                        any_entry = true;
-                        if status.up { any_up = true; }
-                    }
+        // poll_sg up-test (treat an unpolled SG — e.g. a contact's SG we don't
+        // actively poll — as up). Mirrors the test used by writer/relay selection.
+        let is_up = |uuid: &Uuid| -> bool {
+            let mut any_entry = false;
+            let mut any_up = false;
+            for ((u, _), status) in &node.sg_statuses {
+                if *u == *uuid {
+                    any_entry = true;
+                    if status.up { any_up = true; }
                 }
-                !any_entry || any_up
-            })
-        else { return; };
+            }
+            !any_entry || any_up
+        };
 
-        // Find the active connection to that SG.
-        let Some(conn) = node.owner.active_connections.values()
-            .find(|c| c.device_uuid == sg.uuid)
-        else { return; };
-
-        // Encrypt an empty plaintext so the SG can verify the connection is live.
-        let pkt = build_encrypted_packet(DG_KEEPALIVE_OP, conn, &[]);
-        Some((pkt, conn.peer_addr))
+        // One keepalive per connected SG that's up (or unpolled).
+        node.owner.active_connections.values()
+            .filter(|c| is_known_sg(&c.device_uuid) && is_up(&c.device_uuid))
+            .map(|conn| (build_encrypted_packet(DG_KEEPALIVE_OP, conn, &[]), conn.peer_addr))
+            .collect()
     };
 
-    if let Some((pkt, dest)) = out {
+    for (pkt, dest) in outs {
         send(ctx, dest, &pkt);
     }
 }
@@ -5435,6 +5434,13 @@ pub fn keepalive_dg(ctx: &WorkerContext) {
 /// Attempts to decrypt the keepalive using the named connection.  If the
 /// conn_id is unknown or decryption fails the SG replies with a conn-reset
 /// (op `0x13`) so the DG evicts the stale connection and reconnects.
+///
+/// On success, refresh the connection's `peer_addr` and lifetime from this
+/// packet: the keepalive's source is authoritative for where to reach the DG
+/// right now (DGs roam and NAT bindings rebind), so app packets and relays to
+/// this DG always target its current mapping rather than a fixed address
+/// captured at connect time. The conn_id is the receiver-side id in the packet
+/// header (see `decrypt_packet_body`).
 pub fn dg_keepalive_receive(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let ok = {
         let node = ctx.node.read().unwrap();
@@ -5442,6 +5448,16 @@ pub fn dg_keepalive_receive(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) 
     };
     if !ok {
         send(ctx, src, &[CONN_RESET_OP]);
+        return;
+    }
+
+    if buf.len() >= 2 {
+        let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+        let mut node = ctx.node.write().unwrap();
+        if let Some(conn) = node.owner.active_connections.get_mut(&conn_id) {
+            conn.peer_addr = src;
+            conn.timeout   = SystemTime::now() + CONNECTION_LIFETIME;
+        }
     }
 }
 
@@ -7339,6 +7355,120 @@ mod tests {
             last_seen_public_version: SyncVersion::default(),
         });
         (device_uuid, kp)
+    }
+
+    // ── DG keepalive (NAT-mapping maintenance) ────────────────────────────────
+
+    /// A DG must keep an inbound NAT mapping warm on *every* SG it holds a
+    /// connection to — its own SGs and each contact's SG — not just the
+    /// top-ranked own SG, or another SG's app/relay sends are dropped by NAT.
+    #[test]
+    fn keepalive_dg_fans_out_to_own_and_contact_sgs() {
+        let t = TestCtx::new();
+
+        // Stand-in receiving sockets for the two SGs the DG connects to.
+        let own_sg_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        own_sg_sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let contact_sg_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        contact_sg_sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+
+        let own_sg_uuid = generate_uuid();
+        let contact_sg_uuid;
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            // Local device stays a DG (Node::new default). Add one own SG...
+            node.owner.user.devices.push(Device {
+                alias:        "own-sg".to_string(),
+                uuid:         own_sg_uuid,
+                grade:        DeviceGrade::SG,
+                sg_rank:      Some(1),
+                hosts:        vec!["127.0.0.1:7777".into()],
+                applications: Vec::new(),
+            });
+            // ...and a contact whose device is an SG.
+            let (csg, _kp) = add_contact_with_device(&mut node);
+            contact_sg_uuid = csg;
+
+            // Active connections to both, aimed at the receiving sockets.
+            node.owner.active_connections.insert(1, ActiveConnection {
+                id: 1,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: generate_x25519_keypair(),
+                peer_public_key: generate_key_bytes(),
+                peer_active_connection_id: 10,
+                device_uuid: own_sg_uuid,
+                peer_addr: own_sg_sock.local_addr().unwrap(),
+            });
+            node.owner.active_connections.insert(2, ActiveConnection {
+                id: 2,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: generate_x25519_keypair(),
+                peer_public_key: generate_key_bytes(),
+                peer_active_connection_id: 20,
+                device_uuid: contact_sg_uuid,
+                peer_addr: contact_sg_sock.local_addr().unwrap(),
+            });
+            // sg_statuses left empty → both treated as up.
+        }
+
+        keepalive_dg(&t.ctx);
+
+        let mut buf = [0u8; 64];
+        let (_n, _) = own_sg_sock.recv_from(&mut buf).expect("own SG should get a keepalive");
+        assert_eq!(buf[0], DG_KEEPALIVE_OP);
+        let (_n, _) = contact_sg_sock.recv_from(&mut buf).expect("contact SG should get a keepalive");
+        assert_eq!(buf[0], DG_KEEPALIVE_OP);
+    }
+
+    /// A verified keepalive updates the SG's stored address for the DG, so app
+    /// packets/relays follow the DG through a NAT rebind or roam.
+    #[test]
+    fn dg_keepalive_receive_refreshes_peer_addr() {
+        let t = TestCtx::new();
+
+        let sg_kp  = generate_x25519_keypair();
+        let dg_kp  = generate_x25519_keypair();
+        let sg_pub = sg_kp.public_key;
+        let dg_pub = dg_kp.public_key;
+        let sg_conn_id: u16 = 5;
+        let old_addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            // SG-side record of the DG connection, at a now-stale address.
+            node.owner.active_connections.insert(sg_conn_id, ActiveConnection {
+                id: sg_conn_id,
+                timeout: SystemTime::now() + Duration::from_secs(60),
+                key_pair: sg_kp,
+                peer_public_key: dg_pub,
+                peer_active_connection_id: 99,
+                device_uuid: generate_uuid(),
+                peer_addr: old_addr,
+            });
+        }
+
+        // DG builds a keepalive addressed to the SG's conn id.
+        let dg_side_conn = ActiveConnection {
+            id: 99,
+            timeout: SystemTime::now() + Duration::from_secs(60),
+            key_pair: dg_kp,
+            peer_public_key: sg_pub,
+            peer_active_connection_id: sg_conn_id,
+            device_uuid: generate_uuid(),
+            peer_addr: old_addr,
+        };
+        let pkt = build_encrypted_packet(DG_KEEPALIVE_OP, &dg_side_conn, &[]);
+
+        let before = t.ctx.node.read().unwrap()
+            .owner.active_connections[&sg_conn_id].timeout;
+        // Arrives from a NEW source address (NAT rebind / roam).
+        let new_addr: SocketAddr = "127.0.0.1:2222".parse().unwrap();
+        dg_keepalive_receive(new_addr, pkt[1..].to_vec(), &t.ctx);
+
+        let node = t.ctx.node.read().unwrap();
+        let conn = &node.owner.active_connections[&sg_conn_id];
+        assert_eq!(conn.peer_addr, new_addr, "peer_addr should track the keepalive source");
+        assert!(conn.timeout > before, "timeout should be refreshed");
     }
 
     /// Build the buf for connect_request (op byte already stripped).
