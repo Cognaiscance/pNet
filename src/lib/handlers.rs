@@ -2615,6 +2615,17 @@ fn is_own_user_sg(owner: &Owner, peer_uuid: Uuid) -> bool {
         .any(|d| d.uuid == peer_uuid && matches!(d.grade, DeviceGrade::SG))
 }
 
+/// True if the *local* device is an SG. Partition reconciliation is strictly an
+/// SG↔SG protocol, so both endpoints must be own-user SGs — `is_own_user_sg`
+/// covers the peer, this covers us. Without it a DG that connects to its own SG
+/// would kick off the merge handshake and the SG would reject every proposal as
+/// `malformed`, once per reconcile tick, forever.
+fn local_is_sg(node: &super::data_models::Node) -> bool {
+    let uuid = node.device_uuid;
+    node.owner.user.devices.iter()
+        .any(|d| d.uuid == uuid && matches!(d.grade, DeviceGrade::SG))
+}
+
 /// Periodic merge tick. Fires the partition-reconcile kickoff against every
 /// active connection to an own-user SG, so reconciliation makes progress even
 /// when the underlying `active_connection` survives a transient partition
@@ -2624,6 +2635,8 @@ fn is_own_user_sg(owner: &Owner, peer_uuid: Uuid) -> bool {
 pub fn partition_reconcile_tick(ctx: &WorkerContext) {
     let conn_ids: Vec<u16> = {
         let node = ctx.node.read().unwrap();
+        // Reconciliation is SG↔SG only; a DG never initiates.
+        if !local_is_sg(&node) { return; }
         node.owner.active_connections.iter()
             .filter(|(_, c)| is_own_user_sg(&node.owner, c.device_uuid))
             .map(|(id, _)| *id)
@@ -2643,6 +2656,8 @@ pub fn partition_reconcile_tick(ctx: &WorkerContext) {
 fn partition_reconcile_on_reconnect(conn_id: u16, ctx: &WorkerContext) {
     let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
         let node = ctx.node.read().unwrap();
+        // Reconciliation is SG↔SG only: both ends must be own-user SGs.
+        if !local_is_sg(&node) { return; }
         let Some(conn) = node.owner.active_connections.get(&conn_id) else { return };
         let peer_uuid = conn.device_uuid;
         if !is_own_user_sg(&node.owner, peer_uuid) { return; }
@@ -3786,6 +3801,17 @@ pub fn watermark_probe_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
         return;
     };
 
+    // SG↔SG only: ignore a probe unless we're an SG and the sender is an
+    // own-user SG. Keeps an SG from engaging a stray probe (e.g. a DG running
+    // an older build during a rollout).
+    {
+        let node = ctx.node.read().unwrap();
+        let peer_is_own_sg = node.owner.active_connections.get(&conn_id)
+            .map(|c| is_own_user_sg(&node.owner, c.device_uuid))
+            .unwrap_or(false);
+        if !local_is_sg(&node) || !peer_is_own_sg { return; }
+    }
+
     let body = {
         let node = ctx.node.read().unwrap();
         let map = build_local_watermark_map(&node, scope);
@@ -3871,12 +3897,12 @@ pub fn watermark_probe_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
         node.owner.last_watermarks.insert(peer_uuid, merged);
     }
 
-    // Sync v2: only own-user SGs participate in partition reconciliation.
-    // For any other peer the probe shouldn't have been sent in the first
-    // place, but guard here too.
+    // Sync v2: partition reconciliation is SG↔SG only — both this node and the
+    // peer must be own-user SGs. A DG should never have probed (so never get
+    // here), but guard so it never emits a proposal a peer would reject.
     let send_proposal = {
         let node = ctx.node.read().unwrap();
-        is_own_user_sg(&node.owner, peer_uuid)
+        local_is_sg(&node) && is_own_user_sg(&node.owner, peer_uuid)
     };
     if !send_proposal { return; }
 
@@ -10821,6 +10847,8 @@ mod tests {
     fn watermark_probe_request_replies_with_empty_map_when_log_is_empty() {
         let t = TestCtx::new();
         let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+        // A watermark probe is an SG↔SG message: make the peer an own-user SG.
+        promote_peer_to_sg(&t, dg_conn.device_uuid, 2);
 
         let mut body = Vec::new();
         write_scope(&mut body, Scope::Public);
@@ -10839,6 +10867,8 @@ mod tests {
     fn watermark_probe_request_reports_max_per_writer_in_log() {
         let t = TestCtx::new();
         let (_, dg_conn, dg_socket) = writer_setup_with_capture(&t);
+        // A watermark probe is an SG↔SG message: make the peer an own-user SG.
+        promote_peer_to_sg(&t, dg_conn.device_uuid, 2);
 
         // Seed two writers into the local write log.
         let w1: Uuid = [0x11; 16];
@@ -10885,6 +10915,48 @@ mod tests {
         assert_eq!((v1.epoch, v1.seq), (1, 5),
                    "w1 should be the max of its in-log entries");
         assert_eq!((v2.epoch, v2.seq), (3, 7));
+    }
+
+    /// Regression: a DG must never initiate partition reconciliation, even
+    /// against its own SG. Before the fix, the reconcile kickoff only checked
+    /// the peer's grade, so a DG probed its own SG and got a `malformed` merge
+    /// ack once per tick, forever.
+    #[test]
+    fn dg_does_not_initiate_partition_reconcile_against_own_sg() {
+        let t = TestCtx::new();
+        // Local device stays a DG (Node::new default).
+        let sg_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sg_sock.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let own_sg_uuid = generate_uuid();
+        let conn_id = 7u16;
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:        "own-sg".to_string(),
+                uuid:         own_sg_uuid,
+                grade:        DeviceGrade::SG,
+                sg_rank:      Some(1),
+                hosts:        vec!["127.0.0.1:7777".into()],
+                applications: Vec::new(),
+            });
+            node.owner.active_connections.insert(conn_id, ActiveConnection {
+                id: conn_id,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: generate_x25519_keypair(),
+                peer_public_key: generate_key_bytes(),
+                peer_active_connection_id: 1,
+                device_uuid: own_sg_uuid,
+                peer_addr: sg_sock.local_addr().unwrap(),
+            });
+        }
+
+        // Neither the on-reconnect kickoff nor the periodic tick may emit a probe.
+        partition_reconcile_on_reconnect(conn_id, &t.ctx);
+        partition_reconcile_tick(&t.ctx);
+
+        let mut rx = [0u8; 64];
+        assert!(sg_sock.recv_from(&mut rx).is_err(),
+                "a DG must not send a watermark probe to its own SG");
     }
 
     #[test]
