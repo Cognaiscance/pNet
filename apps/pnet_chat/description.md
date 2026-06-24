@@ -465,7 +465,7 @@ traceability:
 | 2 | Role selection (`UserAgent`/`SgStandby`/`DataGuest`) from the get-data tree + the `app_id → owner` reverse map; a DG resolves its UA (own top-ranked SG) and delegates via the `CLIENT_ATTACH`/`CLIENT_ATTACH_ACK` handshake (UA tracks attached clients, auth-by-stamp own-user check). |
 | 3 | Room lifecycle on the RH: `OPEN_ROOM`/`ROOM_CREATED`, membership (`ADD`/`REMOVE`/`LEAVE`/`MEMBER_UPDATE`), `INVITE`, `HELLO`, and the `app_id → (user, device)` reverse map for auth-by-stamp permission checks. |
 | 4 | Text messaging: `POST` → RH `seq` assignment → `MSG` fan-out; `client_msg_id` echo correlation; per-UA local history; idempotent apply by `(room, seq)`. ✓ |
-| 5 | Reliability: cumulative `ACK` + RH retry, `HISTORY_REQ`/`HISTORY_RESP` (self-chunking), reconnect cursor, idempotent apply by `(room, seq)`. |
+| 5 | Reliability: cumulative `ACK` + RH retry, `HISTORY_REQ`/`HISTORY_RESP` (self-chunking), reconnect cursor (HELLO carries last contiguous seq → RH replays the gap), idempotent apply by `(room, seq)`. ✓ |
 | 6 | Backfill on join; new-member history streaming. Blob family (`0x30`–`0x33`) for attachments and oversized replays. |
 | 7 | Host failover: mirror room state across the host user's SGs; `HOST_MOVED`; member re-resolution. |
 | 8 | Voice: `MEDIA_FRAME` path through the RH SFU; small-room target. |

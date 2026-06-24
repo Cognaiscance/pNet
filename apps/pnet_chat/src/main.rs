@@ -378,6 +378,59 @@ fn decode_msg(body: &[u8]) -> Option<DecodedMsg> {
     Some(DecodedMsg { seq, sender_user, ts_ms, client_msg_id, text })
 }
 
+/// `ACK` body: `seq:u64` (cumulative highest-contiguous applied).
+fn encode_ack(seq: u64) -> Vec<u8> { seq.to_be_bytes().to_vec() }
+fn decode_ack(body: &[u8]) -> Option<u64> {
+    let mut pos = 0;
+    Some(u64::from_be_bytes(read_bytes::<8>(body, &mut pos)?))
+}
+
+/// `HISTORY_REQ` body: `since_seq:u64, max_count:u16`.
+fn encode_history_req(since: u64, max: u16) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&since.to_be_bytes());
+    b.extend_from_slice(&max.to_be_bytes());
+    b
+}
+fn decode_history_req(body: &[u8]) -> Option<(u64, u16)> {
+    let mut pos = 0;
+    let since = u64::from_be_bytes(read_bytes::<8>(body, &mut pos)?);
+    let max = u16::from_be_bytes(read_bytes::<2>(body, &mut pos)?);
+    Some((since, max))
+}
+
+/// `HISTORY_RESP` body: `from_seq:u64, to_seq:u64, more:u8, count:u16,
+/// (entry_len:u16, MSG-body)×count`. Each entry is a full MSG body so the
+/// requester applies it exactly like a live MSG. Self-chunking: while `more`,
+/// the requester re-asks with `since = to_seq`.
+fn encode_history_resp(from: u64, to: u64, more: bool, entries: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&from.to_be_bytes());
+    b.extend_from_slice(&to.to_be_bytes());
+    b.push(more as u8);
+    b.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    for e in entries {
+        b.extend_from_slice(&(e.len() as u16).to_be_bytes());
+        b.extend_from_slice(e);
+    }
+    b
+}
+fn decode_history_resp(body: &[u8]) -> Option<(u64, u64, bool, Vec<Vec<u8>>)> {
+    let mut pos = 0;
+    let from = u64::from_be_bytes(read_bytes::<8>(body, &mut pos)?);
+    let to = u64::from_be_bytes(read_bytes::<8>(body, &mut pos)?);
+    let more = *body.get(pos)? != 0; pos += 1;
+    let count = u16::from_be_bytes(read_bytes::<2>(body, &mut pos)?) as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = u16::from_be_bytes(read_bytes::<2>(body, &mut pos)?) as usize;
+        let e = body.get(pos..pos + len)?.to_vec();
+        pos += len;
+        entries.push(e);
+    }
+    Some((from, to, more, entries))
+}
+
 // ── Data types ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize)]
@@ -542,6 +595,9 @@ struct RoomState {
     next_seq: u64,
     /// Highest `seq` we have applied (for idempotent apply / Phase 5 cursor).
     last_seq: u64,
+    /// RH-side: per-member highest acked `seq` — drives retry + reconnect replay.
+    #[serde(skip)]
+    member_acks: HashMap<[u8; 16], u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1132,13 +1188,16 @@ fn handle_frame(
 
         msg::OPEN_ROOM => handle_open_room(inner, env, sender_id, owner, outs),
         msg::INVITE => handle_invite(inner, env, owner, outs),
-        msg::HELLO => handle_hello(inner, env, owner),
+        msg::HELLO => handle_hello(inner, env, owner, outs),
         msg::ADD_MEMBER => handle_add_member(inner, env, owner, outs),
         msg::REMOVE_MEMBER => handle_remove_member(inner, env, owner, outs),
         msg::LEAVE => handle_leave(inner, env, owner, outs),
         msg::MEMBER_UPDATE => handle_member_update(inner, env, owner),
         msg::POST => handle_post(inner, env, owner, outs),
-        msg::MSG => handle_msg(inner, env, owner),
+        msg::MSG => handle_msg(inner, env, owner, outs),
+        msg::ACK => handle_ack(inner, env, owner),
+        msg::HISTORY_REQ => handle_history_req(inner, env, owner, outs),
+        msg::HISTORY_RESP => handle_history_resp(inner, env, owner, outs),
 
         _ => format!(
             "room {}…, {} body byte(s) — not handled until a later phase",
@@ -1210,6 +1269,7 @@ fn create_room(
         messages: Vec::new(),
         next_seq: 1,
         last_seq: 0,
+        member_acks: HashMap::new(),
     };
     for m in &room.members {
         queue_invite(inner, &room, m, outs);
@@ -1272,6 +1332,7 @@ fn handle_invite(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>
         messages,
         next_seq: 1,
         last_seq,
+        member_acks: HashMap::new(),
     };
     // HELLO back to the RH announcing our UA address + (room, last applied seq).
     let body = encode_hello(&my_device, &my_app, &[(env.room_id, last_seq)]);
@@ -1285,21 +1346,30 @@ fn handle_invite(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>
     }
 }
 
-fn handle_hello(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>) -> String {
+fn handle_hello(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>, outs: &mut Vec<Outbound>) -> String {
     let Some(owner) = owner else { return "HELLO from unresolved sender — dropped".into() };
-    let Some((_dev, _app, rooms)) = decode_hello(env.body) else { return "HELLO malformed".into() };
+    let Some((dev, app, rooms)) = decode_hello(env.body) else { return "HELLO malformed".into() };
     let mut touched = 0;
-    for (rid, _seq) in &rooms {
-        let Some(room) = inner.rooms.get_mut(rid) else { continue };
-        if !room.is_rh { continue; }
-        // Auth-by-stamp: the sender's user must be a current member.
-        if let Some(m) = room.members.iter_mut().find(|m| m.user_uuid == owner.user_uuid) {
-            m.present = true;
-            touched += 1;
+    for (rid, reported_seq) in &rooms {
+        let is_member = inner.rooms.get(rid)
+            .map(|r| r.is_rh && r.members.iter().any(|m| m.user_uuid == owner.user_uuid))
+            .unwrap_or(false);
+        if !is_member { continue; }
+        // Auth-by-stamp: the sender's user is a current member. Mark present and
+        // seed the reconnect cursor from the reported seq, then replay the gap.
+        {
+            let room = inner.rooms.get_mut(rid).unwrap();
+            if let Some(m) = room.members.iter_mut().find(|m| m.user_uuid == owner.user_uuid) {
+                m.present = true;
+            }
+            let cur = room.member_acks.entry(owner.user_uuid).or_insert(0);
+            if *reported_seq > *cur { *cur = *reported_seq; }
         }
+        replay_to_member(inner, rid, owner.user_uuid, &dev, &app, outs);
+        touched += 1;
     }
     if touched > 0 {
-        format!("HELLO from {} — marked present in {} room(s)", owner.label, touched)
+        format!("HELLO from {} — present + replayed in {} room(s)", owner.label, touched)
     } else {
         format!("HELLO from {} — no matching room we host", owner.label)
     }
@@ -1461,17 +1531,133 @@ fn handle_post(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>, 
     }
 }
 
-fn handle_msg(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>) -> String {
+/// The highest seq N such that every seq in 1..=N is present — the cumulative
+/// applied-through cursor we ACK and report in HELLO (gaps below it block it).
+fn contiguous_seq(room: &RoomState) -> u64 {
+    let mut n = 0u64;
+    loop {
+        if room.messages.iter().any(|m| m.seq == n + 1) { n += 1; } else { return n; }
+    }
+}
+
+fn uuid_from_hex(s: &str) -> [u8; 16] { hex_to_uuid(s).unwrap_or([0u8; 16]) }
+
+/// Address of a room's RH (for member → RH frames). None if we don't hold the room.
+fn rh_addr(inner: &Inner, room_id: &[u8; 16]) -> Option<([u8; 16], [u8; 16])> {
+    inner.rooms.get(room_id).filter(|r| !r.is_rh).map(|r| (r.rh_device, r.rh_app_id))
+}
+
+/// Queue a frame from a member to its room's RH.
+fn to_rh(inner: &Inner, room_id: &[u8; 16], msg_type: u8, body: Vec<u8>, outs: &mut Vec<Outbound>) {
+    if let Some((dev, app)) = rh_addr(inner, room_id) {
+        outs.push(Outbound { dest_device: dev, dest_app: app, msg_type, room_id: *room_id, body });
+    }
+}
+
+/// Send an ACK for our current contiguous cursor to a room's RH.
+fn ack_to_rh(inner: &Inner, room_id: &[u8; 16], outs: &mut Vec<Outbound>) {
+    if let Some(room) = inner.rooms.get(room_id) {
+        if room.is_rh { return; } // the RH does not ACK itself
+        let cursor = contiguous_seq(room);
+        to_rh(inner, room_id, msg::ACK, encode_ack(cursor), outs);
+    }
+}
+
+fn handle_msg(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>, outs: &mut Vec<Outbound>) -> String {
     let Some(owner) = owner else { return "MSG from unresolved sender — dropped".into() };
     let Some(m) = decode_msg(env.body) else { return "MSG malformed".into() };
     // Accept ordered messages only from the room's current RH.
     let from_rh = inner.rooms.get(&env.room_id).map(|r| r.rh_device == owner.device_uuid).unwrap_or(false);
     if !from_rh { return "MSG not from our RH — dropped".into(); }
-    if apply_message(inner, &env.room_id, m.seq, m.sender_user, m.ts_ms, m.text) {
-        format!("MSG seq {} applied", m.seq)
-    } else {
-        format!("MSG seq {} duplicate — ignored", m.seq)
+    let prev_cursor = inner.rooms.get(&env.room_id).map(contiguous_seq).unwrap_or(0);
+    let applied = apply_message(inner, &env.room_id, m.seq, m.sender_user, m.ts_ms, m.text);
+    // If this MSG jumped ahead of our contiguous cursor, ask the RH for the gap.
+    if m.seq > prev_cursor + 1 {
+        to_rh(inner, &env.room_id, msg::HISTORY_REQ, encode_history_req(prev_cursor, 0), outs);
     }
+    // ACK our (possibly advanced) contiguous cursor.
+    ack_to_rh(inner, &env.room_id, outs);
+    if applied { format!("MSG seq {} applied", m.seq) } else { format!("MSG seq {} duplicate — ignored", m.seq) }
+}
+
+fn handle_ack(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>) -> String {
+    let Some(owner) = owner else { return "ACK from unresolved sender — dropped".into() };
+    let Some(seq) = decode_ack(env.body) else { return "ACK malformed".into() };
+    let Some(room) = inner.rooms.get_mut(&env.room_id) else { return "ACK for unknown room".into() };
+    if !room.is_rh { return "ACK ignored — we are not this room's RH".into(); }
+    if !room.members.iter().any(|m| m.user_uuid == owner.user_uuid) {
+        return "ACK from non-member — dropped".into();
+    }
+    let cur = room.member_acks.entry(owner.user_uuid).or_insert(0);
+    if seq > *cur { *cur = seq; }
+    format!("ACK from {} → seq {seq}", owner.label)
+}
+
+/// RH-side: replay messages with seq above a member's cursor to its UA address.
+fn replay_to_member(inner: &mut Inner, room_id: &[u8; 16], member: [u8; 16], dev: &[u8; 16], app: &[u8; 16], outs: &mut Vec<Outbound>) {
+    let Some(room) = inner.rooms.get(room_id) else { return };
+    if !room.is_rh { return; }
+    let cursor = *room.member_acks.get(&member).unwrap_or(&0);
+    let mut pending: Vec<&ChatMsg> = room.messages.iter().filter(|m| m.seq > cursor).collect();
+    pending.sort_by_key(|m| m.seq);
+    for m in pending {
+        let body = encode_msg(m.seq, &uuid_from_hex(&m.sender_user_hex), m.ts_ms, &[0u8; 16], &m.text);
+        outs.push(Outbound { dest_device: *dev, dest_app: *app, msg_type: msg::MSG,
+                             room_id: *room_id, body });
+    }
+}
+
+fn handle_history_req(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>, outs: &mut Vec<Outbound>) -> String {
+    let Some(owner) = owner else { return "HISTORY_REQ from unresolved sender — dropped".into() };
+    let Some((since, max)) = decode_history_req(env.body) else { return "HISTORY_REQ malformed".into() };
+    let Some(room) = inner.rooms.get(&env.room_id) else { return "HISTORY_REQ for unknown room".into() };
+    if !room.is_rh { return "HISTORY_REQ ignored — we are not this room's RH".into(); }
+    if !room.members.iter().any(|m| m.user_uuid == owner.user_uuid) {
+        return "HISTORY_REQ from non-member — dropped".into();
+    }
+    // Collect messages after `since`, chunked to fit one datagram.
+    let mut msgs: Vec<&ChatMsg> = room.messages.iter().filter(|m| m.seq > since).collect();
+    msgs.sort_by_key(|m| m.seq);
+    let cap = if max == 0 { usize::MAX } else { max as usize };
+    let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut size = ENVELOPE_LEN + 8 + 8 + 1 + 2; // envelope + from/to/more/count
+    let mut to = since;
+    for m in msgs.into_iter().take(cap) {
+        let e = encode_msg(m.seq, &uuid_from_hex(&m.sender_user_hex), m.ts_ms, &[0u8; 16], &m.text);
+        if size + 2 + e.len() > MAX_APP_PAYLOAD && !entries.is_empty() { break; }
+        size += 2 + e.len();
+        to = m.seq;
+        entries.push(e);
+    }
+    let highest = room.messages.iter().map(|m| m.seq).max().unwrap_or(0);
+    let more = to < highest;
+    let n = entries.len();
+    let body = encode_history_resp(since, to, more, &entries);
+    // Reply to the member's UA (resolved from the directory).
+    if let Some((dev, app)) = inner.directory.get(&owner.user_uuid).and_then(|d| d.resolve_ua()) {
+        outs.push(Outbound { dest_device: dev, dest_app: app, msg_type: msg::HISTORY_RESP,
+                             room_id: env.room_id, body });
+    }
+    format!("HISTORY_REQ since {since} → replied {n} entries (more={more})")
+}
+
+fn handle_history_resp(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>, outs: &mut Vec<Outbound>) -> String {
+    let Some(owner) = owner else { return "HISTORY_RESP from unresolved sender — dropped".into() };
+    let from_rh = inner.rooms.get(&env.room_id).map(|r| r.rh_device == owner.device_uuid).unwrap_or(false);
+    if !from_rh { return "HISTORY_RESP not from our RH — dropped".into(); }
+    let Some((_from, to, more, entries)) = decode_history_resp(env.body) else { return "HISTORY_RESP malformed".into() };
+    let mut applied = 0;
+    for e in &entries {
+        if let Some(m) = decode_msg(e) {
+            if apply_message(inner, &env.room_id, m.seq, m.sender_user, m.ts_ms, m.text) { applied += 1; }
+        }
+    }
+    // Continue the chunked replay if there is more, then ACK our cursor.
+    if more {
+        to_rh(inner, &env.room_id, msg::HISTORY_REQ, encode_history_req(to, 0), outs);
+    }
+    ack_to_rh(inner, &env.room_id, outs);
+    format!("HISTORY_RESP applied {applied} (more={more})")
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
@@ -1869,6 +2055,46 @@ async fn room_maintenance_loop(state: Arc<AppState>) {
     }
 }
 
+// ── RH reliability: retry unacked MSGs until every member's UA acks ───────────
+
+const RH_RETRY_INTERVAL_SECS: u64 = 5;
+
+/// On each tick, for every room we host, re-send any messages a member has not
+/// yet acked to that member's UA. This is the reliable RH↔UA leg: a MSG lost in
+/// the immediate fan-out, or a member that was offline/unresolvable when it was
+/// posted, is healed here; the member's ACK trims the backlog so it converges
+/// and stops. Idempotent apply on the member makes duplicate sends harmless.
+async fn rh_retry_loop(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(RH_RETRY_INTERVAL_SECS)).await;
+        let mut outs: Vec<Outbound> = Vec::new();
+        let token = {
+            let inner = state.inner.lock().unwrap();
+            for room in inner.rooms.values() {
+                if !room.is_rh { continue; }
+                let latest = room.messages.iter().map(|m| m.seq).max().unwrap_or(0);
+                for m in &room.members {
+                    let acked = *room.member_acks.get(&m.user_uuid).unwrap_or(&0);
+                    if acked >= latest { continue; }
+                    let Some((dev, app)) = inner.directory.get(&m.user_uuid).and_then(|d| d.resolve_ua())
+                    else { continue };
+                    for cm in room.messages.iter().filter(|x| x.seq > acked) {
+                        let body = encode_msg(cm.seq, &uuid_from_hex(&cm.sender_user_hex), cm.ts_ms, &[0u8; 16], &cm.text);
+                        outs.push(Outbound { dest_device: dev, dest_app: app, msg_type: msg::MSG,
+                                             room_id: room.room_id, body });
+                    }
+                }
+            }
+            inner.token
+        };
+        if let Some(token) = token {
+            if !outs.is_empty() {
+                flush(&state, &token, outs).await;
+            }
+        }
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1960,6 +2186,7 @@ async fn main() {
     tokio::spawn(data_refresh_loop(state.clone()));
     tokio::spawn(attach_loop(state.clone()));
     tokio::spawn(room_maintenance_loop(state.clone()));
+    tokio::spawn(rh_retry_loop(state.clone()));
 
     let app = Router::new()
         .route("/", get(handle_index))
