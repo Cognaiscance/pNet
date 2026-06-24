@@ -1,3 +1,7 @@
 /target
 .claude/
 docker-compose.yml
+
+# App runtime tokens (minted per registration, never committed)
+pnet_token.bin
+pnet_chat_token.bin

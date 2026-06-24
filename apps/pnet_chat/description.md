@@ -40,6 +40,22 @@ guarantee that a sent packet arrives. Every one of those is the app's job. pNet
 a per-device view of our contacts and their devices/apps, and best-effort
 delivery of one payload to one app.
 
+One more pipe property is load-bearing and was confirmed against the core
+(`handlers.rs` `app_send_packet`): **an app payload is a single, unfragmented
+UDP datagram.** pNet appends our bytes after a 48-byte header and wraps the
+result in one encrypted packet; nothing in the relay or tunnel path splits or
+reassembles. After on-wire crypto overhead (24-byte nonce + 16-byte tag) and
+relay addressing, the WAN-safe app-body ceiling is ~1 KB (avoiding IP
+fragmentation); ~4 KB is the absolute limit set by the apps' receive buffers.
+We fix **`MAX_APP_PAYLOAD = 1024` bytes** (envelope included) as the unit every
+message must fit in. Anything larger — history replays, attachments, video
+frames — is the app's job to chunk (see *Attachments* and the blob family).
+
+A second pipe property shapes the whole permission model: **an inbound push is
+stamped only with the sender's `app_id`** (push format `[0x04][sender_app_id:16]
+[payload]`), never a device or user. Identity is therefore something the
+receiver *resolves*, not something the sender *asserts* — see *Permissions*.
+
 We also assume one deployment fact that the whole design leans on:
 
 > **The app is installed and user-approved on every SG a participating user owns.**
@@ -103,6 +119,13 @@ star centered on the host, never a full mesh.
   for everyone. The member list is shown to all members so there are no surprises.
 - **Only the host adds or removes members**, and only from the host's own contact
   list. The RH enforces this (see *Permissions*).
+- **Leaving stops the feed; it does not unsend history.** Both a host
+  `REMOVE_MEMBER` and a member's voluntary `LEAVE` simply drop the member from the
+  list, halt their feed, and emit a `MEMBER_UPDATE` to the rest. A departed member
+  keeps the local history their UA already holds — we cannot enforce deletion on
+  another user's SG, and pretending to would be security theater (the same trust
+  reality as every chat app). An optional per-room `purge_on_leave` flag may
+  *ask* a departing UA to drop its copy, honored voluntarily; it is off in v1.
 
 ## Discovery and addressing
 
@@ -180,10 +203,15 @@ in the same order.
 
 New member joins: when the host adds B, the RH sends an invite, B's UA announces
 itself, and the RH streams the room's history to B's UA. **Default: full history**
-(Discord-like); configurable per room to "from join point."
+(Discord-like); the per-room `join_history_mode` byte can switch this to "from
+join point."
 
-Retention is app-defined; default is keep-all on both the RH and each UA. (A
-later phase can add per-room retention windows.)
+Retention is app-defined and host-configured (the RH is the authority). v1 ships
+**keep-all** on both the RH and each UA, but the `OPEN_ROOM`/`INVITE` wire format
+reserves two bytes now for forward-compatibility: `retention_mode` (0=keep-all,
+1=window-by-count, 2=window-by-age) and `join_history_mode` (0=full, 1=from-join).
+Each UA manages its own local storage independently; the RH's retention only
+bounds what backfill it can still serve.
 
 ## Delivery and ordering guarantees
 
@@ -230,6 +258,21 @@ and re-delivering when the DG reconnects. Reliability is lower (a DG can be offl
 arbitrarily long and the RH must hold its backlog), but the model still works.
 Recommended UX: nudge active users to install the app on an SG.
 
+## Attachments and large payloads
+
+Because every app payload is a single ≤ 1 KB datagram, anything bigger than a
+text line is chunked by the app over the **blob family** (`0x30`–`0x33`). This is
+one generic mechanism reused for both attachments and oversized history replays —
+not a special case per feature, and explicitly **not** the `pnet_deliverer` path
+(that is a separate app with separate ids; all chat bytes stay inside pnet_chat).
+
+A chat message references its attachments by `blob_id` only; the sender's UA
+ships the bytes to the RH with a `BLOB_OFFER` followed by `BLOB_CHUNK`s, and the
+RH re-offers them to each member UA on demand. Transfers run on the reliable
+RH↔UA leg with cumulative `BLOB_ACK` / explicit `BLOB_NACK`, reassembled by
+`blob_id` and verified against the offered `sha256`. A DG pulls a blob from its
+own UA the same way it pulls history.
+
 ## Voice and screen share
 
 Live media is a separate, **ephemeral** path. It is never appended to history and
@@ -240,86 +283,190 @@ never `seq`-ordered; frames carry their own timestamps and late frames are dropp
 - The RH acts as a **selective forwarding unit (SFU)**: each speaker/streamer sends
   one media stream up to the RH, which forwards it to the other members.
 - **This concentrates bandwidth on the RH.** Text fan-out is nothing; voice is
-  modest; screen-share fan-out for a large room is heavy. v1 targets small rooms
-  and documents this as the known hotspot and the scaling limit.
+  modest; screen-share fan-out for a large room is heavy.
 
-Open refinement (see *Open questions*): for latency, media may travel
-RH ↔ member **DG** directly (the RH already may address member devices, all
-contacts), skipping the member-UA hop that control/history traffic uses. v1 may
-route media through the UA for simplicity and revisit.
+**Media routes RH ↔ member DG directly, bypassing the UA.** The UA hop exists
+only to give text durability and `seq`-ordering; media has neither (ephemeral,
+self-timestamped, late frames dropped), so routing it through a member's UA adds
+an SG hop of latency and doubles SG bandwidth for no benefit. The contact rule
+already permits RH↔member-DG (the host is a contact of the member). A member's
+DG announces a media endpoint with `MEDIA_JOIN` on entering a call; the RH
+forwards frames straight to each joined DG and drops the endpoint on
+`MEDIA_LEAVE` or presence timeout. Control and history stay on the reliable UA
+leg.
+
+**Single-RH SFU, hard-capped.** A relay-tree or peer-assisted path cannot help
+here: the contact rule forbids member↔member links, so every alternative still
+funnels through host-grade nodes — not worth v1 complexity. The RH enforces
+explicit caps (rejecting `MEDIA_JOIN` past them): v1 targets **≤ 8 participants
+in a voice call and ≤ 1 concurrent screen-share**. The RH uplink is the
+documented scaling wall; simulcast/SVC layers are the later lever, not topology
+changes.
 
 ## App-level protocol
 
 All payloads below are the opaque bytes carried in the `0x03` / `0x04` body; pNet
-does not parse them. Envelope:
+does not parse them. Every payload begins with the same envelope:
 
 ```
-[version:u8][msg_type:u8][room_id:16][body...]
+[version:u8 = 1][msg_type:u8][room_id:16][body...]
 ```
 
-`room_id` is a UUID the RH generates at room creation. Message types:
+`room_id` is a UUID the RH generates at room creation. An all-zero `room_id` is
+the **multi-room sentinel** used by messages that are not scoped to one room
+(currently `HELLO`). A receiver drops any payload whose `version` it does not
+understand or whose `msg_type` it does not recognize (logging it), so new types
+are additive.
 
-| Type | Direction | Purpose |
+**Field conventions.** `uuid` = 16 bytes. `str` = `[len:u8][utf8]` (≤ 255 bytes,
+for names/aliases/mime). `text` = `[len:u16][utf8]` (chat bodies, up to the
+datagram budget). All multi-byte integers are big-endian. Timestamps are
+`u64` milliseconds since the Unix epoch. Every message must fit
+`MAX_APP_PAYLOAD = 1024` bytes including the 18-byte envelope; oversized content
+goes through the blob family (`0x30`–`0x33`).
+
+### Control and text
+
+| Type | Name | Direction | Body |
+|---|---|---|---|
+| `0x01` | `OPEN_ROOM` | host DG → own UA | `name:str, retention_mode:u8, join_history_mode:u8, member_count:u8, member_user:16 ×N`. Envelope `room_id = 0`; the UA mints the real id. |
+| `0x02` | `ROOM_CREATED` | UA → host DG | *(empty)* — envelope `room_id` is the minted room id. |
+| `0x03` | `INVITE` | RH → member (UA or DG) | `name:str, host_user:16, rh_device:16, rh_app_id:16, retention_mode:u8, join_history_mode:u8, member_count:u8, (member_user:16, alias:str)×N`. |
+| `0x04` | `HELLO` | member UA → RH | `ua_device:16, ua_app_id:16, room_count:u16, (room_id:16, last_seq:u64)×N`. Envelope `room_id = 0`; one `HELLO` per RH batches that RH's rooms. |
+| `0x06` | `ADD_MEMBER` | host DG → RH | `member_user:16` (must be a host contact). |
+| `0x07` | `REMOVE_MEMBER` | host DG → RH | `member_user:16`. |
+| `0x08` | `LEAVE` | member UA → RH | *(empty)*. |
+| `0x09` | `MEMBER_UPDATE` | RH → member UAs | `change:u8 (0=add, 1=remove, 2=leave), member_user:16, alias:str`. |
+| `0x0A` | `POST` | member DG → own UA → RH | `client_msg_id:16, text, attach_count:u8, blob_id:16 ×N`. |
+| `0x0B` | `MSG` | RH → member UA → DG | `seq:u64, sender_user:16, ts_ms:u64, client_msg_id:16, text, attach_count:u8, (blob_id:16, name:str, mime:str, total_len:u32)×N`. |
+| `0x0C` | `ACK` | UA → RH | `seq:u64` — cumulative applied-through; drives RH retry/backlog trim. |
+| `0x0D` | `HISTORY_REQ` | UA/DG → RH/own UA | `since_seq:u64, max_count:u16`. |
+| `0x0E` | `HISTORY_RESP` | RH/UA → requester | `from_seq:u64, to_seq:u64, more:u8, count:u16, (entry_len:u16, MSG-body)×count`. Self-chunks: while `more`, the requester re-asks with `since = to_seq`. |
+| `0x0F` | `HOST_MOVED` | new RH → members | `new_rh_device:16, new_rh_app_id:16`. |
+
+`client_msg_id` is minted by the originating DG so it can correlate its
+optimistic local echo with the ordered `MSG` the RH sends back — the round trip
+*is* the delivery confirmation. Apply is idempotent by `(room_id, seq)`.
+
+### Intra-user (client ↔ User Agent)
+
+A DG is a thin client of its own user's UA; before any room traffic it announces
+itself so the UA knows it is online and where to deliver. Authenticated by
+auth-by-stamp (the UA accepts only its *own user's* devices). Envelope
+`room_id = 0` (not room-scoped).
+
+| Type | Name | Direction | Body |
+|---|---|---|---|
+| `0x10` | `CLIENT_ATTACH` | DG → own UA | *(empty)* — sender resolved from the stamp; re-sent on a presence interval. |
+| `0x11` | `CLIENT_ATTACH_ACK` | UA → DG | *(empty)* — confirms the UA registered this client. |
+
+### Media (ephemeral, unacked, RH ↔ member DG)
+
+| Type | Name | Direction | Body |
+|---|---|---|---|
+| `0x20` | `MEDIA_JOIN` | member DG → RH | `media_device:16, media_app_id:16, modes:u8 (bit0 audio, bit1 video/screen)`. |
+| `0x21` | `MEDIA_LEAVE` | member DG → RH | *(empty)*. |
+| `0x22` | `MEDIA_FRAME` | streamer → RH → members | `stream_id:u32, codec:u8, frame_seq:u16, ts:u32, flags:u8 (bit0 keyframe), payload`. Not persisted, not `seq`-ordered; late frames dropped. |
+
+### Blob family (chunked transfer for attachments and large history)
+
+A `MSG`/`POST` carries only `blob_id` references; the bytes flow separately over
+the reliable RH↔UA leg. Reassembly is keyed by `blob_id`, idempotent by
+`(blob_id, chunk_index)`. Default `chunk_size` is 1000 bytes (fits the datagram
+budget after the envelope and blob header).
+
+| Type | Name | Body |
 |---|---|---|
-| `OPEN_ROOM` | host DG → own UA | Create a room; UA becomes its RH. Body: room name, initial member uuids. |
-| `INVITE` | RH → member (UA or DG) | "You're in room R." Body: room name, host user uuid, RH `(device_uuid, app_id)`, current member list. |
-| `HELLO` | member UA → RH | Announce this user's UA address for the room. Body: UA `(device_uuid, app_id)`, last-applied `seq`. |
-| `ADD_MEMBER` / `REMOVE_MEMBER` | host DG → RH | Change membership (host only; target must be a host contact). |
-| `POST` | member DG → own UA → RH | Submit a chat message. Body: text (or attachment ref). |
-| `MSG` | RH → member UA → DG | Ordered, fanned-out message. Body: `seq`, sender uuid, text, timestamp. |
-| `HISTORY_REQ` | UA/DG → RH/own UA | Request backlog. Body: `since_seq`. |
-| `HISTORY_RESP` | RH/UA → requester | Replay of messages after `since_seq`. |
-| `ACK` | UA → RH | Confirm applied up to `seq` (drives RH retry/backlog). |
-| `HOST_MOVED` | new RH → members | Host failover notice. Body: new RH `(device_uuid, app_id)`. |
-| `MEDIA_FRAME` | streamer → RH → members | Ephemeral voice/screen frame. Body: stream id, codec, timestamp, payload. Not persisted, not `seq`-ordered. |
-
-Byte-level field layouts are deferred to implementation; this table fixes the
-protocol's shape and the routing of each message.
+| `0x30` | `BLOB_OFFER` | `blob_id:16, total_len:u32, chunk_size:u16, chunk_count:u32, sha256:32, name:str, mime:str`. |
+| `0x31` | `BLOB_CHUNK` | `blob_id:16, chunk_index:u32, bytes`. |
+| `0x32` | `BLOB_ACK` | `blob_id:16, next_needed:u32` (cumulative). |
+| `0x33` | `BLOB_NACK` | `blob_id:16, missing_count:u16, chunk_index:u32 ×N`. |
 
 ## Permissions and authority checks (all at the RH)
 
-The RH is the only node that grants authority, and it checks everything against its
-own `app_get_data` snapshot — never trusting a payload's self-claims:
+The RH is the only node that grants authority. The foundation is the pipe
+property noted above: **a push carries only the sender's `app_id`** — no device,
+no user. So identity is *resolved*, never *asserted*:
+
+> The RH maintains a reverse map `app_id → (user_uuid, device_uuid)` built from
+> its own `app_get_data` snapshot (this is exactly the deliverer's `app_labels`,
+> extended to carry user + device). **Every inbound packet is authenticated by
+> the pNet-stamped `sender_app_id`, resolved through this map. A payload's own
+> claims about who it is are ignored for authentication.** If the stamped
+> `app_id` does not resolve, or resolves to a non-member, the packet is dropped.
+
+Two consequences follow and must be honored:
+
+- A member is authenticatable **only once their app is approved and visible in
+  the RH's snapshot.** Until public-state sync catches up, the RH cannot verify
+  them — it must treat "unresolvable sender" as "wait," not "reject forever"
+  (ties to *Discovery is eventually consistent*).
+- A `HELLO`'s self-claimed `(device_uuid, app_id)` is a **return-address hint
+  only.** The RH trusts the *stamped* id for identity and resolves the reply
+  `device_uuid` from its snapshot; it never lets a payload name its own sender.
+
+With identity resolved, the authority rules are:
 
 - **Control messages** (`OPEN_ROOM`, `ADD_MEMBER`, `REMOVE_MEMBER`) are accepted
-  only when the sender device is one of the **host user's own devices** (sender
-  `device_uuid` ∈ our `owner.user.devices`). This is what "only the host manages
+  only when the resolved sender device is one of the **host user's own devices**
+  (resolved `user_uuid` == our owner's user). This is what "only the host manages
   the room" means in code.
 - **`ADD_MEMBER` targets** must be in the host's `contact_users`. Reject otherwise
   — you cannot add a stranger.
-- **`POST` / `HELLO`** are accepted only from a device belonging to a **current
-  member** (sender's user is in the room's member list). A non-member's packet is
-  dropped.
-- A member UA, symmetrically, only accepts `MSG` for a room from that room's
-  current RH address.
+- **`POST` / `HELLO` / `LEAVE`** are accepted only when the resolved sender's user
+  is in the room's current member list. A non-member's packet is dropped.
+- A member UA, symmetrically, only accepts `MSG`/`HISTORY_RESP`/`MEMBER_UPDATE`
+  for a room from that room's **current RH** address (resolved the same way).
 
-## Open questions
+## Resolved design decisions
 
-- **Media path**: route voice/screen through each member's UA (simple, one model
-  for everything) or RH ↔ member-DG directly (lower latency, RH must track each
-  member's online DGs)? Lean direct-to-DG for media once v1 text is solid.
-- **Media at scale**: at what room size does single-RH SFU forwarding stop being
-  acceptable, and is a relay-tree or peer-assisted path ever worth the added
-  complexity given the contact-only routing rule?
-- **History retention defaults**: keep-all forever vs a per-room window; who can
-  configure it.
-- **Leaving a room**: does a departed member keep their local history copy, and
-  does `REMOVE_MEMBER` request deletion or just stop the feed?
-- **Attachments/large payloads**: chunking strategy over the single-payload `0x03`
-  primitive, and whether large blobs reuse the `pnet_deliverer` path.
-- **Multiple rooms, one UA**: confirm a single UA cleanly multiplexes many rooms
-  (it should — `room_id` scopes everything).
+The original open questions are now settled in the body above; recorded here for
+traceability:
+
+- **Media path** → RH ↔ member **DG** directly, bypassing the UA. Media needs
+  neither durability nor ordering, and the contact rule already permits it; the
+  UA hop would only add latency and SG load. (*Voice and screen share*.)
+- **Media at scale** → single-RH SFU with hard caps (≤ 8 voice, ≤ 1
+  screen-share). Relay-trees/peer-assist can't satisfy the member↔member
+  contact rule, so the lever is codec layering (simulcast/SVC), not topology.
+- **History retention** → keep-all by default; host-configured; two reserved
+  wire bytes (`retention_mode`, `join_history_mode`) for forward-compat.
+- **Leaving a room** → `LEAVE`/`REMOVE_MEMBER` stop the feed only; local copies
+  persist (deletion is unenforceable on another user's SG). Optional
+  `purge_on_leave` courtesy flag, off in v1.
+- **Attachments / large payloads** → generic blob family (`0x30`–`0x33`),
+  chunked over the ≤ 1 KB datagram, reused for history replay; not the
+  `pnet_deliverer` path.
+- **Multiple rooms, one UA** → confirmed; `room_id` scopes all UA state and
+  every envelope. `HELLO` batches a UA's rooms per RH in one datagram.
+
+## Remaining open questions
+
+- **Presence / typing indicators**: worth a lightweight ephemeral channel
+  (like media, unordered) or out of scope for v1?
+- ~~**DG-direct media NAT**: confirm the RH can reach a member's DG directly.~~
+  **Resolved against the core.** A member's DG already opens connections to every
+  contact's SG of every rank (`maintain_connections`), and `keepalive_dg`
+  (post-7c.15) warms the NAT mapping on *each* every 20s — so the RH, being a
+  contact's SG, always has a live mapping to the member DG and reaches it via the
+  direct-path branch of `app_send_packet`. Host failover inherits a warm mapping
+  too (the DG warms the rank-2 SG as well). The only residual gap is the same
+  eventual-consistency one as discovery: a host SG the member's snapshot has not
+  yet synced has no connection until sync catches up. No pNet-core change needed.
+- **Blob backpressure**: a slow member UA pulling a large history shouldn't stall
+  the RH's text fan-out — confirm blob transfers and `MSG` fan-out interleave
+  fairly on one RH.
 
 ## Implementation phasing
 
 | Phase | Scope |
 |---|---|
 | 1 | App skeleton: register (`pnet-chat` alias), get-data, send, push. Reuse the `pnet_deliverer` client scaffolding. |
-| 2 | UA/RH role selection: a DG resolves and delegates to its own top SG; that SG runs the RH/UA logic. |
-| 3 | Room lifecycle on the RH: `OPEN_ROOM`, membership list, `INVITE`, `HELLO`, permission checks. |
-| 4 | Text messaging: `POST` → RH `seq` assignment → `MSG` fan-out; per-UA local history. |
-| 5 | Reliability: `ACK` + RH retry, `HISTORY_REQ`/`HISTORY_RESP`, reconnect cursor, idempotent apply. |
-| 6 | Backfill on join; new-member history streaming. |
+| 2 | Role selection (`UserAgent`/`SgStandby`/`DataGuest`) from the get-data tree + the `app_id → owner` reverse map; a DG resolves its UA (own top-ranked SG) and delegates via the `CLIENT_ATTACH`/`CLIENT_ATTACH_ACK` handshake (UA tracks attached clients, auth-by-stamp own-user check). |
+| 3 | Room lifecycle on the RH: `OPEN_ROOM`/`ROOM_CREATED`, membership (`ADD`/`REMOVE`/`LEAVE`/`MEMBER_UPDATE`), `INVITE`, `HELLO`, and the `app_id → (user, device)` reverse map for auth-by-stamp permission checks. |
+| 4 | Text messaging: `POST` → RH `seq` assignment → `MSG` fan-out; `client_msg_id` echo correlation; per-UA local history. |
+| 5 | Reliability: cumulative `ACK` + RH retry, `HISTORY_REQ`/`HISTORY_RESP` (self-chunking), reconnect cursor, idempotent apply by `(room, seq)`. |
+| 6 | Backfill on join; new-member history streaming. Blob family (`0x30`–`0x33`) for attachments and oversized replays. |
 | 7 | Host failover: mirror room state across the host user's SGs; `HOST_MOVED`; member re-resolution. |
 | 8 | Voice: `MEDIA_FRAME` path through the RH SFU; small-room target. |
 | 9 | Screen share on the same media path; measure the RH hotspot; decide on direct-to-DG media. |

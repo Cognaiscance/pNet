@@ -637,6 +637,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pnet_chat"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pnet_deliverer"
 version = "0.1.0"
 dependencies = [
