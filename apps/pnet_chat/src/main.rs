@@ -314,6 +314,70 @@ fn decode_member_update(body: &[u8]) -> Option<(u8, [u8; 16], String)> {
     Some((change, user, alias))
 }
 
+fn push_text(buf: &mut Vec<u8>, text: &str) {
+    let b = text.as_bytes();
+    buf.extend_from_slice(&(b.len() as u16).to_be_bytes());
+    buf.extend_from_slice(b);
+}
+
+fn read_text(data: &[u8], pos: &mut usize) -> Option<String> {
+    let len = u16::from_be_bytes([*data.get(*pos)?, *data.get(*pos + 1)?]) as usize;
+    *pos += 2;
+    let s = std::str::from_utf8(data.get(*pos..*pos + len)?).ok()?.to_string();
+    *pos += len;
+    Some(s)
+}
+
+/// `POST` body: `client_msg_id:16, text, attach_count:u8` (attachments are
+/// Phase 6 — always 0 for now).
+fn encode_post(client_msg_id: &[u8; 16], text: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(client_msg_id);
+    push_text(&mut b, text);
+    b.push(0); // attach_count
+    b
+}
+
+fn decode_post(body: &[u8]) -> Option<([u8; 16], String)> {
+    let mut pos = 0;
+    let cid = read_bytes::<16>(body, &mut pos)?;
+    let text = read_text(body, &mut pos)?;
+    // attach_count present but ignored until Phase 6.
+    Some((cid, text))
+}
+
+/// `MSG` body: `seq:u64, sender_user:16, ts_ms:u64, client_msg_id:16, text,
+/// attach_count:u8`.
+fn encode_msg(seq: u64, sender_user: &[u8; 16], ts_ms: u64, client_msg_id: &[u8; 16], text: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&seq.to_be_bytes());
+    b.extend_from_slice(sender_user);
+    b.extend_from_slice(&ts_ms.to_be_bytes());
+    b.extend_from_slice(client_msg_id);
+    push_text(&mut b, text);
+    b.push(0); // attach_count
+    b
+}
+
+struct DecodedMsg {
+    seq: u64,
+    sender_user: [u8; 16],
+    ts_ms: u64,
+    #[allow(dead_code)]
+    client_msg_id: [u8; 16],
+    text: String,
+}
+
+fn decode_msg(body: &[u8]) -> Option<DecodedMsg> {
+    let mut pos = 0;
+    let seq = u64::from_be_bytes(read_bytes::<8>(body, &mut pos)?);
+    let sender_user = read_bytes::<16>(body, &mut pos)?;
+    let ts_ms = u64::from_be_bytes(read_bytes::<8>(body, &mut pos)?);
+    let client_msg_id = read_bytes::<16>(body, &mut pos)?;
+    let text = read_text(body, &mut pos)?;
+    Some(DecodedMsg { seq, sender_user, ts_ms, client_msg_id, text })
+}
+
 // ── Data types ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize)]
@@ -435,6 +499,18 @@ struct Member {
     present: bool,
 }
 
+/// One ordered chat message. The RH assigns `seq`; everyone applies in seq
+/// order (idempotent by `(room_id, seq)`).
+#[derive(Clone, Debug, Serialize)]
+struct ChatMsg {
+    seq: u64,
+    sender_user_hex: String,
+    sender_alias: String,
+    sender_is_self: bool,
+    ts_ms: u64,
+    text: String,
+}
+
 /// One chat room, as known by this node. The RH holds the authoritative copy;
 /// a member's UA holds its own copy with `is_rh = false`.
 #[derive(Clone, Debug, Serialize)]
@@ -460,6 +536,12 @@ struct RoomState {
     join_history_mode: u8,
     /// Member-side: timestamp we last sent HELLO to the RH (None = not yet).
     hello_sent: Option<u64>,
+    /// This node's copy of the room's ordered message history.
+    messages: Vec<ChatMsg>,
+    /// RH-side: next `seq` to assign. Member-side: unused (always 1).
+    next_seq: u64,
+    /// Highest `seq` we have applied (for idempotent apply / Phase 5 cursor).
+    last_seq: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -570,6 +652,13 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Generate a 16-byte room id. Reads OS entropy (`/dev/urandom`); falls back to
@@ -1048,6 +1137,8 @@ fn handle_frame(
         msg::REMOVE_MEMBER => handle_remove_member(inner, env, owner, outs),
         msg::LEAVE => handle_leave(inner, env, owner, outs),
         msg::MEMBER_UPDATE => handle_member_update(inner, env, owner),
+        msg::POST => handle_post(inner, env, owner, outs),
+        msg::MSG => handle_msg(inner, env, owner),
 
         _ => format!(
             "room {}…, {} body byte(s) — not handled until a later phase",
@@ -1116,6 +1207,9 @@ fn create_room(
         members,
         retention_mode: retention, join_history_mode: join_hist,
         hello_sent: None,
+        messages: Vec::new(),
+        next_seq: 1,
+        last_seq: 0,
     };
     for m in &room.members {
         queue_invite(inner, &room, m, outs);
@@ -1158,6 +1252,14 @@ fn handle_invite(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>
     let members: Vec<Member> = inv.members.iter().map(|(u, a)| Member {
         user_uuid_hex: hex(u), user_uuid: *u, alias: a.clone(), present: false,
     }).collect();
+
+    // Idempotent: a re-INVITE (RH maintenance loop re-sending until we HELLO)
+    // must not wipe history we already hold — just refresh the member list and
+    // re-HELLO with our current cursor.
+    let existing = inner.rooms.get(&env.room_id);
+    let last_seq = existing.map(|r| r.last_seq).unwrap_or(0);
+    let messages = existing.map(|r| r.messages.clone()).unwrap_or_default();
+    let was_member = existing.is_some();
     let room = RoomState {
         room_id_hex: hex(&env.room_id), room_id: env.room_id,
         name: inv.name.clone(),
@@ -1167,13 +1269,20 @@ fn handle_invite(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>
         members,
         retention_mode: inv.retention, join_history_mode: inv.join_hist,
         hello_sent: Some(now_secs()),
+        messages,
+        next_seq: 1,
+        last_seq,
     };
-    // HELLO back to the RH announcing our UA address + (room, last_seq=0).
-    let body = encode_hello(&my_device, &my_app, &[(env.room_id, 0)]);
+    // HELLO back to the RH announcing our UA address + (room, last applied seq).
+    let body = encode_hello(&my_device, &my_app, &[(env.room_id, last_seq)]);
     outs.push(Outbound { dest_device: inv.rh_device, dest_app: inv.rh_app,
                          msg_type: msg::HELLO, room_id: ZERO_ROOM, body });
     inner.rooms.insert(env.room_id, room);
-    format!("invited to '{}' by {} — joined, HELLO sent", inv.name, owner.label)
+    if was_member {
+        format!("re-INVITE to '{}' — re-HELLO sent (cursor {last_seq})", inv.name)
+    } else {
+        format!("invited to '{}' by {} — joined, HELLO sent", inv.name, owner.label)
+    }
 }
 
 fn handle_hello(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>) -> String {
@@ -1283,6 +1392,85 @@ fn handle_member_update(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&Ap
             format!("{alias} {verb} '{}'", room.name)
         }
         _ => "MEMBER_UPDATE unknown change kind".into(),
+    }
+}
+
+// ── Text messaging (Phase 4): POST → RH seq → MSG fan-out ─────────────────────
+
+/// Resolve a user's display alias from the room's member list, then the
+/// directory; mark whether it is us.
+fn resolve_sender(inner: &Inner, room_id: &[u8; 16], user: &[u8; 16]) -> (String, bool) {
+    let is_self = Some(*user) == inner.own_user_uuid;
+    let alias = inner.rooms.get(room_id)
+        .and_then(|r| r.members.iter().find(|m| m.user_uuid == *user).map(|m| m.alias.clone()))
+        .or_else(|| inner.directory.get(user).map(|d| d.alias.clone()))
+        .unwrap_or_else(|| if is_self { "me".into() } else { format!("user#{}", &hex(user)[..8]) });
+    (alias, is_self)
+}
+
+/// Append an ordered message to a room's local history, idempotent by `seq`.
+/// Returns true if it was newly applied.
+fn apply_message(inner: &mut Inner, room_id: &[u8; 16], seq: u64, sender_user: [u8; 16], ts_ms: u64, text: String) -> bool {
+    let (alias, is_self) = resolve_sender(inner, room_id, &sender_user);
+    let Some(room) = inner.rooms.get_mut(room_id) else { return false };
+    if room.messages.iter().any(|m| m.seq == seq) { return false; }
+    room.messages.push(ChatMsg {
+        seq, sender_user_hex: hex(&sender_user),
+        sender_alias: alias, sender_is_self: is_self, ts_ms, text,
+    });
+    room.messages.sort_by_key(|m| m.seq);
+    if seq > room.last_seq { room.last_seq = seq; }
+    true
+}
+
+/// RH-side acceptance of a new message: assign the next `seq`, append to our
+/// authoritative history, and fan a `MSG` out to every member's UA. Returns the
+/// assigned seq.
+fn rh_accept_message(inner: &mut Inner, room_id: &[u8; 16], sender_user: [u8; 16], cid: [u8; 16], text: String, outs: &mut Vec<Outbound>) -> Result<u64, String> {
+    let (seq, members) = {
+        let room = inner.rooms.get(room_id).ok_or("unknown room")?;
+        if !room.is_rh { return Err("not this room's RH".into()); }
+        (room.next_seq, room.members.clone())
+    };
+    let ts = now_ms();
+    inner.rooms.get_mut(room_id).unwrap().next_seq = seq + 1;
+    apply_message(inner, room_id, seq, sender_user, ts, text.clone());
+    let body = encode_msg(seq, &sender_user, ts, &cid, &text);
+    for m in &members {
+        if let Some((dev, app)) = inner.directory.get(&m.user_uuid).and_then(|d| d.resolve_ua()) {
+            outs.push(Outbound { dest_device: dev, dest_app: app, msg_type: msg::MSG,
+                                 room_id: *room_id, body: body.clone() });
+        }
+    }
+    Ok(seq)
+}
+
+fn handle_post(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>, outs: &mut Vec<Outbound>) -> String {
+    let Some(owner) = owner else { return "POST from unresolved sender — dropped".into() };
+    let Some((cid, text)) = decode_post(env.body) else { return "POST malformed".into() };
+    // Auth-by-stamp: only a current member (or the host) may post.
+    let (is_rh, allowed) = match inner.rooms.get(&env.room_id) {
+        Some(r) => (r.is_rh, r.members.iter().any(|m| m.user_uuid == owner.user_uuid) || owner.own_user),
+        None => return "POST for unknown room".into(),
+    };
+    if !is_rh { return "POST ignored — we are not this room's RH".into(); }
+    if !allowed { return format!("POST from non-member {} dropped", owner.label); }
+    match rh_accept_message(inner, &env.room_id, owner.user_uuid, cid, text, outs) {
+        Ok(seq) => format!("POST from {} ordered as seq {seq}", owner.label),
+        Err(e) => e,
+    }
+}
+
+fn handle_msg(inner: &mut Inner, env: &Envelope<'_>, owner: Option<&AppOwner>) -> String {
+    let Some(owner) = owner else { return "MSG from unresolved sender — dropped".into() };
+    let Some(m) = decode_msg(env.body) else { return "MSG malformed".into() };
+    // Accept ordered messages only from the room's current RH.
+    let from_rh = inner.rooms.get(&env.room_id).map(|r| r.rh_device == owner.device_uuid).unwrap_or(false);
+    if !from_rh { return "MSG not from our RH — dropped".into(); }
+    if apply_message(inner, &env.room_id, m.seq, m.sender_user, m.ts_ms, m.text) {
+        format!("MSG seq {} applied", m.seq)
+    } else {
+        format!("MSG seq {} duplicate — ignored", m.seq)
     }
 }
 
@@ -1556,6 +1744,53 @@ fn local_remove_member(inner: &mut Inner, room_id: &[u8; 16], target: &[u8; 16],
     Ok(format!("removed {}", removed.alias))
 }
 
+#[derive(Deserialize)]
+struct PostRequest {
+    room_id: String,
+    text: String,
+}
+
+/// Post a message to a room. When we are the RH we order it locally and fan it
+/// out; otherwise we send a POST to the RH (the ordered MSG comes back and is
+/// applied like everyone else's — the round trip is the delivery confirmation).
+async fn handle_room_post(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PostRequest>,
+) -> Json<SendResponse> {
+    let Some(room_id) = hex_to_uuid(&req.room_id) else {
+        return Json(SendResponse { ok: false, error: Some("bad room id".into()) });
+    };
+    if req.text.trim().is_empty() {
+        return Json(SendResponse { ok: false, error: Some("empty message".into()) });
+    }
+    let cid = gen_uuid();
+    let mut outs: Vec<Outbound> = Vec::new();
+    let (token, result) = {
+        let mut inner = state.inner.lock().unwrap();
+        let token = inner.token;
+        let Some((is_rh, rh_dev, rh_app)) = inner.rooms.get(&room_id)
+            .map(|r| (r.is_rh, r.rh_device, r.rh_app_id))
+        else {
+            return Json(SendResponse { ok: false, error: Some("unknown room".into()) });
+        };
+        let res = if is_rh {
+            let sender = inner.own_user_uuid.unwrap_or([0u8; 16]);
+            rh_accept_message(&mut inner, &room_id, sender, cid, req.text.clone(), &mut outs)
+                .map(|seq| format!("posted as seq {seq}"))
+        } else {
+            outs.push(Outbound { dest_device: rh_dev, dest_app: rh_app, msg_type: msg::POST,
+                                 room_id, body: encode_post(&cid, &req.text) });
+            Ok("POST sent to RH".to_string())
+        };
+        (token, res)
+    };
+    match (token, result) {
+        (Some(token), Ok(m)) => { flush(&state, &token, outs).await; Json(SendResponse { ok: true, error: Some(m) }) }
+        (_, Err(e)) => Json(SendResponse { ok: false, error: Some(e) }),
+        (None, _) => Json(SendResponse { ok: false, error: Some("not registered".into()) }),
+    }
+}
+
 // ── Background data refresh loop ─────────────────────────────────────────────
 
 async fn data_refresh_loop(state: Arc<AppState>) {
@@ -1735,6 +1970,7 @@ async fn main() {
         .route("/api/room/add", post(handle_room_add))
         .route("/api/room/remove", post(handle_room_remove))
         .route("/api/room/leave", post(handle_room_leave))
+        .route("/api/room/post", post(handle_room_post))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{http_port}"))
@@ -1784,6 +2020,13 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .refresh-btn { float: right; font-size: 0.8em; padding: 4px 10px; }
     .error { color: #e08080; margin-top: 6px; font-size: 0.85em; }
     .gradetag { font-size: 0.7em; padding: 1px 5px; border-radius: 3px; background: #333; color: #9ab; }
+    .chatlog { margin-top: 8px; max-height: 200px; overflow-y: auto; background: #1f1f1f; border: 1px solid #383838; border-radius: 4px; padding: 6px 8px; }
+    .chatmsg { padding: 2px 0; font-size: 0.9em; word-break: break-word; }
+    .chatmsg .seq { color: #555; font-size: 0.75em; }
+    .chatmsg .who { font-weight: bold; }
+    .compose { display: flex; gap: 6px; margin-top: 6px; }
+    .compose input { flex: 1; background: #1a1a1a; color: #e0e0e0; border: 1px solid #555; padding: 6px 8px; border-radius: 3px; font-family: monospace; font-size: 0.9em; }
+    .compose button { padding: 6px 14px; }
   </style>
 </head>
 <body>
@@ -1894,7 +2137,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
       roleEl.innerHTML = roleHtml;
 
-      // Rooms panel.
+      // Rooms panel. Preserve a compose box the user is typing in across the
+      // periodic re-render.
+      const active = document.activeElement;
+      const keepId = (active && active.id && active.id.startsWith('compose-')) ? active.id : null;
+      const keepVal = keepId ? active.value : null;
       const roomsEl = document.getElementById('rooms');
       if (!s.rooms || s.rooms.length === 0) {
         roomsEl.innerHTML = '<span class="empty">No rooms yet.</span>';
@@ -1908,12 +2155,26 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           ).join(' ');
           const addCtl = r.is_rh ? `<a onclick="addPrompt('${r.room_id_hex}');return false" style="cursor:pointer;color:#7ec8e3;font-size:0.8em">+ add</a>` : '';
           const leaveCtl = !r.is_rh ? `<a onclick="leaveRoom('${r.room_id_hex}');return false" style="cursor:pointer;color:#e08080;font-size:0.8em">leave</a>` : '';
+          const msgs = (r.messages && r.messages.length)
+            ? r.messages.map(m =>
+                `<div class="chatmsg"><span class="seq">#${m.seq}</span> <span class="who" style="color:${m.sender_is_self ? '#7ec8e3' : '#c39be0'}">${escHtml(m.sender_alias)}</span>: <span class="ctext">${escHtml(m.text)}</span></div>`
+              ).join('')
+            : '<span class="empty">No messages yet.</span>';
           return `<div class="entry">
             <strong>${escHtml(r.name)}</strong> ${tag}
             <span class="kind">${r.room_id_hex.slice(0,8)}…</span>
             <div style="margin-top:4px">members: ${mem || '<span class="empty">none</span>'} &nbsp; ${addCtl} ${leaveCtl}</div>
+            <div class="chatlog">${msgs}</div>
+            <div class="compose">
+              <input id="compose-${r.room_id_hex}" placeholder="Message #${escHtml(r.name)}" onkeydown="if(event.key==='Enter'){postMsg('${r.room_id_hex}');}">
+              <button onclick="postMsg('${r.room_id_hex}')">Send</button>
+            </div>
           </div>`;
         }).join('');
+        if (keepId) {
+          const restored = document.getElementById(keepId);
+          if (restored) { restored.value = keepVal; restored.focus(); }
+        }
       }
 
       // Contact member picker for create-room.
@@ -2013,6 +2274,15 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     async function leaveRoom(roomId) {
       const res = await postJson('/api/room/leave', { room_id: roomId });
       if (!res.ok) alert(res.error || 'Leave failed.'); await loadState();
+    }
+    async function postMsg(roomId) {
+      const el = document.getElementById('compose-' + roomId);
+      const text = el.value.trim();
+      if (!text) return;
+      el.value = '';
+      const res = await postJson('/api/room/post', { room_id: roomId, text });
+      if (!res.ok) { alert(res.error || 'Post failed.'); el.value = text; }
+      await loadState();
     }
 
     loadState();
