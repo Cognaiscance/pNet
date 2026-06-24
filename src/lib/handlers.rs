@@ -4886,14 +4886,28 @@ pub fn maintain_connections(ctx: &WorkerContext) {
             .map(|d| matches!(d.grade, DeviceGrade::SG))
             .unwrap_or(false);
 
-        // Desired peers: own devices (all if SG, SGs-only if DG) + contact devices (same rule).
+        // Desired peers — who WE initiate connections to. Directional, to avoid
+        // connection glare (both peers initiating at once, whose crossed
+        // handshakes leave each side keyed on a connection the other evicted,
+        // breaking all later encrypted traffic — and SG↔SG never self-heals).
+        //
+        // Rule: only ever initiate TO an SG, and to a peer SG only when we are a
+        // DG, or we are an SG with the lower device_uuid. So:
+        //   - DG → SG: only the DG initiates (an SG never initiates to a DG; it
+        //     gets the reciprocal connection when the DG connects to it).
+        //   - SG ↔ SG: only the lower-uuid SG initiates.
+        // Exactly one side of any pair initiates, so connect_request only ever
+        // sees requests from the rightful initiator and its evict-rebuild is safe.
+        let want_initiate = |d: &Device| -> bool {
+            matches!(d.grade, DeviceGrade::SG) && (!is_sg || our_device_uuid < d.uuid)
+        };
         // Skip peers with no resolvable address — happy eyeballs data, if present,
         // picks the lowest-RTT up address; otherwise we fall back to the first
         // resolvable entry in the peer's host list.
         let mut desired: Vec<(Uuid, SocketAddrV4, PublicKey)> = Vec::new();
         for d in &node.owner.user.devices {
             if d.uuid == our_device_uuid { continue; }
-            if is_sg || matches!(d.grade, DeviceGrade::SG) {
+            if want_initiate(d) {
                 if let Some(addr) = best_address_for_device(&node, &d.uuid) {
                     desired.push((d.uuid, addr, our_longterm_pk));
                 }
@@ -4901,7 +4915,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
         }
         for contact in &node.owner.contact_users {
             for d in &contact.user.devices {
-                if is_sg || matches!(d.grade, DeviceGrade::SG) {
+                if want_initiate(d) {
                     if let Some(addr) = best_address_for_device(&node, &d.uuid) {
                         desired.push((d.uuid, addr, contact.public_key));
                     }
@@ -7495,6 +7509,76 @@ mod tests {
         let conn = &node.owner.active_connections[&sg_conn_id];
         assert_eq!(conn.peer_addr, new_addr, "peer_addr should track the keepalive source");
         assert!(conn.timeout > before, "timeout should be refreshed");
+    }
+
+    // ── Connection glare avoidance (directional initiation) ───────────────────
+
+    /// Teach `t` about a contact SG device under the peer's long-term key.
+    fn add_specific_contact(t: &TestCtx, peer_dev: Uuid, peer_lt_pub: PublicKey) {
+        let mut n = t.ctx.node.write().unwrap();
+        n.owner.contact_users.push(Contact {
+            public_key: peer_lt_pub,
+            user: User { alias: "peer".into(), uuid: generate_uuid(), devices: vec![make_sg_device(peer_dev)] },
+            last_seen_public_version: SyncVersion::default(),
+        });
+    }
+
+    /// Force this node's local device to a known uuid and grade.
+    fn set_local_identity(t: &TestCtx, uuid: Uuid, grade: DeviceGrade) {
+        let mut n = t.ctx.node.write().unwrap();
+        let old = n.device_uuid;
+        n.device_uuid = uuid;
+        for d in n.owner.user.devices.iter_mut() {
+            if d.uuid == old {
+                d.uuid = uuid;
+                d.grade = grade;
+                d.sg_rank = if matches!(grade, DeviceGrade::SG) { Some(1) } else { None };
+            }
+        }
+        n.owner.key_pair = generate_ed25519_keypair();
+    }
+
+    fn pending_peers(t: &TestCtx) -> Vec<Uuid> {
+        t.ctx.node.read().unwrap().owner.pending_connections.values()
+            .map(|p| p.peer_device_uuid).collect()
+    }
+
+    /// Connection glare (both peers initiating at once) leaves each side keyed
+    /// on a connection the other evicted, breaking all later encrypted traffic
+    /// (observed live as `[cross_user_*] decryption failed`, and SG↔SG never
+    /// self-heals). The cure is directional initiation: an SG initiates only to
+    /// a *higher*-uuid SG, so exactly one side of every SG↔SG pair initiates.
+    #[test]
+    fn sg_initiates_only_to_higher_uuid_sg() {
+        let t = TestCtx::new();
+        set_local_identity(&t, [0x80; 16], DeviceGrade::SG);
+
+        let higher: Uuid = [0xff; 16];
+        let lower:  Uuid = [0x00; 16];
+        add_specific_contact(&t, higher, generate_ed25519_keypair().public_key);
+        add_specific_contact(&t, lower,  generate_ed25519_keypair().public_key);
+
+        maintain_connections(&t.ctx);
+
+        let pend = pending_peers(&t);
+        assert!(pend.contains(&higher), "SG must initiate to a higher-uuid SG peer");
+        assert!(!pend.contains(&lower), "SG must NOT initiate to a lower-uuid SG peer — it responds instead (else glare)");
+    }
+
+    /// A DG must always initiate to its contacts' SGs (it punches out through
+    /// NAT), regardless of uuid order — the uuid tiebreak is SG↔SG only.
+    #[test]
+    fn dg_initiates_to_sg_regardless_of_uuid() {
+        let t = TestCtx::new();
+        set_local_identity(&t, [0x80; 16], DeviceGrade::DG);
+
+        let lower_sg: Uuid = [0x00; 16];
+        add_specific_contact(&t, lower_sg, generate_ed25519_keypair().public_key);
+
+        maintain_connections(&t.ctx);
+
+        assert!(pending_peers(&t).contains(&lower_sg),
+            "a DG must initiate to a contact SG even when the SG's uuid is lower");
     }
 
     /// Build the buf for connect_request (op byte already stripped).
