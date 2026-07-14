@@ -5542,35 +5542,122 @@ pub fn ui_request(
     method: String,
     path:   String,
     query:  String,
+    cookie: String,
     body:   Vec<u8>,
     ctx:    &WorkerContext,
 ) {
-    // Setup guard — redirect to /setup when not yet initialized, and redirect
-    // away from /setup once initialization is complete.
+    use super::admin_auth::{
+        clear_session_cookie_header, session_id_from_cookie_header, set_session_cookie_header,
+    };
+
+    let (initialized, has_password) = {
+        let node = ctx.node.read().unwrap();
+        (node.is_initialized(), node.admin_password_hash.is_some())
+    };
+
+    let session_id = session_id_from_cookie_header(&cookie);
+    let authed = session_id
+        .as_ref()
+        .map(|id| ctx.sessions.is_valid(id))
+        .unwrap_or(false);
+
     let is_setup_route = matches!(path.as_str(), "/setup" | "/setup/create" | "/setup/join");
-    if is_setup_route {
-        if ctx.node.read().unwrap().is_initialized() {
+    let is_login_route = matches!(path.as_str(), "/login");
+    let is_set_password_route = matches!(path.as_str(), "/set-password");
+    let is_logout = method == "POST" && path == "/logout";
+
+    // ── Access gates ─────────────────────────────────────────────────────────
+    // 1. Uninitialized → setup only.
+    // 2. Initialized without password (upgrade path) → set-password only.
+    // 3. Initialized with password → login public; everything else needs session.
+    if !initialized {
+        if !is_setup_route {
+            return respond_redirect(&stream, "/setup");
+        }
+    } else if !has_password {
+        if is_setup_route {
+            return respond_redirect(&stream, "/set-password");
+        }
+        if !is_set_password_route {
+            return respond_redirect(&stream, "/set-password");
+        }
+    } else {
+        if is_setup_route {
+            return respond_redirect(&stream, if authed { "/dashboard" } else { "/login" });
+        }
+        if is_set_password_route {
+            // Password already set — no open reset without auth (out of scope for 1.1).
+            return respond_redirect(&stream, if authed { "/dashboard" } else { "/login" });
+        }
+        if !authed && !is_login_route {
+            return respond_redirect(&stream, "/login");
+        }
+        if authed && is_login_route && method == "GET" {
             return respond_redirect(&stream, "/dashboard");
         }
-    } else if !ctx.node.read().unwrap().is_initialized() {
-        return respond_redirect(&stream, "/setup");
     }
 
     match (method.as_str(), path.as_str()) {
-        ("GET",  "/setup") => respond_html(&stream, 200, &render_setup(&query)),
+        ("GET",  "/setup") => respond_html(&stream, 200, &render_setup(&query), None),
         ("POST", "/setup/create") => {
             match complete_setup(&body, ctx) {
-                None      => respond_redirect(&stream, "/dashboard"),
-                Some(err) => respond_redirect(&stream, &format!("/setup?grade=sg&role=new&error={err}")),
+                Ok(sid) => respond_redirect_cookie(
+                    &stream, "/dashboard", &set_session_cookie_header(&sid),
+                ),
+                Err(err) => respond_redirect(
+                    &stream,
+                    &format!("/setup?grade=sg&role=new&error={err}"),
+                ),
             }
         }
         ("POST", "/setup/join") => {
-            initiate_bootstrap(&body, ctx);
-            respond_redirect(&stream, "/setup?waiting=1")
+            match complete_join_setup(&body, ctx) {
+                Ok(sid) => respond_redirect_cookie(
+                    &stream, "/setup?waiting=1", &set_session_cookie_header(&sid),
+                ),
+                Err(err) => {
+                    let grade = form_field(&body, "grade").unwrap_or("dg");
+                    let role_q = if grade == "sg" { "&role=join" } else { "" };
+                    respond_redirect(
+                        &stream,
+                        &format!("/setup?grade={grade}{role_q}&error={err}"),
+                    )
+                }
+            }
+        }
+        ("GET",  "/login") => {
+            let err = query_param(&query, "error").unwrap_or("");
+            respond_html(&stream, 200, &render_login(err), None)
+        }
+        ("POST", "/login") => {
+            match try_login(&body, ctx) {
+                Ok(sid) => respond_redirect_cookie(
+                    &stream, "/dashboard", &set_session_cookie_header(&sid),
+                ),
+                Err(()) => respond_redirect(&stream, "/login?error=bad"),
+            }
+        }
+        ("GET",  "/set-password") => {
+            let err = query_param(&query, "error").unwrap_or("");
+            respond_html(&stream, 200, &render_set_password(err), None)
+        }
+        ("POST", "/set-password") => {
+            match complete_set_password(&body, ctx) {
+                Ok(sid) => respond_redirect_cookie(
+                    &stream, "/dashboard", &set_session_cookie_header(&sid),
+                ),
+                Err(err) => respond_redirect(&stream, &format!("/set-password?error={err}")),
+            }
+        }
+        ("POST", "/logout") if is_logout => {
+            if let Some(id) = session_id {
+                ctx.sessions.revoke(&id);
+            }
+            respond_redirect_cookie(&stream, "/login", &clear_session_cookie_header())
         }
         ("GET",  "/")                     => respond_redirect(&stream, "/dashboard"),
-        ("GET",  "/dashboard")            => respond_html(&stream, 200, &render_dashboard(ctx)),
-        ("GET",  "/pending-apps")         => respond_html(&stream, 200, &render_pending_apps(ctx, &query)),
+        ("GET",  "/dashboard")            => respond_html(&stream, 200, &render_dashboard(ctx), None),
+        ("GET",  "/pending-apps")         => respond_html(&stream, 200, &render_pending_apps(ctx, &query), None),
         ("POST", "/pending-apps/approve") => {
             let target = redirect_with_error("/pending-apps", approve_app(&body, ctx));
             respond_redirect(&stream, &target);
@@ -5579,7 +5666,7 @@ pub fn ui_request(
             let target = redirect_with_error("/pending-apps", reject_app(&body, ctx));
             respond_redirect(&stream, &target);
         }
-        ("GET",  "/applications")  => respond_html(&stream, 200, &render_applications(ctx, &query)),
+        ("GET",  "/applications")  => respond_html(&stream, 200, &render_applications(ctx, &query), None),
         ("POST", "/applications/delete") => {
             let target = redirect_with_error("/applications", reject_app(&body, ctx));
             respond_redirect(&stream, &target);
@@ -5588,8 +5675,8 @@ pub fn ui_request(
             let target = redirect_with_error("/applications", rename_app(&body, ctx));
             respond_redirect(&stream, &target);
         }
-        ("GET",  "/contacts")      => respond_html(&stream, 200, &render_contacts(ctx)),
-        ("GET",  "/devices")       => respond_html(&stream, 200, &render_devices(ctx)),
+        ("GET",  "/contacts")      => respond_html(&stream, 200, &render_contacts(ctx), None),
+        ("GET",  "/devices")       => respond_html(&stream, 200, &render_devices(ctx), None),
         ("POST", "/devices/sync")  => {
             // Manual refresh: pull the latest public/private state from the
             // writer SG. No-op when this node is the writer or has no
@@ -5597,8 +5684,8 @@ pub fn ui_request(
             sync_pull(ctx);
             respond_redirect(&stream, "/devices");
         }
-        ("GET",  "/diagnostics")   => respond_html(&stream, 200, &render_diagnostics(ctx)),
-        ("GET",  "/invitations")   => respond_html(&stream, 200, &render_invitations(ctx, &query)),
+        ("GET",  "/diagnostics")   => respond_html(&stream, 200, &render_diagnostics(ctx), None),
+        ("GET",  "/invitations")   => respond_html(&stream, 200, &render_invitations(ctx, &query), None),
         ("POST", "/invitations/device") => {
             match generate_device_invitation(ctx) {
                 Some(code) => respond_redirect(&stream, &format!("/invitations?code={code}")),
@@ -5612,6 +5699,8 @@ pub fn ui_request(
             }
         }
         ("POST", "/invitations/enter") => {
+            // Device invitation redeem from an already-configured node is not
+            // first-run setup; password was set at setup. Keep bootstrap only.
             initiate_bootstrap(&body, ctx);
             respond_redirect(&stream, "/invitations");
         }
@@ -5619,19 +5708,23 @@ pub fn ui_request(
             initiate_contact_exchange(&body, ctx);
             respond_redirect(&stream, "/contacts");
         }
-        _ => respond_html(&stream, 404, &layout(ctx, "Not Found", "<h1>404 — Not Found</h1>")),
+        _ => respond_html(&stream, 404, &layout(ctx, "Not Found", "<h1>404 — Not Found</h1>"), None),
     }
 }
 
 // ── Routing helpers ───────────────────────────────────────────────────────────
 
-fn respond_html(stream: &std::net::TcpStream, status: u16, html: &str) {
+fn respond_html(stream: &std::net::TcpStream, status: u16, html: &str, set_cookie: Option<&str>) {
     use std::io::Write;
     let status_text = match status { 200 => "OK", 404 => "Not Found", _ => "OK" };
     let body = html.as_bytes();
+    let cookie_line = set_cookie
+        .map(|c| format!("Set-Cookie: {c}\r\n"))
+        .unwrap_or_default();
     let header = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
+         {cookie_line}\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n",
         body.len()
@@ -5642,12 +5735,62 @@ fn respond_html(stream: &std::net::TcpStream, status: u16, html: &str) {
 }
 
 fn respond_redirect(stream: &std::net::TcpStream, location: &str) {
+    respond_redirect_cookie(stream, location, "");
+}
+
+fn respond_redirect_cookie(stream: &std::net::TcpStream, location: &str, set_cookie: &str) {
     use std::io::Write;
+    let cookie_line = if set_cookie.is_empty() {
+        String::new()
+    } else {
+        format!("Set-Cookie: {set_cookie}\r\n")
+    };
     let response = format!(
-        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 302 Found\r\n\
+         Location: {location}\r\n\
+         {cookie_line}\
+         Content-Length: 0\r\n\
+         Connection: close\r\n\r\n"
     );
     let mut s = stream;
     let _ = s.write_all(response.as_bytes());
+}
+
+/// Store an admin password hash and issue a new session. Call after validation.
+fn store_password_and_session(ctx: &WorkerContext, password: &str) -> String {
+    use super::admin_auth::hash_password;
+    let hash = hash_password(password);
+    {
+        let mut node = ctx.node.write().unwrap();
+        node.admin_password_hash = Some(hash);
+    }
+    ctx.save_node();
+    ctx.sessions.create()
+}
+
+fn try_login(body: &[u8], ctx: &WorkerContext) -> Result<String, ()> {
+    use super::admin_auth::verify_password;
+    let password = form_field(body, "password")
+        .map(url_decode)
+        .unwrap_or_default();
+    let stored = ctx.node.read().unwrap().admin_password_hash.clone();
+    let Some(stored) = stored else { return Err(()) };
+    if !verify_password(&password, &stored) {
+        return Err(());
+    }
+    Ok(ctx.sessions.create())
+}
+
+fn complete_set_password(body: &[u8], ctx: &WorkerContext) -> Result<String, &'static str> {
+    use super::admin_auth::validate_new_password;
+    // Only when no password exists yet (upgrade / missing env).
+    if ctx.node.read().unwrap().admin_password_hash.is_some() {
+        return Err("exists");
+    }
+    let password = form_field(body, "password").map(url_decode).unwrap_or_default();
+    let confirm  = form_field(body, "password_confirm").map(url_decode).unwrap_or_default();
+    validate_new_password(&password, &confirm)?;
+    Ok(store_password_and_session(ctx, &password))
 }
 
 /// Helper for POST routes: redirect to `base` on success, or to
@@ -6764,11 +6907,17 @@ fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
 // ── Setup wizard ─────────────────────────────────────────────────────────────
 
 /// Apply first-run setup from the new-user form.
-/// Returns `None` on success, or `Some(error_code)` if a field is invalid.
-fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+/// On success returns a new session id (password stored, user logged in).
+fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Result<String, &'static str> {
+    use super::admin_auth::validate_new_password;
+
     let alias        = form_field(body, "alias").map(url_decode).unwrap_or_default();
     let device_alias = form_field(body, "device_alias").map(url_decode).unwrap_or_default();
     let grade_str    = form_field(body, "grade").unwrap_or("sg");
+    let password     = form_field(body, "password").map(url_decode).unwrap_or_default();
+    let confirm      = form_field(body, "password_confirm").map(url_decode).unwrap_or_default();
+
+    validate_new_password(&password, &confirm)?;
 
     let grade = if grade_str == "sg" { DeviceGrade::SG } else { DeviceGrade::DG };
     let sg_rank = if matches!(grade, DeviceGrade::SG) {
@@ -6780,7 +6929,25 @@ fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
         None
     };
 
-    apply_new_user_setup(alias.trim(), device_alias.trim(), grade, sg_rank, ctx)
+    if let Some(err) = apply_new_user_setup(alias.trim(), device_alias.trim(), grade, sg_rank, ctx) {
+        return Err(err);
+    }
+    Ok(store_password_and_session(ctx, &password))
+}
+
+/// First-run join path: set admin password, then kick off bootstrap.
+/// Returns a session so the waiting page (and dashboard after init) stay authed.
+fn complete_join_setup(body: &[u8], ctx: &WorkerContext) -> Result<String, &'static str> {
+    use super::admin_auth::validate_new_password;
+
+    let password = form_field(body, "password").map(url_decode).unwrap_or_default();
+    let confirm  = form_field(body, "password_confirm").map(url_decode).unwrap_or_default();
+    validate_new_password(&password, &confirm)?;
+
+    // Stash password before bootstrap so a completed join is never passwordless.
+    let session = store_password_and_session(ctx, &password);
+    initiate_bootstrap(body, ctx);
+    Ok(session)
 }
 
 /// Typed entry point for first-run new-user setup. Used by both the HTTP form
@@ -6826,8 +6993,10 @@ fn render_setup(query: &str) -> String {
     let grade   = query_param(query, "grade").unwrap_or("");
     let role    = query_param(query, "role").unwrap_or("");
     let waiting = query_param(query, "waiting").is_some();
+    let error   = query_param(query, "error").unwrap_or("");
 
     let body: String = if waiting {
+        // While waiting, allow refresh; once initialized the gate sends to dashboard/login.
         "<meta http-equiv=\"refresh\" content=\"3; url=/setup\">\
          <h1>Connecting\u{2026}</h1>\
          <p class=\"swiz-sub\">Waiting for a response from the server.<br>\
@@ -6839,8 +7008,8 @@ fn render_setup(query: &str) -> String {
         match (grade, role) {
             ("", _) => render_setup_grade_step(),
             ("sg", "") => render_setup_role_step(),
-            ("sg", "new") => render_setup_new_user_form(&query_param(query, "error").unwrap_or("")),
-            ("sg", "join") | ("dg", _) => render_setup_code_entry(grade),
+            ("sg", "new") => render_setup_new_user_form(error),
+            ("sg", "join") | ("dg", _) => render_setup_code_entry(grade, error),
             _ => render_setup_grade_step(),
         }
     };
@@ -6885,7 +7054,11 @@ fn render_setup_new_user_form(error: &str) -> String {
     let error_msg = match error {
         "fields" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
                      Name and device name are required.</p>",
-        _        => "",
+        "password_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     Admin password must be at least 8 characters.</p>",
+        "password_mismatch" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     Passwords do not match.</p>",
+        _ => "",
     };
     format!(
         "<h1>Create Your Identity</h1>\
@@ -6903,35 +7076,99 @@ fn render_setup_new_user_form(error: &str) -> String {
            <label class=\"swiz-label\">SG rank (1 = highest priority relay)</label>\
            <input class=\"swiz-input\" type=\"number\" name=\"sg_rank\" \
                   value=\"1\" min=\"1\" max=\"255\" autocomplete=\"off\">\
+           <label class=\"swiz-label\">Admin password</label>\
+           <input class=\"swiz-input\" type=\"password\" name=\"password\" \
+                  required minlength=\"8\" autocomplete=\"new-password\">\
+           <label class=\"swiz-label\">Confirm admin password</label>\
+           <input class=\"swiz-input\" type=\"password\" name=\"password_confirm\" \
+                  required minlength=\"8\" autocomplete=\"new-password\">\
            <button class=\"swiz-btn\" type=\"submit\">Create Identity</button>\
          </form>\
          <a class=\"swiz-back\" href=\"/setup?grade=sg\">\u{2190} Back</a>"
     )
 }
 
-fn render_setup_code_entry(grade: &str) -> String {
+fn render_setup_code_entry(grade: &str, error: &str) -> String {
     let back = if grade == "sg" { "/setup?grade=sg" } else { "/setup" };
     let form_grade = if grade == "sg" { "sg" } else { "dg" };
+    let error_msg = match error {
+        "password_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     Admin password must be at least 8 characters.</p>",
+        "password_mismatch" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     Passwords do not match.</p>",
+        _ => "",
+    };
     format!(
         "<h1>Enter Invitation Code</h1>\
-         <p class=\"swiz-sub\">Paste the invitation code generated on your existing device.</p>\
+         <p class=\"swiz-sub\">Paste the invitation code generated on your existing device. \
+         Also set an admin password for this device\u{2019}s web UI.</p>\
+         {error_msg}\
          <form method=\"post\" action=\"/setup/join\" style=\"display:block\">\
            <input type=\"hidden\" name=\"grade\" value=\"{form_grade}\">\
            <label class=\"swiz-label\">Device name</label>\
-           <input name=\"device_alias\" type=\"text\" \
-             style=\"width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #ccc;\
-                    border-radius:4px;margin-bottom:.75rem;font-size:1rem\" \
-             placeholder=\"e.g. My Laptop\" required><br>\
+           <input class=\"swiz-input\" name=\"device_alias\" type=\"text\" \
+             placeholder=\"e.g. My Laptop\" required autocomplete=\"off\">\
            <label class=\"swiz-label\">Invitation code</label>\
-           <textarea name=\"code\" rows=\"4\" \
-             style=\"width:100%;box-sizing:border-box;font-family:monospace;\
-                    font-size:.8rem;padding:.5rem;border:1px solid #ccc;\
-                    border-radius:4px;margin-bottom:.75rem;resize:vertical\" \
+           <textarea name=\"code\" rows=\"4\" class=\"swiz-input\" \
+             style=\"font-family:monospace;font-size:.8rem;resize:vertical\" \
              placeholder=\"Paste code here\u{2026}\" required></textarea>\
+           <label class=\"swiz-label\">Admin password</label>\
+           <input class=\"swiz-input\" type=\"password\" name=\"password\" \
+                  required minlength=\"8\" autocomplete=\"new-password\">\
+           <label class=\"swiz-label\">Confirm admin password</label>\
+           <input class=\"swiz-input\" type=\"password\" name=\"password_confirm\" \
+                  required minlength=\"8\" autocomplete=\"new-password\">\
            <button class=\"swiz-btn\" type=\"submit\">Connect</button>\
          </form>\
          <a class=\"swiz-back\" href=\"{back}\">\u{2190} Back</a>"
     )
+}
+
+fn render_login(error: &str) -> String {
+    let error_msg = if error == "bad" {
+        "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+         Incorrect password.</p>"
+    } else {
+        ""
+    };
+    setup_layout(&format!(
+        "<h1>Admin login</h1>\
+         <p class=\"swiz-sub\">Enter the admin password for this pNet node.</p>\
+         {error_msg}\
+         <form method=\"post\" action=\"/login\" style=\"display:block\">\
+           <label class=\"swiz-label\">Password</label>\
+           <input class=\"swiz-input\" type=\"password\" name=\"password\" \
+                  required autocomplete=\"current-password\">\
+           <button class=\"swiz-btn\" type=\"submit\">Log in</button>\
+         </form>"
+    ))
+}
+
+fn render_set_password(error: &str) -> String {
+    let error_msg = match error {
+        "password_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     Password must be at least 8 characters.</p>",
+        "password_mismatch" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     Passwords do not match.</p>",
+        "exists" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     A password is already set. Log in instead.</p>",
+        _ => "",
+    };
+    setup_layout(&format!(
+        "<h1>Set admin password</h1>\
+         <p class=\"swiz-sub\">This node has no admin password yet. \
+         Choose one to protect the control UI.</p>\
+         {error_msg}\
+         <form method=\"post\" action=\"/set-password\" style=\"display:block\">\
+           <label class=\"swiz-label\">Admin password</label>\
+           <input class=\"swiz-input\" type=\"password\" name=\"password\" \
+                  required minlength=\"8\" autocomplete=\"new-password\">\
+           <label class=\"swiz-label\">Confirm password</label>\
+           <input class=\"swiz-input\" type=\"password\" name=\"password_confirm\" \
+                  required minlength=\"8\" autocomplete=\"new-password\">\
+           <button class=\"swiz-btn\" type=\"submit\">Save password</button>\
+         </form>"
+    ))
 }
 
 // ── HTML layout ───────────────────────────────────────────────────────────────
@@ -6976,6 +7213,9 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
     html.push_str("  <a href=\"/devices\">Devices</a>\n");
     html.push_str("  <a href=\"/invitations\">Invitations</a>\n");
     html.push_str("  <a href=\"/diagnostics\">Diagnostics</a>\n");
+    html.push_str("  <form method=\"post\" action=\"/logout\" style=\"margin-left:auto;display:inline\">\
+                   <button type=\"submit\" style=\"background:transparent;color:#aac;border:1px solid #556;\
+                   padding:.25rem .6rem;cursor:pointer;font-size:.85rem\">Log out</button></form>\n");
     html.push_str("</nav>\n<main>\n");
     html.push_str(&banner);
     html.push_str(body);
@@ -7091,7 +7331,14 @@ mod tests {
             let (writer_tx, _writer_rx) = mpsc::sync_channel(64);
             let (scheduler_tx, _sched_rx) = mpsc::channel();
 
-            let ctx = WorkerContext { node, udp_socket: pnet_socket, writer_tx, scheduler_tx, pending_invites: Default::default() };
+            let ctx = WorkerContext {
+                node,
+                udp_socket: pnet_socket,
+                writer_tx,
+                scheduler_tx,
+                pending_invites: Default::default(),
+                sessions: Arc::new(super::super::admin_auth::SessionStore::new()),
+            };
             TestCtx { ctx, app_socket, _writer_rx, _sched_rx }
         }
 
@@ -10169,6 +10416,29 @@ mod tests {
         );
         assert!(!t.ctx.node.read().unwrap().is_initialized(),
             "failed setup must not flip the node to initialized");
+    }
+
+    #[test]
+    fn complete_setup_stores_password_hash_and_returns_session() {
+        let t = TestCtx::new();
+        let body = b"alias=Alice&device_alias=Home&grade=sg&sg_rank=1\
+            &password=secretpass&password_confirm=secretpass";
+        let sid = complete_setup(body, &t.ctx).expect("setup should succeed");
+        assert!(!sid.is_empty());
+        assert!(t.ctx.sessions.is_valid(&sid));
+        let node = t.ctx.node.read().unwrap();
+        assert!(node.is_initialized());
+        let hash = node.admin_password_hash.as_ref().expect("hash stored");
+        assert!(super::super::admin_auth::verify_password("secretpass", hash));
+        assert!(!super::super::admin_auth::verify_password("wrongwrong", hash));
+    }
+
+    #[test]
+    fn complete_setup_rejects_short_password() {
+        let t = TestCtx::new();
+        let body = b"alias=Alice&device_alias=Home&grade=sg&password=short&password_confirm=short";
+        assert_eq!(complete_setup(body, &t.ctx), Err("password_short"));
+        assert!(!t.ctx.node.read().unwrap().is_initialized());
     }
 
     #[test]

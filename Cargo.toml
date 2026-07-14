@@ -14,3 +14,4 @@ chacha20poly1305   = "0.10"
 base64             = "0.22"
 serde              = { version = "1", features = ["derive"] }
 toml               = "0.8"
+sha2 = "0.10"

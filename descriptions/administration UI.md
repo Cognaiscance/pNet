@@ -4,7 +4,18 @@ The administration UI is a web interface accessible only to the owner of the pNe
 
 ## Access & Authentication
 
-The UI is only accessible from localhost. On first access, the owner is prompted to set an admin password. On subsequent visits, a password prompt is shown before access is granted.
+On first-run setup (new user or join), the owner sets an **admin password** for this node. The password is stored as a salted hash on the local node only (`admin_password_hash` in `node.toml`) and is never synced to peers.
+
+After setup, every admin page requires a login session:
+
+* `POST /login` with the admin password issues an HttpOnly `pnet_session` cookie (24h, in-memory sessions).
+* Unauthenticated requests redirect to `/login`.
+* `POST /logout` clears the session.
+* Nodes upgraded from a pre-password build (initialized but no hash) are forced through `/set-password` once.
+
+Headless deploys may set `PNET_ADMIN_PASSWORD` at startup to store a hash when none exists yet.
+
+HTTP bind policy (loopback vs all interfaces) is separate — see control-plane checklist item 1.2.
 
 ## Pages
 

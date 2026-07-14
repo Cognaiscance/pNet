@@ -113,6 +113,28 @@ fn apply_env_setup(ctx: &WorkerContext) {
     }
 }
 
+/// If `PNET_ADMIN_PASSWORD` is set and the node has no admin hash yet, store it.
+/// Used by headless deploys so the UI is not left passwordless after env setup.
+fn apply_env_admin_password(ctx: &WorkerContext) {
+    let Ok(password) = std::env::var("PNET_ADMIN_PASSWORD") else { return };
+    if password.is_empty() { return; }
+    {
+        let node = ctx.node.read().unwrap();
+        if node.admin_password_hash.is_some() { return; }
+    }
+    if password.len() < lib::admin_auth::MIN_PASSWORD_LEN {
+        eprintln!(
+            "[apply_env_admin_password] PNET_ADMIN_PASSWORD shorter than {} chars; ignored",
+            lib::admin_auth::MIN_PASSWORD_LEN
+        );
+        return;
+    }
+    let hash = lib::admin_auth::hash_password(&password);
+    ctx.node.write().unwrap().admin_password_hash = Some(hash);
+    ctx.save_node();
+    println!("[apply_env_admin_password] admin password hash stored from env");
+}
+
 fn main() {
     // ── 1. Load data from disk ───────────────────────────────────────────────
     let dir = data_dir();
@@ -158,10 +180,14 @@ fn main() {
         writer_tx:    writer.sender(),
         scheduler_tx,
         pending_invites: Default::default(),
+        sessions:     Arc::new(lib::admin_auth::SessionStore::new()),
     });
 
     // ── 6a. Headless env-driven first-run setup, if requested ────────────────
     apply_env_setup(&ctx);
+    // Optional admin password for headless / first boot (also used when the
+    // node was already initialized without a hash — sets it if still missing).
+    apply_env_admin_password(&ctx);
 
     let mut pool = ThreadPool::new(WORKER_COUNT, Arc::clone(&queue), Arc::clone(&stop), Arc::clone(&ctx));
 
@@ -268,6 +294,7 @@ mod tests {
             writer_tx:    writer.sender(),
             scheduler_tx,
             pending_invites: Default::default(),
+            sessions:     Arc::new(crate::lib::admin_auth::SessionStore::new()),
         });
         // Retain `ctx` in this scope via Arc::clone, exactly as `main` does.
         // This is what makes the test faithful: the lingering `WorkerContext`

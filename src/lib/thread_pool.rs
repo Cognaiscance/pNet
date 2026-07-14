@@ -102,6 +102,7 @@ mod tests {
             writer_tx,
             scheduler_tx,
             pending_invites: Default::default(),
+            sessions:     Arc::new(super::super::admin_auth::SessionStore::new()),
         })
     }
 

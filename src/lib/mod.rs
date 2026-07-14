@@ -1,4 +1,5 @@
 pub mod action_queue;
+pub mod admin_auth;
 pub mod data_models;
 pub mod handlers;
 pub mod http_server;

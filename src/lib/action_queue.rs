@@ -30,7 +30,15 @@ pub enum Action {
     AppSendPacket { src: SocketAddr, buf: Vec<u8> },
 
     // From HTTP UI
-    UiRequest { stream: TcpStream, method: String, path: String, query: String, body: Vec<u8> },
+    UiRequest {
+        stream: TcpStream,
+        method: String,
+        path: String,
+        query: String,
+        /// Raw `Cookie` header value (may be empty).
+        cookie: String,
+        body: Vec<u8>,
+    },
 
     // From peer pNet nodes
     SgPing             { src: SocketAddr, nonce: [u8; 16] },
@@ -100,6 +108,8 @@ pub struct WorkerContext {
     pub scheduler_tx: mpsc::Sender<ScheduleRequest>,
     /// Rendezvous for DG→SG invitation requests (op 0x35/0x36).
     pub pending_invites: Arc<PendingInvites>,
+    /// In-memory admin UI sessions (cookie → expiry). Not persisted.
+    pub sessions: Arc<super::admin_auth::SessionStore>,
 }
 
 impl WorkerContext {
@@ -119,8 +129,8 @@ impl Action {
             Action::AppUpdate     { src, buf } => handlers::app_update(src, buf, ctx),
             Action::AppGetData    { src, buf } => handlers::app_get_data(src, buf, ctx),
             Action::AppSendPacket { src, buf } => handlers::app_send_packet(src, buf, ctx),
-            Action::UiRequest { stream, method, path, query, body } => {
-                handlers::ui_request(stream, method, path, query, body, ctx)
+            Action::UiRequest { stream, method, path, query, cookie, body } => {
+                handlers::ui_request(stream, method, path, query, cookie, body, ctx)
             }
             Action::SgPing             { src, nonce } => handlers::sg_ping(src, nonce, ctx),
             Action::DgKeepalive        { src, buf }   => handlers::dg_keepalive_receive(src, buf, ctx),

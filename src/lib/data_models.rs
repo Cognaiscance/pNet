@@ -517,6 +517,11 @@ pub struct Node {
     pub owner:       Owner,
     #[serde(with = "serde_bytes_16")]
     pub device_uuid: Uuid,
+    /// Local admin UI password hash (`v1$salt$hash`). Never synced to peers —
+    /// each device has its own admin password. Empty / `None` means no password
+    /// set yet (first-run or pre-auth upgrade); the UI forces set-password.
+    #[serde(default)]
+    pub admin_password_hash: Option<String>,
     /// Ephemeral — not persisted; refreshed by PollSG on each run.
     /// Keyed by `(device_uuid, host_string)` — the host_string matches an
     /// entry in that device's `hosts` list.
@@ -566,6 +571,7 @@ impl Node {
 
         Node {
             device_uuid,
+            admin_password_hash: None,
             sg_statuses: HashMap::new(),
             owner: Owner {
                 user: User {

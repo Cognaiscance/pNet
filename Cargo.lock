@@ -632,6 +632,7 @@ dependencies = [
  "ctrlc",
  "ed25519-dalek",
  "serde",
+ "sha2",
  "toml",
  "x25519-dalek",
 ]
