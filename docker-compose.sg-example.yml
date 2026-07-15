@@ -22,6 +22,8 @@ services:
       - PNET_USER_ALIAS=william
       - PNET_DEVICE_ALIAS=sg-william
       - PNET_SG_RANK=1
+      # Admin UI is loopback-only by default; required for host port publish.
+      - PNET_HTTP_BIND=0.0.0.0
       # Testing only: auto-approves any app that registers, skipping the UI step.
       - PNET_AUTO_APPROVE_APPS=1
     volumes:
@@ -58,6 +60,7 @@ services:
       - PNET_USER_ALIAS=chad
       - PNET_DEVICE_ALIAS=sg-chad
       - PNET_SG_RANK=1
+      - PNET_HTTP_BIND=0.0.0.0
       - PNET_AUTO_APPROVE_APPS=1
     volumes:
       - /opt/pnet/chad:/root/.pnet

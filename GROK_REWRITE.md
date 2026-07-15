@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §1.2)* |
-| Last completed | 1.1 Admin authentication (2026-07-14) |
+| Current focus | *(none — next is §1.3)* |
+| Last completed | 1.2 Safe HTTP bind defaults (2026-07-15) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -44,11 +44,11 @@ Highest risk relative to data-plane quality. Finish this phase before treating t
 **Done:** 2026-07-14 — `admin_auth` module (salted SHA-256 stretch hash, in-memory sessions, HttpOnly cookie). Password on new-user + join setup; `/login` + `/logout`; upgrade path `/set-password` when initialized without hash; `PNET_ADMIN_PASSWORD` for headless. See `descriptions/administration UI.md`.
 
 ### 1.2 Safe HTTP bind defaults
-- [ ] Default bind is loopback for all grades unless explicitly opted in
-- [ ] Opt-in remote admin via clear env (e.g. `PNET_HTTP_BIND=0.0.0.0`); document it
-- [ ] Align `main.rs` DG/SG bind logic with the above (invert “SG open by default”)
+- [x] Default bind is loopback for all grades unless explicitly opted in
+- [x] Opt-in remote admin via clear env (e.g. `PNET_HTTP_BIND=0.0.0.0`); document it
+- [x] Align `main.rs` DG/SG bind logic with the above (invert “SG open by default”)
 
-**Done:**  
+**Done:** 2026-07-15 — `http_bind_ip()` / `parse_http_bind()` in `http_server.rs`; default `127.0.0.1` for all grades; opt-in `PNET_HTTP_BIND` (legacy `PNET_HTTP_BIND_ALL` alias kept). Docker compose + live harness set `PNET_HTTP_BIND=0.0.0.0` where admin ports are published. Docs: `descriptions/administration UI.md`.
 
 ### 1.3 State-changing POSTs
 - [ ] CSRF protection (or same-site session policy documented) for admin POSTs when bind is non-loopback
@@ -277,6 +277,7 @@ Add a line per work session (newest at top).
 
 | Date | Item(s) | Notes |
 |------|---------|--------|
+| 2026-07-15 | 1.2 Safe HTTP bind defaults | Loopback default; `PNET_HTTP_BIND` opt-in; compose/live updated. |
 | 2026-07-14 | 1.1 Admin authentication | Password hash + session cookie + route gates; tests green (198). |
 | | | |
 

@@ -1,6 +1,6 @@
 # Administration UI
 
-The administration UI is a web interface accessible only to the owner of the pNet node. It is served over HTTP on localhost, port 8087.
+The administration UI is a web interface accessible only to the owner of the pNet node. It is served over HTTP on port **8777** by default (`PNET_HTTP_PORT` overrides).
 
 ## Access & Authentication
 
@@ -15,7 +15,19 @@ After setup, every admin page requires a login session:
 
 Headless deploys may set `PNET_ADMIN_PASSWORD` at startup to store a hash when none exists yet.
 
-HTTP bind policy (loopback vs all interfaces) is separate — see control-plane checklist item 1.2.
+## HTTP bind policy
+
+The admin UI binds to **loopback only** by default (`127.0.0.1`), for every device grade (SG and DG). That keeps the control plane off the LAN/WAN unless the operator opts in.
+
+To expose the UI beyond the host (Docker port publish, remote admin, etc.), set:
+
+```
+PNET_HTTP_BIND=0.0.0.0
+```
+
+Any IPv4 address is accepted (e.g. a specific LAN interface). Invalid values fall back to loopback. Legacy `PNET_HTTP_BIND_ALL=1` is still accepted as an alias for `0.0.0.0` when `PNET_HTTP_BIND` is unset; prefer `PNET_HTTP_BIND`.
+
+Password auth alone is not a full substitute for network exposure controls — bind loopback when you can, and treat non-loopback binds as intentional remote admin.
 
 ## Pages
 

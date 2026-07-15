@@ -22,6 +22,8 @@ services:
       - PNET_GRADE=dg
       - PNET_DEVICE_ALIAS=${PNET_DEVICE_ALIAS:-}
       - PNET_INVITATION_CODE=${PNET_INVITATION_CODE:-}
+      # Admin UI is loopback-only by default; required for host port publish.
+      - PNET_HTTP_BIND=0.0.0.0
       # Testing only: auto-approves any app that registers, skipping the UI step.
       - PNET_AUTO_APPROVE_APPS=1
     volumes:

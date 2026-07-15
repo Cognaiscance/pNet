@@ -38,6 +38,7 @@ services:
       - PNET_DEVICE_ALIAS=sg-william-1
       - PNET_SG_RANK=1
       - PNET_HOSTS=sg-william-1
+      - PNET_HTTP_BIND=0.0.0.0
       - PNET_AUTO_APPROVE_APPS=1
     volumes:
       - pnet-data-sg-william-1:/root/.pnet

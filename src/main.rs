@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use lib::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW};
 use lib::data_models::DeviceGrade;
 use lib::handlers::{apply_new_user_setup, parse_pnet_hosts, start_bootstrap};
-use lib::http_server::{http_port, HttpServer};
+use lib::http_server::{http_bind_ip, http_port, HttpServer};
 use lib::persistence;
 use lib::scheduler::SchedulerThread;
 use lib::thread_pool::{SharedQueue, ThreadPool};
@@ -199,23 +199,10 @@ fn main() {
     }
 
     // ── 8. Start HTTP server ─────────────────────────────────────────────────
-    // SG devices (and uninitialized nodes awaiting setup) bind on all interfaces
-    // so the admin UI is reachable. DG devices bind on loopback only, unless
-    // PNET_HTTP_BIND_ALL=1 — set by docker-compose so the host can reach the UI
-    // through the container's port publish.
-    let http_bind = {
-        let n = node.read().unwrap();
-        let is_dg = n.is_initialized() && {
-            let device_uuid = n.device_uuid;
-            n.owner.user.devices.iter()
-                .find(|d| d.uuid == device_uuid)
-                .map_or(false, |d| matches!(d.grade, DeviceGrade::DG))
-        };
-        let force_all = std::env::var("PNET_HTTP_BIND_ALL")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if is_dg && !force_all { std::net::Ipv4Addr::LOCALHOST } else { std::net::Ipv4Addr::UNSPECIFIED }
-    };
+    // Default bind is loopback for all grades (SG and DG). Opt into remote admin
+    // with PNET_HTTP_BIND=0.0.0.0 (or another IPv4). Docker / live harnesses that
+    // publish the admin port must set this explicitly.
+    let http_bind = http_bind_ip();
     let hport = http_port();
     let http = HttpServer::start(http_bind, hport, Arc::clone(&queue), Arc::clone(&stop));
 
