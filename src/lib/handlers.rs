@@ -5543,11 +5543,15 @@ pub fn ui_request(
     path:   String,
     query:  String,
     cookie: String,
+    host:   String,
+    origin: String,
+    referer: String,
     body:   Vec<u8>,
     ctx:    &WorkerContext,
 ) {
     use super::admin_auth::{
-        clear_session_cookie_header, session_id_from_cookie_header, set_session_cookie_header,
+        clear_session_cookie_header, csrf_post_ok, session_id_from_cookie_header,
+        set_session_cookie_header, UiFlash, INVITE_CODE_HEADER,
     };
 
     let (initialized, has_password) = {
@@ -5595,6 +5599,18 @@ pub fn ui_request(
         if authed && is_login_route && method == "GET" {
             return respond_redirect(&stream, "/dashboard");
         }
+    }
+
+    // CSRF: SameSite=Strict on the session cookie is the primary defence.
+    // When Origin/Referer is present, require it to match Host.
+    if method == "POST" && !csrf_post_ok(&host, &origin, &referer) {
+        return respond_html(
+            &stream,
+            403,
+            &layout(ctx, "Forbidden", "<h1>403 — CSRF check failed</h1>\
+             <p>Origin/Referer does not match this host.</p>"),
+            None,
+        );
     }
 
     match (method.as_str(), path.as_str()) {
@@ -5685,17 +5701,44 @@ pub fn ui_request(
             respond_redirect(&stream, "/devices");
         }
         ("GET",  "/diagnostics")   => respond_html(&stream, 200, &render_diagnostics(ctx), None),
-        ("GET",  "/invitations")   => respond_html(&stream, 200, &render_invitations(ctx, &query), None),
+        ("GET",  "/invitations")   => {
+            let flash = session_id
+                .as_ref()
+                .and_then(|id| ctx.sessions.take_flash(id));
+            respond_html(&stream, 200, &render_invitations(ctx, &query, flash), None)
+        }
         ("POST", "/invitations/device") => {
             match generate_device_invitation(ctx) {
-                Some(code) => respond_redirect(&stream, &format!("/invitations?code={code}")),
-                None       => respond_redirect(&stream, "/invitations?error=no_host"),
+                Some(code) => {
+                    if let Some(ref id) = session_id {
+                        ctx.sessions
+                            .set_flash(id, UiFlash::DeviceCode(code.clone()));
+                    }
+                    respond_redirect_extra(
+                        &stream,
+                        "/invitations",
+                        "",
+                        &[(INVITE_CODE_HEADER, code.as_str())],
+                    );
+                }
+                None => respond_redirect(&stream, "/invitations?error=no_host"),
             }
         }
         ("POST", "/invitations/contact") => {
             match generate_contact_invitation(ctx) {
-                Some(code) => respond_redirect(&stream, &format!("/invitations?contact_code={code}")),
-                None       => respond_redirect(&stream, "/invitations?error=no_host"),
+                Some(code) => {
+                    if let Some(ref id) = session_id {
+                        ctx.sessions
+                            .set_flash(id, UiFlash::ContactCode(code.clone()));
+                    }
+                    respond_redirect_extra(
+                        &stream,
+                        "/invitations",
+                        "",
+                        &[(INVITE_CODE_HEADER, code.as_str())],
+                    );
+                }
+                None => respond_redirect(&stream, "/invitations?error=no_host"),
             }
         }
         ("POST", "/invitations/enter") => {
@@ -5716,7 +5759,12 @@ pub fn ui_request(
 
 fn respond_html(stream: &std::net::TcpStream, status: u16, html: &str, set_cookie: Option<&str>) {
     use std::io::Write;
-    let status_text = match status { 200 => "OK", 404 => "Not Found", _ => "OK" };
+    let status_text = match status {
+        200 => "OK",
+        403 => "Forbidden",
+        404 => "Not Found",
+        _ => "OK",
+    };
     let body = html.as_bytes();
     let cookie_line = set_cookie
         .map(|c| format!("Set-Cookie: {c}\r\n"))
@@ -5739,16 +5787,35 @@ fn respond_redirect(stream: &std::net::TcpStream, location: &str) {
 }
 
 fn respond_redirect_cookie(stream: &std::net::TcpStream, location: &str, set_cookie: &str) {
+    respond_redirect_extra(stream, location, set_cookie, &[]);
+}
+
+/// 302 redirect with optional Set-Cookie and extra response headers
+/// (e.g. `X-Pnet-Invitation-Code` for harnesses — never put secrets in the URL).
+fn respond_redirect_extra(
+    stream: &std::net::TcpStream,
+    location: &str,
+    set_cookie: &str,
+    extra: &[(&str, &str)],
+) {
     use std::io::Write;
     let cookie_line = if set_cookie.is_empty() {
         String::new()
     } else {
         format!("Set-Cookie: {set_cookie}\r\n")
     };
+    let mut extra_lines = String::new();
+    for (name, value) in extra {
+        extra_lines.push_str(name);
+        extra_lines.push_str(": ");
+        extra_lines.push_str(value);
+        extra_lines.push_str("\r\n");
+    }
     let response = format!(
         "HTTP/1.1 302 Found\r\n\
          Location: {location}\r\n\
          {cookie_line}\
+         {extra_lines}\
          Content-Length: 0\r\n\
          Connection: close\r\n\r\n"
     );
@@ -6791,17 +6858,19 @@ fn initiate_contact_exchange(body: &[u8], ctx: &WorkerContext) {
     send(ctx, SocketAddr::V4(sg_addr), &pkt);
 }
 
-fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
+fn render_invitations(
+    ctx: &WorkerContext,
+    query: &str,
+    flash: Option<super::admin_auth::UiFlash>,
+) -> String {
+    use super::admin_auth::UiFlash;
+
     let node = ctx.node.read().unwrap();
 
-    // Show a generated code if one was passed back via the redirect query string.
-    let code_param = query.split('&')
-        .find_map(|p| p.strip_prefix("code="))
-        .unwrap_or("");
-    let contact_code_param = query.split('&')
-        .find_map(|p| p.strip_prefix("contact_code="))
-        .unwrap_or("");
-    let error_param = query.split('&')
+    // Codes come from a one-shot session flash (POST → 302 → GET), never from
+    // a long-lived query string (history, logs, Referer leakage).
+    let error_param = query
+        .split('&')
         .find_map(|p| p.strip_prefix("error="))
         .unwrap_or("");
 
@@ -6814,30 +6883,32 @@ fn render_invitations(ctx: &WorkerContext, query: &str) -> String {
         _ => String::new(),
     };
 
-    let code_section = if !code_param.is_empty() {
-        format!(
-            "<div class='card'>\
-               <div class='label'>Share this code with the new device (expires in 24 h):</div>\
-               <pre style='word-break:break-all;background:#f0f0f0;padding:.75rem;\
-                           border-radius:4px;font-size:.85rem;margin:.5rem 0 0'>{}</pre>\
-             </div>",
-            html_escape(code_param)
-        )
-    } else {
-        String::new()
-    };
-
-    let contact_code_section = if !contact_code_param.is_empty() {
-        format!(
-            "<div class='card'>\
-               <div class='label'>Share this code with your new contact (expires in 24 h):</div>\
-               <pre style='word-break:break-all;background:#f0f0f0;padding:.75rem;\
-                           border-radius:4px;font-size:.85rem;margin:.5rem 0 0'>{}</pre>\
-             </div>",
-            html_escape(contact_code_param)
-        )
-    } else {
-        String::new()
+    let (code_section, contact_code_section) = match flash {
+        Some(UiFlash::DeviceCode(code)) => (
+            format!(
+                "<div class='card'>\
+                   <div class='label'>Share this code with the new device (expires in 24 h). \
+                   It is shown once — copy it now.</div>\
+                   <pre style='word-break:break-all;background:#f0f0f0;padding:.75rem;\
+                               border-radius:4px;font-size:.85rem;margin:.5rem 0 0'>{}</pre>\
+                 </div>",
+                html_escape(&code)
+            ),
+            String::new(),
+        ),
+        Some(UiFlash::ContactCode(code)) => (
+            String::new(),
+            format!(
+                "<div class='card'>\
+                   <div class='label'>Share this code with your new contact (expires in 24 h). \
+                   It is shown once — copy it now.</div>\
+                   <pre style='word-break:break-all;background:#f0f0f0;padding:.75rem;\
+                               border-radius:4px;font-size:.85rem;margin:.5rem 0 0'>{}</pre>\
+                 </div>",
+                html_escape(&code)
+            ),
+        ),
+        None => (String::new(), String::new()),
     };
 
     let dev_inv_rows: String = node.owner.device_invitations.iter()

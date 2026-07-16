@@ -2,6 +2,15 @@
 //!
 //! Password hashes are node-local (never synced). Sessions live only in process
 //! memory and are identified by an HttpOnly cookie (`pnet_session`).
+//!
+//! ## CSRF policy
+//!
+//! Session cookies are issued with `SameSite=Strict` so browsers do not attach
+//! them to cross-site POSTs. That is the primary CSRF defence for remote admin
+//! (`PNET_HTTP_BIND` non-loopback). When a browser also sends `Origin` or
+//! `Referer`, handlers reject the POST unless the host matches the `Host`
+//! header. Clients that send neither (curl, scripts) are allowed; they must
+//! still present a valid session cookie when auth is required.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -20,10 +29,26 @@ pub const SESSION_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Minimum password length accepted by setup / set-password / change paths.
 pub const MIN_PASSWORD_LEN: usize = 8;
 
-/// Ephemeral session map: session id (32-char hex) → expiry instant.
+/// Response header carrying a freshly minted invitation code (for harnesses).
+/// The human UI uses a one-shot flash; this header avoids putting the secret
+/// in a redirect URL / query string / browser history.
+pub const INVITE_CODE_HEADER: &str = "X-Pnet-Invitation-Code";
+
+/// One-shot UI message after a state-changing POST (consumed on next GET).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UiFlash {
+    /// Device invitation code to display once.
+    DeviceCode(String),
+    /// Contact invitation code to display once.
+    ContactCode(String),
+}
+
+/// Ephemeral session map: session id (32-char hex) → expiry instant,
+/// plus per-session one-shot flash messages for the admin UI.
 #[derive(Default)]
 pub struct SessionStore {
     inner: Mutex<HashMap<String, Instant>>,
+    flashes: Mutex<HashMap<String, UiFlash>>,
 }
 
 impl SessionStore {
@@ -57,6 +82,26 @@ impl SessionStore {
 
     pub fn revoke(&self, id: &str) {
         self.inner.lock().unwrap().remove(id);
+        self.flashes.lock().unwrap().remove(id);
+    }
+
+    /// Store a one-shot flash for this session (overwrites any previous).
+    pub fn set_flash(&self, session_id: &str, flash: UiFlash) {
+        if session_id.is_empty() {
+            return;
+        }
+        self.flashes
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), flash);
+    }
+
+    /// Take and clear the flash for this session, if any.
+    pub fn take_flash(&self, session_id: &str) -> Option<UiFlash> {
+        if session_id.is_empty() {
+            return None;
+        }
+        self.flashes.lock().unwrap().remove(session_id)
     }
 }
 
@@ -178,6 +223,9 @@ pub fn session_id_from_cookie_header(cookie_header: &str) -> Option<String> {
 }
 
 /// `Set-Cookie` header value that installs a session.
+///
+/// `SameSite=Strict` is intentional CSRF mitigation: the cookie is not sent
+/// on cross-site requests (including cross-site form POSTs).
 pub fn set_session_cookie_header(session_id: &str) -> String {
     format!(
         "{SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
@@ -199,6 +247,49 @@ pub fn validate_new_password(password: &str, confirm: &str) -> Result<(), &'stat
         return Err("password_mismatch");
     }
     Ok(())
+}
+
+/// Extract host[:port] from a `Host` header or an absolute URL (`Origin`/`Referer`).
+pub fn authority_host(value: &str) -> Option<&str> {
+    let v = value.trim();
+    if v.is_empty() || v == "null" {
+        return None;
+    }
+    let rest = if let Some(r) = v.strip_prefix("https://") {
+        r
+    } else if let Some(r) = v.strip_prefix("http://") {
+        r
+    } else {
+        // Host header form (no scheme).
+        return Some(v.split('/').next().unwrap_or(v));
+    };
+    // Drop path/query from Origin/Referer.
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    if hostport.is_empty() {
+        None
+    } else {
+        Some(hostport)
+    }
+}
+
+/// CSRF check for admin POSTs.
+///
+/// * Primary: session cookie is `SameSite=Strict` (browser will not send it
+///   cross-site).
+/// * Secondary: if `Origin` or `Referer` is present, its host must match `Host`.
+/// * If neither Origin nor Referer is sent (typical for curl/scripts), allow.
+pub fn csrf_post_ok(host: &str, origin: &str, referer: &str) -> bool {
+    let Some(expected) = authority_host(host) else {
+        // No Host header — rare; allow so we do not brick odd clients.
+        return true;
+    };
+    if let Some(o) = authority_host(origin) {
+        return o.eq_ignore_ascii_case(expected);
+    }
+    if let Some(r) = authority_host(referer) {
+        return r.eq_ignore_ascii_case(expected);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -233,6 +324,27 @@ mod tests {
     }
 
     #[test]
+    fn flash_set_take_once() {
+        let store = SessionStore::new();
+        let id = store.create();
+        store.set_flash(&id, UiFlash::DeviceCode("abc".into()));
+        assert_eq!(
+            store.take_flash(&id),
+            Some(UiFlash::DeviceCode("abc".into()))
+        );
+        assert_eq!(store.take_flash(&id), None);
+    }
+
+    #[test]
+    fn revoke_clears_flash() {
+        let store = SessionStore::new();
+        let id = store.create();
+        store.set_flash(&id, UiFlash::ContactCode("xyz".into()));
+        store.revoke(&id);
+        assert_eq!(store.take_flash(&id), None);
+    }
+
+    #[test]
     fn parse_session_cookie_among_others() {
         let h = "foo=bar; pnet_session=abc123; other=1";
         assert_eq!(session_id_from_cookie_header(h).as_deref(), Some("abc123"));
@@ -247,5 +359,54 @@ mod tests {
             Err("password_mismatch")
         );
         assert!(validate_new_password("longenough", "longenough").is_ok());
+    }
+
+    #[test]
+    fn authority_host_from_host_and_urls() {
+        assert_eq!(authority_host("localhost:8801"), Some("localhost:8801"));
+        assert_eq!(
+            authority_host("http://localhost:8801/path"),
+            Some("localhost:8801")
+        );
+        assert_eq!(
+            authority_host("https://admin.example/"),
+            Some("admin.example")
+        );
+        assert_eq!(authority_host(""), None);
+        assert_eq!(authority_host("null"), None);
+    }
+
+    #[test]
+    fn csrf_post_ok_matches_origin_and_allows_missing() {
+        assert!(csrf_post_ok("localhost:8801", "", ""));
+        assert!(csrf_post_ok(
+            "localhost:8801",
+            "http://localhost:8801",
+            ""
+        ));
+        assert!(csrf_post_ok(
+            "localhost:8801",
+            "",
+            "http://localhost:8801/invitations"
+        ));
+        assert!(!csrf_post_ok(
+            "localhost:8801",
+            "http://evil.example",
+            ""
+        ));
+        assert!(!csrf_post_ok(
+            "localhost:8801",
+            "",
+            "https://evil.example/x"
+        ));
+    }
+
+    #[test]
+    fn session_cookie_is_samesite_strict() {
+        let h = set_session_cookie_header("deadbeef");
+        assert!(h.contains("SameSite=Strict"));
+        assert!(h.contains("HttpOnly"));
+        let c = clear_session_cookie_header();
+        assert!(c.contains("SameSite=Strict"));
     }
 }

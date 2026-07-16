@@ -57,6 +57,8 @@ start_node() {
     local env="HOME='$home' PNET_GRADE='$grade' PNET_DEVICE_ALIAS='$dalias'"
     env+=" PNET_SG_RANK='$rank' PNET_UDP_PORT='$udp' PNET_HTTP_PORT='$http'"
     env+=" PNET_HTTP_BIND=0.0.0.0 PNET_AUTO_APPROVE_APPS=1"
+    # Match harness default; mint/rename helpers log in with this password.
+    env+=" PNET_ADMIN_PASSWORD='${PNET_TEST_ADMIN_PASSWORD:-stagetest1}'"
     [[ -n "$hosts" ]] && env+=" PNET_HOSTS='$hosts'"
     if [[ "$role" == "new" ]]; then
         env+=" PNET_USER_ALIAS='$ualias'"
@@ -99,39 +101,67 @@ start_probe() {
 admin_url() { eval echo "\$ADMIN_${1}"; }       # <node name>
 probe_url() { eval echo "\$PROBE_URL_${1}"; }    # <probe name>
 
+# Live nodes must set PNET_ADMIN_PASSWORD (default matches stage harnesses).
+ADMIN_PASSWORD="${PNET_TEST_ADMIN_PASSWORD:-stagetest1}"
+
+admin_cookie_jar() {  # <admin base url> -> prints cookie jar path
+    local admin="$1"
+    local jar
+    jar=$(mktemp)
+    curl -sS -c "$jar" -b "$jar" -o /dev/null -X POST \
+        --data-urlencode "password=${ADMIN_PASSWORD}" \
+        "${admin}/login" \
+        || { rm -f "$jar"; die "POST ${admin}/login failed"; }
+    grep -q 'pnet_session' "$jar" \
+        || { rm -f "$jar"; die "no pnet_session cookie from ${admin}/login"; }
+    printf '%s' "$jar"
+}
+
 mint_device_invitation() {  # <node name> -> prints code
     local admin; admin="$(admin_url "$1")"
-    local resp loc code
-    resp=$(curl -sS -i -X POST "${admin}/invitations/device") || die "POST $admin/invitations/device failed"
-    loc=$(awk '/^[Ll]ocation:/{print $2}' <<< "$resp" | tr -d '\r' | head -n1)
+    local jar resp loc code
+    jar=$(admin_cookie_jar "$admin")
+    resp=$(curl -sS -i -b "$jar" -X POST "${admin}/invitations/device") \
+        || { rm -f "$jar"; die "POST $admin/invitations/device failed"; }
+    rm -f "$jar"
+    loc=$(awk 'BEGIN{IGNORECASE=1}/^Location:/{print $2; exit}' <<< "$resp" | tr -d '\r')
     [[ "$loc" == *"error="* || -z "$loc" ]] && die "device invitation error from $admin: ${loc:-<none>}"
-    code="${loc#*code=}"; code="${code%%&*}"
-    [[ -z "$code" ]] && die "could not parse device code from: $loc"
+    code=$(awk 'BEGIN{IGNORECASE=1}/^X-Pnet-Invitation-Code:/{print $2; exit}' <<< "$resp" | tr -d '\r')
+    [[ -z "$code" ]] && die "no X-Pnet-Invitation-Code from $admin"
     printf '%s' "$code"
 }
 
 mint_contact_invitation() {  # <node name> -> prints contact_code
     local admin; admin="$(admin_url "$1")"
-    local resp loc code
-    resp=$(curl -sS -i -X POST "${admin}/invitations/contact") || die "POST $admin/invitations/contact failed"
-    loc=$(awk '/^[Ll]ocation:/{print $2}' <<< "$resp" | tr -d '\r' | head -n1)
+    local jar resp loc code
+    jar=$(admin_cookie_jar "$admin")
+    resp=$(curl -sS -i -b "$jar" -X POST "${admin}/invitations/contact") \
+        || { rm -f "$jar"; die "POST $admin/invitations/contact failed"; }
+    rm -f "$jar"
+    loc=$(awk 'BEGIN{IGNORECASE=1}/^Location:/{print $2; exit}' <<< "$resp" | tr -d '\r')
     [[ "$loc" == *"error="* || -z "$loc" ]] && die "contact invitation error from $admin: ${loc:-<none>}"
-    code="${loc#*contact_code=}"; code="${code%%&*}"
-    [[ -z "$code" ]] && die "could not parse contact code from: $loc"
+    code=$(awk 'BEGIN{IGNORECASE=1}/^X-Pnet-Invitation-Code:/{print $2; exit}' <<< "$resp" | tr -d '\r')
+    [[ -z "$code" ]] && die "no X-Pnet-Invitation-Code from $admin"
     printf '%s' "$code"
 }
 
 redeem_contact() {  # <node name> <contact_code>
     local admin; admin="$(admin_url "$1")"
-    curl -sS -o /dev/null --data-urlencode "code=$2" "${admin}/contacts/enter" \
-        || die "POST $admin/contacts/enter failed"
+    local jar
+    jar=$(admin_cookie_jar "$admin")
+    curl -sS -o /dev/null -b "$jar" --data-urlencode "code=$2" "${admin}/contacts/enter" \
+        || { rm -f "$jar"; die "POST $admin/contacts/enter failed"; }
+    rm -f "$jar"
 }
 
 # rename_app <node name> <app_id_hex> <new_alias>
 rename_app() {
     local admin; admin="$(admin_url "$1")"
-    curl -sS -o /dev/null --data-urlencode "id=$2" --data-urlencode "alias=$3" \
-        "${admin}/applications/rename" || die "POST $admin/applications/rename failed"
+    local jar
+    jar=$(admin_cookie_jar "$admin")
+    curl -sS -o /dev/null -b "$jar" --data-urlencode "id=$2" --data-urlencode "alias=$3" \
+        "${admin}/applications/rename" || { rm -f "$jar"; die "POST $admin/applications/rename failed"; }
+    rm -f "$jar"
 }
 
 # ── Waits / oracles (probe /status JSON) ───────────────────────────────────

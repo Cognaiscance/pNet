@@ -119,19 +119,31 @@ fn enqueue_request(stream: TcpStream, queue: &SharedQueue) {
 
     // If parsing fails, drop the stream (connection reset — acceptable for
     // malformed requests against a localhost admin UI).
-    let Some((method, path, query, cookie, body)) = result else { return };
+    let Some((method, path, query, cookie, host, origin, referer, body)) = result else {
+        return;
+    };
 
     let (lock, cvar) = &**queue;
     let mut guard = lock.lock().unwrap();
     guard.push(PRIORITY_NORMAL, Action::UiRequest {
-        stream, method, path, query, cookie, body,
+        stream, method, path, query, cookie, host, origin, referer, body,
     });
     cvar.notify_one();
 }
 
-fn parse_request(
-    reader: &mut BufReader<&TcpStream>,
-) -> Option<(String, String, String, String, Vec<u8>)> {
+/// Parsed HTTP request fields used by the admin UI handler.
+type ParsedRequest = (
+    String, // method
+    String, // path
+    String, // query
+    String, // cookie
+    String, // host
+    String, // origin
+    String, // referer
+    Vec<u8>, // body
+);
+
+fn parse_request(reader: &mut BufReader<&TcpStream>) -> Option<ParsedRequest> {
     // Request line.
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
@@ -147,9 +159,12 @@ fn parse_request(
         None      => (raw_path, String::new()),
     };
 
-    // Headers — scan for Content-Length and Cookie.
+    // Headers — Content-Length, Cookie, Host, Origin, Referer.
     let mut content_length: usize = 0;
     let mut cookie = String::new();
+    let mut host = String::new();
+    let mut origin = String::new();
+    let mut referer = String::new();
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).is_err() {
@@ -163,10 +178,13 @@ fn parse_request(
         if lower.starts_with("content-length:") {
             content_length = lower["content-length:".len()..].trim().parse().unwrap_or(0);
         } else if lower.starts_with("cookie:") {
-            cookie = trimmed
-                .split_once(':')
-                .map(|(_, v)| v.trim().to_string())
-                .unwrap_or_default();
+            cookie = header_value(trimmed);
+        } else if lower.starts_with("host:") {
+            host = header_value(trimmed);
+        } else if lower.starts_with("origin:") {
+            origin = header_value(trimmed);
+        } else if lower.starts_with("referer:") {
+            referer = header_value(trimmed);
         }
     }
 
@@ -179,7 +197,14 @@ fn parse_request(
         Vec::new()
     };
 
-    Some((method, path, query, cookie, body))
+    Some((method, path, query, cookie, host, origin, referer, body))
+}
+
+fn header_value(trimmed_line: &str) -> String {
+    trimmed_line
+        .split_once(':')
+        .map(|(_, v)| v.trim().to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

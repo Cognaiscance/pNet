@@ -59,37 +59,55 @@ wait_for_url() {
     done
 }
 
-mint_device_invitation() {
-    # POST /invitations/device → 302 Location: /invitations?code=<base64>
+# Shared with stage compose: PNET_ADMIN_PASSWORD on seed SG(s).
+ADMIN_PASSWORD="${PNET_TEST_ADMIN_PASSWORD:-stagetest1}"
+
+admin_cookie_jar() {
     local admin="$1"
-    local resp location
-    resp=$(curl -sS -i -X POST "${admin}/invitations/device") \
-        || die "POST ${admin}/invitations/device failed"
-    location=$(printf '%s' "$resp" | awk '/^[Ll]ocation:/{print $2}' | tr -d '\r' | head -n1)
+    local jar
+    jar=$(mktemp)
+    curl -sS -c "$jar" -b "$jar" -o /dev/null -X POST \
+        --data-urlencode "password=${ADMIN_PASSWORD}" \
+        "${admin}/login" \
+        || { rm -f "$jar"; die "POST ${admin}/login failed"; }
+    grep -q 'pnet_session' "$jar" \
+        || { rm -f "$jar"; die "no pnet_session cookie from ${admin}/login"; }
+    printf '%s' "$jar"
+}
+
+mint_device_invitation() {
+    # POST /invitations/device (authed) → 302 + X-Pnet-Invitation-Code
+    local admin="$1"
+    local jar resp location code
+    jar=$(admin_cookie_jar "$admin")
+    resp=$(curl -sS -i -b "$jar" -X POST "${admin}/invitations/device") \
+        || { rm -f "$jar"; die "POST ${admin}/invitations/device failed"; }
+    rm -f "$jar"
+    location=$(printf '%s' "$resp" | awk 'BEGIN{IGNORECASE=1}/^Location:/{print $2; exit}' | tr -d '\r')
     [[ -z "$location" ]] && die "no Location header from ${admin}/invitations/device"
     if [[ "$location" == *"error="* ]]; then
         die "device invitation generation reported error from ${admin}: $location"
     fi
-    local code="${location#*code=}"
-    code="${code%%&*}"
-    [[ -z "$code" ]] && die "could not parse code from Location: $location"
+    code=$(printf '%s' "$resp" | awk 'BEGIN{IGNORECASE=1}/^X-Pnet-Invitation-Code:/{print $2; exit}' | tr -d '\r')
+    [[ -z "$code" ]] && die "no X-Pnet-Invitation-Code from ${admin}/invitations/device"
     printf '%s' "$code"
 }
 
 mint_contact_invitation() {
-    # POST /invitations/contact → 302 Location: /invitations?contact_code=<base64>
+    # POST /invitations/contact (authed) → 302 + X-Pnet-Invitation-Code
     local admin="$1"
-    local resp location
-    resp=$(curl -sS -i -X POST "${admin}/invitations/contact") \
-        || die "POST ${admin}/invitations/contact failed"
-    location=$(printf '%s' "$resp" | awk '/^[Ll]ocation:/{print $2}' | tr -d '\r' | head -n1)
+    local jar resp location code
+    jar=$(admin_cookie_jar "$admin")
+    resp=$(curl -sS -i -b "$jar" -X POST "${admin}/invitations/contact") \
+        || { rm -f "$jar"; die "POST ${admin}/invitations/contact failed"; }
+    rm -f "$jar"
+    location=$(printf '%s' "$resp" | awk 'BEGIN{IGNORECASE=1}/^Location:/{print $2; exit}' | tr -d '\r')
     [[ -z "$location" ]] && die "no Location header from ${admin}/invitations/contact"
     if [[ "$location" == *"error="* ]]; then
         die "contact invitation generation reported error from ${admin}: $location"
     fi
-    local code="${location#*contact_code=}"
-    code="${code%%&*}"
-    [[ -z "$code" ]] && die "could not parse contact code from Location: $location"
+    code=$(printf '%s' "$resp" | awk 'BEGIN{IGNORECASE=1}/^X-Pnet-Invitation-Code:/{print $2; exit}' | tr -d '\r')
+    [[ -z "$code" ]] && die "no X-Pnet-Invitation-Code from ${admin}/invitations/contact"
     printf '%s' "$code"
 }
 
@@ -97,11 +115,14 @@ redeem_contact_code() {
     # POST /contacts/enter with form field code=<base64>. Returns nothing useful;
     # we verify the outcome by polling the contacts list afterwards.
     local admin="$1" code="$2"
-    curl -sS -o /dev/null -X POST \
+    local jar
+    jar=$(admin_cookie_jar "$admin")
+    curl -sS -o /dev/null -b "$jar" -X POST \
         -H 'Content-Type: application/x-www-form-urlencoded' \
         --data-urlencode "code=${code}" \
         "${admin}/contacts/enter" \
-        || die "POST ${admin}/contacts/enter failed"
+        || { rm -f "$jar"; die "POST ${admin}/contacts/enter failed"; }
+    rm -f "$jar"
 }
 
 probe_status() {

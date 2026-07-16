@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §1.3)* |
-| Last completed | 1.2 Safe HTTP bind defaults (2026-07-15) |
+| Current focus | *(none — next is §1.4)* |
+| Last completed | 1.3 State-changing POSTs (2026-07-16) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -51,10 +51,10 @@ Highest risk relative to data-plane quality. Finish this phase before treating t
 **Done:** 2026-07-15 — `http_bind_ip()` / `parse_http_bind()` in `http_server.rs`; default `127.0.0.1` for all grades; opt-in `PNET_HTTP_BIND` (legacy `PNET_HTTP_BIND_ALL` alias kept). Docker compose + live harness set `PNET_HTTP_BIND=0.0.0.0` where admin ports are published. Docs: `descriptions/administration UI.md`.
 
 ### 1.3 State-changing POSTs
-- [ ] CSRF protection (or same-site session policy documented) for admin POSTs when bind is non-loopback
-- [ ] Avoid putting invitation codes only in long-lived query strings when easy to fix (prefer POST body + display once)
+- [x] CSRF protection (or same-site session policy documented) for admin POSTs when bind is non-loopback
+- [x] Avoid putting invitation codes only in long-lived query strings when easy to fix (prefer POST body + display once)
 
-**Done:**  
+**Done:** 2026-07-16 — Documented `SameSite=Strict` session cookie CSRF policy; Origin/Referer host must match `Host` when present (403 otherwise). Invitation codes no longer in redirect query strings: one-shot session flash for UI + `X-Pnet-Invitation-Code` header for harnesses. Stage/live helpers log in with `PNET_ADMIN_PASSWORD` / `stagetest1`. Docs: `descriptions/administration UI.md`.
 
 ### 1.4 Data directory permissions
 - [ ] Ensure data dir is `0700` on create/load
@@ -277,6 +277,7 @@ Add a line per work session (newest at top).
 
 | Date | Item(s) | Notes |
 |------|---------|--------|
+| 2026-07-16 | 1.3 State-changing POSTs | SameSite CSRF policy + Origin check; invite flash + X-Pnet-Invitation-Code; harness auth. |
 | 2026-07-15 | 1.2 Safe HTTP bind defaults | Loopback default; `PNET_HTTP_BIND` opt-in; compose/live updated. |
 | 2026-07-14 | 1.1 Admin authentication | Password hash + session cookie + route gates; tests green (198). |
 | | | |

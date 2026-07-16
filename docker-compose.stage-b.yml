@@ -38,6 +38,7 @@ services:
       - PNET_SG_RANK=1
       - PNET_HOSTS=sg-alice
       - PNET_HTTP_BIND=0.0.0.0
+      - PNET_ADMIN_PASSWORD=stagetest1
       - PNET_AUTO_APPROVE_APPS=1
     volumes:
       - pnet-data-sg-alice:/root/.pnet
@@ -66,6 +67,7 @@ services:
       - PNET_SG_RANK=1
       - PNET_HOSTS=sg-bob
       - PNET_HTTP_BIND=0.0.0.0
+      - PNET_ADMIN_PASSWORD=stagetest1
       - PNET_AUTO_APPROVE_APPS=1
     volumes:
       - pnet-data-sg-bob:/root/.pnet

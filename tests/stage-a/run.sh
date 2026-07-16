@@ -56,20 +56,39 @@ wait_for_url() {
     done
 }
 
+# Shared with stage compose: PNET_ADMIN_PASSWORD on seed SG(s).
+ADMIN_PASSWORD="${PNET_TEST_ADMIN_PASSWORD:-stagetest1}"
+
+admin_cookie_jar() {
+    # Login to $1; write a cookie jar path on stdout.
+    local admin="$1"
+    local jar
+    jar=$(mktemp)
+    curl -sS -c "$jar" -b "$jar" -o /dev/null -X POST \
+        --data-urlencode "password=${ADMIN_PASSWORD}" \
+        "${admin}/login" \
+        || { rm -f "$jar"; die "POST ${admin}/login failed"; }
+    # Require a session cookie was set.
+    grep -q 'pnet_session' "$jar" \
+        || { rm -f "$jar"; die "no pnet_session cookie from ${admin}/login"; }
+    printf '%s' "$jar"
+}
+
 mint_invitation() {
-    # POST /invitations/device → 302 Location: /invitations?code=<base64>
+    # POST /invitations/device (authed) → 302 + X-Pnet-Invitation-Code: <base64>
     # Returns the code on stdout. Dies on error.
-    local resp location
-    resp=$(curl -sS -i -X POST "${SG1_ADMIN}/invitations/device") \
-        || die "POST /invitations/device failed"
-    location=$(printf '%s' "$resp" | awk '/^[Ll]ocation:/{print $2}' | tr -d '\r' | head -n1)
+    local jar resp location code
+    jar=$(admin_cookie_jar "$SG1_ADMIN")
+    resp=$(curl -sS -i -b "$jar" -X POST "${SG1_ADMIN}/invitations/device") \
+        || { rm -f "$jar"; die "POST /invitations/device failed"; }
+    rm -f "$jar"
+    location=$(printf '%s' "$resp" | awk 'BEGIN{IGNORECASE=1}/^Location:/{print $2; exit}' | tr -d '\r')
     [[ -z "$location" ]] && die "no Location header from /invitations/device (resp: ${resp:0:200})"
     if [[ "$location" == *"error="* ]]; then
         die "invitation generation reported error: $location"
     fi
-    local code="${location#*code=}"
-    code="${code%%&*}"
-    [[ -z "$code" ]] && die "could not parse code from Location: $location"
+    code=$(printf '%s' "$resp" | awk 'BEGIN{IGNORECASE=1}/^X-Pnet-Invitation-Code:/{print $2; exit}' | tr -d '\r')
+    [[ -z "$code" ]] && die "no X-Pnet-Invitation-Code header (resp: ${resp:0:300})"
     printf '%s' "$code"
 }
 

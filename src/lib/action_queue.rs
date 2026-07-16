@@ -37,6 +37,12 @@ pub enum Action {
         query: String,
         /// Raw `Cookie` header value (may be empty).
         cookie: String,
+        /// Raw `Host` header (for CSRF Origin/Referer checks).
+        host: String,
+        /// Raw `Origin` header (may be empty).
+        origin: String,
+        /// Raw `Referer` header (may be empty).
+        referer: String,
         body: Vec<u8>,
     },
 
@@ -129,8 +135,12 @@ impl Action {
             Action::AppUpdate     { src, buf } => handlers::app_update(src, buf, ctx),
             Action::AppGetData    { src, buf } => handlers::app_get_data(src, buf, ctx),
             Action::AppSendPacket { src, buf } => handlers::app_send_packet(src, buf, ctx),
-            Action::UiRequest { stream, method, path, query, cookie, body } => {
-                handlers::ui_request(stream, method, path, query, cookie, body, ctx)
+            Action::UiRequest {
+                stream, method, path, query, cookie, host, origin, referer, body,
+            } => {
+                handlers::ui_request(
+                    stream, method, path, query, cookie, host, origin, referer, body, ctx,
+                )
             }
             Action::SgPing             { src, nonce } => handlers::sg_ping(src, nonce, ctx),
             Action::DgKeepalive        { src, buf }   => handlers::dg_keepalive_receive(src, buf, ctx),

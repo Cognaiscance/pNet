@@ -161,14 +161,32 @@ wait_for_sg1_app_count_from_probe2() {
     done
 }
 
+ADMIN_PASSWORD="${PNET_TEST_ADMIN_PASSWORD:-stagetest1}"
+
+admin_cookie_jar() {
+    local admin="$1"
+    local jar
+    jar=$(mktemp)
+    curl -sS -c "$jar" -b "$jar" -o /dev/null -X POST \
+        --data-urlencode "password=${ADMIN_PASSWORD}" \
+        "${admin}/login" \
+        || { rm -f "$jar"; die "POST ${admin}/login failed"; }
+    grep -q 'pnet_session' "$jar" \
+        || { rm -f "$jar"; die "no pnet_session cookie from ${admin}/login"; }
+    printf '%s' "$jar"
+}
+
 post_rename() {
-    local admin="$1" id="$2" alias="$3" code
+    local admin="$1" id="$2" alias="$3" code jar
+    jar=$(admin_cookie_jar "$admin")
     code=$(curl -sS -o /dev/null -w '%{http_code}' \
+        -b "$jar" \
         -X POST \
         -H 'Content-Type: application/x-www-form-urlencoded' \
         --data-urlencode "id=${id}" \
         --data-urlencode "alias=${alias}" \
         "${admin}/applications/rename")
+    rm -f "$jar"
     [[ "$code" == "303" || "$code" == "302" ]] \
         || die "rename returned ${code}, expected 302/303 (admin=${admin} id=${id})"
 }
@@ -254,11 +272,14 @@ say "  waiting ${WAIT_POLL_DOWN_SECS}s for sg-alice-1's poll to mark sg-alice-2 
 sleep "$WAIT_POLL_DOWN_SECS"
 
 say "  deleting probe-1's app via sg-alice-1's admin UI..."
+DELETE_JAR=$(admin_cookie_jar "$SG1_ADMIN")
 DELETE_RESP=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -b "$DELETE_JAR" \
     -X POST \
     -H 'Content-Type: application/x-www-form-urlencoded' \
     --data-urlencode "id=${APP1_ID}" \
     "${SG1_ADMIN}/applications/delete")
+rm -f "$DELETE_JAR"
 [[ "$DELETE_RESP" == "303" || "$DELETE_RESP" == "302" ]] \
     || die "delete returned ${DELETE_RESP}, expected 302/303"
 

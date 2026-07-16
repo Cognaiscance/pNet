@@ -132,11 +132,18 @@ SG_BOB_PROBE_APP_ID=$(own_app_id_for "$PROBE_SG_BOB" "sg-bob" "probe")
 ok "sg-bob/probe app_id = $SG_BOB_PROBE_APP_ID"
 
 say "deleting sg-bob's probe app via admin UI..."
-curl -sSf -o /dev/null -X POST \
+ADMIN_PASSWORD="${PNET_TEST_ADMIN_PASSWORD:-stagetest1}"
+JAR=$(mktemp)
+curl -sS -c "$JAR" -b "$JAR" -o /dev/null -X POST \
+    --data-urlencode "password=${ADMIN_PASSWORD}" \
+    "${BOB_ADMIN}/login" \
+    || { rm -f "$JAR"; die "POST ${BOB_ADMIN}/login failed"; }
+curl -sSf -o /dev/null -b "$JAR" -X POST \
     -H 'Content-Type: application/x-www-form-urlencoded' \
     --data-urlencode "id=${SG_BOB_PROBE_APP_ID}" \
     "${BOB_ADMIN}/applications/delete" \
-    || die "POST ${BOB_ADMIN}/applications/delete failed"
+    || { rm -f "$JAR"; die "POST ${BOB_ADMIN}/applications/delete failed"; }
+rm -f "$JAR"
 
 say "waiting up to ${PROPAGATE_WAIT_SECS}s for the removal to reach alice's probes..."
 for port in "$PROBE_SG_ALICE" "$PROBE_DG_ALICE"; do
