@@ -6,6 +6,17 @@ use std::time::Duration;
 
 use super::action_queue::{Action, PRIORITY_HIGH};
 use super::thread_pool::SharedQueue;
+use super::wire::{
+    APP_GET_DATA_OP, APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_PACKET_OP, APP_UPDATE_OP,
+    BOOTSTRAP_REQUEST_OP, BOOTSTRAP_RESPONSE_OP, CONNECT_ACK_OP, CONNECT_REQUEST_OP,
+    CONTACT_REQUEST_OP, CONTACT_RESPONSE_OP, CONN_RESET_OP, CROSS_USER_PULL_REQUEST_OP,
+    CROSS_USER_PULL_RESPONSE_OP, CROSS_USER_UPDATE_AVAILABLE_OP, DEVICE_REGISTER_OP,
+    DG_KEEPALIVE_OP, GENERATE_INVITATION_REQUEST_OP, GENERATE_INVITATION_RESPONSE_OP,
+    MERGE_ACK_OP, MERGE_PROPOSAL_OP, RELAY_PACKET_OP, SG_PING_OP, SYNC_PULL_REQUEST_OP,
+    SYNC_PULL_RESPONSE_OP, SYNC_UPDATE_AVAILABLE_OP, SYNC_WRITE_ACK_OP, SYNC_WRITE_REQUEST_OP,
+    TUNNEL_CONNECT_ACK_OP, TUNNEL_CONNECT_REQUEST_OP, TUNNEL_DELIVERY_OP, TUNNEL_FORWARD_OP,
+    TUNNEL_INIT_OP, WATERMARK_PROBE_REQUEST_OP, WATERMARK_PROBE_RESPONSE_OP,
+};
 
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_PORT: u16 = 7777;
@@ -60,11 +71,11 @@ impl UdpListener {
                 let payload = buf[1..len].to_vec();
 
                 let action = match op {
-                    0x00 => Action::AppRegister   { src, buf: payload },
-                    0x01 => Action::AppUpdate     { src, buf: payload },
-                    0x02 => Action::AppGetData    { src, buf: payload },
-                    0x03 => Action::AppSendPacket { src, buf: payload },
-                    0x10 => {
+                    APP_REGISTER_OP => Action::AppRegister { src, buf: payload },
+                    APP_UPDATE_OP => Action::AppUpdate { src, buf: payload },
+                    APP_GET_DATA_OP => Action::AppGetData { src, buf: payload },
+                    APP_SEND_PACKET_OP => Action::AppSendPacket { src, buf: payload },
+                    SG_PING_OP => {
                         if payload.len() < 16 {
                             eprintln!("[udp] sg_ping too short from {src}");
                             continue;
@@ -73,39 +84,55 @@ impl UdpListener {
                         Action::SgPing { src, nonce }
                     }
                     // DG encrypted keepalive: SG verifies the connection is still
-                    // live and sends a conn-reset (0x13) if it isn't.
-                    0x12 => Action::DgKeepalive { src, buf: payload },
+                    // live and sends a conn-reset if it isn't.
+                    DG_KEEPALIVE_OP => Action::DgKeepalive { src, buf: payload },
                     // SG conn-reset: tells the DG its connection is gone so it
                     // can reconnect immediately.
-                    0x13 => Action::ConnReset { src },
-                    0x20 => Action::ConnectRequest     { src, buf: payload },
-                    0x21 => Action::ConnectAck         { src, buf: payload },
-                    0x30 => Action::BootstrapRequest   { src, buf: payload },
-                    0x31 => Action::BootstrapResponse  { src, buf: payload },
-                    0x32 => Action::DeviceRegistration { src, buf: payload },
-                    0x33 => Action::ContactRequest         { src, buf: payload },
-                    0x34 => Action::ContactResponse        { src, buf: payload },
-                    0x35 => Action::GenerateInvitationRequest  { src, buf: payload },
-                    0x36 => Action::GenerateInvitationResponse { src, buf: payload },
-                    0x70 => Action::SyncWriteRequest       { src, buf: payload },
-                    0x71 => Action::SyncWriteAck           { src, buf: payload },
-                    0x72 => Action::SyncUpdateAvailable    { src, buf: payload },
-                    0x73 => Action::SyncPullRequest        { src, buf: payload },
-                    0x74 => Action::SyncPullResponse       { src, buf: payload },
-                    0x75 => Action::CrossUserUpdateAvailable { src, buf: payload },
-                    0x76 => Action::CrossUserPullRequest     { src, buf: payload },
-                    0x77 => Action::CrossUserPullResponse    { src, buf: payload },
-                    0x78 => Action::MergeProposal            { src, buf: payload },
-                    0x79 => Action::MergeAck                 { src, buf: payload },
-                    0x7A => Action::WatermarkProbeRequest    { src, buf: payload },
-                    0x7B => Action::WatermarkProbeResponse   { src, buf: payload },
-                    0x40 => Action::RelayPacket        { src, buf: payload },
-                    0x41 => Action::AppPacket          { src, buf: payload },
-                    0x50 => Action::TunnelInit           { src, buf: payload },
-                    0x51 => Action::TunnelForward        { src, buf: payload },
-                    0x52 => Action::TunnelConnectRequest { src, buf: payload },
-                    0x53 => Action::TunnelConnectAck     { src, buf: payload },
-                    0x54 => Action::TunnelDelivery       { src, buf: payload },
+                    CONN_RESET_OP => Action::ConnReset { src },
+                    CONNECT_REQUEST_OP => Action::ConnectRequest { src, buf: payload },
+                    CONNECT_ACK_OP => Action::ConnectAck { src, buf: payload },
+                    BOOTSTRAP_REQUEST_OP => Action::BootstrapRequest { src, buf: payload },
+                    BOOTSTRAP_RESPONSE_OP => Action::BootstrapResponse { src, buf: payload },
+                    DEVICE_REGISTER_OP => Action::DeviceRegistration { src, buf: payload },
+                    CONTACT_REQUEST_OP => Action::ContactRequest { src, buf: payload },
+                    CONTACT_RESPONSE_OP => Action::ContactResponse { src, buf: payload },
+                    GENERATE_INVITATION_REQUEST_OP => {
+                        Action::GenerateInvitationRequest { src, buf: payload }
+                    }
+                    GENERATE_INVITATION_RESPONSE_OP => {
+                        Action::GenerateInvitationResponse { src, buf: payload }
+                    }
+                    SYNC_WRITE_REQUEST_OP => Action::SyncWriteRequest { src, buf: payload },
+                    SYNC_WRITE_ACK_OP => Action::SyncWriteAck { src, buf: payload },
+                    SYNC_UPDATE_AVAILABLE_OP => Action::SyncUpdateAvailable { src, buf: payload },
+                    SYNC_PULL_REQUEST_OP => Action::SyncPullRequest { src, buf: payload },
+                    SYNC_PULL_RESPONSE_OP => Action::SyncPullResponse { src, buf: payload },
+                    CROSS_USER_UPDATE_AVAILABLE_OP => {
+                        Action::CrossUserUpdateAvailable { src, buf: payload }
+                    }
+                    CROSS_USER_PULL_REQUEST_OP => {
+                        Action::CrossUserPullRequest { src, buf: payload }
+                    }
+                    CROSS_USER_PULL_RESPONSE_OP => {
+                        Action::CrossUserPullResponse { src, buf: payload }
+                    }
+                    MERGE_PROPOSAL_OP => Action::MergeProposal { src, buf: payload },
+                    MERGE_ACK_OP => Action::MergeAck { src, buf: payload },
+                    WATERMARK_PROBE_REQUEST_OP => {
+                        Action::WatermarkProbeRequest { src, buf: payload }
+                    }
+                    WATERMARK_PROBE_RESPONSE_OP => {
+                        Action::WatermarkProbeResponse { src, buf: payload }
+                    }
+                    RELAY_PACKET_OP => Action::RelayPacket { src, buf: payload },
+                    APP_PACKET_OP => Action::AppPacket { src, buf: payload },
+                    TUNNEL_INIT_OP => Action::TunnelInit { src, buf: payload },
+                    TUNNEL_FORWARD_OP => Action::TunnelForward { src, buf: payload },
+                    TUNNEL_CONNECT_REQUEST_OP => {
+                        Action::TunnelConnectRequest { src, buf: payload }
+                    }
+                    TUNNEL_CONNECT_ACK_OP => Action::TunnelConnectAck { src, buf: payload },
+                    TUNNEL_DELIVERY_OP => Action::TunnelDelivery { src, buf: payload },
                     _ => {
                         eprintln!("[udp] unknown op byte {op} from {src}");
                         continue;

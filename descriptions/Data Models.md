@@ -70,15 +70,15 @@ description: holds information specific to a device (laptop, server, phone)
 
 # Application
 description: data required to handle communication with apps through the app api
-* id: u16
-	* unique per device; used in packet headers to save space
+* id: Uuid (16 bytes)
+	* unique application id (partition-safe; union-by-id in sync v2 merge)
 * alias
 * host
 	* a SocketAddrV4 (ipv4 address with port number)
 * user_approved
 	* true | false
 * token
-	* a UUID used to identify the application on subsequent requests
+	* a UUID used to identify the application on subsequent local app-API requests
 
 # KeyPair
 description: a pair of Curve25519 encryption keys; Ed25519 for signing, X25519 for key exchange

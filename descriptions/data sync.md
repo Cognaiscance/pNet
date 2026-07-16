@@ -124,7 +124,7 @@ These rules apply only when concurrent writes touch the same field during a part
 
 | Change kind | Rule |
 |---|---|
-| Add (application, device, contact, invitation) | **Union.** All adds from both sides are kept. Identity is by UUID; if two sides happen to allocate the same `application.id` (a `u16`), the writer with higher SG rank keeps the id and the other is reassigned at merge time. |
+| Add (application, device, contact, invitation) | **Union.** All adds from both sides are kept. Identity is by UUID (app ids are 16-byte UUIDs — pure union by id; no reassignment). |
 | Remove (any of the above) | **Tombstone wins.** A remove on either side overrides a concurrent add or modification of the same record. Removes are recorded as tombstones in the write log so a late-arriving add from the partitioned side cannot resurrect the record. |
 | Scalar update (`alias`, `sg_rank`, `hosts`, etc.) | **Highest writer-rank wins.** Tie broken by `(epoch, seq)`. |
 
@@ -137,11 +137,9 @@ These rules are deliberately small. Most users on a small home pNet will never t
 
 ## v2: partition reconciliation
 
-### Prerequisite — UUID app ids
+### Prerequisite — UUID app ids (done, 7c.0)
 
-Today `Application.id` is a `u16` assigned by the local pnet. Two SGs accepting `AddApplication` on the same device during a partition can collide on an id, and the doc's "writer with higher SG rank keeps the id and the other is reassigned at merge time" path drags every app, probe, and DG client through the reassignment.
-
-Phase **7c.0** widens `Application.id` to a `Uuid` everywhere — `Application`, every `Change` variant carrying the id, every app-facing op (`app_register`, `app_get_data`, `app_send_packet`, `OP_PUSH`), the probe, and the persisted state (`#[serde(default)]`-driven migration for existing nodes). Once ids are UUIDs, Add collisions cannot happen and the merge engine for Adds reduces to a pure union by id.
+`Application.id` is a 16-byte `Uuid` everywhere — `Application`, every `Change` variant carrying the id, app-facing ops (`app_register`, `app_get_data`, `app_send_packet`, push), and persisted state. Add collisions cannot happen; the merge engine for Adds is a pure union by id.
 
 ### Write log
 
@@ -195,7 +193,7 @@ where `result` is `0` (applied), `1` (retention-exhausted, falling back to full 
 
 Given two `Vec<WriteLogEntry>` lists, sort by `(epoch, seq, writer_uuid)`, walk in order:
 
-- **Add (`AddApplication`, `AddDevice`)**: union by id (UUID, after 7c.0). Idempotent.
+- **Add (`AddApplication`, `AddDevice`)**: union by id (UUID). Idempotent.
 - **Tombstone (`TombstoneTarget`)**: removes the matching record from the merged state and suppresses any later Change whose `(epoch, seq)` ≤ the tombstone's. Tombstone wins regardless of which side has the higher epoch.
 - **Scalar update (`UpdateApplicationAlias`, future device/contact field updates)**: highest writer-rank wins; tiebreaker `(epoch, seq)`.
 
@@ -211,7 +209,7 @@ Policy on exhaustion: **the returning SG accepts the other side's full public st
 
 | Phase | Scope |
 |---|---|
-| 7c.0 | Widen `Application.id` from u16 to UUID across the codebase + snapshot migration. |
+| 7c.0 | Widen `Application.id` from u16 to UUID across the codebase + snapshot migration. **Done.** |
 | 7c.1 | This design doc (you are here). |
 | 7c.2 | `WriteLogEntry` / `WriteLogKind` / `TombstoneTarget`, persistence, append in `apply_change_locally` + `sync_write_request`, retention pruning. |
 | 7c.3 | Watermark discovery — `0x7A WatermarkProbe` request + reply, store result. |

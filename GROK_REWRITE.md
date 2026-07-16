@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §2.1)* |
-| Last completed | 1.4 Data directory permissions (2026-07-16) |
+| Current focus | *(none — next is §3.1)* |
+| Last completed | 2.2 Fix stale docs and comments (2026-07-16) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -71,26 +71,29 @@ Make the core navigable and stop lying comments/docs from causing wire bugs.
 ### 2.1 Split `handlers.rs` (thin dispatch stays)
 Do one module at a time; keep tests compiling after each move.
 
-- [ ] Extract crypto helpers (`x25519`, ed25519, aead, seal/open packet)
-- [ ] Extract wire constants / min lengths / shared parse helpers
-- [ ] Extract local app edge (`app_register`, `app_update`, `app_get_data`, `app_send_packet`, push path)
-- [ ] Extract sessions (`connect_*`, `maintain_connections`, keepalive, conn_reset, poll_sg)
-- [ ] Extract bootstrap + invitations (device/contact invite mint + exchange)
-- [ ] Extract routing (`find_writer_sg`, `find_pull_source`, best SG, host resolve)
-- [ ] Extract sync (write/pull/cross-user/watermarks/merge)
-- [ ] Extract tunnels
-- [ ] Extract admin UI handlers/pages
-- [ ] `Action::dispatch` remains a thin router into these modules
+- [x] Extract crypto helpers (`x25519`, ed25519, aead, seal/open packet)
+- [x] Extract wire constants / min lengths / shared parse helpers
+- [x] Extract local app edge (`app_register`, `app_update`, `app_get_data`, `app_send_packet`, push path)
+- [x] Extract sessions (`connect_*`, `maintain_connections`, keepalive, conn_reset, poll_sg)
+- [x] Extract bootstrap + invitations (device/contact invite mint + exchange)
+- [x] Extract routing (`find_writer_sg`, `find_pull_source`, best SG, host resolve)
+- [x] Extract sync (write/pull/cross-user/watermarks/merge)
+- [x] Extract tunnels
+- [x] Extract admin UI handlers/pages
+- [x] `Action::dispatch` remains a thin router into these modules
 
-**Done:**  
+**Done:** 2026-07-16 — Full §2.1 split:
+- Top-level: `crypto.rs`, `wire.rs`
+- `handlers/{app_edge,sessions,bootstrap,routing,sync,tunnels,admin_ui}.rs` + thin `handlers/mod.rs` (shared helpers, re-exports, unit tests)
+- `Action::dispatch` only matches → `handlers::*` (unchanged thin router)
 
 ### 2.2 Fix stale docs and comments in core
-- [ ] App id is UUID (16 bytes) everywhere in comments (`app_get_data`, `app_send_packet`, design notes if wrong)
-- [ ] Remove obsolete “TODO: verify Ed25519” where verification already runs
-- [ ] Remove duplicate / “not yet implemented” docblocks above live handlers
-- [ ] Align short notes in `descriptions/` only where they contradict code (core fabric docs, not apps)
+- [x] App id is UUID (16 bytes) everywhere in comments (`app_get_data`, `app_send_packet`, design notes if wrong)
+- [x] Remove obsolete “TODO: verify Ed25519” where verification already runs
+- [x] Remove duplicate / “not yet implemented” docblocks above live handlers
+- [x] Align short notes in `descriptions/` only where they contradict code (core fabric docs, not apps)
 
-**Done:**  
+**Done:** 2026-07-16 — Wire comments use 16-byte app ids (`app_edge`, `relay_packet`, contact/public-state comments). Connect docs note Ed25519 is verified (not TODO). Removed stale “not yet implemented” + duplicate `app_send_packet` docblock. Docs: `Data Models.md` Application.id → Uuid; `data sync.md` merge rules + 7c.0 marked done.
 
 ---
 
@@ -277,6 +280,16 @@ Add a line per work session (newest at top).
 
 | Date | Item(s) | Notes |
 |------|---------|--------|
+| 2026-07-16 | 2.2 stale docs/comments | UUID app-id comments; Ed25519 TODOs fixed; data models + sync docs. |
+| 2026-07-16 | 2.1 admin UI + finish split | `handlers/admin_ui.rs`; §2.1 complete; 217 tests green. |
+| 2026-07-16 | 2.1 tunnels extract | `handlers/tunnels.rs` 0x50–0x54 + cleanup; 217 tests green. |
+| 2026-07-16 | 2.1 sync extract | `handlers/sync.rs` write/pull/cross-user/merge; 217 tests green. |
+| 2026-07-16 | 2.1 routing extract | `handlers/routing.rs` writer election + host resolve; 217 tests green. |
+| 2026-07-16 | 2.1 bootstrap + invitations | `handlers/bootstrap.rs`; 217 tests green. |
+| 2026-07-16 | 2.1 sessions extract | `handlers/sessions.rs` connect/poll/maintain/keepalive; 217 tests green. |
+| 2026-07-16 | 2.1 local app edge extract | `handlers/app_edge.rs`; handlers → directory; 217 tests green. |
+| 2026-07-16 | 2.1 wire constants extract | New `wire.rs`; udp_listener uses named ops; 217 tests green. |
+| 2026-07-16 | 2.1 crypto helpers extract | New `crypto.rs`; handlers uses it; 214 tests green. |
 | 2026-07-16 | 1.4 Data directory permissions | ensure_data_dir 0700; write_atomic 0600 + main hosts path; mode tests. |
 | 2026-07-16 | 1.3 State-changing POSTs | SameSite CSRF policy + Origin check; invite flash + X-Pnet-Invitation-Code; harness auth. |
 | 2026-07-15 | 1.2 Safe HTTP bind defaults | Loopback default; `PNET_HTTP_BIND` opt-in; compose/live updated. |
