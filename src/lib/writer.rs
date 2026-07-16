@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
@@ -53,30 +53,44 @@ impl WriterThread {
     }
 }
 
-fn write_atomic(path: &PathBuf, content: &str) -> io::Result<()> {
-    (|| -> io::Result<()> {
-        let dir = path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
-        })?;
-        let tmp = dir.join(".pnet_write_tmp");
+/// Atomically write `content` to `path` (temp file + fsync + rename).
+///
+/// On Unix the file is mode `0600` (owner read/write only) both on the temp
+/// file and again after rename, matching `descriptions/data persistence.md`.
+pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
+    let tmp = dir.join(".pnet_write_tmp");
 
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
 
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    })()
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    // Drop before rename so the file is closed on all platforms.
+    drop(file);
+    fs::rename(&tmp, path)?;
+
+    // Belt-and-suspenders: ensure final path is 0600 even if rename replaced
+    // an older inode with a looser mode on some platforms, or if an existing
+    // world-readable file was the rename target's previous mode elsewhere.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -85,6 +99,7 @@ mod tests {
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pnet_writer_test_{name}"));
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -108,6 +123,31 @@ mod tests {
         write_atomic(&path, "x = 1\n").unwrap();
 
         assert!(!dir.join(".pnet_write_tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_sets_file_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("mode600");
+        let path = dir.join("secret.toml");
+        write_atomic(&path, "secret = true\n").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_tightens_existing_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("tighten");
+        let path = dir.join("loose.toml");
+        fs::write(&path, "old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(&path, "new\n").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
     }
 
     #[test]

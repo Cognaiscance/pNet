@@ -12,6 +12,8 @@ Data is stored in human-readable files on disk. Changes are written through to d
 
 Data files live in a dedicated directory (e.g. `~/.pnet/data/`). The directory and all files within it are owned by the user running pnet, with permissions set to `700` (directory) and `600` (files) so that only that user (and root) can read or write them. The pnet process, running as that user, has full access.
 
+**Enforced on create/load (Unix):** at startup `ensure_data_dir` creates `~/.pnet/data` if needed, sets the data directory (and parent `.pnet` when present) to mode `0700`, and sets existing `node.toml` / `apps.toml` to `0600` if they exist. The writer thread (and any other durable write of node state) uses atomic temp + rename and always sets file mode `0600`. Wrong ownership or an unwritable path still fails as a normal I/O error — the process does not ask the user to run `chmod` for mode-only drift.
+
 ## Decisions
 
 - **File format** — TOML

@@ -1,6 +1,50 @@
+use std::fs;
+use std::io;
 use std::path::Path;
 
 use super::data_models::Node;
+
+/// Ensure the data directory exists with private permissions and tighten
+/// known data files if they already exist.
+///
+/// * Directory: `0700` (owner rwx only)
+/// * Files `node.toml` / `apps.toml`: `0600` (owner rw only)
+/// * If the immediate parent is named `.pnet`, it is also set to `0700`
+///
+/// Mode bits are applied on Unix only. Wrong owner / unwritable path still
+/// surfaces as a normal I/O error for the operator to fix.
+pub fn ensure_data_dir(data_dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(data_dir)?;
+
+    #[cfg(unix)]
+    {
+        set_mode(data_dir, 0o700)?;
+        if let Some(parent) = data_dir.parent() {
+            if parent
+                .file_name()
+                .map(|n| n == ".pnet")
+                .unwrap_or(false)
+                && parent.exists()
+            {
+                set_mode(parent, 0o700)?;
+            }
+        }
+        for name in ["node.toml", "apps.toml"] {
+            let path = data_dir.join(name);
+            if path.is_file() {
+                set_mode(&path, 0o600)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
 
 /// Load node state from `data_dir/node.toml`.
 /// Falls back to a fresh `Node::new()` if the file doesn't exist or can't be parsed.
@@ -36,6 +80,15 @@ mod tests {
     fn roundtrip(node: &Node) -> Node {
         let toml_str = save(node);
         toml::from_str::<Node>(&toml_str).expect("roundtrip deserialize failed")
+    }
+
+    fn unique_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pnet_persistence_{name}_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
     }
 
     #[test]
@@ -100,26 +153,63 @@ mod tests {
 
     #[test]
     fn load_returns_new_node_when_file_missing() {
-        let dir = std::env::temp_dir().join("pnet_persistence_test_missing");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unique_dir("missing");
+        fs::create_dir_all(&dir).unwrap();
         let node = load(&dir);
         assert_eq!(node.owner.user.alias, "Owner");
     }
 
     #[test]
     fn load_roundtrips_through_file() {
-        let dir = std::env::temp_dir().join("pnet_persistence_test_file");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unique_dir("file");
+        fs::create_dir_all(&dir).unwrap();
 
         let mut original = Node::new();
         original.owner.user.alias = "TestUser".to_string();
 
         let toml_str = save(&original);
-        std::fs::write(dir.join("node.toml"), &toml_str).unwrap();
+        fs::write(dir.join("node.toml"), &toml_str).unwrap();
 
         let restored = load(&dir);
         assert_eq!(restored.owner.user.alias, "TestUser");
         assert_eq!(restored.device_uuid, original.device_uuid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_data_dir_creates_0700_and_tightens_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Layout: <tmp>/.pnet/data  — parent named .pnet should also go 0700.
+        let root = unique_dir("ensure");
+        let pnet = root.join(".pnet");
+        let data = pnet.join("data");
+
+        // Pre-create loose parent + loose file to prove we tighten on load.
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&pnet, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
+        let node_path = data.join("node.toml");
+        fs::write(&node_path, "x = 1\n").unwrap();
+        fs::set_permissions(&node_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        ensure_data_dir(&data).unwrap();
+
+        let data_mode = fs::metadata(&data).unwrap().permissions().mode() & 0o777;
+        let pnet_mode = fs::metadata(&pnet).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&node_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(data_mode, 0o700, "data dir mode {data_mode:o}");
+        assert_eq!(pnet_mode, 0o700, ".pnet dir mode {pnet_mode:o}");
+        assert_eq!(file_mode, 0o600, "node.toml mode {file_mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_data_dir_fresh_create_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = unique_dir("fresh").join("data");
+        ensure_data_dir(&data).unwrap();
+        let mode = fs::metadata(&data).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 }

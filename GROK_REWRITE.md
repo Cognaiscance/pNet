@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §1.4)* |
-| Last completed | 1.3 State-changing POSTs (2026-07-16) |
+| Current focus | *(none — next is §2.1)* |
+| Last completed | 1.4 Data directory permissions (2026-07-16) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -57,10 +57,10 @@ Highest risk relative to data-plane quality. Finish this phase before treating t
 **Done:** 2026-07-16 — Documented `SameSite=Strict` session cookie CSRF policy; Origin/Referer host must match `Host` when present (403 otherwise). Invitation codes no longer in redirect query strings: one-shot session flash for UI + `X-Pnet-Invitation-Code` header for harnesses. Stage/live helpers log in with `PNET_ADMIN_PASSWORD` / `stagetest1`. Docs: `descriptions/administration UI.md`.
 
 ### 1.4 Data directory permissions
-- [ ] Ensure data dir is `0700` on create/load
-- [ ] Confirm writer keeps files at `0600` (already intended; verify all write paths)
+- [x] Ensure data dir is `0700` on create/load
+- [x] Confirm writer keeps files at `0600` (already intended; verify all write paths)
 
-**Done:**  
+**Done:** 2026-07-16 — `persistence::ensure_data_dir` creates/secures `~/.pnet/data` at `0700` (parent `.pnet` too), tightens existing `node.toml`/`apps.toml` to `0600`. Public `writer::write_atomic` used by writer + main `PNET_HOSTS` path (no bare `fs::write`); post-rename `0600`. Unit tests for modes. Docs: `descriptions/data persistence.md`.
 
 ---
 
@@ -277,6 +277,7 @@ Add a line per work session (newest at top).
 
 | Date | Item(s) | Notes |
 |------|---------|--------|
+| 2026-07-16 | 1.4 Data directory permissions | ensure_data_dir 0700; write_atomic 0600 + main hosts path; mode tests. |
 | 2026-07-16 | 1.3 State-changing POSTs | SameSite CSRF policy + Origin check; invite flash + X-Pnet-Invitation-Code; harness auth. |
 | 2026-07-15 | 1.2 Safe HTTP bind defaults | Loopback default; `PNET_HTTP_BIND` opt-in; compose/live updated. |
 | 2026-07-14 | 1.1 Admin authentication | Password hash + session cookie + route gates; tests green (198). |

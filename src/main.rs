@@ -12,7 +12,7 @@ use lib::persistence;
 use lib::scheduler::SchedulerThread;
 use lib::thread_pool::{SharedQueue, ThreadPool};
 use lib::udp_listener::{udp_port, UdpListener};
-use lib::writer::WriterThread;
+use lib::writer::{write_atomic, WriterThread};
 
 const WORKER_COUNT: usize = 4;
 
@@ -137,8 +137,10 @@ fn apply_env_admin_password(ctx: &WorkerContext) {
 
 fn main() {
     // ── 1. Load data from disk ───────────────────────────────────────────────
+    // Ensure ~/.pnet/data exists at 0700 and tighten existing data files to 0600
+    // before reading keys (see descriptions/data persistence.md).
     let dir = data_dir();
-    std::fs::create_dir_all(&dir).expect("could not create data directory");
+    persistence::ensure_data_dir(&dir).expect("could not create or secure data directory");
     let node = Arc::new(RwLock::new(persistence::load(&dir)));
 
     // ── 1a. Apply PNET_HOSTS (authoritative for the local SG device) ─────────
@@ -146,7 +148,8 @@ fn main() {
     apply_pnet_hosts(&node, &pnet_hosts);
     if !pnet_hosts.is_empty() {
         let toml = persistence::save(&node.read().unwrap());
-        std::fs::write(dir.join("node.toml"), &toml)
+        // Same atomic + 0600 path as the writer thread (no bare fs::write).
+        write_atomic(&dir.join("node.toml"), &toml)
             .expect("could not persist PNET_HOSTS update");
         println!("[main] PNET_HOSTS applied: {pnet_hosts:?}");
     }
