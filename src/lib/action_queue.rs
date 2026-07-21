@@ -116,6 +116,8 @@ pub struct WorkerContext {
     pub pending_invites: Arc<PendingInvites>,
     /// In-memory admin UI sessions (cookie → expiry). Not persisted.
     pub sessions: Arc<super::admin_auth::SessionStore>,
+    /// Local app API rate limits (register/send token buckets).
+    pub app_rate_limits: Arc<std::sync::Mutex<super::app_api::AppRateLimiter>>,
 }
 
 impl WorkerContext {

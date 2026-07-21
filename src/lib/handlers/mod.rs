@@ -40,7 +40,7 @@ fn send(ctx: &WorkerContext, dest: SocketAddr, data: &[u8]) {
 }
 
 fn send_error(ctx: &WorkerContext, dest: SocketAddr, code: u8) {
-    send(ctx, dest, &[0x01, code]);
+    send(ctx, dest, &[STATUS_ERR, code]);
 }
 
 /// Extract an IPv4 address from a SocketAddr, mapping IPv4-in-IPv6 if needed.
@@ -163,6 +163,28 @@ fn push_device(buf: &mut Vec<u8>, d: &Device) {
     }
 }
 
+/// Local UDP host for a **user-approved** app on this device, if any.
+///
+/// Every inbound push path (`relay_packet` local delivery, `app_packet`,
+/// `tunnel_delivery`) must use this so unapproved apps never receive traffic.
+fn local_approved_app_host(
+    node: &super::data_models::Node,
+    dest_app_id: Uuid,
+) -> Option<SocketAddrV4> {
+    let device_uuid = node.device_uuid;
+    node.owner
+        .user
+        .devices
+        .iter()
+        .find(|d| d.uuid == device_uuid)
+        .and_then(|d| {
+            d.applications
+                .iter()
+                .find(|a| a.id == dest_app_id && a.user_approved)
+                .map(|a| a.host)
+        })
+}
+
 fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
     let uuid: Uuid   = read_arr(data, pos)?;
     let alias        = read_str(data, pos)?;
@@ -198,6 +220,9 @@ fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
 /// decrypt/re-encrypt step.
 ///
 /// Encrypted body: [dest_device_uuid: 16][dest_app_id: 16][sender_app_id: 16][payload]
+///
+/// App `payload` must be ≤ [`MAX_APP_PAYLOAD`]; oversized bodies are dropped
+/// (same budget as local `app_send_packet`).
 pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // Extract the sender device UUID from the connection ID in the packet header
     // before taking the read lock, so we can update the tunnel counter later.
@@ -229,6 +254,13 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let dest_app_id:      Uuid = plaintext[16..32].try_into().unwrap();
         let sender_app_id:    Uuid = plaintext[32..48].try_into().unwrap();
         let payload                = plaintext[48..].to_vec();
+        if payload.len() > MAX_APP_PAYLOAD {
+            eprintln!(
+                "[relay_packet] app payload too large ({} > {MAX_APP_PAYLOAD}) from {src}",
+                payload.len()
+            );
+            return;
+        }
 
         (node.device_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload)
     };
@@ -238,11 +270,7 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if dest_device_uuid == local_uuid {
         let app_host = {
             let node = ctx.node.read().unwrap();
-            node.owner.user.devices.iter()
-                .find(|d| d.uuid == local_uuid)
-                .and_then(|d| d.applications.iter()
-                    .find(|a| a.id == dest_app_id && a.user_approved))
-                .map(|a| a.host)
+            local_approved_app_host(&node, dest_app_id)
         };
         let Some(app_host) = app_host else {
             eprintln!("[relay_packet] no approved local app with id {}", uuid_hex(&dest_app_id));
@@ -374,6 +402,9 @@ mod tests {
                 scheduler_tx,
                 pending_invites: Default::default(),
                 sessions: Arc::new(super::super::admin_auth::SessionStore::new()),
+                app_rate_limits: Arc::new(std::sync::Mutex::new(
+                    super::super::app_api::AppRateLimiter::new(),
+                )),
             };
             TestCtx { ctx, app_socket, _writer_rx, _sched_rx }
         }
@@ -471,7 +502,7 @@ mod tests {
         app_register(t.app_addr(), vec![], &t.ctx); // empty buf
 
         let reply = t.recv_reply();
-        assert_eq!(reply[0], 0x01); // error
+        assert_eq!(reply[0], STATUS_ERR);
         assert_eq!(reply[1], ERR_BAD_PACKET);
     }
 
@@ -547,7 +578,7 @@ mod tests {
         app_update(t.app_addr(), update_packet(&bad_token, Some("x"), None), &t.ctx);
 
         let reply = t.recv_reply();
-        assert_eq!(reply[0], 0x01);
+        assert_eq!(reply[0], STATUS_ERR);
         assert_eq!(reply[1], ERR_TOKEN_UNKNOWN);
     }
 
@@ -624,8 +655,118 @@ mod tests {
         app_get_data(t.app_addr(), vec![0xFFu8; 16], &t.ctx);
 
         let reply = t.recv_reply();
-        assert_eq!(reply[0], 0x01);
+        assert_eq!(reply[0], STATUS_ERR);
         assert_eq!(reply[1], ERR_TOKEN_UNKNOWN);
+    }
+
+    // ── AppSendPacket ─────────────────────────────────────────────────────────
+
+    fn send_packet(token: &[u8; 16], dest_device: Uuid, dest_app: Uuid, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(48 + payload.len());
+        buf.extend_from_slice(token);
+        buf.extend_from_slice(&dest_device);
+        buf.extend_from_slice(&dest_app);
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    fn approve_local_app(t: &TestCtx, token: &[u8; 16]) {
+        let mut node = t.ctx.node.write().unwrap();
+        let device_uuid = node.device_uuid;
+        let device = node.owner.user.devices.iter_mut()
+            .find(|d| d.uuid == device_uuid)
+            .expect("local device");
+        let app = device.applications.iter_mut()
+            .find(|a| a.token == *token)
+            .expect("app by token");
+        app.user_approved = true;
+    }
+
+    #[test]
+    fn app_send_packet_rejects_bad_packet() {
+        let t = TestCtx::new();
+        app_send_packet(t.app_addr(), vec![0u8; 10], &t.ctx);
+        let reply = t.recv_reply();
+        assert_eq!(reply, vec![STATUS_ERR, ERR_BAD_PACKET]);
+    }
+
+    #[test]
+    fn app_send_packet_rejects_unknown_token() {
+        let t = TestCtx::new();
+        let dest = [0xAAu8; 16];
+        app_send_packet(
+            t.app_addr(),
+            send_packet(&[0xFFu8; 16], dest, dest, b"hi"),
+            &t.ctx,
+        );
+        let reply = t.recv_reply();
+        assert_eq!(reply, vec![STATUS_ERR, ERR_TOKEN_UNKNOWN]);
+    }
+
+    #[test]
+    fn app_send_packet_rejects_unapproved_app() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "pending", 9001);
+        // Registered but not approved — send must fail with NOT_APPROVED, not TOKEN_UNKNOWN.
+        let dest = [0xBBu8; 16];
+        app_send_packet(
+            t.app_addr(),
+            send_packet(&token, dest, dest, b"hi"),
+            &t.ctx,
+        );
+        let reply = t.recv_reply();
+        assert_eq!(reply, vec![STATUS_ERR, ERR_NOT_APPROVED]);
+    }
+
+    #[test]
+    fn app_send_packet_rejects_no_route() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "sender", 9001);
+        approve_local_app(&t, &token);
+        // No sessions and no SGs → nowhere to send.
+        let dest_device = [0xCCu8; 16];
+        let dest_app = [0xDDu8; 16];
+        app_send_packet(
+            t.app_addr(),
+            send_packet(&token, dest_device, dest_app, b"hi"),
+            &t.ctx,
+        );
+        let reply = t.recv_reply();
+        assert_eq!(reply, vec![STATUS_ERR, ERR_NO_ROUTE]);
+    }
+
+    #[test]
+    fn app_send_packet_rejects_payload_too_large() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "big", 9001);
+        approve_local_app(&t, &token);
+        let oversized = vec![0u8; MAX_APP_PAYLOAD + 1];
+        let dest = [0xEEu8; 16];
+        app_send_packet(
+            t.app_addr(),
+            send_packet(&token, dest, dest, &oversized),
+            &t.ctx,
+        );
+        let reply = t.recv_reply();
+        assert_eq!(reply, vec![STATUS_ERR, ERR_PAYLOAD_TOO_LARGE]);
+    }
+
+    #[test]
+    fn app_register_rate_limited() {
+        let t = TestCtx::new();
+        // Exhaust the register bucket for this source.
+        let cap = super::super::app_api::REGISTER_LIMIT.capacity as usize;
+        for i in 0..cap {
+            app_register(
+                t.app_addr(),
+                register_packet(&format!("app{i}"), 9000 + i as u16, "udp"),
+                &t.ctx,
+            );
+            let _ = t.recv_reply();
+        }
+        app_register(t.app_addr(), register_packet("overflow", 9999, "udp"), &t.ctx);
+        let reply = t.recv_reply();
+        assert_eq!(reply, vec![STATUS_ERR, ERR_RATE_LIMITED]);
     }
 
     // ── ConnectRequest ────────────────────────────────────────────────────────
@@ -2856,6 +2997,88 @@ mod tests {
         assert_eq!(&decrypted[32..], b"payload");
     }
 
+    #[test]
+    fn relay_packet_drops_oversized_app_payload() {
+        // Same topology as the happy-path relay test, but payload > MAX_APP_PAYLOAD
+        // must not produce an AppPacket on the dest socket.
+        let dg_sender_kp  = generate_x25519_keypair();
+        let sg_from_dg_kp = generate_x25519_keypair();
+        let sg_to_dest_kp = generate_x25519_keypair();
+        let dest_kp        = generate_x25519_keypair();
+
+        let dest_device_uuid = generate_uuid();
+        let dest_app_id: Uuid = app_uuid(5);
+        let sender_app_id: Uuid = app_uuid(3);
+
+        let dest_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        dest_socket.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        let dest_addr: std::net::SocketAddrV4 = dest_socket.local_addr().unwrap()
+            .to_string().parse().unwrap();
+
+        let t = TestCtx::new();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.active_connections.insert(1, ActiveConnection {
+                id: 1,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: sg_from_dg_kp.clone(),
+                peer_public_key: dg_sender_kp.public_key,
+                peer_active_connection_id: 10,
+                device_uuid: generate_uuid(),
+                peer_addr: "127.0.0.1:0".parse().unwrap(),
+            });
+            node.owner.active_connections.insert(2, ActiveConnection {
+                id: 2,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: sg_to_dest_kp.clone(),
+                peer_public_key: dest_kp.public_key,
+                peer_active_connection_id: 20,
+                device_uuid: dest_device_uuid,
+                peer_addr: SocketAddr::V4(dest_addr),
+            });
+            node.owner.contact_users.push(Contact {
+                public_key: generate_key_bytes(),
+                user: User {
+                    alias: "contact".to_string(),
+                    uuid: generate_uuid(),
+                    devices: vec![Device {
+                        alias: "dest-dg".to_string(),
+                        uuid: dest_device_uuid,
+                        grade: DeviceGrade::DG,
+                        sg_rank: None,
+                        hosts: vec![dest_addr.to_string()],
+                        applications: Vec::new(),
+                    }],
+                },
+                last_seen_public_version: SyncVersion::default(),
+            });
+        }
+
+        let mut relay_body = Vec::new();
+        relay_body.extend_from_slice(&dest_device_uuid);
+        relay_body.extend_from_slice(&dest_app_id);
+        relay_body.extend_from_slice(&sender_app_id);
+        relay_body.extend_from_slice(&vec![0u8; MAX_APP_PAYLOAD + 1]);
+
+        let sender_side_conn = ActiveConnection {
+            id: 10,
+            timeout: SystemTime::now() + Duration::from_secs(3600),
+            key_pair: dg_sender_kp,
+            peer_public_key: sg_from_dg_kp.public_key,
+            peer_active_connection_id: 1,
+            device_uuid: generate_uuid(),
+            peer_addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        let relay_pkt = build_encrypted_packet(RELAY_PACKET_OP, &sender_side_conn, &relay_body);
+        relay_packet(t.app_addr(), relay_pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 512];
+        assert!(
+            dest_socket.recv_from(&mut buf).is_err(),
+            "oversized relay body must not be forwarded as AppPacket"
+        );
+    }
+
     // ── app_packet delivers to local app ──────────────────────────────────────
 
     #[test]
@@ -2923,6 +3146,313 @@ mod tests {
         let sender_id_bytes: [u8; 16] = push[1..17].try_into().unwrap();
         assert_eq!(sender_id_bytes, sender_app_id);
         assert_eq!(&push[17..], b"hello app");
+    }
+
+    #[test]
+    fn app_packet_drops_oversized_app_payload() {
+        let t = TestCtx::new();
+        let app_id: Uuid = app_uuid(9);
+        let sender_app_id = app_uuid(3);
+        let sg_kp = generate_x25519_keypair();
+        let local_kp = generate_x25519_keypair();
+        let app_addr = t.app_addr();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let device_uuid = node.device_uuid;
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == device_uuid).unwrap();
+            dev.applications.push(super::super::data_models::Application {
+                id: app_id,
+                alias: "myapp".to_string(),
+                protocol: "udp".to_string(),
+                host: app_addr.to_string().parse().unwrap(),
+                user_approved: true,
+                token: generate_uuid(),
+            });
+            node.owner.active_connections.insert(5, ActiveConnection {
+                id: 5,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: local_kp.clone(),
+                peer_public_key: sg_kp.public_key,
+                peer_active_connection_id: 99,
+                device_uuid: generate_uuid(),
+                peer_addr: "127.0.0.1:0".parse().unwrap(),
+            });
+        }
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&app_id);
+        body.extend_from_slice(&sender_app_id);
+        body.extend_from_slice(&vec![0u8; MAX_APP_PAYLOAD + 1]);
+
+        let sg_side = ActiveConnection {
+            id: 99,
+            timeout: SystemTime::now() + Duration::from_secs(3600),
+            key_pair: sg_kp,
+            peer_public_key: local_kp.public_key,
+            peer_active_connection_id: 5,
+            device_uuid: generate_uuid(),
+            peer_addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        let pkt = build_encrypted_packet(APP_PACKET_OP, &sg_side, &body);
+        app_packet(t.app_addr(), pkt[1..].to_vec(), &t.ctx);
+
+        // No push should arrive (recv_reply times out).
+        let mut buf = [0u8; 64];
+        assert!(
+            t.app_socket.recv_from(&mut buf).is_err(),
+            "oversized AppPacket must not be pushed to the local app"
+        );
+    }
+
+    #[test]
+    fn app_packet_skips_unapproved_app() {
+        let t = TestCtx::new();
+        let app_id: Uuid = app_uuid(9);
+        let sender_app_id = app_uuid(3);
+        let sg_kp = generate_x25519_keypair();
+        let local_kp = generate_x25519_keypair();
+        let app_addr = t.app_addr();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let device_uuid = node.device_uuid;
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == device_uuid).unwrap();
+            dev.applications.push(super::super::data_models::Application {
+                id: app_id,
+                alias: "pending".to_string(),
+                protocol: "udp".to_string(),
+                host: app_addr.to_string().parse().unwrap(),
+                user_approved: false, // not approved → no push
+                token: generate_uuid(),
+            });
+            node.owner.active_connections.insert(5, ActiveConnection {
+                id: 5,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: local_kp.clone(),
+                peer_public_key: sg_kp.public_key,
+                peer_active_connection_id: 99,
+                device_uuid: generate_uuid(),
+                peer_addr: "127.0.0.1:0".parse().unwrap(),
+            });
+        }
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&app_id);
+        body.extend_from_slice(&sender_app_id);
+        body.extend_from_slice(b"should not land");
+
+        let sg_side = ActiveConnection {
+            id: 99,
+            timeout: SystemTime::now() + Duration::from_secs(3600),
+            key_pair: sg_kp,
+            peer_public_key: local_kp.public_key,
+            peer_active_connection_id: 5,
+            device_uuid: generate_uuid(),
+            peer_addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        let pkt = build_encrypted_packet(APP_PACKET_OP, &sg_side, &body);
+        app_packet(t.app_addr(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 64];
+        assert!(
+            t.app_socket.recv_from(&mut buf).is_err(),
+            "unapproved apps must never receive app_packet pushes"
+        );
+    }
+
+    #[test]
+    fn tunnel_delivery_skips_unapproved_app() {
+        let t = TestCtx::new();
+        let app_id: Uuid = app_uuid(11);
+        let sender_app_id = app_uuid(4);
+        let peer_kp = generate_x25519_keypair();
+        let local_kp = generate_x25519_keypair();
+        let app_addr = t.app_addr();
+        let tunnel_id: u16 = 7;
+        let conn_id: u16 = 42;
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let device_uuid = node.device_uuid;
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == device_uuid).unwrap();
+            dev.applications.push(super::super::data_models::Application {
+                id: app_id,
+                alias: "pending".to_string(),
+                protocol: "udp".to_string(),
+                host: app_addr.to_string().parse().unwrap(),
+                user_approved: false,
+                token: generate_uuid(),
+            });
+            node.owner.active_connections.insert(conn_id, ActiveConnection {
+                id: conn_id,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: local_kp.clone(),
+                peer_public_key: peer_kp.public_key,
+                peer_active_connection_id: 1,
+                device_uuid: generate_uuid(),
+                peer_addr: "127.0.0.1:0".parse().unwrap(),
+            });
+            node.owner.dg_tunnel_map.insert(tunnel_id, conn_id);
+        }
+
+        let shared = x25519_shared(&local_kp.private_key, &peer_kp.public_key);
+        let mut plaintext = Vec::new();
+        plaintext.extend_from_slice(&app_id);
+        plaintext.extend_from_slice(&sender_app_id);
+        plaintext.extend_from_slice(b"tunnel payload");
+        let (ciphertext, nonce) = xchacha20_encrypt(&shared, &plaintext);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&tunnel_id.to_be_bytes());
+        buf.extend_from_slice(&nonce);
+        buf.extend_from_slice(&ciphertext);
+
+        tunnel_delivery(t.app_addr(), buf, &t.ctx);
+
+        let mut rx = [0u8; 64];
+        assert!(
+            t.app_socket.recv_from(&mut rx).is_err(),
+            "unapproved apps must never receive tunnel_delivery pushes"
+        );
+    }
+
+    #[test]
+    fn relay_packet_local_delivery_skips_unapproved_app() {
+        // SG is both relay and destination; unapproved local app must not get a push.
+        let dg_sender_kp = generate_x25519_keypair();
+        let sg_from_dg_kp = generate_x25519_keypair();
+        let dest_app_id: Uuid = app_uuid(5);
+        let sender_app_id: Uuid = app_uuid(3);
+
+        let t = TestCtx::new();
+        let local_uuid = {
+            let mut node = t.ctx.node.write().unwrap();
+            let local_uuid = node.device_uuid;
+            node.owner.active_connections.insert(1, ActiveConnection {
+                id: 1,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: sg_from_dg_kp.clone(),
+                peer_public_key: dg_sender_kp.public_key,
+                peer_active_connection_id: 10,
+                device_uuid: generate_uuid(),
+                peer_addr: "127.0.0.1:0".parse().unwrap(),
+            });
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == local_uuid).unwrap();
+            dev.applications.push(super::super::data_models::Application {
+                id: dest_app_id,
+                alias: "pending".to_string(),
+                protocol: "udp".to_string(),
+                host: t.app_addr().to_string().parse().unwrap(),
+                user_approved: false,
+                token: generate_uuid(),
+            });
+            local_uuid
+        };
+
+        let mut relay_body = Vec::new();
+        relay_body.extend_from_slice(&local_uuid);
+        relay_body.extend_from_slice(&dest_app_id);
+        relay_body.extend_from_slice(&sender_app_id);
+        relay_body.extend_from_slice(b"nope");
+
+        let sender_side = ActiveConnection {
+            id: 10,
+            timeout: SystemTime::now() + Duration::from_secs(3600),
+            key_pair: dg_sender_kp,
+            peer_public_key: sg_from_dg_kp.public_key,
+            peer_active_connection_id: 1,
+            device_uuid: generate_uuid(),
+            peer_addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        let relay_pkt = build_encrypted_packet(RELAY_PACKET_OP, &sender_side, &relay_body);
+        relay_packet(t.app_addr(), relay_pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 64];
+        assert!(
+            t.app_socket.recv_from(&mut buf).is_err(),
+            "unapproved apps must never receive local relay pushes"
+        );
+    }
+
+    #[test]
+    fn app_get_data_does_not_leak_foreign_tokens_or_keys() {
+        let t = TestCtx::new();
+        let token_a = register_and_get_token(&t, "app-a", 9001);
+        let token_b = register_and_get_token(&t, "app-b", 9002);
+
+        // Distinct owner private key (non-zero) so we can search for it in the reply.
+        let owner_sk = {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.key_pair.private_key = [0x5Au8; 32];
+            node.owner.key_pair.public_key = [0xA5u8; 32];
+            let contact_pk = [0xCCu8; 32];
+            let pending_app_id = app_uuid(77);
+            let approved_app_id = app_uuid(78);
+            let foreign_token = [0xF1u8; 16];
+            node.owner.contact_users.push(Contact {
+                public_key: contact_pk,
+                user: User {
+                    alias: "bob".to_string(),
+                    uuid: generate_uuid(),
+                    devices: vec![Device {
+                        alias: "bob-phone".to_string(),
+                        uuid: generate_uuid(),
+                        grade: DeviceGrade::DG,
+                        sg_rank: None,
+                        hosts: vec!["10.0.0.9:7777".into()],
+                        applications: vec![
+                            Application {
+                                id: pending_app_id,
+                                alias: "secret-pending".to_string(),
+                                protocol: "udp".to_string(),
+                                host: "10.0.0.9:9000".parse().unwrap(),
+                                user_approved: false,
+                                token: foreign_token,
+                            },
+                            Application {
+                                id: approved_app_id,
+                                alias: "bob-chat".to_string(),
+                                protocol: "udp".to_string(),
+                                host: "10.0.0.9:9001".parse().unwrap(),
+                                user_approved: true,
+                                token: [0xF2u8; 16],
+                            },
+                        ],
+                    }],
+                },
+                last_seen_public_version: SyncVersion::default(),
+            });
+            node.owner.key_pair.private_key
+        };
+
+        app_get_data(t.app_addr(), token_a.to_vec(), &t.ctx);
+        let reply = t.recv_reply();
+        assert_eq!(reply[0], OK);
+
+        let has16 = |needle: [u8; 16]| reply.windows(16).any(|w| w == needle);
+        let count16 = |needle: [u8; 16]| reply.windows(16).filter(|w| *w == needle).count();
+        let has32 = |needle: [u8; 32]| reply.windows(32).any(|w| w == needle);
+
+        // Own token appears exactly once (echo in own-app section).
+        assert_eq!(count16(token_a), 1, "own token should appear once");
+
+        // Sibling app token must not appear.
+        assert!(!has16(token_b), "must not leak sibling app token");
+
+        // Contact app tokens must not appear.
+        assert!(!has16([0xF1u8; 16]), "must not leak unapproved contact app token");
+        assert!(!has16([0xF2u8; 16]), "must not leak approved contact app token");
+
+        // Owner private key must not appear.
+        assert!(!has32(owner_sk), "must not leak owner private key");
+        // Contact long-term public key must not appear (apps do not get contact crypto).
+        assert!(!has32([0xCCu8; 32]), "must not leak contact public keys");
+
+        // Unapproved contact app id should not be listed; approved id may appear.
+        assert!(!has16(app_uuid(77)), "unapproved contact apps must be omitted from get-data");
+        assert!(has16(app_uuid(78)), "approved contact apps should be visible by id");
     }
 
     // ── Contact exchange (0x33 / 0x34) ───────────────────────────────────────

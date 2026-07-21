@@ -40,6 +40,7 @@ services:
       - PNET_HTTP_BIND=0.0.0.0
       - PNET_ADMIN_PASSWORD=stagetest1
       - PNET_AUTO_APPROVE_APPS=1
+      - PNET_APP_API_REMOTE=1
     volumes:
       - pnet-data-sg-alice:/root/.pnet
 
@@ -51,6 +52,7 @@ services:
       - PNET_DEVICE_ALIAS=dg-alice
       - PNET_INVITATION_CODE=${INV_DG_ALICE:-}
       - PNET_AUTO_APPROVE_APPS=1
+      - PNET_APP_API_REMOTE=1
     volumes:
       - pnet-data-dg-alice:/root/.pnet
     depends_on: [sg-alice]
@@ -69,6 +71,7 @@ services:
       - PNET_HTTP_BIND=0.0.0.0
       - PNET_ADMIN_PASSWORD=stagetest1
       - PNET_AUTO_APPROVE_APPS=1
+      - PNET_APP_API_REMOTE=1
     volumes:
       - pnet-data-sg-bob:/root/.pnet
 
@@ -80,6 +83,7 @@ services:
       - PNET_DEVICE_ALIAS=dg-bob
       - PNET_INVITATION_CODE=${INV_DG_BOB:-}
       - PNET_AUTO_APPROVE_APPS=1
+      - PNET_APP_API_REMOTE=1
     volumes:
       - pnet-data-dg-bob:/root/.pnet
     depends_on: [sg-bob]

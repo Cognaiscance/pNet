@@ -25,6 +25,14 @@ Unencrypted header:
 
 The remainder of the packet is encrypted using the ephemeral keys from the active connection. The encrypted body varies by operation type.
 
+### App data payload size (relay / AppPacket / tunnel)
+
+Opaque app payloads carried on `RelayPacket` (0x40), `AppPacket` (0x41), and
+tunnel delivery (0x54) share the same ceiling as the local app API:
+**`MAX_APP_PAYLOAD = 4096` bytes** (`src/lib/wire.rs`). Oversized bodies are
+dropped after decrypt (or, for tunnel forward 0x51, when the opaque blob
+exceeds `MAX_TUNNEL_FORWARD_BLOB`). See `descriptions/communication methods.md`.
+
 ## Connection Handshake
 
 Before two nodes can exchange encrypted packets they must establish an `ActiveConnection` via a two-message handshake. This is driven by the `MaintainConnections` background task (see background systems.md).

@@ -26,6 +26,7 @@ services:
       - PNET_HTTP_BIND=0.0.0.0
       # Testing only: auto-approves any app that registers, skipping the UI step.
       - PNET_AUTO_APPROVE_APPS=1
+      - PNET_APP_API_REMOTE=1
     volumes:
       - /opt/pnet/william:/root/.pnet
 
@@ -62,6 +63,7 @@ services:
       - PNET_SG_RANK=1
       - PNET_HTTP_BIND=0.0.0.0
       - PNET_AUTO_APPROVE_APPS=1
+      - PNET_APP_API_REMOTE=1
     volumes:
       - /opt/pnet/chad:/root/.pnet
 

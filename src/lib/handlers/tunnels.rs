@@ -16,7 +16,7 @@ use super::super::data_models::{
 };
 use super::super::wire::*;
 use super::super::wire::uuid_hex;
-use super::{allocate_conn_id, send};
+use super::{allocate_conn_id, local_approved_app_host, send};
 
 // ── Tunnel handlers ───────────────────────────────────────────────────────────
 
@@ -286,6 +286,9 @@ pub fn tunnel_connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// the nonce+ciphertext payload as-is without decryption (op 0x54).
 ///
 /// Payload: [sender_sg_conn_id: u16][tunnel_id: u16][nonce: 24][ciphertext...]
+///
+/// The SG does not decrypt; it still caps the blob at
+/// [`MAX_TUNNEL_FORWARD_BLOB`] so an oversized opaque cannot be amplified.
 pub fn tunnel_forward(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 28 {
         eprintln!("[tunnel_forward] packet too short from {src}");
@@ -294,6 +297,13 @@ pub fn tunnel_forward(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let sender_sg_conn_id = u16::from_be_bytes([buf[0], buf[1]]);
     let tunnel_id         = u16::from_be_bytes([buf[2], buf[3]]);
     let payload           = &buf[4..]; // nonce + ciphertext, forwarded as-is
+    if payload.len() > MAX_TUNNEL_FORWARD_BLOB {
+        eprintln!(
+            "[tunnel_forward] blob too large ({} > {MAX_TUNNEL_FORWARD_BLOB}) tunnel {tunnel_id} from {src}",
+            payload.len()
+        );
+        return;
+    }
 
     let dest_host = {
         let mut node = ctx.node.write().unwrap();
@@ -333,6 +343,9 @@ pub fn tunnel_forward(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// `dg_tunnel_map`) and pushes it to the target local app.
 ///
 /// Payload: [tunnel_id: u16][nonce: 24][ciphertext...]
+///
+/// Decrypted app payload must be ≤ [`MAX_APP_PAYLOAD`].
+/// Destination app must be **user-approved** or the push is dropped.
 pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 26 {
         eprintln!("[tunnel_delivery] packet too short from {src}");
@@ -367,14 +380,19 @@ pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let dest_app_id:   Uuid = plaintext[0..16].try_into().unwrap();
         let sender_app_id: Uuid = plaintext[16..32].try_into().unwrap();
         let payload             = &plaintext[32..];
+        if payload.len() > MAX_APP_PAYLOAD {
+            eprintln!(
+                "[tunnel_delivery] app payload too large ({} > {MAX_APP_PAYLOAD}) tunnel {tunnel_id}",
+                payload.len()
+            );
+            return;
+        }
 
-        let device_uuid = node.device_uuid;
-        let Some(app_host) = node.owner.user.devices.iter()
-            .find(|d| d.uuid == device_uuid)
-            .and_then(|d| d.applications.iter().find(|a| a.id == dest_app_id))
-            .map(|a| a.host)
-        else {
-            eprintln!("[tunnel_delivery] no app {} for tunnel {tunnel_id}", uuid_hex(&dest_app_id));
+        let Some(app_host) = local_approved_app_host(&node, dest_app_id) else {
+            eprintln!(
+                "[tunnel_delivery] no approved app {} for tunnel {tunnel_id}",
+                uuid_hex(&dest_app_id)
+            );
             return;
         };
 

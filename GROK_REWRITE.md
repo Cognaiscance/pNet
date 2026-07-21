@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §3.1)* |
-| Last completed | 2.2 Fix stale docs and comments (2026-07-16) |
+| Current focus | *(none — next is §4.1)* |
+| Last completed | 3.4 Push and approval invariants (2026-07-21) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -102,28 +102,28 @@ Do one module at a time; keep tests compiling after each move.
 The fabric API apps depend on. Opaque payloads stay; contracts get boring and explicit.
 
 ### 3.1 Structured errors to apps
-- [ ] Send path returns error reply codes for: bad token, not approved, no route, payload too large (extend existing `0x01` scheme)
-- [ ] Document codes next to app op handlers (or in `descriptions/communication methods.md`)
+- [x] Send path returns error reply codes for: bad token, not approved, no route, payload too large (extend existing `0x01` scheme)
+- [x] Document codes next to app op handlers (or in `descriptions/communication methods.md`)
 
-**Done:**  
+**Done:** 2026-07-21 — `app_send_packet` returns `[STATUS_ERR][code]` for bad packet, unknown token, not approved, no route, payload too large (`ERR_NOT_APPROVED`/`ERR_NO_ROUTE`/`ERR_PAYLOAD_TOO_LARGE` + `MAX_APP_PAYLOAD=4096` in `wire.rs`). Success remains silent. Docs: handler comment block + `descriptions/communication methods.md`. Unit tests for each rejection.
 
 ### 3.2 Payload size limits
-- [ ] Enforce max app payload size on `AppSendPacket` (and reject oversized relay bodies consistently)
-- [ ] Document the limit as a fabric constant
+- [x] Enforce max app payload size on `AppSendPacket` (and reject oversized relay bodies consistently)
+- [x] Document the limit as a fabric constant
 
-**Done:**  
+**Done:** 2026-07-21 — `MAX_APP_PAYLOAD=4096` enforced on send (already §3.1), `relay_packet`, `app_packet`, `tunnel_delivery`; tunnel forward caps opaque blob via `MAX_TUNNEL_FORWARD_BLOB`. Docs: `wire.rs`, `communication methods.md`, `pnet to pnet communication.md`. Unit tests for oversized relay + AppPacket drop.
 
 ### 3.3 App API exposure policy
-- [ ] Prefer accepting app control/data only from loopback (or document multi-user risk and gate via env)
-- [ ] Rate-limit register/send per token and/or source (simple token bucket is enough)
+- [x] Prefer accepting app control/data only from loopback (or document multi-user risk and gate via env)
+- [x] Rate-limit register/send per token and/or source (simple token bucket is enough)
 
-**Done:**  
+**Done:** 2026-07-21 — App ops 0x00–0x03 loopback-only by default (`app_api_source_allowed` in UDP listener); `PNET_APP_API_REMOTE=1` opt-in (compose/live set it for sidecars). Token buckets on register (per IP) and send (per IP + token); `ERR_RATE_LIMITED=0x07`. Module `app_api.rs`. Docs: `communication methods.md`.
 
 ### 3.4 Push and approval invariants
-- [ ] Confirm unapproved apps never receive pushes
-- [ ] get-data never leaks foreign tokens/private keys (spot-check + test)
+- [x] Confirm unapproved apps never receive pushes
+- [x] get-data never leaks foreign tokens/private keys (spot-check + test)
 
-**Done:**  
+**Done:** 2026-07-21 — Shared `local_approved_app_host` on relay local delivery, `app_packet`, `tunnel_delivery` (tunnel path previously lacked approval). get-data secrecy docs + tests for no sibling/contact tokens, no private keys, unapproved contact apps omitted.
 
 ---
 
@@ -280,6 +280,10 @@ Add a line per work session (newest at top).
 
 | Date | Item(s) | Notes |
 |------|---------|--------|
+| 2026-07-21 | 3.4 push/approval invariants | Approval gate on all push paths; get-data leak tests. |
+| 2026-07-21 | 3.3 app API exposure | Loopback-only app ops + PNET_APP_API_REMOTE; rate limits; compose/live updated. |
+| 2026-07-21 | 3.2 payload size limits | Same MAX_APP_PAYLOAD on relay/app_packet/tunnel; docs + drop tests. |
+| 2026-07-21 | 3.1 structured app send errors | Distinct ERR_* on send path; MAX_APP_PAYLOAD; docs + unit tests. |
 | 2026-07-16 | 2.2 stale docs/comments | UUID app-id comments; Ed25519 TODOs fixed; data models + sync docs. |
 | 2026-07-16 | 2.1 admin UI + finish split | `handlers/admin_ui.rs`; §2.1 complete; 217 tests green. |
 | 2026-07-16 | 2.1 tunnels extract | `handlers/tunnels.rs` 0x50–0x54 + cleanup; 217 tests green. |

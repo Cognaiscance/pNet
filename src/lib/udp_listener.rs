@@ -5,6 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::action_queue::{Action, PRIORITY_HIGH};
+use super::app_api::app_api_source_allowed;
 use super::thread_pool::SharedQueue;
 use super::wire::{
     APP_GET_DATA_OP, APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_PACKET_OP, APP_UPDATE_OP,
@@ -69,6 +70,21 @@ impl UdpListener {
 
                 let op = buf[0];
                 let payload = buf[1..len].to_vec();
+
+                // Local app control plane (ops 0x00–0x03): loopback-only by
+                // default. Peer fabric ops stay open on the public UDP socket.
+                // Opt in with PNET_APP_API_REMOTE=1 (e.g. Docker sidecar apps).
+                let is_app_api = matches!(
+                    op,
+                    APP_REGISTER_OP | APP_UPDATE_OP | APP_GET_DATA_OP | APP_SEND_PACKET_OP
+                );
+                if is_app_api && !app_api_source_allowed(src) {
+                    eprintln!(
+                        "[udp] drop app op {op:#04x} from non-loopback {src} \
+                         (set PNET_APP_API_REMOTE=1 to allow)"
+                    );
+                    continue;
+                }
 
                 let action = match op {
                     APP_REGISTER_OP => Action::AppRegister { src, buf: payload },

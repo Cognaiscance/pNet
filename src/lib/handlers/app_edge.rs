@@ -12,8 +12,8 @@ use super::super::crypto::{
 use super::super::data_models::{Application, Uuid, generate_uuid};
 use super::super::wire::*;
 use super::{
-    best_sg_connection, ipv4_from, push_device, request_change, send, send_error,
-    sg_candidates_for_dest, top_ranked_sg_for_device, Change,
+    best_sg_connection, ipv4_from, local_approved_app_host, push_device, request_change, send,
+    send_error, sg_candidates_for_dest, top_ranked_sg_for_device, Change,
 };
 
 
@@ -23,9 +23,19 @@ use super::{
 ///   [alias_len: u8][alias: alias_len bytes][port: u16 be]
 ///   [protocol_len: u8][protocol: protocol_len bytes]
 ///
-/// Reply on success:  [0x00][token: 16 bytes]
-/// Reply on error:    [0x01][error_code: u8]
+/// Reply on success:  [OK][token: 16 bytes]
+/// Reply on error:    [STATUS_ERR][error_code] — see `wire` ERR_* constants
 pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if !ctx
+        .app_rate_limits
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allow_register(src)
+    {
+        eprintln!("[app_register] rate limited from {src}");
+        return send_error(ctx, src, ERR_RATE_LIMITED);
+    }
+
     // Parse.
     if buf.is_empty() {
         return send_error(ctx, src, ERR_BAD_PACKET);
@@ -153,8 +163,8 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 ///   if flags & 0x01: [alias_len: u8][alias: alias_len bytes]
 ///   if flags & 0x02: [port: u16 be]  (IP is taken from src)
 ///
-/// Reply on success:  [0x00]
-/// Reply on error:    [0x01][error_code: u8]
+/// Reply on success:  [OK]
+/// Reply on error:    [STATUS_ERR][error_code] — see `wire` ERR_* constants
 pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // Parse header.
     if buf.len() < 17 {
@@ -279,6 +289,15 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 ///
 /// Authenticates the app via its token and returns its view of the node data tree.
 ///
+/// # Secrecy invariants
+///
+/// - The requesting app receives **its own** token only (echo of the auth
+///   token). Other apps' tokens are never included.
+/// - No identity private keys, X25519 private keys, or contact long-term
+///   public keys appear in this reply (directory is identity-free for apps).
+/// - Contact devices list **user-approved** apps only (`id` + `alias`); no
+///   host/port/token for foreign apps.
+///
 /// Response format:
 ///   [OK: 1]
 ///   -- Requesting app's own data (full Application struct) --
@@ -292,6 +311,7 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 ///       [host_count: u8][each host: u8+bytes]
 ///       [app_count: u8]
 ///         each app: [id: 16][alias: u8+bytes][ip: 4][port: 2 BE][user_approved: u8]
+///                   (no token)
 ///   [contact_count: u8]
 ///     each contact:
 ///       [alias: u8+bytes][uuid: 16]
@@ -387,6 +407,17 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// DG↔DG tunnel if one is active, a direct `AppPacket` if this node already
 /// has a session to the dest device, or a `RelayPacket` (op 0x40) through the
 /// best reachable SG for that destination.
+///
+/// # Replies
+///
+/// - **Success:** no reply (fire-and-forget; acceptance ≠ end-to-end delivery).
+/// - **Error:** `[STATUS_ERR=0x01][error_code]` with one of:
+///   - `ERR_BAD_PACKET` (0x01) — body shorter than 48 bytes
+///   - `ERR_TOKEN_UNKNOWN` (0x02) — token not registered on this device
+///   - `ERR_NOT_APPROVED` (0x04) — token valid but app not user-approved
+///   - `ERR_NO_ROUTE` (0x05) — no session to dest and no reachable SG to relay
+///   - `ERR_PAYLOAD_TOO_LARGE` (0x06) — payload longer than `MAX_APP_PAYLOAD`
+///   - `ERR_RATE_LIMITED` (0x07) — per-IP / per-token send rate exceeded
 pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     const MIN_LEN: usize = 16 + 16 + 16;
     if buf.len() < MIN_LEN {
@@ -398,20 +429,40 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let dest_app_id: Uuid      = buf[32..48].try_into().unwrap();
     let payload                = &buf[48..];
 
+    if !ctx
+        .app_rate_limits
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allow_send(src, Some(token))
+    {
+        eprintln!("[app_send_packet] rate limited from {src}");
+        return send_error(ctx, src, ERR_RATE_LIMITED);
+    }
+
+    if payload.len() > MAX_APP_PAYLOAD {
+        return send_error(ctx, src, ERR_PAYLOAD_TOO_LARGE);
+    }
+
     // Build packet and look up the SG address under a single read lock.
     let out: Option<(Vec<u8>, SocketAddr)> = {
         let node = ctx.node.read().unwrap();
 
-        // Find the sending app by token.
+        // Find the sending app by token; distinguish unknown vs not approved.
         let device_uuid = node.device_uuid;
-        let Some(sender_app_id) = node.owner.user.devices.iter()
+        let Some(local_device) = node.owner.user.devices.iter()
             .find(|d| d.uuid == device_uuid)
-            .and_then(|d| d.applications.iter()
-                .find(|a| a.token == token && a.user_approved))
-            .map(|a| a.id)
         else {
             return send_error(ctx, src, ERR_TOKEN_UNKNOWN);
         };
+        let Some(sender_app) = local_device.applications.iter()
+            .find(|a| a.token == token)
+        else {
+            return send_error(ctx, src, ERR_TOKEN_UNKNOWN);
+        };
+        if !sender_app.user_approved {
+            return send_error(ctx, src, ERR_NOT_APPROVED);
+        }
+        let sender_app_id = sender_app.id;
 
         // ── Tunnel path (if a DG-to-DG tunnel is active for this destination) ──
         // Only use if the tunnel's ActiveConnection still exists.
@@ -448,7 +499,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 });
             let Some(sg_conn) = sg_conn else {
                 eprintln!("[app_send_packet] no reachable SG for tunnel dest {:?}", dest_device_uuid);
-                return;
+                return send_error(ctx, src, ERR_NO_ROUTE);
             };
 
             // `peer_active_connection_id` is the SG's local conn_id for this DG's connection.
@@ -490,7 +541,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 });
             let Some(sg_conn) = sg_conn else {
                 eprintln!("[app_send_packet] no reachable SG for dest {:?}", dest_device_uuid);
-                return;
+                return send_error(ctx, src, ERR_NO_ROUTE);
             };
 
             // RelayPacket body: [dest_device_uuid: 16][dest_app_id: 16][sender_app_id: 16][payload]
@@ -518,6 +569,8 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 ///
 /// Encrypted body: [dest_app_id: 16][sender_app_id: 16][payload]
 /// Push to app:    [0x04][sender_app_id: 16][payload]
+///
+/// `payload` must be ≤ [`MAX_APP_PAYLOAD`]; oversized packets are dropped.
 pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let (push_pkt, app_host) = {
         let node = ctx.node.read().unwrap();
@@ -534,15 +587,16 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let dest_app_id:   Uuid = plaintext[0..16].try_into().unwrap();
         let sender_app_id: Uuid = plaintext[16..32].try_into().unwrap();
         let payload             = &plaintext[32..];
+        if payload.len() > MAX_APP_PAYLOAD {
+            eprintln!(
+                "[app_packet] app payload too large ({} > {MAX_APP_PAYLOAD}) from {src}",
+                payload.len()
+            );
+            return;
+        }
 
-        // Find the destination app on this node.
-        let device_uuid = node.device_uuid;
-        let Some(app_host) = node.owner.user.devices.iter()
-            .find(|d| d.uuid == device_uuid)
-            .and_then(|d| d.applications.iter()
-                .find(|a| a.id == dest_app_id && a.user_approved))
-            .map(|a| a.host)
-        else {
+        // Unapproved apps must never receive pushes.
+        let Some(app_host) = local_approved_app_host(&node, dest_app_id) else {
             eprintln!("[app_packet] no approved app with id {}", uuid_hex(&dest_app_id));
             return;
         };

@@ -7,11 +7,52 @@
 use super::data_models::{Scope, SyncVersion, Uuid};
 
 // ── Local app control-plane replies (UDP app API) ─────────────────────────────
+//
+// Success: `[OK]` or `[OK][…]` depending on the op.
+// Error:   `[STATUS_ERR][error_code]` where error_code is one of ERR_* below.
+//
+// Op 3 (`app_send_packet`) is fire-and-forget on success (no reply). On failure
+// it uses the same two-byte error form so apps can optionally wait for a
+// rejection. See `handlers/app_edge.rs` and `descriptions/communication methods.md`.
 
+/// Status byte: request accepted / success payload follows.
 pub(crate) const OK: u8 = 0x00;
+/// Status byte: error; next byte is an `ERR_*` code.
+pub(crate) const STATUS_ERR: u8 = 0x01;
+
+/// Malformed request body (too short, bad UTF-8, zero port, etc.).
 pub(crate) const ERR_BAD_PACKET: u8 = 0x01;
+/// Token not found on the local device.
 pub(crate) const ERR_TOKEN_UNKNOWN: u8 = 0x02;
+/// Sync-v1 publish needs a writer SG and none is reachable.
 pub(crate) const ERR_NO_WRITER: u8 = 0x03;
+/// Token is valid but the app is not user-approved yet.
+pub(crate) const ERR_NOT_APPROVED: u8 = 0x04;
+/// No path to the destination (no session, no reachable SG for relay/tunnel).
+pub(crate) const ERR_NO_ROUTE: u8 = 0x05;
+/// App payload exceeds [`MAX_APP_PAYLOAD`].
+pub(crate) const ERR_PAYLOAD_TOO_LARGE: u8 = 0x06;
+/// Register or send rate limit exceeded (token bucket).
+pub(crate) const ERR_RATE_LIMITED: u8 = 0x07;
+
+/// Fabric-wide maximum **opaque app payload** length in bytes.
+///
+/// Applies to:
+/// - local `app_send_packet` (body after the 48-byte token + dest header) →
+///   rejected with `ERR_PAYLOAD_TOO_LARGE`
+/// - peer `RelayPacket` (0x40) plaintext after the 48-byte dest/sender header
+/// - peer `AppPacket` (0x41) plaintext after the 32-byte dest/sender app ids
+/// - tunnel delivery (0x54) decrypted body after the 32-byte app ids
+///
+/// Inbound fabric paths that exceed this drop the packet (no error to the
+/// remote peer). Apps that care about WAN path-MTU should stay well under
+/// this (≈1 KiB is a practical no-fragmentation budget).
+pub(crate) const MAX_APP_PAYLOAD: usize = 4096;
+
+/// Max `nonce ‖ ciphertext` size for tunnel forward (0x51) blobs the SG will
+/// relay without decrypting. Covers AEAD tag + 32-byte app-id header + payload.
+pub(crate) const MAX_TUNNEL_FORWARD_BLOB: usize =
+    24 /* nonce */ + 16 /* Poly1305 tag */ + 32 /* dest+sender app id */ + MAX_APP_PAYLOAD;
 
 // ── Local app op bytes ────────────────────────────────────────────────────────
 

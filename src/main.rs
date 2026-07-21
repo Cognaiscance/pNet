@@ -175,6 +175,13 @@ fn main() {
     let port = udp_port();
     let udp = UdpListener::start(port, Arc::clone(&queue), Arc::clone(&stop));
     println!("[main] UDP listening on port {}", udp.local_addr.port());
+    if lib::app_api::app_api_remote_enabled() {
+        println!(
+            "[main] app API accepts non-loopback sources (PNET_APP_API_REMOTE=1) — multi-user risk"
+        );
+    } else {
+        println!("[main] app API restricted to loopback (set PNET_APP_API_REMOTE=1 for remote apps)");
+    }
 
     // ── 6. Build WorkerContext and start worker threads ──────────────────────
     let ctx = Arc::new(WorkerContext {
@@ -184,6 +191,7 @@ fn main() {
         scheduler_tx,
         pending_invites: Default::default(),
         sessions:     Arc::new(lib::admin_auth::SessionStore::new()),
+        app_rate_limits: Arc::new(std::sync::Mutex::new(lib::app_api::AppRateLimiter::new())),
     });
 
     // ── 6a. Headless env-driven first-run setup, if requested ────────────────
@@ -285,6 +293,9 @@ mod tests {
             scheduler_tx,
             pending_invites: Default::default(),
             sessions:     Arc::new(crate::lib::admin_auth::SessionStore::new()),
+            app_rate_limits: Arc::new(std::sync::Mutex::new(
+                crate::lib::app_api::AppRateLimiter::new(),
+            )),
         });
         // Retain `ctx` in this scope via Arc::clone, exactly as `main` does.
         // This is what makes the test faithful: the lingering `WorkerContext`

@@ -56,7 +56,7 @@ start_node() {
 
     local env="HOME='$home' PNET_GRADE='$grade' PNET_DEVICE_ALIAS='$dalias'"
     env+=" PNET_SG_RANK='$rank' PNET_UDP_PORT='$udp' PNET_HTTP_PORT='$http'"
-    env+=" PNET_HTTP_BIND=0.0.0.0 PNET_AUTO_APPROVE_APPS=1"
+    env+=" PNET_HTTP_BIND=0.0.0.0 PNET_AUTO_APPROVE_APPS=1 PNET_APP_API_REMOTE=1"
     # Match harness default; mint/rename helpers log in with this password.
     env+=" PNET_ADMIN_PASSWORD='${PNET_TEST_ADMIN_PASSWORD:-stagetest1}'"
     [[ -n "$hosts" ]] && env+=" PNET_HOSTS='$hosts'"

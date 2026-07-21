@@ -11,8 +11,9 @@
 # starting the rest.
 #
 # `compose down -v` blows away the named volumes, so every test run starts
-# from a clean slate. Combined with PNET_AUTO_APPROVE_APPS=1 and the probe's
-# no-token-persistence design, no manual cleanup is needed between iterations.
+# from a clean slate. Combined with PNET_AUTO_APPROVE_APPS=1,
+# PNET_APP_API_REMOTE=1, and the probe's no-token-persistence design, no
+# manual cleanup is needed between iterations.
 
 networks:
   net-pnet:
@@ -41,6 +42,7 @@ services:
       - PNET_HTTP_BIND=0.0.0.0
       - PNET_ADMIN_PASSWORD=stagetest1
       - PNET_AUTO_APPROVE_APPS=1
+      - PNET_APP_API_REMOTE=1
     volumes:
       - pnet-data-sg-william-1:/root/.pnet
 
@@ -54,6 +56,7 @@ services:
       - PNET_HOSTS=sg-william-2
       - PNET_INVITATION_CODE=${INV_SG2:-}
       - PNET_AUTO_APPROVE_APPS=1
+      - PNET_APP_API_REMOTE=1
     volumes:
       - pnet-data-sg-william-2:/root/.pnet
     depends_on: [sg-william-1]
@@ -66,6 +69,7 @@ services:
       - PNET_DEVICE_ALIAS=dg-william-a
       - PNET_INVITATION_CODE=${INV_DGA:-}
       - PNET_AUTO_APPROVE_APPS=1
+      - PNET_APP_API_REMOTE=1
     volumes:
       - pnet-data-dg-william-a:/root/.pnet
     depends_on: [sg-william-1]
@@ -78,6 +82,7 @@ services:
       - PNET_DEVICE_ALIAS=dg-william-b
       - PNET_INVITATION_CODE=${INV_DGB:-}
       - PNET_AUTO_APPROVE_APPS=1
+      - PNET_APP_API_REMOTE=1
     volumes:
       - pnet-data-dg-william-b:/root/.pnet
     depends_on: [sg-william-1]
