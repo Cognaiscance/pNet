@@ -74,7 +74,10 @@ pub fn save(node: &Node) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lib::data_models::{DeviceGrade, Invitation, KeyPair, generate_uuid};
+    use crate::lib::data_models::{
+        DeviceGrade, Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Invitation,
+        X25519KeyPair, X25519PublicKey, X25519SecretKey, generate_uuid,
+    };
     use std::time::{Duration, UNIX_EPOCH};
 
     fn roundtrip(node: &Node) -> Node {
@@ -112,13 +115,13 @@ mod tests {
     #[test]
     fn key_pair_roundtrips() {
         let mut node = Node::new();
-        node.owner.key_pair = KeyPair {
-            public_key:  [0xAB; 32],
-            private_key: [0xCD; 32],
+        node.owner.key_pair = Ed25519KeyPair {
+            public_key:  Ed25519PublicKey([0xAB; 32]),
+            private_key: Ed25519SecretKey([0xCD; 32]),
         };
         let restored = roundtrip(&node);
-        assert_eq!(restored.owner.key_pair.public_key,  [0xAB; 32]);
-        assert_eq!(restored.owner.key_pair.private_key, [0xCD; 32]);
+        assert_eq!(restored.owner.key_pair.public_key,  Ed25519PublicKey([0xAB; 32]));
+        assert_eq!(restored.owner.key_pair.private_key, Ed25519SecretKey([0xCD; 32]));
     }
 
     #[test]
@@ -127,13 +130,16 @@ mod tests {
         let expires = UNIX_EPOCH + Duration::from_secs(9_999_999_999);
         node.owner.device_invitations.push(Invitation {
             id:         generate_uuid(),
-            key_pair:   KeyPair { public_key: [0x12; 32], private_key: [0x34; 32] },
+            key_pair:   X25519KeyPair {
+                public_key: X25519PublicKey([0x12; 32]),
+                private_key: X25519SecretKey([0x34; 32]),
+            },
             expires_at: expires,
         });
         let restored = roundtrip(&node);
         assert_eq!(restored.owner.device_invitations.len(), 1);
         let inv = &restored.owner.device_invitations[0];
-        assert_eq!(inv.key_pair.public_key, [0x12; 32]);
+        assert_eq!(inv.key_pair.public_key, X25519PublicKey([0x12; 32]));
         // SystemTime is serialized as whole seconds, so compare at that precision.
         let orig_secs  = expires.duration_since(UNIX_EPOCH).unwrap().as_secs();
         let resto_secs = inv.expires_at.duration_since(UNIX_EPOCH).unwrap().as_secs();

@@ -9,12 +9,13 @@ use std::time::{Duration, SystemTime};
 
 use super::super::action_queue::{Action, ScheduleRequest, WorkerContext};
 use super::super::crypto::{
-    build_encrypted_packet, decrypt_packet_body, generate_x25519_keypair, x25519_shared,
-    xchacha20_decrypt, xchacha20_encrypt,
+    aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body,
+    generate_x25519_keypair, xchacha20_decrypt, xchacha20_encrypt,
 };
 use super::super::data_models::{
-    Contact, Device, DeviceGrade, Invitation, KeyPair, Node, PendingBootstrap,
-    PendingContactExchange, PendingDeviceAcceptance, PublicKey, SyncVersion, User, Uuid,
+    Contact, Device, DeviceGrade, Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey,
+    Invitation, Node, PendingBootstrap, PendingContactExchange, PendingDeviceAcceptance,
+    SyncVersion, User, Uuid, X25519PublicKey,
     generate_uuid,
 };
 use super::super::wire::*;
@@ -33,15 +34,15 @@ fn serialize_bootstrap_payload(node: &Node) -> Vec<u8> {
     let user  = &owner.user;
     push_str(&mut buf, &user.alias);
     buf.extend_from_slice(&user.uuid);
-    buf.extend_from_slice(&owner.key_pair.public_key);
-    buf.extend_from_slice(&owner.key_pair.private_key);
+    buf.extend_from_slice(owner.key_pair.public_key.as_bytes());
+    buf.extend_from_slice(owner.key_pair.private_key.as_bytes());
     buf.push(user.devices.len() as u8);
     for d in &user.devices { push_device(&mut buf, d); }
     buf.push(owner.contact_users.len() as u8);
     for c in &owner.contact_users {
         buf.extend_from_slice(&c.user.uuid);
         push_str(&mut buf, &c.user.alias);
-        buf.extend_from_slice(&c.public_key);
+        buf.extend_from_slice(c.public_key.as_bytes());
         buf.push(c.user.devices.len() as u8);
         for d in &c.user.devices { push_device(&mut buf, d); }
     }
@@ -51,7 +52,7 @@ fn serialize_bootstrap_payload(node: &Node) -> Vec<u8> {
 struct BootstrapPayload {
     user_alias: String,
     user_uuid:  Uuid,
-    key_pair:   KeyPair,
+    key_pair:   Ed25519KeyPair,
     devices:    Vec<Device>,
     contacts:   Vec<Contact>,
 }
@@ -60,18 +61,21 @@ fn deserialize_bootstrap_payload(data: &[u8]) -> Option<BootstrapPayload> {
     let mut pos = 0usize;
     let user_alias  = read_str(data, &mut pos)?;
     let user_uuid:  Uuid      = read_arr(data, &mut pos)?;
-    let pk: PublicKey         = read_arr(data, &mut pos)?;
-    let sk: [u8; 32]          = read_arr(data, &mut pos)?;
-    let key_pair = KeyPair { public_key: pk, private_key: sk };
+    let pk: [u8; 32] = read_arr(data, &mut pos)?;
+    let sk: [u8; 32] = read_arr(data, &mut pos)?;
+    let key_pair = Ed25519KeyPair {
+        public_key:  Ed25519PublicKey(pk),
+        private_key: Ed25519SecretKey(sk),
+    };
     let device_count = *data.get(pos)? as usize; pos += 1;
     let mut devices = Vec::new();
     for _ in 0..device_count { devices.push(read_device(data, &mut pos)?); }
     let contact_count = *data.get(pos)? as usize; pos += 1;
     let mut contacts = Vec::new();
     for _ in 0..contact_count {
-        let c_uuid: Uuid   = read_arr(data, &mut pos)?;
-        let c_alias        = read_str(data, &mut pos)?;
-        let c_pk: PublicKey = read_arr(data, &mut pos)?;
+        let c_uuid: Uuid = read_arr(data, &mut pos)?;
+        let c_alias = read_str(data, &mut pos)?;
+        let c_pk = Ed25519PublicKey(read_arr(data, &mut pos)?);
         let c_dev_count = *data.get(pos)? as usize; pos += 1;
         let mut c_devices = Vec::new();
         for _ in 0..c_dev_count { c_devices.push(read_device(data, &mut pos)?); }
@@ -100,7 +104,7 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
     let invitation_id:    Uuid      = buf[0..16].try_into().unwrap();
-    let new_dev_ephem_pk: PublicKey = buf[16..48].try_into().unwrap();
+    let new_dev_ephem_pk = X25519PublicKey(buf[16..48].try_into().unwrap());
 
     // Validate invitation, derive shared secret, serialize payload — all under write lock.
     let (shared_secret, payload) = {
@@ -120,11 +124,16 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         }
 
-        let inv:           Invitation = node.owner.device_invitations.remove(pos);
-        let shared_secret: [u8; 32]   = x25519_shared(&inv.key_pair.private_key, &new_dev_ephem_pk);
-        let payload:       Vec<u8>    = serialize_bootstrap_payload(&node);
+        let inv: Invitation = node.owner.device_invitations.remove(pos);
+        // AEAD key (HKDF bootstrap domain over X25519), not the raw DH output.
+        let shared_secret: [u8; 32] = aead_key_from_dh(
+            &inv.key_pair.private_key,
+            &new_dev_ephem_pk,
+            aead_domain::BOOTSTRAP,
+        );
+        let payload: Vec<u8> = serialize_bootstrap_payload(&node);
 
-        // Remember the shared secret so we can decrypt the incoming DeviceRegistration.
+        // Remember the AEAD key so we can decrypt the incoming DeviceRegistration.
         node.owner.pending_device_acceptances.insert(invitation_id, PendingDeviceAcceptance {
             shared_secret,
             expires_at: now + PENDING_ACCEPTANCE_TTL,
@@ -172,7 +181,11 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             eprintln!("[bootstrap_response] unexpected source {src}, ignoring");
             return;
         }
-        let ss = x25519_shared(&pb.our_ephem_key_pair.private_key, &pb.invitation_pk);
+        let ss = aead_key_from_dh(
+            &pb.our_ephem_key_pair.private_key,
+            &pb.invitation_pk,
+            aead_domain::BOOTSTRAP,
+        );
         (ss, pb.invitation_id, pb.sg_addr, pb.device_alias.clone(), pb.desired_grade, pb.desired_sg_rank)
     };
 
@@ -258,7 +271,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// Payload (after op byte):
 ///   [invitation_id: 16][nonce: 24][encrypted device info]
 ///
-/// The SG decrypts using the shared secret it stored for this invitation,
+/// The SG decrypts using the bootstrap AEAD key it stored for this invitation,
 /// and adds the new device to `owner.user.devices`.
 pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 16 + 24 {
@@ -350,7 +363,7 @@ pub(crate) fn serialize_contact_payload(node: &Node) -> Vec<u8> {
     let user = &node.owner.user;
     push_str(&mut buf, &user.alias);
     buf.extend_from_slice(&user.uuid);
-    buf.extend_from_slice(&node.owner.key_pair.public_key);
+    buf.extend_from_slice(node.owner.key_pair.public_key.as_bytes());
     buf.push(user.devices.len() as u8);
     for d in &user.devices { push_device(&mut buf, d); }
     buf
@@ -359,7 +372,7 @@ pub(crate) fn serialize_contact_payload(node: &Node) -> Vec<u8> {
 struct ContactPayload {
     alias:      String,
     uuid:       Uuid,
-    public_key: PublicKey,
+    public_key: Ed25519PublicKey,
     devices:    Vec<Device>,
 }
 
@@ -367,7 +380,7 @@ fn deserialize_contact_payload(data: &[u8]) -> Option<ContactPayload> {
     let mut pos = 0usize;
     let alias       = read_str(data, &mut pos)?;
     let uuid: Uuid  = read_arr(data, &mut pos)?;
-    let pk: PublicKey = read_arr(data, &mut pos)?;
+    let pk = Ed25519PublicKey(read_arr(data, &mut pos)?);
     let device_count = *data.get(pos)? as usize; pos += 1;
     let mut devices = Vec::new();
     for _ in 0..device_count { devices.push(read_device(data, &mut pos)?); }
@@ -393,7 +406,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
 
     let invitation_id:   Uuid      = buf[0..16].try_into().unwrap();
-    let requester_ephem_pk: PublicKey = buf[16..48].try_into().unwrap();
+    let requester_ephem_pk = X25519PublicKey(buf[16..48].try_into().unwrap());
     let nonce:           [u8; 24]  = buf[48..72].try_into().unwrap();
     let ciphertext:      &[u8]     = &buf[72..];
 
@@ -415,7 +428,11 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
 
         let inv = node.owner.contact_invitations.remove(pos);
-        let shared_secret: [u8; 32] = x25519_shared(&inv.key_pair.private_key, &requester_ephem_pk);
+        let shared_secret: [u8; 32] = aead_key_from_dh(
+            &inv.key_pair.private_key,
+            &requester_ephem_pk,
+            aead_domain::BOOTSTRAP,
+        );
 
         let Some(plaintext) = xchacha20_decrypt(&shared_secret, &nonce, ciphertext) else {
             eprintln!("[contact_request] decryption failed from {src}");
@@ -497,7 +514,11 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             eprintln!("[contact_response] unexpected source {src}, ignoring");
             return;
         }
-        x25519_shared(&pce.our_ephem_key_pair.private_key, &pce.invitation_pk)
+        aead_key_from_dh(
+            &pce.our_ephem_key_pair.private_key,
+            &pce.invitation_pk,
+            aead_domain::BOOTSTRAP,
+        )
     };
 
     let Some(plaintext) = xchacha20_decrypt(&shared_secret, &nonce, ciphertext) else {
@@ -579,7 +600,7 @@ pub(crate) fn top_online_sg(node: &Node) -> Option<Uuid> {
 /// Mint a fresh invitation and store it in the local device/contact vec
 /// according to `kind`. Returns `(id, public_key)` for embedding in the code.
 /// Caller is responsible for `ctx.save_node()`.
-fn store_new_invitation(kind: u8, ctx: &WorkerContext) -> (Uuid, PublicKey) {
+fn store_new_invitation(kind: u8, ctx: &WorkerContext) -> (Uuid, X25519PublicKey) {
     let mut node = ctx.node.write().unwrap();
     let kp = generate_x25519_keypair();
     let pk = kp.public_key;
@@ -604,12 +625,12 @@ fn store_new_invitation(kind: u8, ctx: &WorkerContext) -> (Uuid, PublicKey) {
 /// Format: `[inv_id:16][inv_pk:32][host_count:1] { [host_len:1][host_str:N] }*`
 /// Each `host_str` carries its own optional `:port` suffix (same grammar as
 /// `Device.hosts`); default port 7777 is applied at resolve time.
-pub(crate) fn encode_invitation_code(inv_id: &Uuid, inv_pk: &PublicKey, hosts: &[String]) -> String {
+pub(crate) fn encode_invitation_code(inv_id: &Uuid, inv_pk: &X25519PublicKey, hosts: &[String]) -> String {
     use base64::Engine;
     let host_count = hosts.len().min(u8::MAX as usize);
     let mut raw = Vec::with_capacity(16 + 32 + 1 + host_count * 32);
     raw.extend_from_slice(inv_id);
-    raw.extend_from_slice(inv_pk);
+    raw.extend_from_slice(inv_pk.as_bytes());
     raw.push(host_count as u8);
     for h in hosts.iter().take(host_count) {
         let b = h.as_bytes();
@@ -621,12 +642,12 @@ pub(crate) fn encode_invitation_code(inv_id: &Uuid, inv_pk: &PublicKey, hosts: &
 }
 
 /// Decode an invitation code. Returns `(inv_id, inv_pk, hosts)`.
-pub(crate) fn decode_invitation_code(code_str: &str) -> Option<(Uuid, PublicKey, Vec<String>)> {
+pub(crate) fn decode_invitation_code(code_str: &str) -> Option<(Uuid, X25519PublicKey, Vec<String>)> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(code_str.trim()).ok()?;
     if raw.len() < 49 { return None; }
     let inv_id:    Uuid      = raw[0..16].try_into().ok()?;
-    let inv_pk:    PublicKey = raw[16..48].try_into().ok()?;
+    let inv_pk = X25519PublicKey(raw[16..48].try_into().ok()?);
     let host_count = raw[48] as usize;
     let mut off = 49;
     let mut hosts = Vec::with_capacity(host_count);
@@ -796,7 +817,7 @@ pub fn start_bootstrap(
     let mut pkt = [0u8; 49];
     pkt[0] = BOOTSTRAP_REQUEST_OP;
     pkt[1..17].copy_from_slice(&invitation_id);
-    pkt[17..49].copy_from_slice(&ephem_pk);
+    pkt[17..49].copy_from_slice(ephem_pk.as_bytes());
     println!("[start_bootstrap] sending bootstrap request to {sg_addr} (picked {picked_host} from {hosts:?})");
     send(ctx, SocketAddr::V4(sg_addr), &pkt);
     Ok(())
@@ -925,14 +946,18 @@ pub(crate) fn initiate_contact_exchange(body: &[u8], ctx: &WorkerContext) {
 
     let ephem_kp = generate_x25519_keypair();
     let ephem_pk = ephem_kp.public_key;
-    let shared_secret = x25519_shared(&ephem_kp.private_key, &invitation_pk);
+    let aead_key = aead_key_from_dh(
+        &ephem_kp.private_key,
+        &invitation_pk,
+        aead_domain::BOOTSTRAP,
+    );
 
     // Serialize and encrypt our contact card.
     let payload = {
         let node = ctx.node.read().unwrap();
         serialize_contact_payload(&node)
     };
-    let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
+    let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &payload);
 
     {
         let mut node = ctx.node.write().unwrap();
@@ -947,7 +972,7 @@ pub(crate) fn initiate_contact_exchange(body: &[u8], ctx: &WorkerContext) {
     let mut pkt = Vec::with_capacity(1 + 16 + 32 + 24 + ciphertext.len());
     pkt.push(CONTACT_REQUEST_OP);
     pkt.extend_from_slice(&invitation_id);
-    pkt.extend_from_slice(&ephem_pk);
+    pkt.extend_from_slice(ephem_pk.as_bytes());
     pkt.extend_from_slice(&nonce);
     pkt.extend_from_slice(&ciphertext);
     send(ctx, SocketAddr::V4(sg_addr), &pkt);

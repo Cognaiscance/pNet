@@ -36,7 +36,7 @@ Connection establishment is a two-message exchange:
 1. **ConnectRequest** (op `0x20`) — sent by the initiator. Contains the initiator's ephemeral public key, device UUID, and long-term public key (Ed25519, for identity verification).
 2. **ConnectAck** (op `0x21`) — sent by the responder. Contains the responder's ephemeral public key and echoes the initiator's connection ID so the initiator can correlate it to the pending entry.
 
-After the ack, both sides hold an `ActiveConnection` with the peer's ephemeral public key and a matched pair of connection IDs. The X25519 shared secret is derived from the ephemeral keys on demand during encryption/decryption.
+After the ack, both sides hold an `ActiveConnection` with the peer's ephemeral public key and a matched pair of connection IDs. Encryption uses an AEAD key derived on demand: X25519 DH of the ephemeral keys, then **HKDF-SHA256** with info label `pnet-aead-v1-session` (raw DH output is never used as the AEAD key).
 
 **Initiation rule**: a DG always initiates to an SG (NAT — the DG must punch outward). For SG-to-SG connections, the node whose device UUID sorts lower initiates, preventing simultaneous handshake collisions.
 

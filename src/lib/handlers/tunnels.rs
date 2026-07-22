@@ -8,10 +8,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{
-    generate_x25519_keypair, x25519_shared, xchacha20_decrypt,
+    aead_domain, aead_key_from_dh, generate_x25519_keypair, xchacha20_decrypt,
 };
 use super::super::data_models::{
-    ActiveConnection, ActiveTunnel, Node, PendingTunnel, PendingTunnelConnection, PublicKey,
+    ActiveConnection, ActiveTunnel, Node, PendingTunnel, PendingTunnelConnection, X25519PublicKey,
     Uuid, CONNECTION_LIFETIME, TUNNEL_COUNTER_WINDOW,
 };
 use super::super::wire::*;
@@ -106,7 +106,7 @@ pub fn tunnel_init(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let mut pkt = [0u8; 35];
     pkt[0]     = TUNNEL_CONNECT_REQUEST_OP;
     pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
-    pkt[3..35].copy_from_slice(&our_ephem_pk);
+    pkt[3..35].copy_from_slice(our_ephem_pk.as_bytes());
     send(ctx, src, &pkt);
 }
 
@@ -128,7 +128,7 @@ pub fn tunnel_connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext
         return;
     }
     let tunnel_id       = u16::from_be_bytes([buf[0], buf[1]]);
-    let sender_ephem_pk: PublicKey = buf[2..34].try_into().unwrap();
+    let sender_ephem_pk = X25519PublicKey(buf[2..34].try_into().unwrap());
 
     // Determine role by checking which pending map has this tunnel_id.
     let is_sg_relay = ctx.node.read().unwrap()
@@ -157,7 +157,7 @@ pub fn tunnel_connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext
             let mut pkt = [0u8; 51];
             pkt[0]      = TUNNEL_CONNECT_REQUEST_OP;
             pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
-            pkt[3..35].copy_from_slice(&sender_ephem_pk);
+            pkt[3..35].copy_from_slice(sender_ephem_pk.as_bytes());
             pkt[35..51].copy_from_slice(&sender_uuid);
             send(ctx, dest, &pkt);
         }
@@ -191,7 +191,7 @@ pub fn tunnel_connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext
         let mut pkt = [0u8; 35];
         pkt[0]     = TUNNEL_CONNECT_ACK_OP;
         pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
-        pkt[3..35].copy_from_slice(&our_ephem_pk);
+        pkt[3..35].copy_from_slice(our_ephem_pk.as_bytes());
         send(ctx, src, &pkt);
     } else {
         eprintln!("[tunnel_connect_request] unexpected packet length {} from {src}", buf.len());
@@ -217,7 +217,7 @@ pub fn tunnel_connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
     let tunnel_id    = u16::from_be_bytes([buf[0], buf[1]]);
-    let dest_ephem_pk: PublicKey = buf[2..34].try_into().unwrap();
+    let dest_ephem_pk = X25519PublicKey(buf[2..34].try_into().unwrap());
 
     let is_sg_relay = ctx.node.read().unwrap()
         .owner.pending_tunnels.contains_key(&tunnel_id);
@@ -257,7 +257,7 @@ pub fn tunnel_connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             let mut pkt = [0u8; 35];
             pkt[0]     = TUNNEL_CONNECT_ACK_OP;
             pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
-            pkt[3..35].copy_from_slice(&dest_ephem_pk);
+            pkt[3..35].copy_from_slice(dest_ephem_pk.as_bytes());
             send(ctx, dest, &pkt);
         }
     } else if is_dg_sender {
@@ -367,8 +367,12 @@ pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         };
 
-        let shared = x25519_shared(&conn.key_pair.private_key, &conn.peer_public_key);
-        let Some(plaintext) = xchacha20_decrypt(&shared, &nonce, ciphertext) else {
+        let aead_key = aead_key_from_dh(
+            &conn.key_pair.private_key,
+            &conn.peer_public_key,
+            aead_domain::TUNNEL,
+        );
+        let Some(plaintext) = xchacha20_decrypt(&aead_key, &nonce, ciphertext) else {
             eprintln!("[tunnel_delivery] decryption failed for tunnel {tunnel_id} from {src}");
             return;
         };

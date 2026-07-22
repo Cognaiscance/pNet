@@ -4,15 +4,16 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::action_queue::WorkerContext;
 use super::crypto::{
-    build_encrypted_packet, decrypt_packet_body, ed25519_sign, ed25519_verify,
-    generate_ed25519_keypair, generate_x25519_keypair, x25519_shared, xchacha20_decrypt,
+    aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body, ed25519_sign,
+    ed25519_verify, generate_ed25519_keypair, generate_x25519_keypair, xchacha20_decrypt,
     xchacha20_encrypt,
 };
 use super::data_models::{
-    ActiveConnection, ActiveTunnel, Application, Contact, Device, DeviceGrade, Invitation,
-    KeyPair, Owner, PendingBootstrap, PendingConnection, PendingContactExchange,
-    PendingDeviceAcceptance, PendingTunnel, PendingTunnelConnection, PublicKey, Scope, SgStatus,
-    SyncVersion, TunnelCounter, User, Uuid, WriteLogEntry, WRITE_LOG_RETENTION,
+    ActiveConnection, ActiveTunnel, Application, Contact, Device, DeviceGrade,
+    Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Invitation, Owner, PendingBootstrap,
+    PendingConnection, PendingContactExchange, PendingDeviceAcceptance, PendingTunnel,
+    PendingTunnelConnection, Scope, SgStatus, SyncVersion, TunnelCounter, User, Uuid,
+    WriteLogEntry, X25519KeyPair, X25519PublicKey, WRITE_LOG_RETENTION,
     CONNECTION_LIFETIME, TUNNEL_COUNTER_WINDOW, TUNNEL_THRESHOLD, generate_key_bytes, generate_uuid,
 };
 // Op bytes, reply codes, and shared binary parse helpers.
@@ -773,7 +774,7 @@ mod tests {
 
     /// Add a contact with its own Ed25519 key pair to the node.
     /// Returns the contact's device UUID and key pair.
-    fn add_contact_with_device(node: &mut Node) -> (Uuid, KeyPair) {
+    fn add_contact_with_device(node: &mut Node) -> (Uuid, Ed25519KeyPair) {
         let kp          = generate_ed25519_keypair();
         let device_uuid = generate_uuid();
         node.owner.contact_users.push(Contact {
@@ -832,7 +833,7 @@ mod tests {
                 id: 1,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
                 key_pair: generate_x25519_keypair(),
-                peer_public_key: generate_key_bytes(),
+                peer_public_key: X25519PublicKey(generate_key_bytes()),
                 peer_active_connection_id: 10,
                 device_uuid: own_sg_uuid,
                 peer_addr: own_sg_sock.local_addr().unwrap(),
@@ -841,7 +842,7 @@ mod tests {
                 id: 2,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
                 key_pair: generate_x25519_keypair(),
-                peer_public_key: generate_key_bytes(),
+                peer_public_key: X25519PublicKey(generate_key_bytes()),
                 peer_active_connection_id: 20,
                 device_uuid: contact_sg_uuid,
                 peer_addr: contact_sg_sock.local_addr().unwrap(),
@@ -912,7 +913,7 @@ mod tests {
     // ── Connection glare avoidance (directional initiation) ───────────────────
 
     /// Teach `t` about a contact SG device under the peer's long-term key.
-    fn add_specific_contact(t: &TestCtx, peer_dev: Uuid, peer_lt_pub: PublicKey) {
+    fn add_specific_contact(t: &TestCtx, peer_dev: Uuid, peer_lt_pub: Ed25519PublicKey) {
         let mut n = t.ctx.node.write().unwrap();
         n.owner.contact_users.push(Contact {
             public_key: peer_lt_pub,
@@ -983,16 +984,16 @@ mod tests {
     fn connect_request_buf(
         conn_id:      u16,
         device_uuid:  &Uuid,
-        ephemeral_pk: &PublicKey,
-        longterm_pk:  &PublicKey,
-        longterm_sk:  &[u8; 32],
+        ephemeral_pk: &X25519PublicKey,
+        longterm_pk:  &Ed25519PublicKey,
+        longterm_sk:  &Ed25519SecretKey,
         tamper_sig:   bool,
     ) -> Vec<u8> {
         let mut buf = vec![0u8; 146];
         buf[0..2].copy_from_slice(&conn_id.to_be_bytes());
         buf[2..18].copy_from_slice(device_uuid);
-        buf[18..50].copy_from_slice(ephemeral_pk);
-        buf[50..82].copy_from_slice(longterm_pk);
+        buf[18..50].copy_from_slice(ephemeral_pk.as_bytes());
+        buf[50..82].copy_from_slice(longterm_pk.as_bytes());
 
         let mut signed_msg = [0u8; 83];
         signed_msg[0] = CONNECT_REQUEST_OP;
@@ -1057,14 +1058,14 @@ mod tests {
     fn connect_ack_buf(
         responder_conn_id: u16,
         our_conn_id:       u16,
-        eph_pk:            &PublicKey,
-        responder_sk:      &[u8; 32],
+        eph_pk:            &X25519PublicKey,
+        responder_sk:      &Ed25519SecretKey,
         tamper_sig:        bool,
     ) -> Vec<u8> {
         let mut buf = vec![0u8; 100];
         buf[0..2].copy_from_slice(&responder_conn_id.to_be_bytes());
         buf[2..4].copy_from_slice(&our_conn_id.to_be_bytes());
-        buf[4..36].copy_from_slice(eph_pk);
+        buf[4..36].copy_from_slice(eph_pk.as_bytes());
 
         let mut signed_msg = [0u8; 37];
         signed_msg[0] = CONNECT_ACK_OP;
@@ -1164,7 +1165,7 @@ mod tests {
             let mut node = t.ctx.node.write().unwrap();
             node.owner.user.devices.push(make_sg_device(own_sg_uuid));
             node.owner.contact_users.push(Contact {
-                public_key: generate_key_bytes(),
+                public_key: Ed25519PublicKey(generate_key_bytes()),
                 user: User {
                     alias:   "contact".to_string(),
                     uuid:    generate_uuid(),
@@ -1204,7 +1205,7 @@ mod tests {
                 id: 1,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
                 key_pair: generate_x25519_keypair(),
-                peer_public_key: generate_key_bytes(),
+                peer_public_key: X25519PublicKey(generate_key_bytes()),
                 peer_active_connection_id: 10,
                 device_uuid: slow_uuid,
             peer_addr:   "127.0.0.1:0".parse().unwrap(),
@@ -1213,7 +1214,7 @@ mod tests {
                 id: 2,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
                 key_pair: generate_x25519_keypair(),
-                peer_public_key: generate_key_bytes(),
+                peer_public_key: X25519PublicKey(generate_key_bytes()),
                 peer_active_connection_id: 20,
                 device_uuid: fast_uuid,
             peer_addr:   "127.0.0.1:0".parse().unwrap(),
@@ -1247,7 +1248,7 @@ mod tests {
                 id: 1,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
                 key_pair: generate_x25519_keypair(),
-                peer_public_key: generate_key_bytes(),
+                peer_public_key: X25519PublicKey(generate_key_bytes()),
                 peer_active_connection_id: 10,
                 device_uuid: sg_uuid,
             peer_addr:   "127.0.0.1:0".parse().unwrap(),
@@ -1288,7 +1289,7 @@ mod tests {
                 id: rank as u16,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
                 key_pair: generate_x25519_keypair(),
-                peer_public_key: generate_key_bytes(),
+                peer_public_key: X25519PublicKey(generate_key_bytes()),
                 peer_active_connection_id: 100 + rank as u16,
                 device_uuid: uuid,
                 peer_addr:   "127.0.0.1:0".parse().unwrap(),
@@ -1821,7 +1822,7 @@ mod tests {
                 id:                        11,
                 timeout:                   SystemTime::now() + Duration::from_secs(3600),
                 key_pair:                  generate_x25519_keypair(),
-                peer_public_key:           generate_key_bytes(),
+                peer_public_key:           X25519PublicKey(generate_key_bytes()),
                 peer_active_connection_id: 22,
                 device_uuid:               sg_uuid,
                 peer_addr:                 sg_addr,
@@ -2917,7 +2918,7 @@ mod tests {
 
             // Dest device must be in the node's known devices/contacts.
             node.owner.contact_users.push(Contact {
-                public_key: generate_key_bytes(),
+                public_key: Ed25519PublicKey(generate_key_bytes()),
                 user: User {
                     alias:   "contact".to_string(),
                     uuid:    generate_uuid(),
@@ -2935,8 +2936,8 @@ mod tests {
         }
 
         // Build a RelayPacket as if sent by the sender DG.
-        // Shared secret for SG conn #1 = x25519_shared(dg_sender_sk, sg_from_dg_pk)
-        //                               = x25519_shared(sg_from_dg_sk, dg_sender_pk) — same
+        // Session AEAD key for SG conn #1 is domain-separated HKDF over the
+        // X25519 DH of (dg_sender_sk, sg_from_dg_pk) — symmetric with the SG side.
         let mut relay_body = Vec::new();
         relay_body.extend_from_slice(&dest_device_uuid);
         relay_body.extend_from_slice(&dest_app_id);
@@ -3037,7 +3038,7 @@ mod tests {
                 peer_addr: SocketAddr::V4(dest_addr),
             });
             node.owner.contact_users.push(Contact {
-                public_key: generate_key_bytes(),
+                public_key: Ed25519PublicKey(generate_key_bytes()),
                 user: User {
                     alias: "contact".to_string(),
                     uuid: generate_uuid(),
@@ -3296,12 +3297,16 @@ mod tests {
             node.owner.dg_tunnel_map.insert(tunnel_id, conn_id);
         }
 
-        let shared = x25519_shared(&local_kp.private_key, &peer_kp.public_key);
+        let aead_key = aead_key_from_dh(
+            &local_kp.private_key,
+            &peer_kp.public_key,
+            aead_domain::TUNNEL,
+        );
         let mut plaintext = Vec::new();
         plaintext.extend_from_slice(&app_id);
         plaintext.extend_from_slice(&sender_app_id);
         plaintext.extend_from_slice(b"tunnel payload");
-        let (ciphertext, nonce) = xchacha20_encrypt(&shared, &plaintext);
+        let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &plaintext);
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&tunnel_id.to_be_bytes());
@@ -3385,9 +3390,9 @@ mod tests {
         // Distinct owner private key (non-zero) so we can search for it in the reply.
         let owner_sk = {
             let mut node = t.ctx.node.write().unwrap();
-            node.owner.key_pair.private_key = [0x5Au8; 32];
-            node.owner.key_pair.public_key = [0xA5u8; 32];
-            let contact_pk = [0xCCu8; 32];
+            node.owner.key_pair.private_key = Ed25519SecretKey([0x5Au8; 32]);
+            node.owner.key_pair.public_key = Ed25519PublicKey([0xA5u8; 32]);
+            let contact_pk = Ed25519PublicKey([0xCCu8; 32]);
             let pending_app_id = app_uuid(77);
             let approved_app_id = app_uuid(78);
             let foreign_token = [0xF1u8; 16];
@@ -3446,7 +3451,7 @@ mod tests {
         assert!(!has16([0xF2u8; 16]), "must not leak approved contact app token");
 
         // Owner private key must not appear.
-        assert!(!has32(owner_sk), "must not leak owner private key");
+        assert!(!has32(owner_sk.0), "must not leak owner private key");
         // Contact long-term public key must not appear (apps do not get contact crypto).
         assert!(!has32([0xCCu8; 32]), "must not leak contact public keys");
 
@@ -3460,14 +3465,18 @@ mod tests {
     /// Build a ContactRequest buf (after op byte) from the requester's node and
     /// the invitation stored on the target.
     fn contact_request_buf(requester_node: &Node, inv: &Invitation) -> Vec<u8> {
-        let ephem_kp      = generate_x25519_keypair();
-        let shared_secret = x25519_shared(&ephem_kp.private_key, &inv.key_pair.public_key);
-        let payload       = serialize_contact_payload(requester_node);
-        let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
+        let ephem_kp = generate_x25519_keypair();
+        let aead_key = aead_key_from_dh(
+            &ephem_kp.private_key,
+            &inv.key_pair.public_key,
+            aead_domain::BOOTSTRAP,
+        );
+        let payload = serialize_contact_payload(requester_node);
+        let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &payload);
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&inv.id);
-        buf.extend_from_slice(&ephem_kp.public_key);
+        buf.extend_from_slice(ephem_kp.public_key.as_bytes());
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&ciphertext);
         buf
@@ -3489,7 +3498,7 @@ mod tests {
         fn clone(&self) -> Self {
             Invitation {
                 id:         self.id,
-                key_pair:   KeyPair {
+                key_pair:   X25519KeyPair {
                     public_key:  self.key_pair.public_key,
                     private_key: self.key_pair.private_key,
                 },
@@ -3666,8 +3675,12 @@ mod tests {
             });
         }
 
-        // Shared secret from requester's perspective.
-        let shared_secret = x25519_shared(&ephem_kp.private_key, &inv_kp.public_key);
+        // Bootstrap AEAD key from requester's perspective.
+        let aead_key = aead_key_from_dh(
+            &ephem_kp.private_key,
+            &inv_kp.public_key,
+            aead_domain::BOOTSTRAP,
+        );
 
         // Build the target's contact payload.
         let target_uuid = generate_uuid();
@@ -3675,10 +3688,10 @@ mod tests {
         let mut payload = Vec::new();
         push_str(&mut payload, "will");
         payload.extend_from_slice(&target_uuid);
-        payload.extend_from_slice(&target_pk);
+        payload.extend_from_slice(target_pk.as_bytes());
         payload.push(0u8); // 0 devices
 
-        let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
+        let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &payload);
         let mut buf = Vec::new();
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&ciphertext);
@@ -3710,13 +3723,17 @@ mod tests {
             });
         }
 
-        let shared_secret = x25519_shared(&ephem_kp.private_key, &inv_kp.public_key);
+        let aead_key = aead_key_from_dh(
+            &ephem_kp.private_key,
+            &inv_kp.public_key,
+            aead_domain::BOOTSTRAP,
+        );
         let mut payload = Vec::new();
         push_str(&mut payload, "will");
         payload.extend_from_slice(&generate_uuid());
         payload.extend_from_slice(&generate_key_bytes());
         payload.push(0u8);
-        let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
+        let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &payload);
         let mut buf = Vec::new();
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&ciphertext);
@@ -3780,7 +3797,7 @@ mod tests {
 
             // Add the contact.
             node.owner.contact_users.push(Contact {
-                public_key: generate_key_bytes(),
+                public_key: Ed25519PublicKey(generate_key_bytes()),
                 user: User {
                     alias:   "chad".to_string(),
                     uuid:    contact_user_uuid,
@@ -4735,7 +4752,7 @@ mod tests {
                 id: conn_id,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
                 key_pair: generate_x25519_keypair(),
-                peer_public_key: generate_key_bytes(),
+                peer_public_key: X25519PublicKey(generate_key_bytes()),
                 peer_active_connection_id: 1,
                 device_uuid: own_sg_uuid,
                 peer_addr: sg_sock.local_addr().unwrap(),
@@ -4956,7 +4973,7 @@ mod tests {
         // The contact as the writer logged it: identity + one device carrying apps.
         let writer        = [0xC0; 16];
         let contact_uuid  = [0xCA; 16];
-        let contact_pk    = [0x77; 32];
+        let contact_pk    = Ed25519PublicKey([0x77; 32]);
         let contact_dev   = [0xDE; 16];
         let contact_app   = app_uuid(909);
         let card = ContactDeviceCard {

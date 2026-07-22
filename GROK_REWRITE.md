@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §4.1)* |
-| Last completed | 3.4 Push and approval invariants (2026-07-21) |
+| Current focus | *(none — next is §4.3)* |
+| Last completed | 4.2 Distinct key types (2026-07-22) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -132,16 +132,16 @@ The fabric API apps depend on. Opaque payloads stay; contracts get boring and ex
 Data plane is already real; tighten key use and typing.
 
 ### 4.1 KDF before AEAD
-- [ ] Derive AEAD keys via HKDF (or domain-separated KDF) from X25519 shared secrets
-- [ ] Separate domain labels for session / bootstrap / tunnel if all use the helper
+- [x] Derive AEAD keys via HKDF (or domain-separated KDF) from X25519 shared secrets
+- [x] Separate domain labels for session / bootstrap / tunnel if all use the helper
 
-**Done:**  
+**Done:** 2026-07-22 — HKDF-SHA256 (`hkdf` crate) in `crypto.rs`: `derive_aead_key` / `aead_key_from_dh` with `aead_domain::{SESSION,BOOTSTRAP,TUNNEL}` (`pnet-aead-v1-…`). Session seal/open, bootstrap + contact invitation AEAD, and tunnel encrypt/decrypt all use derived keys (raw DH never fed to XChaCha). `PendingDeviceAcceptance.shared_secret` stores the bootstrap AEAD key. Docs: background systems, pnet-to-pnet, transport diagram. 234 tests green.
 
 ### 4.2 Distinct key types
-- [ ] Split identity (Ed25519) vs ephemeral (X25519) types so they cannot be mixed at compile time
-- [ ] Update generation sites (`generate_ed25519_keypair`, `generate_x25519_keypair`)
+- [x] Split identity (Ed25519) vs ephemeral (X25519) types so they cannot be mixed at compile time
+- [x] Update generation sites (`generate_ed25519_keypair`, `generate_x25519_keypair`)
 
-**Done:**  
+**Done:** 2026-07-22 — Replaced flat `KeyPair`/`PublicKey` aliases with `Ed25519{KeyPair,PublicKey,SecretKey}` and `X25519{KeyPair,PublicKey,SecretKey}` in `data_models`. Generators and crypto helpers take/return the matching types (`ed25519_sign/verify` vs `x25519_shared`/`aead_key_from_dh`). Field types: Owner/Contact identity → Ed25519; ActiveConnection/Invitation/Pending*/tunnel ephemerals → X25519. TOML hex shape unchanged. Docs: `Data Models.md`. 235 tests green.
 
 ### 4.3 RNG
 - [ ] Replace ad-hoc `/dev/urandom` opens with `getrandom` (or one shared helper); avoid panic on hot paths where practical
@@ -272,6 +272,13 @@ Core behavior is largely designed; make it observable and resilient.
 - Turning core into a message store or app-level ACK bus (unless a later checklist revisits hop-ACK deliberately)
 - Third-party hosted SG product packaging (optional later; not blocking phases 1–8)
 
+## Deferred — after this checklist
+
+**App web surfaces (hybrid native + web apps)** — rank-1 SG hosts optional
+public HTTPS mounts for apps (`/filesync`, etc.); native agents on DGs; same
+app identity. Design captured in `descriptions/app-web-surfaces.md`. **Start
+only after phases above are done**; do not fold into rewrite PRs.
+
 ---
 
 ## Session log
@@ -280,6 +287,8 @@ Add a line per work session (newest at top).
 
 | Date | Item(s) | Notes |
 |------|---------|--------|
+| 2026-07-22 | 4.2 Distinct key types | Ed25519 vs X25519 newtypes end-to-end; 235 tests. |
+| 2026-07-22 | 4.1 KDF before AEAD | HKDF-SHA256 + domain labels session/bootstrap/tunnel; 234 tests. |
 | 2026-07-21 | 3.4 push/approval invariants | Approval gate on all push paths; get-data leak tests. |
 | 2026-07-21 | 3.3 app API exposure | Loopback-only app ops + PNET_APP_API_REMOTE; rate limits; compose/live updated. |
 | 2026-07-21 | 3.2 payload size limits | Same MAX_APP_PAYLOAD on relay/app_packet/tunnel; docs + drop tests. |

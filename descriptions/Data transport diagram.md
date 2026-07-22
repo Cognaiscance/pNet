@@ -68,7 +68,7 @@ The same rule applies. All of a user's DGs keep their keep-alive with the user's
 
 ### Motivation
 
-In the standard routing model, every packet that passes through a relay SG is fully decrypted and then re-encrypted for the next leg of the journey. For a high-throughput use case — such as a file sync app streaming many packets between two DGs — this per-packet decrypt/re-encrypt cost at the SG adds up. A **lazy tunnel** allows the relay SG to forward packets without touching the encrypted payload, using a direct DG-to-DG shared secret negotiated automatically once traffic between a pair crosses a threshold.
+In the standard routing model, every packet that passes through a relay SG is fully decrypted and then re-encrypted for the next leg of the journey. For a high-throughput use case — such as a file sync app streaming many packets between two DGs — this per-packet decrypt/re-encrypt cost at the SG adds up. A **lazy tunnel** allows the relay SG to forward packets without touching the encrypted payload, using a direct DG-to-DG AEAD key (X25519 then HKDF with info `pnet-aead-v1-tunnel`) negotiated automatically once traffic between a pair crosses a threshold.
 
 ### Threshold and trigger
 
@@ -89,15 +89,15 @@ sequenceDiagram
     DG_s->>SG: TUNNEL_CONNECT_REQUEST (0x52) [tunnel_id, sender_ephem_pk]
     SG->>DG_d: TUNNEL_CONNECT_REQUEST (0x52) [tunnel_id, sender_ephem_pk, sender_device_uuid]
     DG_d->>SG: TUNNEL_CONNECT_ACK (0x53) [tunnel_id, dest_ephem_pk]
-    Note over DG_d: derives shared secret, records tunnel
+    Note over DG_d: records tunnel ephemerals (AEAD key via HKDF tunnel domain)
     SG->>DG_s: TUNNEL_CONNECT_ACK (0x53) [tunnel_id, dest_ephem_pk]
-    Note over DG_s: derives shared secret, records tunnel
+    Note over DG_s: records tunnel ephemerals (AEAD key via HKDF tunnel domain)
     Note over SG: promotes to ActiveTunnel
 ```
 
 ### Tunnel packet forwarding
 
-Once the tunnel is established, the sender DG encrypts directly for the destination DG using the negotiated shared secret and sends a tunnel forward packet to the relay SG. The SG forwards it without decryption.
+Once the tunnel is established, the sender DG encrypts directly for the destination DG using the tunnel-domain AEAD key and sends a tunnel forward packet to the relay SG. The SG forwards it without decryption.
 
 ```
 DG_sender → SG:  [0x51 TUNNEL_FORWARD][sender_conn_id: u16][tunnel_id: u16][nonce: 24][ciphertext]

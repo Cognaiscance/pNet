@@ -7,7 +7,7 @@ use std::net::{SocketAddr, SocketAddrV4};
 
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{
-    build_encrypted_packet, decrypt_packet_body, x25519_shared, xchacha20_encrypt,
+    aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body, xchacha20_encrypt,
 };
 use super::super::data_models::{Application, Uuid, generate_uuid};
 use super::super::wire::*;
@@ -477,11 +477,15 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             .filter(|(_, cid)| node.owner.active_connections.contains_key(cid));
 
         if let Some((tunnel_id, dg_dg_conn_id)) = tunnel_info {
-            // Encrypt with the DG-to-DG shared secret.
+            // Encrypt with the DG-to-DG tunnel AEAD key (HKDF tunnel domain).
             let Some(dg_dg_conn) = node.owner.active_connections.get(&dg_dg_conn_id) else {
                 unreachable!("filtered above");
             };
-            let shared = x25519_shared(&dg_dg_conn.key_pair.private_key, &dg_dg_conn.peer_public_key);
+            let aead_key = aead_key_from_dh(
+                &dg_dg_conn.key_pair.private_key,
+                &dg_dg_conn.peer_public_key,
+                aead_domain::TUNNEL,
+            );
 
             // Plaintext format: [dest_app_id: 16][sender_app_id: 16][payload]
             let mut plaintext = Vec::with_capacity(32 + payload.len());
@@ -489,7 +493,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             plaintext.extend_from_slice(&sender_app_id);
             plaintext.extend_from_slice(payload);
 
-            let (ciphertext, nonce) = xchacha20_encrypt(&shared, &plaintext);
+            let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &plaintext);
 
             // Route the tunnel forward packet via the relay SG.
             let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid)

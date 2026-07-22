@@ -121,7 +121,7 @@ Sent by the new device to the SG whose address was in the invitation code.
 ```
 Total: 49 bytes.
 
-The new device generates a one-time ephemeral key pair for this exchange. The SG uses the invitation's private key and this public key to derive a shared secret (X25519).
+The new device generates a one-time ephemeral key pair for this exchange. The SG uses the invitation's private key and this public key to derive an X25519 shared secret, then an AEAD key via **HKDF-SHA256** with info label `pnet-aead-v1-bootstrap` (same for contact-invitation handshakes).
 
 ### BootstrapResponse — op `0x31`
 
@@ -145,7 +145,7 @@ The encrypted payload contains the full user data needed to configure the new de
 
 After sending the response the SG removes the invitation — it is single-use.
 
-The new device derives the same shared secret (X25519 using its ephemeral private key and the invitation's public key from the code) and decrypts the payload.
+The new device derives the same AEAD key (X25519 of its ephemeral private key and the invitation's public key from the code, then HKDF bootstrap domain) and decrypts the payload.
 
 ### DeviceRegistration — op `0x32`
 
@@ -156,7 +156,7 @@ Sent by the new device to the SG after successfully decrypting the bootstrap pay
 │ Field                        │ Bytes │
 ├──────────────────────────────┼───────┤
 │ Operation type (0x32)        │ 1     │
-│ Nonce                        │ 24    │   same shared secret as above
+│ Nonce                        │ 24    │   same bootstrap AEAD key as above
 │ Encrypted payload            │ var   │
 └──────────────────────────────┴───────┘
 ```
@@ -167,7 +167,7 @@ Encrypted payload:
 - Device grade (SG or DG)
 - Device host (IP + port)
 
-The SG decrypts using the same shared secret, adds the new device to `owner.user.devices`, and the new device is now a full participant. Future changes are propagated via the device-sync system (not yet defined).
+The SG decrypts using the same bootstrap AEAD key, adds the new device to `owner.user.devices`, and the new device is now a full participant. Future changes are propagated via the device-sync system (not yet defined).
 
 ### GenerateInvitationRequest / Response — ops `0x35` / `0x36`
 

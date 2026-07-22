@@ -13,7 +13,8 @@ use super::super::crypto::{
     generate_x25519_keypair,
 };
 use super::super::data_models::{
-    ActiveConnection, Device, DeviceGrade, Node, PendingConnection, PublicKey, SgStatus, Uuid,
+    ActiveConnection, Device, DeviceGrade, Ed25519PublicKey, Node, PendingConnection, SgStatus,
+    Uuid, X25519PublicKey,
     generate_uuid, CONNECTION_LIFETIME, PENDING_CONNECTION_TIMEOUT, RENEW_THRESHOLD,
 };
 use super::super::wire::*;
@@ -25,7 +26,7 @@ use super::{
 /// Find the device UUID for an incoming connection request, given the peer's
 /// long-term public key and claimed device UUID.  Returns `Some(uuid)` if both
 /// the key and the UUID are known (own devices or a contact's devices).
-fn find_device_uuid_for_pk(node: &Node, longterm_pk: &PublicKey, device_uuid: &Uuid) -> Option<Uuid> {
+fn find_device_uuid_for_pk(node: &Node, longterm_pk: &Ed25519PublicKey, device_uuid: &Uuid) -> Option<Uuid> {
     // Own devices share the owner's long-term public key.
     if node.owner.key_pair.public_key == *longterm_pk {
         if node.owner.user.devices.iter().any(|d| d.uuid == *device_uuid) {
@@ -71,8 +72,8 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     let initiator_conn_id                   = u16::from_be_bytes([buf[0], buf[1]]);
     let initiator_device_uuid: Uuid         = buf[2..18].try_into().unwrap();
-    let initiator_ephemeral_pk: PublicKey   = buf[18..50].try_into().unwrap();
-    let initiator_longterm_pk: PublicKey    = buf[50..82].try_into().unwrap();
+    let initiator_ephemeral_pk = X25519PublicKey(buf[18..50].try_into().unwrap());
+    let initiator_longterm_pk = Ed25519PublicKey(buf[50..82].try_into().unwrap());
     let signature: [u8; 64]                 = buf[82..146].try_into().unwrap();
 
     // Verify Ed25519 signature over [op=0x20] || buf[0..82].
@@ -121,7 +122,7 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     pkt[0]       = CONNECT_ACK_OP;
     pkt[1..3].copy_from_slice(&our_conn_id.to_be_bytes());
     pkt[3..5].copy_from_slice(&initiator_conn_id.to_be_bytes());
-    pkt[5..37].copy_from_slice(&our_ephemeral_pk);
+    pkt[5..37].copy_from_slice(our_ephemeral_pk.as_bytes());
     let sig = ed25519_sign(&our_longterm_sk, &pkt[0..37]);
     pkt[37..101].copy_from_slice(&sig);
     send(ctx, src, &pkt);
@@ -153,7 +154,7 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     let responder_conn_id               = u16::from_be_bytes([buf[0], buf[1]]);
     let our_conn_id                     = u16::from_be_bytes([buf[2], buf[3]]);
-    let responder_ephemeral_pk: PublicKey = buf[4..36].try_into().unwrap();
+    let responder_ephemeral_pk = X25519PublicKey(buf[4..36].try_into().unwrap());
     let signature: [u8; 64]             = buf[36..100].try_into().unwrap();
 
     let mut node = ctx.node.write().unwrap();
@@ -354,7 +355,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
         // Skip peers with no resolvable address — happy eyeballs data, if present,
         // picks the lowest-RTT up address; otherwise we fall back to the first
         // resolvable entry in the peer's host list.
-        let mut desired: Vec<(Uuid, SocketAddrV4, PublicKey)> = Vec::new();
+        let mut desired: Vec<(Uuid, SocketAddrV4, Ed25519PublicKey)> = Vec::new();
         for d in &node.owner.user.devices {
             if d.uuid == our_device_uuid { continue; }
             if want_initiate(d) {
@@ -386,7 +387,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
             .map(|p| p.peer_device_uuid)
             .collect();
 
-        let need_conn: Vec<(Uuid, SocketAddrV4, PublicKey)> = desired.into_iter()
+        let need_conn: Vec<(Uuid, SocketAddrV4, Ed25519PublicKey)> = desired.into_iter()
             .filter(|(uuid, _, _)| !healthy.contains(uuid) && !pending.contains(uuid))
             .collect();
 
@@ -396,7 +397,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
     // ── For each peer that needs a connection, allocate state and send ────────
     let mut issued: u32 = 0;
     for (peer_uuid, peer_host, peer_longterm_pk) in need_conn {
-        let result: Option<(u16, PublicKey)> = {
+        let result: Option<(u16, X25519PublicKey)> = {
             let mut node = ctx.node.write().unwrap();
 
             // Re-check under write lock to avoid TOCTOU if this action fires twice.
@@ -432,8 +433,8 @@ pub fn maintain_connections(ctx: &WorkerContext) {
         pkt[0]        = CONNECT_REQUEST_OP;
         pkt[1..3].copy_from_slice(&conn_id.to_be_bytes());
         pkt[3..19].copy_from_slice(&our_device_uuid);
-        pkt[19..51].copy_from_slice(&our_ephemeral_pk);
-        pkt[51..83].copy_from_slice(&our_longterm_pk);
+        pkt[19..51].copy_from_slice(our_ephemeral_pk.as_bytes());
+        pkt[51..83].copy_from_slice(our_longterm_pk.as_bytes());
         let sig = ed25519_sign(&our_longterm_sk, &pkt[0..83]);
         pkt[83..147].copy_from_slice(&sig);
 

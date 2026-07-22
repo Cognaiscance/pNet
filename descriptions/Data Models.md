@@ -80,20 +80,25 @@ description: data required to handle communication with apps through the app api
 * token
 	* a UUID used to identify the application on subsequent local app-API requests
 
-# KeyPair
-description: a pair of Curve25519 encryption keys; Ed25519 for signing, X25519 for key exchange
-* public_key
-	* 32-byte Ed25519/X25519 public key
-* private_key
-	* 32-byte Ed25519/X25519 private key
+# Ed25519KeyPair / Ed25519PublicKey / Ed25519SecretKey
+description: long-term **identity** keys (Ed25519). Used for ConnectRequest/ConnectAck signatures and contact cards. Never used for Diffie–Hellman.
+* public_key — 32-byte Ed25519 verifying key
+* private_key — 32-byte Ed25519 seed / signing key
+
+# X25519KeyPair / X25519PublicKey / X25519SecretKey
+description: **ephemeral / invitation** keys (X25519). Used only for DH (sessions, bootstrap/contact invitations, tunnels). Never used for Ed25519 sign/verify.
+* public_key — 32-byte X25519 public key
+* private_key — 32-byte X25519 secret scalar
+
+These are distinct Rust types so identity and DH material cannot be mixed at compile time. On disk and on the wire they remain 32-byte fields (hex in TOML).
 
 # ActiveConnection
 description: represents an active encrypted session with a peer device. Stored in a HashMap<u16, ActiveConnection> on Owner. Incoming packets include the receiver's id in the header, enabling O(1) key lookup for decryption without sending a full UUID.
 * id: u16
 	* local identifier; also the HashMap key
 * timeout
-* key_pair (ephemeral)
-* peer_public_key (ephemeral)
+* key_pair — local X25519 ephemeral (`X25519KeyPair`)
+* peer_public_key — peer's X25519 ephemeral (`X25519PublicKey`)
 * peer_active_connection_id: u16
 	* the id the peer uses on their end; included in outbound packet headers
 * device_uuid

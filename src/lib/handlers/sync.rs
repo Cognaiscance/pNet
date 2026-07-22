@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
 use super::super::data_models::{
-    Application, Contact, Device, DeviceGrade, Node, Owner, PublicKey, Scope, SyncVersion,
+    Application, Contact, Device, DeviceGrade, Ed25519PublicKey, Node, Owner, Scope, SyncVersion,
     User, Uuid, WriteLogEntry, WRITE_LOG_RETENTION,
 };
 use super::super::wire::*;
@@ -169,7 +169,7 @@ pub enum Change {
     UpsertContact {
         uuid:       Uuid,
         alias:      String,
-        public_key: PublicKey,
+        public_key: Ed25519PublicKey,
         devices:    Vec<ContactDeviceCard>,
     },
 }
@@ -227,7 +227,7 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
             buf.push(CHANGE_KIND_UPSERT_CONTACT);
             buf.extend_from_slice(uuid);
             push_str(&mut buf, alias);
-            buf.extend_from_slice(public_key);
+            buf.extend_from_slice(public_key.as_bytes());
             buf.push(devices.len().min(u8::MAX as usize) as u8);
             for card in devices.iter().take(u8::MAX as usize) {
                 // Reuse push_device's layout via a temp Device (apps follow).
@@ -286,7 +286,7 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
         CHANGE_KIND_UPSERT_CONTACT => {
             let uuid:       Uuid      = read_arr(data, &mut pos)?;
             let alias                 = read_str(data, &mut pos)?;
-            let public_key: PublicKey = read_arr(data, &mut pos)?;
+            let public_key = Ed25519PublicKey(read_arr(data, &mut pos)?);
             let dev_count = *data.get(pos)? as usize; pos += 1;
             let mut devices = Vec::with_capacity(dev_count);
             for _ in 0..dev_count {
@@ -962,7 +962,7 @@ pub(crate) fn serialize_public_state(node: &Node) -> Vec<u8> {
     for contact in node.owner.contact_users.iter().take(u8::MAX as usize) {
         push_str(&mut buf, &contact.user.alias);
         buf.extend_from_slice(&contact.user.uuid);
-        buf.extend_from_slice(&contact.public_key);
+        buf.extend_from_slice(contact.public_key.as_bytes());
         buf.push(contact.user.devices.len().min(u8::MAX as usize) as u8);
         for d in contact.user.devices.iter().take(u8::MAX as usize) {
             push_device(&mut buf, d);
@@ -1033,14 +1033,15 @@ pub(crate) fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
     struct ParsedContact {
         alias:      String,
         uuid:       Uuid,
-        public_key: PublicKey,
+        public_key: Ed25519PublicKey,
         devices:    Vec<ParsedDevice>,
     }
     let mut contacts: Vec<ParsedContact> = Vec::with_capacity(contact_count as usize);
     for _ in 0..contact_count {
         let Some(alias)      = read_str(state, &mut pos) else { return false; };
         let Some(uuid)       = read_arr::<16>(state, &mut pos) else { return false; };
-        let Some(public_key) = read_arr::<32>(state, &mut pos) else { return false; };
+        let Some(pk_bytes) = read_arr::<32>(state, &mut pos) else { return false; };
+        let public_key = Ed25519PublicKey(pk_bytes);
         let Some(&dc) = state.get(pos) else { return false; };
         pos += 1;
         let mut devs = Vec::with_capacity(dc as usize);
@@ -2464,7 +2465,7 @@ struct MergedState {
 /// entry that set it.
 struct MergedContact {
     alias:      String,
-    public_key: PublicKey,
+    public_key: Ed25519PublicKey,
     devices:    Vec<ContactDeviceCard>,
     priority:   EntryPriority,
 }

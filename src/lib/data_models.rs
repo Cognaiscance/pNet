@@ -7,11 +7,147 @@ pub const TUNNEL_COUNTER_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 use serde::{Deserialize, Serialize};
 
-// Curve25519 keys (32 bytes), compatible with NaCl/libsodium (rbnacl on the Rails side).
-// Use X25519 for key exchange (EphemeralKeyExchange) and Ed25519 for signing (KeyPair).
-pub type PublicKey  = [u8; 32];
-pub type PrivateKey = [u8; 32];
-pub type Uuid       = [u8; 16];
+pub type Uuid = [u8; 16];
+
+// ── Distinct key types (Ed25519 identity vs X25519 DH) ────────────────────────
+//
+// Both are 32-byte Curve25519-family keys on the wire/disk, but they must not be
+// mixed at the type level: long-term identity keys are Ed25519 (sign/verify);
+// session, invitation, and tunnel ephemerals are X25519 (DH only).
+
+/// Long-term identity public key (Ed25519 verifying key).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Ed25519PublicKey(pub [u8; 32]);
+
+/// Long-term identity secret key (Ed25519 seed / signing key).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Ed25519SecretKey(pub [u8; 32]);
+
+/// X25519 Diffie–Hellman public key (ephemeral / invitation).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct X25519PublicKey(pub [u8; 32]);
+
+/// X25519 Diffie–Hellman secret key (ephemeral / invitation).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct X25519SecretKey(pub [u8; 32]);
+
+impl Ed25519PublicKey {
+    pub const ZERO: Self = Self([0u8; 32]);
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+impl AsRef<[u8]> for Ed25519PublicKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Ed25519SecretKey {
+    pub const ZERO: Self = Self([0u8; 32]);
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+impl AsRef<[u8]> for Ed25519SecretKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl X25519PublicKey {
+    pub const ZERO: Self = Self([0u8; 32]);
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+impl AsRef<[u8]> for X25519PublicKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl X25519SecretKey {
+    pub const ZERO: Self = Self([0u8; 32]);
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+impl AsRef<[u8]> for X25519SecretKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for Ed25519PublicKey {
+    fn from(b: [u8; 32]) -> Self {
+        Self(b)
+    }
+}
+impl From<[u8; 32]> for Ed25519SecretKey {
+    fn from(b: [u8; 32]) -> Self {
+        Self(b)
+    }
+}
+impl From<[u8; 32]> for X25519PublicKey {
+    fn from(b: [u8; 32]) -> Self {
+        Self(b)
+    }
+}
+impl From<[u8; 32]> for X25519SecretKey {
+    fn from(b: [u8; 32]) -> Self {
+        Self(b)
+    }
+}
+
+macro_rules! impl_key_serde {
+    ($t:ty) => {
+        impl Serialize for $t {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                serde_bytes_32::serialize(&self.0, s)
+            }
+        }
+        impl<'de> Deserialize<'de> for $t {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                serde_bytes_32::deserialize(d).map(Self)
+            }
+        }
+    };
+}
+impl_key_serde!(Ed25519PublicKey);
+impl_key_serde!(Ed25519SecretKey);
+impl_key_serde!(X25519PublicKey);
+impl_key_serde!(X25519SecretKey);
+
+/// Long-term user identity key pair (Ed25519). Used for Connect signatures and
+/// contact cards. Never used for X25519 DH.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct Ed25519KeyPair {
+    pub public_key:  Ed25519PublicKey,
+    pub private_key: Ed25519SecretKey,
+}
+
+impl Ed25519KeyPair {
+    pub const ZERO: Self = Self {
+        public_key:  Ed25519PublicKey::ZERO,
+        private_key: Ed25519SecretKey::ZERO,
+    };
+}
+
+/// X25519 key pair for DH (sessions, invitations, tunnels). Never used for
+/// Ed25519 sign/verify.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct X25519KeyPair {
+    pub public_key:  X25519PublicKey,
+    pub private_key: X25519SecretKey,
+}
+
+impl X25519KeyPair {
+    pub const ZERO: Self = Self {
+        public_key:  X25519PublicKey::ZERO,
+        private_key: X25519SecretKey::ZERO,
+    };
+}
 
 /// Active connections are renewed when less than this much time remains.
 /// Must exceed MAINTAIN_CONNECTIONS_INTERVAL so a connection never lapses between checks.
@@ -252,19 +388,13 @@ pub struct WriteLogEntry {
 pub const WRITE_LOG_RETENTION: std::time::Duration =
     std::time::Duration::from_secs(30 * 24 * 3600);
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct KeyPair {
-    #[serde(with = "serde_bytes_32")]
-    pub public_key:  PublicKey,
-    #[serde(with = "serde_bytes_32")]
-    pub private_key: PrivateKey,
-}
-
 pub struct ActiveConnection {
     pub id:                        u16,
     pub timeout:                   SystemTime,
-    pub key_pair:                  KeyPair,
-    pub peer_public_key:           PublicKey,
+    /// Local X25519 ephemeral for this session.
+    pub key_pair:                  X25519KeyPair,
+    /// Peer's X25519 ephemeral public key.
+    pub peer_public_key:           X25519PublicKey,
     pub peer_active_connection_id: u16,
     pub device_uuid:               Uuid,
     /// The actual source address of the peer's last connection packet.
@@ -277,10 +407,10 @@ pub struct ActiveConnection {
 /// Keyed by our local connection ID in `Owner::pending_connections`.
 pub struct PendingConnection {
     pub our_conn_id:      u16,
-    pub our_key_pair:     KeyPair,
+    pub our_key_pair:     X25519KeyPair,
     pub peer_device_uuid: Uuid,
-    /// Long-term public key of the peer's user — used to verify the ConnectAck signature.
-    pub peer_longterm_pk: PublicKey,
+    /// Long-term Ed25519 public key of the peer's user — used to verify the ConnectAck signature.
+    pub peer_longterm_pk: Ed25519PublicKey,
     /// When this PendingConnection was created. Used by `maintain_connections`
     /// to evict entries whose ConnectAck never arrived.
     pub created_at:       SystemTime,
@@ -339,7 +469,8 @@ pub struct User {
 pub struct Invitation {
     #[serde(with = "serde_bytes_16")]
     pub id:         Uuid,
-    pub key_pair:   KeyPair,
+    /// One-time X25519 pair for the invitation DH (not an identity key).
+    pub key_pair:   X25519KeyPair,
     #[serde(with = "serde_system_time")]
     pub expires_at: SystemTime,
 }
@@ -347,10 +478,9 @@ pub struct Invitation {
 /// State held by a node while waiting for a ContactResponse from the target's SG.
 pub struct PendingContactExchange {
     /// Our one-time X25519 ephemeral key pair for this exchange.
-    pub our_ephem_key_pair: KeyPair,
-    /// The invitation's public key (from the code) — combined with our ephemeral
-    /// private key to derive the shared secret.
-    pub invitation_pk:      PublicKey,
+    pub our_ephem_key_pair: X25519KeyPair,
+    /// The invitation's X25519 public key (from the code).
+    pub invitation_pk:      X25519PublicKey,
     /// Where the ContactResponse will come from.
     pub sg_addr:            SocketAddrV4,
 }
@@ -361,10 +491,9 @@ pub struct PendingBootstrap {
     /// can look up the shared secret.
     pub invitation_id:      Uuid,
     /// Our one-time X25519 ephemeral key pair for this exchange.
-    pub our_ephem_key_pair: KeyPair,
-    /// The invitation's public key (from the code) — combined with our ephemeral
-    /// private key to derive the shared secret.
-    pub invitation_pk:      PublicKey,
+    pub our_ephem_key_pair: X25519KeyPair,
+    /// The invitation's X25519 public key (from the code).
+    pub invitation_pk:      X25519PublicKey,
     /// Where to send DeviceRegistration once the response is received.
     pub sg_addr:            SocketAddrV4,
     /// Device alias entered by the user during setup — applied once bootstrap completes.
@@ -378,7 +507,8 @@ pub struct PendingBootstrap {
 /// State held by an SG after sending a BootstrapResponse, while waiting for
 /// the new device to send a DeviceRegistration.  Keyed by invitation ID.
 pub struct PendingDeviceAcceptance {
-    /// X25519 shared secret derived during the bootstrap exchange.
+    /// Bootstrap AEAD key (`aead_domain::BOOTSTRAP` over the X25519 DH output),
+    /// not the raw shared secret. Used to decrypt DeviceRegistration.
     pub shared_secret: [u8; 32],
     pub expires_at:    SystemTime,
 }
@@ -388,7 +518,8 @@ pub struct PendingDeviceAcceptance {
 pub struct Owner {
     pub user:                User,
     pub contact_users:       Vec<Contact>,
-    pub key_pair:            KeyPair,
+    /// Long-term Ed25519 identity for this user (sign Connect*, contact card).
+    pub key_pair:            Ed25519KeyPair,
     pub contact_invitations: Vec<Invitation>,
     pub device_invitations:  Vec<Invitation>,
 
@@ -456,12 +587,12 @@ pub struct Owner {
     pub pending_tunnel_connections: HashMap<u16, PendingTunnelConnection>,
 }
 
-/// A known contact. Extends User with an active ephemeral key exchange.
+/// A known contact. Extends User with their long-term Ed25519 identity.
 #[derive(Serialize, Deserialize)]
 pub struct Contact {
     pub user:       User,
-    #[serde(with = "serde_bytes_32")]
-    pub public_key: PublicKey,
+    /// Contact's long-term Ed25519 public key (identity verification).
+    pub public_key: Ed25519PublicKey,
     /// Highest public-scope version we have applied for this contact via
     /// cross-user sync v1. Used as the `last_seen` baseline on outbound
     /// CrossUserPullRequest so the reply is `NoUpdates` when caught up.
@@ -484,7 +615,7 @@ pub struct PendingTunnel {
     pub tunnel_id:          u16,
     pub sender_device_uuid: Uuid,
     pub dest_device_uuid:   Uuid,
-    pub sender_ephem_pk:    Option<PublicKey>,
+    pub sender_ephem_pk:    Option<X25519PublicKey>,
 }
 
 /// SG side: rolling packet count between a (sender, dest) DG pair.
@@ -499,7 +630,7 @@ pub struct TunnelCounter {
 pub struct PendingTunnelConnection {
     pub tunnel_id:        u16,
     pub our_conn_id:      u16,
-    pub our_key_pair:     KeyPair,
+    pub our_key_pair:     X25519KeyPair,
     pub dest_device_uuid: Uuid,
 }
 
@@ -553,7 +684,7 @@ impl Node {
     /// Used on first run before the user has completed setup.
     /// Returns true once the node has completed first-run setup (keys are non-zero).
     pub fn is_initialized(&self) -> bool {
-        self.owner.key_pair.public_key != [0u8; 32]
+        self.owner.key_pair.public_key != Ed25519PublicKey::ZERO
     }
 
     pub fn new() -> Self {
@@ -580,7 +711,7 @@ impl Node {
                     devices: vec![device],
                 },
                 contact_users:       Vec::new(),
-                key_pair:            KeyPair { public_key: [0; 32], private_key: [0; 32] }, // TODO: generate real Curve25519 keys
+                key_pair:            Ed25519KeyPair::ZERO,
                 contact_invitations:        Vec::new(),
                 device_invitations:         Vec::new(),
                 private_version:            SyncVersion::zero(),
