@@ -6249,4 +6249,322 @@ mod tests {
         assert!(matches!(&out.changes_to_apply[0],
             Change::AddApplication { app_alias, .. } if app_alias == "new-app"));
     }
+
+    // ── Phase 9 — in-process fabric + goldens ─────────────────────────────────
+
+    /// Drain any pending datagrams on a fabric socket (cross-user pull noise, etc.).
+    fn drain_udp(sock: &UdpSocket) {
+        let mut buf = [0u8; 2048];
+        while sock.recv_from(&mut buf).is_ok() {}
+    }
+
+    /// §9.1 — Two-node loopback: real connect handshake → AppPacket → APP_PUSH.
+    ///
+    /// No Docker/stage harness: two `TestCtx` nodes pipe UDP by reading each
+    /// other's `udp_socket`. Stage/live remain the place for NAT + partition.
+    #[test]
+    fn two_node_loopback_connect_app_packet_local_push() {
+        let a = TestCtx::new();
+        let b = TestCtx::new();
+        a.ctx
+            .udp_socket
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        b.ctx
+            .udp_socket
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        let a_pnet = a.ctx.udp_socket.local_addr().unwrap();
+        let b_pnet = b.ctx.udp_socket.local_addr().unwrap();
+
+        let a_kp = generate_ed25519_keypair();
+        let b_kp = generate_ed25519_keypair();
+        let (a_uuid, a_user) = {
+            let mut n = a.ctx.node.write().unwrap();
+            n.owner.key_pair = a_kp.clone();
+            n.owner.user.alias = "alice".into();
+            (n.device_uuid, n.owner.user.uuid)
+        };
+        let (b_uuid, b_user) = {
+            let mut n = b.ctx.node.write().unwrap();
+            n.owner.key_pair = b_kp.clone();
+            n.owner.user.alias = "bob".into();
+            (n.device_uuid, n.owner.user.uuid)
+        };
+
+        // Mutual contact entries so ConnectRequest signature/device checks pass.
+        {
+            let mut n = a.ctx.node.write().unwrap();
+            n.owner.contact_users.push(Contact {
+                public_key: b_kp.public_key,
+                user: User {
+                    alias: "bob".into(),
+                    uuid: b_user,
+                    devices: vec![Device {
+                        alias: "bob-dev".into(),
+                        uuid: b_uuid,
+                        grade: DeviceGrade::DG,
+                        sg_rank: None,
+                        hosts: vec![b_pnet.to_string()],
+                        applications: Vec::new(),
+                    }],
+                },
+                last_seen_public_version: SyncVersion::default(),
+            });
+        }
+        {
+            let mut n = b.ctx.node.write().unwrap();
+            n.owner.contact_users.push(Contact {
+                public_key: a_kp.public_key,
+                user: User {
+                    alias: "alice".into(),
+                    uuid: a_user,
+                    devices: vec![Device {
+                        alias: "alice-dev".into(),
+                        uuid: a_uuid,
+                        grade: DeviceGrade::DG,
+                        sg_rank: None,
+                        hosts: vec![a_pnet.to_string()],
+                        applications: Vec::new(),
+                    }],
+                },
+                last_seen_public_version: SyncVersion::default(),
+            });
+        }
+
+        // A initiates: pending + ConnectRequest → B.
+        let our_conn_id = 1u16;
+        let eph = generate_x25519_keypair();
+        {
+            let mut n = a.ctx.node.write().unwrap();
+            n.owner.pending_connections.insert(
+                our_conn_id,
+                PendingConnection {
+                    our_conn_id,
+                    our_key_pair: eph.clone(),
+                    peer_device_uuid: b_uuid,
+                    peer_longterm_pk: b_kp.public_key,
+                    created_at: SystemTime::now(),
+                },
+            );
+        }
+        let req = connect_request_buf(
+            our_conn_id,
+            &a_uuid,
+            &eph.public_key,
+            &a_kp.public_key,
+            &a_kp.private_key,
+            false,
+        );
+        // B stores peer_addr = a_pnet; ack is UDP'd to a_pnet.
+        connect_request(a_pnet, req, &b.ctx);
+
+        let mut buf = [0u8; 2048];
+        let (len, _from) = a
+            .ctx
+            .udp_socket
+            .recv_from(&mut buf)
+            .expect("ConnectAck should arrive on initiator fabric socket");
+        assert_eq!(buf[0], CONNECT_ACK_OP, "first fabric reply must be ConnectAck");
+        // A stores peer_addr = b_pnet for later AppPacket send.
+        connect_ack(b_pnet, buf[1..len].to_vec(), &a.ctx);
+
+        // connect_ack may emit CrossUserPullRequest to B — drain it.
+        drain_udp(&b.ctx.udp_socket);
+        drain_udp(&a.ctx.udp_socket);
+
+        assert_eq!(
+            a.ctx.node.read().unwrap().owner.active_connections.len(),
+            1,
+            "initiator must have active session"
+        );
+        assert_eq!(
+            b.ctx.node.read().unwrap().owner.active_connections.len(),
+            1,
+            "responder must have active session"
+        );
+
+        // Approved apps on both sides; B's host is its app_socket (push target).
+        let a_token = register_and_get_token(&a, "a-app", a.app_addr().port());
+        approve_local_app(&a, &a_token);
+        let b_token = register_and_get_token(&b, "b-app", b.app_addr().port());
+        approve_local_app(&b, &b_token);
+
+        let (a_app_id, b_app_id) = {
+            let a_node = a.ctx.node.read().unwrap();
+            let b_node = b.ctx.node.read().unwrap();
+            let a_app = a_node
+                .owner
+                .user
+                .devices
+                .iter()
+                .find(|d| d.uuid == a_uuid)
+                .unwrap()
+                .applications
+                .iter()
+                .find(|ap| ap.token == a_token)
+                .unwrap()
+                .id;
+            let b_app = b_node
+                .owner
+                .user
+                .devices
+                .iter()
+                .find(|d| d.uuid == b_uuid)
+                .unwrap()
+                .applications
+                .iter()
+                .find(|ap| ap.token == b_token)
+                .unwrap()
+                .id;
+            (a_app, b_app)
+        };
+
+        // Direct path: session to dest → AppPacket on fabric → app_packet → APP_PUSH.
+        app_send_packet(
+            a.app_addr(),
+            send_packet(&a_token, b_uuid, b_app_id, b"hello-fabric"),
+            &a.ctx,
+        );
+        let (n, _) = b
+            .ctx
+            .udp_socket
+            .recv_from(&mut buf)
+            .expect("AppPacket should land on dest fabric socket");
+        assert_eq!(buf[0], APP_PACKET_OP, "direct path uses AppPacket (0x41)");
+        app_packet(a_pnet, buf[1..n].to_vec(), &b.ctx);
+
+        let push = b.recv_reply();
+        assert_eq!(push[0], APP_PUSH_OP);
+        assert_eq!(&push[1..17], &a_app_id);
+        assert_eq!(&push[17..], b"hello-fabric");
+    }
+
+    /// §9.2 — Golden encode for `app_get_data` tree with 16-byte UUID app ids.
+    #[test]
+    fn app_get_data_tree_golden_uuid_app_ids() {
+        let t = TestCtx::new();
+        let fixed_token: [u8; 16] = [0xAA; 16];
+        let fixed_app_id: Uuid = [0xBB; 16];
+        let fixed_device: Uuid = [0xCC; 16];
+        let fixed_user: Uuid = [0xDD; 16];
+        let fixed_contact: Uuid = [0xEE; 16];
+        let fixed_contact_dev: Uuid = [0x01; 16];
+        let fixed_contact_app: Uuid = [0x02; 16];
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.device_uuid = fixed_device;
+            node.owner.user.alias = "Owner".into();
+            node.owner.user.uuid = fixed_user;
+            node.owner.user.devices = vec![Device {
+                alias: "This Device".into(),
+                uuid: fixed_device,
+                grade: DeviceGrade::DG,
+                sg_rank: None,
+                hosts: vec![],
+                applications: vec![Application {
+                    id: fixed_app_id,
+                    alias: "probe".into(),
+                    protocol: "udp".into(),
+                    host: "127.0.0.1:9001".parse().unwrap(),
+                    user_approved: true,
+                    token: fixed_token,
+                }],
+            }];
+            node.owner.contact_users = vec![Contact {
+                public_key: Ed25519PublicKey([0x55; 32]),
+                user: User {
+                    alias: "friend".into(),
+                    uuid: fixed_contact,
+                    devices: vec![Device {
+                        alias: "friend-phone".into(),
+                        uuid: fixed_contact_dev,
+                        grade: DeviceGrade::DG,
+                        sg_rank: None,
+                        hosts: vec!["10.0.0.2:7777".into()],
+                        applications: vec![
+                            Application {
+                                id: fixed_contact_app,
+                                alias: "chat".into(),
+                                protocol: "udp".into(),
+                                host: "10.0.0.2:9000".parse().unwrap(),
+                                user_approved: true,
+                                token: [0xFF; 16], // must NOT appear in reply
+                            },
+                            Application {
+                                id: [0x03; 16],
+                                alias: "secret".into(),
+                                protocol: "udp".into(),
+                                host: "10.0.0.2:9001".parse().unwrap(),
+                                user_approved: false, // filtered out
+                                token: [0x00; 16],
+                            },
+                        ],
+                    }],
+                },
+                last_seen_public_version: SyncVersion::default(),
+            }];
+        }
+
+        app_get_data(t.app_addr(), fixed_token.to_vec(), &t.ctx);
+        let reply = t.recv_reply();
+        assert_eq!(reply[0], OK);
+
+        // Hand-built golden (same layout as app_get_data).
+        let mut exp = vec![OK];
+        exp.extend_from_slice(&fixed_app_id);
+        push_str(&mut exp, "probe");
+        exp.extend_from_slice(&[127, 0, 0, 1]);
+        exp.extend_from_slice(&9001u16.to_be_bytes());
+        exp.push(1); // approved
+        exp.extend_from_slice(&fixed_token);
+        exp.extend_from_slice(&fixed_device);
+        push_str(&mut exp, "Owner");
+        exp.extend_from_slice(&fixed_user);
+        exp.push(1); // one own device
+        push_device(&mut exp, &Device {
+            alias: "This Device".into(),
+            uuid: fixed_device,
+            grade: DeviceGrade::DG,
+            sg_rank: None,
+            hosts: vec![],
+            applications: Vec::new(),
+        });
+        exp.push(1); // one app on own device
+        exp.extend_from_slice(&fixed_app_id);
+        push_str(&mut exp, "probe");
+        exp.extend_from_slice(&[127, 0, 0, 1]);
+        exp.extend_from_slice(&9001u16.to_be_bytes());
+        exp.push(1);
+        exp.push(1); // one contact
+        push_str(&mut exp, "friend");
+        exp.extend_from_slice(&fixed_contact);
+        exp.push(1); // one contact device
+        push_device(&mut exp, &Device {
+            alias: "friend-phone".into(),
+            uuid: fixed_contact_dev,
+            grade: DeviceGrade::DG,
+            sg_rank: None,
+            hosts: vec!["10.0.0.2:7777".into()],
+            applications: Vec::new(),
+        });
+        exp.push(1); // only approved contact apps
+        exp.extend_from_slice(&fixed_contact_app);
+        push_str(&mut exp, "chat");
+
+        assert_eq!(
+            reply, exp,
+            "app_get_data golden mismatch\n got={reply:02x?}\n exp={exp:02x?}"
+        );
+        // Contact app tokens and unapproved apps must not appear.
+        assert!(
+            !reply.windows(16).any(|w| w == [0xFFu8; 16]),
+            "foreign app tokens must not leak"
+        );
+        assert!(
+            !reply.windows(5).any(|w| w == b"secret"),
+            "unapproved contact apps must not appear"
+        );
+    }
 }

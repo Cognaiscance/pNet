@@ -28,7 +28,14 @@ use super::{
 /// How long the SG keeps a PendingDeviceAcceptance waiting for DeviceRegistration.
 const PENDING_ACCEPTANCE_TTL: Duration = Duration::from_secs(5 * 60);
 
-fn serialize_bootstrap_payload(node: &Node) -> Vec<u8> {
+/// Serialize owner bootstrap payload (user + keys + devices + contacts).
+///
+/// Layout (plaintext before AEAD wrap in BootstrapResponse):
+///   `[alias:lp][user_uuid:16][ed25519_pk:32][ed25519_sk:32]
+///    [device_count:u8][device…][contact_count:u8][contact…]`
+/// Device card: `push_device`. Contact: `[uuid:16][alias:lp][pk:32][dev_count][device…]`.
+/// Exported for golden-vector tests (§9.2).
+pub(crate) fn serialize_bootstrap_payload(node: &Node) -> Vec<u8> {
     let mut buf = Vec::new();
     let owner = &node.owner;
     let user  = &owner.user;
@@ -57,6 +64,7 @@ struct BootstrapPayload {
     contacts:   Vec<Contact>,
 }
 
+/// Inverse of [`serialize_bootstrap_payload`].
 fn deserialize_bootstrap_payload(data: &[u8]) -> Option<BootstrapPayload> {
     let mut pos = 0usize;
     let user_alias  = read_str(data, &mut pos)?;
@@ -993,5 +1001,153 @@ pub(crate) fn initiate_contact_exchange(body: &[u8], ctx: &WorkerContext) {
     pkt.extend_from_slice(&nonce);
     pkt.extend_from_slice(&ciphertext);
     send(ctx, SocketAddr::V4(sg_addr), &pkt);
+}
+
+// ── Golden vectors (§9.2) ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    /// Deterministic Ed25519 key pair from a fixed seed (not CSPRNG).
+    fn keypair_from_seed(seed: [u8; 32]) -> Ed25519KeyPair {
+        let signing = SigningKey::from_bytes(&seed);
+        Ed25519KeyPair {
+            private_key: Ed25519SecretKey(seed),
+            public_key: Ed25519PublicKey(*signing.verifying_key().as_bytes()),
+        }
+    }
+
+    /// Minimal fixed fixture for bootstrap encode/decode goldens.
+    fn fixture_node() -> Node {
+        let mut n = Node::new();
+        n.owner.user.alias = "alice".into();
+        n.owner.user.uuid = [0x11; 16];
+        n.device_uuid = [0x22; 16];
+        n.owner.key_pair = keypair_from_seed([0x07; 32]);
+        n.owner.user.devices = vec![Device {
+            alias: "phone".into(),
+            uuid: [0x22; 16],
+            grade: DeviceGrade::DG,
+            sg_rank: None,
+            hosts: vec!["127.0.0.1:7777".into()],
+            applications: Vec::new(),
+        }];
+        n.owner.contact_users = vec![Contact {
+            public_key: keypair_from_seed([0x08; 32]).public_key,
+            user: User {
+                alias: "bob".into(),
+                uuid: [0x33; 16],
+                devices: vec![Device {
+                    alias: "bob-sg".into(),
+                    uuid: [0x44; 16],
+                    grade: DeviceGrade::SG,
+                    sg_rank: Some(1),
+                    hosts: vec!["sg.example:7777".into()],
+                    applications: Vec::new(),
+                }],
+            },
+            last_seen_public_version: SyncVersion::default(),
+        }];
+        n
+    }
+
+    /// Manually lay out the expected wire bytes (independent of serialize helper
+    /// control flow) so drift in field order is caught.
+    fn expected_bootstrap_bytes(node: &Node) -> Vec<u8> {
+        let mut e = Vec::new();
+        // alias
+        e.push(5); // "alice"
+        e.extend_from_slice(b"alice");
+        e.extend_from_slice(&[0x11; 16]);
+        e.extend_from_slice(node.owner.key_pair.public_key.as_bytes());
+        e.extend_from_slice(node.owner.key_pair.private_key.as_bytes());
+        e.push(1); // one device
+        // push_device: uuid, alias, grade, rank, hosts
+        e.extend_from_slice(&[0x22; 16]);
+        e.push(5);
+        e.extend_from_slice(b"phone");
+        e.push(0); // DG
+        e.push(0); // no rank
+        e.push(1); // one host
+        e.push(14);
+        e.extend_from_slice(b"127.0.0.1:7777");
+        e.push(1); // one contact
+        e.extend_from_slice(&[0x33; 16]);
+        e.push(3);
+        e.extend_from_slice(b"bob");
+        e.extend_from_slice(node.owner.contact_users[0].public_key.as_bytes());
+        e.push(1); // one contact device
+        e.extend_from_slice(&[0x44; 16]);
+        e.push(6);
+        e.extend_from_slice(b"bob-sg");
+        e.push(1); // SG
+        e.push(1); // rank 1
+        e.push(1);
+        e.push(15); // "sg.example:7777".len()
+        e.extend_from_slice(b"sg.example:7777");
+        e
+    }
+
+    #[test]
+    fn bootstrap_payload_golden_bytes_and_roundtrip() {
+        let node = fixture_node();
+        let got = serialize_bootstrap_payload(&node);
+        let expected = expected_bootstrap_bytes(&node);
+        assert_eq!(
+            got, expected,
+            "bootstrap payload golden mismatch\n got={got:02x?}\n exp={expected:02x?}"
+        );
+
+        let parsed = deserialize_bootstrap_payload(&got).expect("deserialize golden");
+        assert_eq!(parsed.user_alias, "alice");
+        assert_eq!(parsed.user_uuid, [0x11; 16]);
+        assert_eq!(parsed.key_pair.public_key, node.owner.key_pair.public_key);
+        assert_eq!(parsed.key_pair.private_key, node.owner.key_pair.private_key);
+        assert_eq!(parsed.devices.len(), 1);
+        assert_eq!(parsed.devices[0].uuid, [0x22; 16]);
+        assert_eq!(parsed.devices[0].alias, "phone");
+        assert!(matches!(parsed.devices[0].grade, DeviceGrade::DG));
+        assert_eq!(parsed.devices[0].hosts, vec!["127.0.0.1:7777".to_string()]);
+        assert_eq!(parsed.contacts.len(), 1);
+        assert_eq!(parsed.contacts[0].user.alias, "bob");
+        assert_eq!(parsed.contacts[0].user.uuid, [0x33; 16]);
+        assert_eq!(parsed.contacts[0].user.devices[0].uuid, [0x44; 16]);
+        assert!(matches!(
+            parsed.contacts[0].user.devices[0].grade,
+            DeviceGrade::SG
+        ));
+        assert_eq!(parsed.contacts[0].user.devices[0].sg_rank, Some(1));
+
+        // Re-serialize after deserialize path is exercised by applying fields.
+        let mut round = Node::new();
+        round.owner.user.alias = parsed.user_alias;
+        round.owner.user.uuid = parsed.user_uuid;
+        round.owner.key_pair = parsed.key_pair;
+        round.owner.user.devices = parsed.devices;
+        round.owner.contact_users = parsed.contacts;
+        assert_eq!(serialize_bootstrap_payload(&round), expected);
+    }
+
+    #[test]
+    fn bootstrap_payload_empty_user_minimal() {
+        let mut n = Node::new();
+        n.owner.user.alias = "".into();
+        n.owner.user.uuid = [0; 16];
+        n.owner.key_pair = keypair_from_seed([1u8; 32]);
+        n.owner.user.devices.clear();
+        n.owner.contact_users.clear();
+        let bytes = serialize_bootstrap_payload(&n);
+        // [alias_len=0][uuid:16][pk:32][sk:32][devs=0][contacts=0]
+        assert_eq!(bytes.len(), 1 + 16 + 32 + 32 + 1 + 1);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1 + 16 + 32 + 32], 0); // device count
+        assert_eq!(bytes[1 + 16 + 32 + 32 + 1], 0); // contact count
+        let p = deserialize_bootstrap_payload(&bytes).unwrap();
+        assert!(p.user_alias.is_empty());
+        assert!(p.devices.is_empty());
+        assert!(p.contacts.is_empty());
+    }
 }
 

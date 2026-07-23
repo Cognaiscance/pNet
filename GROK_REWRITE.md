@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §9.1)* |
-| Last completed | 8.3 Wire versioning note (2026-07-23) |
+| Current focus | *(none — Phase 9 complete; rewrite checklist done)* |
+| Last completed | 9.2 Golden vectors (2026-07-23) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -241,15 +241,15 @@ Core behavior is largely designed; make it observable and resilient.
 ## Phase 9 — Core test harness hygiene
 
 ### 9.1 Fast in-process fabric tests
-- [ ] Two-node loopback test: connect → relay/app packet → local push path (no Docker)
-- [ ] Keep stage/live harnesses for NAT and partition only
+- [x] Two-node loopback test: connect → relay/app packet → local push path (no Docker)
+- [x] Keep stage/live harnesses for NAT and partition only
 
-**Done:**  
+**Done:** 2026-07-23 — `two_node_loopback_connect_app_packet_local_push`: two `TestCtx` nodes, real ConnectRequest/Ack over loopback UDP sockets, direct AppPacket, local `APP_PUSH`. Stage/live remain for NAT + partition only (unchanged).
 
 ### 9.2 Golden vectors
-- [ ] Golden encode/decode for bootstrap payload and app get-data tree (UUID app ids)
+- [x] Golden encode/decode for bootstrap payload and app get-data tree (UUID app ids)
 
-**Done:**  
+**Done:** 2026-07-23 — Bootstrap: fixed fixture + hand-built wire golden + roundtrip (`bootstrap::golden_tests`). App get-data: fixed UUID app ids/token tree golden (`app_get_data_tree_golden_uuid_app_ids`); contact tokens and unapproved apps must not appear. Phase 9 complete; full suite 271 ok.
 
 ---
 
