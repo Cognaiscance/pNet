@@ -2,11 +2,15 @@
 //!
 //! Pure (mostly) selection helpers used by app edge, sessions, bootstrap, and
 //! sync. `find_writer_sg_probing` is the only path that may call `poll_sg`.
+//!
+//! DNS (§5.3): send/routing uses [`DnsCache::lookup`] only. Maintain, poll,
+//! and bootstrap join call [`DnsCache::resolve`] (may hit the OS).
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use super::super::action_queue::WorkerContext;
 use super::super::data_models::{ActiveConnection, Device, DeviceGrade, Node, Uuid};
+use super::super::dns_cache::{resolve_host_uncached, DnsCache};
 use super::poll_sg;
 
 pub(crate) fn ipv4_from(addr: SocketAddr) -> Option<Ipv4Addr> {
@@ -16,66 +20,65 @@ pub(crate) fn ipv4_from(addr: SocketAddr) -> Option<Ipv4Addr> {
     }
 }
 
-/// Resolve a `Device.hosts` entry (hostname or IP, optional ":port", default 7777)
-/// to an IPv4 socket address via the OS DNS resolver. Returns `None` if the entry
-/// is malformed or fails to resolve — callers should treat that as "skip this
-/// address" silently; it's expected behaviour when a name only resolves inside
-/// certain networks.
+/// Blocking OS resolve (no cache). Prefer cache-aware APIs on live paths.
+/// Kept for unit tests and as the back end of [`DnsCache::resolve`].
 pub(crate) fn resolve_host_entry(entry: &str) -> Option<SocketAddrV4> {
-    use std::net::ToSocketAddrs;
-
-    let entry = entry.trim();
-    if entry.is_empty() { return None; }
-
-    // Direct "1.2.3.4:port" parse first.
-    if let Ok(addr) = entry.parse::<SocketAddrV4>() {
-        return Some(addr);
-    }
-
-    // Split optional ":port", default 7777.
-    let (host_part, port) = match entry.rfind(':') {
-        Some(pos) => {
-            let port: u16 = entry[pos + 1..].parse().ok()?;
-            (&entry[..pos], port)
-        }
-        None => (entry, 7777u16),
-    };
-
-    let addr_str = format!("{host_part}:{port}");
-    addr_str.to_socket_addrs().ok()?.find_map(|a| match a {
-        SocketAddr::V4(v4) => Some(v4),
-        _ => None,
-    })
+    resolve_host_uncached(entry)
 }
 
-/// Resolve every entry in a hosts list, dropping any that fail to resolve.
-/// Returns `(original_entry, resolved_addr)` pairs so downstream code (e.g.
-/// `sg_statuses`) can still key by the hostname string the operator
-/// configured, rather than by a transient resolved IP.
-pub(crate) fn resolve_hosts(hosts: &[String]) -> Vec<(String, SocketAddrV4)> {
-    hosts.iter()
-        .filter_map(|h| resolve_host_entry(h).map(|a| (h.clone(), a)))
+/// Cache-only resolve (hot path: send / routing).
+pub(crate) fn resolve_host_cached(cache: &DnsCache, entry: &str) -> Option<SocketAddrV4> {
+    cache.lookup(entry)
+}
+
+/// Resolve every entry via the cache (OS on miss/expiry). For maintain / poll /
+/// bootstrap. Returns `(original_entry, resolved_addr)` pairs.
+pub(crate) fn resolve_hosts(cache: &mut DnsCache, hosts: &[String]) -> Vec<(String, SocketAddrV4)> {
+    hosts
+        .iter()
+        .filter_map(|h| cache.resolve(h).map(|a| (h.clone(), a)))
         .collect()
+}
+
+/// Warm the DNS cache for every host on own + contact devices.
+pub(crate) fn refresh_dns_for_known_hosts(ctx: &WorkerContext) {
+    let host_list: Vec<String> = {
+        let node = ctx.node.read().unwrap();
+        let mut hosts = Vec::new();
+        for d in &node.owner.user.devices {
+            hosts.extend(d.hosts.iter().cloned());
+        }
+        for contact in &node.owner.contact_users {
+            for d in &contact.user.devices {
+                hosts.extend(d.hosts.iter().cloned());
+            }
+        }
+        hosts
+    };
+    let mut cache = ctx.dns_cache.lock().unwrap();
+    for h in host_list {
+        let _ = cache.resolve(&h);
+    }
 }
 
 // ── Packet routing helpers ────────────────────────────────────────────────────
 // Crypto primitives (x25519 / ed25519 / AEAD / seal-open) live in `crypto`.
 
 /// Pick the best address for reaching `device_uuid`: the up entry with the
-/// lowest recorded RTT in `sg_statuses`. Falls back to the first resolvable
-/// entry in the device's host list when no poll data exists yet.
+/// lowest recorded RTT in `sg_statuses`. Falls back to the first **cached**
+/// host when no poll data exists yet.
 ///
-/// Cold-boot note: the first ConnectRequest after startup may land on a dead
-/// address if the happy-eyeballs data isn't populated yet; the next `poll_sg`
-/// cycle (≤30s) corrects that.
+/// Uses the DNS cache only — never blocks on OS resolve. Cold-boot: maintain
+/// and poll warm the cache (or hosts are IPv4 literals).
 pub(crate) fn best_address_for_device(
     node: &Node,
+    cache: &DnsCache,
     device_uuid: &Uuid,
 ) -> Option<SocketAddrV4> {
     let best_polled: Option<SocketAddrV4> = node.sg_statuses.iter()
         .filter(|((u, _), s)| *u == *device_uuid && s.up && s.last_rtt.is_some())
         .min_by_key(|(_, s)| s.last_rtt.unwrap())
-        .and_then(|((_, host), _)| resolve_host_entry(host));
+        .and_then(|((_, host), _)| resolve_host_cached(cache, host));
 
     if best_polled.is_some() {
         return best_polled;
@@ -85,7 +88,12 @@ pub(crate) fn best_address_for_device(
         .chain(node.owner.contact_users.iter().flat_map(|c| c.user.devices.iter()))
         .find(|d| d.uuid == *device_uuid)?;
 
-    resolve_hosts(&dev.hosts).into_iter().next().map(|(_, a)| a)
+    for h in &dev.hosts {
+        if let Some(addr) = resolve_host_cached(cache, h) {
+            return Some(addr);
+        }
+    }
+    None
 }
 
 /// Build the pool of candidate SG UUIDs for routing a packet to `dest_device_uuid`.

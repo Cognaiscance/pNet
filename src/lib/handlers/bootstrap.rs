@@ -663,8 +663,24 @@ pub(crate) fn decode_invitation_code(code_str: &str) -> Option<(Uuid, X25519Publ
     Some((inv_id, inv_pk, hosts))
 }
 
+/// Outcome of starting an invitation mint on a worker (no long wait).
+///
+/// Local mint returns [`InvitationMint::Ready`] immediately. Delegated mint
+/// sends 0x35 and returns [`InvitationMint::Pending`]; the admin UI must call
+/// [`super::super::action_queue::PendingInvites::wait_result`] on an **off-pool**
+/// thread so a worker is not pinned for the RTT (§5.2).
+#[derive(Debug)]
+pub(crate) enum InvitationMint {
+    /// Encoded code available now (this node is the top online SG).
+    Ready(String),
+    /// 0x35 sent; wait for op 0x36 on `token` outside the worker pool.
+    Pending { token: Uuid },
+    /// No reachable SG / no connection / other terminal failure before wait.
+    Failed,
+}
+
 /// Generate a device invitation for the UI. See `generate_invitation`.
-pub(crate) fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> {
+pub(crate) fn generate_device_invitation(ctx: &WorkerContext) -> InvitationMint {
     generate_invitation(INVITE_TYPE_DEVICE, ctx)
 }
 
@@ -674,14 +690,9 @@ pub(crate) fn generate_device_invitation(ctx: &WorkerContext) -> Option<String> 
 /// the SG that actually stores it. The minting SG is always the top-ranked
 /// online SG (`top_online_sg`). If that is the local node, it mints the
 /// invitation itself and embeds its own hosts. Otherwise — whether the local
-/// node is a DG or a lower-ranked SG — it asks that SG to mint and return the
-/// code, guaranteeing the invitation is present on the SG the code points to
-/// before the code exists.
-///
-/// Returns `None` on any terminal failure (no reachable SG, no hosts, or — for
-/// the delegated path — the SG not replying within the timeout). Consistent
-/// with the sync design rule that such failures are terminal, not retried.
-fn generate_invitation(kind: u8, ctx: &WorkerContext) -> Option<String> {
+/// node is a DG or a lower-ranked SG — it asks that SG to mint and returns
+/// [`InvitationMint::Pending`] so the caller can wait **off the pool**.
+fn generate_invitation(kind: u8, ctx: &WorkerContext) -> InvitationMint {
     let (target, local_uuid, hosts) = {
         let node = ctx.node.read().unwrap();
         (top_online_sg(&node), node.device_uuid, local_device_hosts(&node))
@@ -689,7 +700,7 @@ fn generate_invitation(kind: u8, ctx: &WorkerContext) -> Option<String> {
 
     let Some(target) = target else {
         eprintln!("[generate_invitation] no reachable SG to mint invitation");
-        return None;
+        return InvitationMint::Failed;
     };
 
     if target == local_uuid {
@@ -698,21 +709,18 @@ fn generate_invitation(kind: u8, ctx: &WorkerContext) -> Option<String> {
         // non-empty here.
         let (inv_id, inv_pk) = store_new_invitation(kind, ctx);
         ctx.save_node();
-        Some(encode_invitation_code(&inv_id, &inv_pk, &hosts))
+        InvitationMint::Ready(encode_invitation_code(&inv_id, &inv_pk, &hosts))
     } else {
-        request_invitation_from_sg(kind, target, ctx)
+        start_invitation_from_sg(kind, target, ctx)
     }
 }
 
-/// Delegated path: ask `sg_uuid` (the top-ranked online SG) to mint an
-/// invitation, block until it replies (op 0x36) or a short timeout elapses,
-/// then return the encoded code. Used by DGs and by lower-ranked SGs.
+/// Delegated path (worker-side, non-blocking): ask `sg_uuid` to mint, register
+/// a rendezvous token, send op 0x35, return immediately with that token.
 ///
-/// The parked worker thread is woken by `generate_invitation_response` running
-/// on another worker. With `WORKER_COUNT > 1` this can't self-deadlock for a
-/// single request; only the pathological case of every worker parked at once
-/// would stall, and the timeout breaks even that.
-fn request_invitation_from_sg(kind: u8, sg_uuid: Uuid, ctx: &WorkerContext) -> Option<String> {
+/// The admin UI waits via [`PendingInvites::wait_result`] on a dedicated
+/// thread (not a pool worker). `generate_invitation_response` fills the slot.
+fn start_invitation_from_sg(kind: u8, sg_uuid: Uuid, ctx: &WorkerContext) -> InvitationMint {
     let token = generate_uuid();
 
     // Build the 0x35 request to the chosen SG over its active connection.
@@ -729,8 +737,8 @@ fn request_invitation_from_sg(kind: u8, sg_uuid: Uuid, ctx: &WorkerContext) -> O
             })
     };
     let Some((pkt, addr)) = pkt_and_addr else {
-        eprintln!("[request_invitation_from_sg] no reachable SG to mint invitation");
-        return None;
+        eprintln!("[start_invitation_from_sg] no reachable SG to mint invitation");
+        return InvitationMint::Failed;
     };
 
     // Register the rendezvous slot BEFORE sending so a fast reply can't race us.
@@ -739,22 +747,7 @@ fn request_invitation_from_sg(kind: u8, sg_uuid: Uuid, ctx: &WorkerContext) -> O
         slots.insert(token, None);
     }
     send(ctx, addr, &pkt);
-
-    // Park until the slot is filled (Some(_)) or the timeout fires.
-    let timeout = Duration::from_secs(5);
-    let outcome = {
-        let slots = ctx.pending_invites.slots.lock().unwrap();
-        let (mut slots, _) = ctx.pending_invites.cv
-            .wait_timeout_while(slots, timeout, |s| matches!(s.get(&token), Some(None)))
-            .unwrap();
-        slots.remove(&token).flatten()
-    };
-
-    match outcome {
-        Some(Ok(code)) => Some(code),
-        Some(Err(())) => { eprintln!("[request_invitation_from_sg] SG reported mint failure"); None }
-        None => { eprintln!("[request_invitation_from_sg] timed out waiting for SG reply"); None }
-    }
+    InvitationMint::Pending { token }
 }
 
 /// Parse an invitation code entered via the UI and send a BootstrapRequest to the SG.
@@ -793,7 +786,10 @@ pub fn start_bootstrap(
         return Err("invalid invitation code");
     };
 
-    let Some((picked_host, sg_addr)) = resolve_hosts(&hosts).into_iter().next() else {
+    let Some((picked_host, sg_addr)) = ({
+        let mut cache = ctx.dns_cache.lock().unwrap();
+        resolve_hosts(&mut cache, &hosts).into_iter().next()
+    }) else {
         eprintln!("[start_bootstrap] no host in invitation code resolved: {hosts:?}");
         return Err("no host resolved from invitation code");
     };
@@ -824,7 +820,7 @@ pub fn start_bootstrap(
 }
 
 /// Generate a contact invitation code for the UI. See `generate_invitation`.
-pub(crate) fn generate_contact_invitation(ctx: &WorkerContext) -> Option<String> {
+pub(crate) fn generate_contact_invitation(ctx: &WorkerContext) -> InvitationMint {
     generate_invitation(INVITE_TYPE_CONTACT, ctx)
 }
 
@@ -892,7 +888,7 @@ pub fn generate_invitation_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
 }
 
 /// DG side of the invitation reply (op 0x36). Fills the rendezvous slot keyed
-/// by the echoed token and wakes the parked `request_invitation_from_sg` thread.
+/// by the echoed token and wakes any off-pool waiter on [`PendingInvites`].
 pub fn generate_invitation_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let plaintext = {
         let node = ctx.node.read().unwrap();
@@ -938,7 +934,10 @@ pub(crate) fn initiate_contact_exchange(body: &[u8], ctx: &WorkerContext) {
         return;
     };
 
-    let Some((picked_host, sg_addr)) = resolve_hosts(&hosts).into_iter().next() else {
+    let Some((picked_host, sg_addr)) = ({
+        let mut cache = ctx.dns_cache.lock().unwrap();
+        resolve_hosts(&mut cache, &hosts).into_iter().next()
+    }) else {
         eprintln!("[initiate_contact_exchange] no host in invitation code resolved: {hosts:?}");
         return;
     };

@@ -20,7 +20,7 @@ use super::super::data_models::{
 use super::super::wire::*;
 use super::{
     allocate_conn_id, best_address_for_device, cross_user_pull_on_reconnect, ipv4_from,
-    partition_reconcile_on_reconnect, resolve_host_entry, send, sync_pull,
+    partition_reconcile_on_reconnect, refresh_dns_for_known_hosts, send, sync_pull,
 };
 
 /// Find the device UUID for an incoming connection request, given the peer's
@@ -220,14 +220,16 @@ pub fn poll_sg(ctx: &WorkerContext) {
     // Collect (device_uuid, host_entry, resolved_addr_opt) for every advertised
     // address on every candidate SG. `None` addr means the host failed to
     // resolve and will be recorded as down without a ping attempt.
+    // Resolve via the DNS cache (OS on miss/expiry) — poll is an allowed
+    // warm path for DNS (§5.3). Send/routing only looks up the cache.
     let candidates: Vec<(Uuid, String, Option<SocketAddrV4>)> = {
         let node = ctx.node.read().unwrap();
         let local_uuid = node.device_uuid;
-        let mut v: Vec<(Uuid, String, Option<SocketAddrV4>)> = Vec::new();
+        let mut host_rows: Vec<(Uuid, String)> = Vec::new();
         for d in &node.owner.user.devices {
             if matches!(d.grade, DeviceGrade::SG) && d.uuid != local_uuid {
                 for h in &d.hosts {
-                    v.push((d.uuid, h.clone(), resolve_host_entry(h)));
+                    host_rows.push((d.uuid, h.clone()));
                 }
             }
         }
@@ -235,12 +237,20 @@ pub fn poll_sg(ctx: &WorkerContext) {
             for d in &contact.user.devices {
                 if matches!(d.grade, DeviceGrade::SG) {
                     for h in &d.hosts {
-                        v.push((d.uuid, h.clone(), resolve_host_entry(h)));
+                        host_rows.push((d.uuid, h.clone()));
                     }
                 }
             }
         }
-        v
+        drop(node);
+        let mut cache = ctx.dns_cache.lock().unwrap();
+        host_rows
+            .into_iter()
+            .map(|(uuid, h)| {
+                let addr = cache.resolve(&h);
+                (uuid, h, addr)
+            })
+            .collect()
     };
 
     if candidates.is_empty() {
@@ -325,9 +335,13 @@ pub fn maintain_connections(ctx: &WorkerContext) {
         }
     }
 
+    // Warm DNS before cache-only address selection (§5.3).
+    refresh_dns_for_known_hosts(ctx);
+
     // ── Collect desired peers and current state (read lock) ───────────────────
     let (need_conn, our_longterm_pk, our_longterm_sk, our_device_uuid) = {
         let node = ctx.node.read().unwrap();
+        let cache = ctx.dns_cache.lock().unwrap();
         let our_device_uuid = node.device_uuid;
         let our_longterm_pk = node.owner.key_pair.public_key;
         let our_longterm_sk = node.owner.key_pair.private_key;
@@ -352,14 +366,13 @@ pub fn maintain_connections(ctx: &WorkerContext) {
         let want_initiate = |d: &Device| -> bool {
             matches!(d.grade, DeviceGrade::SG) && (!is_sg || our_device_uuid < d.uuid)
         };
-        // Skip peers with no resolvable address — happy eyeballs data, if present,
-        // picks the lowest-RTT up address; otherwise we fall back to the first
-        // resolvable entry in the peer's host list.
+        // Skip peers with no cached address — happy eyeballs data, if present,
+        // picks the lowest-RTT up address; otherwise first cached host entry.
         let mut desired: Vec<(Uuid, SocketAddrV4, Ed25519PublicKey)> = Vec::new();
         for d in &node.owner.user.devices {
             if d.uuid == our_device_uuid { continue; }
             if want_initiate(d) {
-                if let Some(addr) = best_address_for_device(&node, &d.uuid) {
+                if let Some(addr) = best_address_for_device(&node, &cache, &d.uuid) {
                     desired.push((d.uuid, addr, our_longterm_pk));
                 }
             }
@@ -367,7 +380,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
         for contact in &node.owner.contact_users {
             for d in &contact.user.devices {
                 if want_initiate(d) {
-                    if let Some(addr) = best_address_for_device(&node, &d.uuid) {
+                    if let Some(addr) = best_address_for_device(&node, &cache, &d.uuid) {
                         desired.push((d.uuid, addr, contact.public_key));
                     }
                 }

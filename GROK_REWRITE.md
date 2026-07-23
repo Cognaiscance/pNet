@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §5.1)* |
-| Last completed | 4.3 RNG (2026-07-23) |
+| Current focus | *(none — next is §6.1)* |
+| Last completed | 5.4 Locking audit (2026-07-23) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -154,29 +154,25 @@ Data plane is already real; tighten key use and typing.
 Keep the hand-rolled pool; remove stall and unbounded-growth risks.
 
 ### 5.1 Queue bounds
-- [ ] Cap queue depth; define drop policy (prefer drop low priority under pressure)
-- [ ] Log/metric when drops happen
+- [x] Cap queue depth; define drop policy (prefer drop low priority under pressure)
+- [x] Log/metric when drops happen
 
-**Done:**  
-
+**Done:** 2026-07-23 — `QUEUE_CAPACITY=1024`; `ActionQueue::push` returns bool; at cap, drop newest item from the lowest-priority bucket strictly worse than the admit, else drop incoming. Logs `[queue] drop existing|incoming …`. `Action::kind_name` for log labels. Unit tests for capacity, shed-low, refuse-equal. Docs: `main program loop.md`.
 ### 5.2 No long waits on worker threads
-- [ ] Invitation mint wait (≤5s) must not hold a pool worker for the whole RTT (wait outside pool or release worker)
-- [ ] Audit other blocking UI/sync waits on workers
+- [x] Invitation mint wait (≤5s) must not hold a pool worker for the whole RTT (wait outside pool or release worker)
+- [x] Audit other blocking UI/sync waits on workers
 
-**Done:**  
-
+**Done:** 2026-07-23 — Delegated mint: worker only sends 0x35 + registers token (`InvitationMint::Pending`); admin UI waits via `PendingInvites::wait_result` on `pnet-invite-wait-*` off-pool threads that own the TCP stream. Local mint still `Ready` on the worker. Audit: no other RTT parks on workers; DNS still blocking on maintain/bootstrap paths (deferred to §5.3); `writer_tx` SyncSender can block if full (unrelated). Tests: wait/timeout + local Ready. Docs: main program loop.
 ### 5.3 DNS off the hot path
-- [ ] Cache host resolutions with TTL
-- [ ] Resolve on maintain/poll paths; send/routing uses cache only
+- [x] Cache host resolutions with TTL
+- [x] Resolve on maintain/poll paths; send/routing uses cache only
 
-**Done:**  
-
+**Done:** 2026-07-23 — `dns_cache::DnsCache` on `WorkerContext` (positive TTL 60s, negative 15s). `lookup` for send/routing (`best_address_for_device` cache-only; IPv4 literals always parse). `resolve` / `refresh_dns_for_known_hosts` on maintain + poll; bootstrap/contact join warm via `resolve_hosts(&mut cache, …)`. Tests: cache hit/miss/negative + hostname routing without OS. Docs: main program loop.
 ### 5.4 Locking (only if needed)
-- [ ] Measure or note contention on global `RwLock<Node>`
-- [ ] If needed: split hot maps (`active_connections`, `sg_statuses`) from cold directory state
+- [x] Measure or note contention on global `RwLock<Node>`
+- [x] If needed: split hot maps (`active_connections`, `sg_statuses`) from cold directory state
 
-**Done:**  
-
+**Done:** 2026-07-23 — **No split.** Code audit: 4 workers; send/DNS/invite-wait already off the node lock; holds are mostly short in-memory updates. Splitting session maps would add dual-lock hazard on almost every path without measured contention. Documented in `descriptions/locking.md`; discipline note on `WorkerContext`; diagnostics line for operators. Revisit if load shows `node.write` stalls. Phase 5 complete.
 ---
 
 ## Phase 6 — Sessions, NAT, routing (fabric ops quality)
@@ -286,6 +282,10 @@ Add a line per work session (newest at top).
 
 | Date | Item(s) | Notes |
 |------|---------|--------|
+| 2026-07-23 | 5.4 Locking | Audit only; keep global RwLock; split deferred. Phase 5 done. |
+| 2026-07-23 | 5.3 DNS off hot path | DnsCache TTL; maintain/poll resolve; routing lookup-only. |
+| 2026-07-23 | 5.2 No long waits on workers | Invite mint wait off-pool; audit note; tests. |
+| 2026-07-23 | 5.1 Queue bounds | Cap 1024; drop low-prio first; log drops; tests. |
 | 2026-07-23 | 4.3 RNG | `getrandom` + shared fill helpers; no `/dev/urandom` in core; tests. |
 | 2026-07-22 | 4.2 Distinct key types | Ed25519 vs X25519 newtypes end-to-end; 235 tests. |
 | 2026-07-22 | 4.1 KDF before AEAD | HKDF-SHA256 + domain labels session/bootstrap/tunnel; 234 tests. |

@@ -106,6 +106,9 @@ mod tests {
             app_rate_limits: Arc::new(std::sync::Mutex::new(
                 super::super::app_api::AppRateLimiter::new(),
             )),
+            dns_cache: Arc::new(std::sync::Mutex::new(
+                super::super::dns_cache::DnsCache::new(),
+            )),
         })
     }
 

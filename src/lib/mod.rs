@@ -3,6 +3,7 @@ pub mod admin_auth;
 pub mod app_api;
 pub mod crypto;
 pub mod data_models;
+pub mod dns_cache;
 pub mod handlers;
 pub mod http_server;
 pub mod persistence;

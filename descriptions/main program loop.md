@@ -6,6 +6,8 @@ The core of pnet is a simple, hand-rolled work queue with a fixed thread pool. N
 
 The queue has priority buckets. When a worker thread is ready, it checks the highest-priority bucket first and works its way down. Items within a bucket are FIFO.
 
+**Bounded depth:** the queue holds at most `QUEUE_CAPACITY` actions (default 1024) across all buckets. Producers (UDP, HTTP, scheduler) always attempt enqueue; under pressure the queue **drops lower-priority work first** to admit higher-priority items. If the queue is full of equal-or-higher priority work, the **incoming** action is dropped. Every drop is logged (`[queue] drop …`) so load shedding is visible.
+
 Priority levels (high → low):
 - **high** — inbound UDP packets (time-sensitive, peer may be waiting)
 - **normal** — UI/API requests
@@ -42,7 +44,13 @@ Things that put items into the queue:
 
 ## Workers
 
-A fixed number of worker threads (configurable, e.g. 4) pull actions from the queue and execute them one at a time per thread. Workers do not spawn their own threads; all concurrency comes from the pool size.
+A fixed number of worker threads (configurable, e.g. 4) pull actions from the queue and execute them one at a time per thread. Workers do not spawn their own threads for fabric work; all concurrency comes from the pool size.
+
+**No long RTT waits on workers:** delegated invitation mint (DG asks rank-1 SG via op 0x35/0x36) registers a rendezvous token on the worker, then waits on a short-lived **off-pool** thread that owns the HTTP response. Pool workers stay free for UDP/session work while the SG reply is in flight (up to ~5s).
+
+**DNS off the hot path:** hostname resolution goes through an in-memory `DnsCache` (positive TTL 60s, negative 15s). `MaintainConnections` and `PollSG` (and bootstrap/contact join) call `resolve` and may hit the OS; send/routing uses **cache lookup only** (IPv4 literals always parse without DNS).
+
+**Node locking:** fabric state is one `RwLock<Node>` for all workers. Prefer short holds and I/O outside the lock. A split of hot session maps from directory state was **deferred** after audit — see `descriptions/locking.md`.
 
 ## Scheduler
 

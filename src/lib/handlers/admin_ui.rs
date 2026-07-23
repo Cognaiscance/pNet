@@ -6,10 +6,15 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 
-use super::super::action_queue::WorkerContext;
+use std::sync::Arc;
+use std::thread;
+
+use super::super::action_queue::{
+    PendingInvites, WorkerContext, INVITATION_MINT_TIMEOUT,
+};
 use super::super::admin_auth::{
     clear_session_cookie_header, csrf_post_ok, hash_password, session_id_from_cookie_header,
-    set_session_cookie_header, validate_new_password, verify_password, UiFlash,
+    set_session_cookie_header, validate_new_password, verify_password, SessionStore, UiFlash,
     INVITE_CODE_HEADER, MIN_PASSWORD_LEN,
 };
 use super::super::crypto::generate_ed25519_keypair;
@@ -20,6 +25,7 @@ use super::super::wire::*;
 use super::{
     generate_contact_invitation, generate_device_invitation, initiate_bootstrap,
     initiate_contact_exchange, parse_pnet_hosts, request_change, sync_pull, uuid_hex, Change,
+    InvitationMint,
 };
 
 // ── UI / HTTP handlers ────────────────────────────────────────────────────────
@@ -195,38 +201,25 @@ pub fn ui_request(
             respond_html(&stream, 200, &render_invitations(ctx, &query, flash), None)
         }
         ("POST", "/invitations/device") => {
-            match generate_device_invitation(ctx) {
-                Some(code) => {
-                    if let Some(ref id) = session_id {
-                        ctx.sessions
-                            .set_flash(id, UiFlash::DeviceCode(code.clone()));
-                    }
-                    respond_redirect_extra(
-                        &stream,
-                        "/invitations",
-                        "",
-                        &[(INVITE_CODE_HEADER, code.as_str())],
-                    );
-                }
-                None => respond_redirect(&stream, "/invitations?error=no_host"),
-            }
+            // Local mint is fast on the worker; delegated mint waits off-pool (§5.2).
+            finish_invitation_mint(
+                stream,
+                session_id,
+                Arc::clone(&ctx.sessions),
+                Arc::clone(&ctx.pending_invites),
+                generate_device_invitation(ctx),
+                true,
+            );
         }
         ("POST", "/invitations/contact") => {
-            match generate_contact_invitation(ctx) {
-                Some(code) => {
-                    if let Some(ref id) = session_id {
-                        ctx.sessions
-                            .set_flash(id, UiFlash::ContactCode(code.clone()));
-                    }
-                    respond_redirect_extra(
-                        &stream,
-                        "/invitations",
-                        "",
-                        &[(INVITE_CODE_HEADER, code.as_str())],
-                    );
-                }
-                None => respond_redirect(&stream, "/invitations?error=no_host"),
-            }
+            finish_invitation_mint(
+                stream,
+                session_id,
+                Arc::clone(&ctx.sessions),
+                Arc::clone(&ctx.pending_invites),
+                generate_contact_invitation(ctx),
+                false,
+            );
         }
         ("POST", "/invitations/enter") => {
             // Device invitation redeem from an already-configured node is not
@@ -243,6 +236,90 @@ pub fn ui_request(
 }
 
 // ── Routing helpers ───────────────────────────────────────────────────────────
+
+/// Complete an invitation mint for the admin UI.
+///
+/// * [`InvitationMint::Ready`] / [`InvitationMint::Failed`] — respond on this
+///   (worker) thread.
+/// * [`InvitationMint::Pending`] — spawn an off-pool waiter so the worker is not
+///   blocked for up to [`INVITATION_MINT_TIMEOUT`] while the SG replies (§5.2).
+fn finish_invitation_mint(
+    stream: std::net::TcpStream,
+    session_id: Option<String>,
+    sessions: Arc<SessionStore>,
+    pending_invites: Arc<PendingInvites>,
+    mint: InvitationMint,
+    is_device: bool,
+) {
+    match mint {
+        InvitationMint::Ready(code) => {
+            write_invitation_success(&stream, &session_id, &sessions, &code, is_device);
+        }
+        InvitationMint::Failed => {
+            respond_redirect(&stream, "/invitations?error=no_host");
+        }
+        InvitationMint::Pending { token } => {
+            let name = if is_device {
+                "pnet-invite-wait-device"
+            } else {
+                "pnet-invite-wait-contact"
+            };
+            // Off-pool waiter owns the TCP stream; worker returns immediately.
+            // Spawn failure is rare (thread limit); the connection then closes
+            // without a response because `stream` is consumed by the closure.
+            if let Err(e) = thread::Builder::new().name(name.into()).spawn(move || {
+                match pending_invites.wait_result(token, INVITATION_MINT_TIMEOUT) {
+                    Some(Ok(code)) => {
+                        write_invitation_success(
+                            &stream,
+                            &session_id,
+                            &sessions,
+                            &code,
+                            is_device,
+                        );
+                    }
+                    Some(Err(())) => {
+                        eprintln!(
+                            "[finish_invitation_mint] SG reported mint failure (device={is_device})"
+                        );
+                        respond_redirect(&stream, "/invitations?error=no_host");
+                    }
+                    None => {
+                        eprintln!(
+                            "[finish_invitation_mint] timed out waiting for SG reply (device={is_device})"
+                        );
+                        respond_redirect(&stream, "/invitations?error=no_host");
+                    }
+                }
+            }) {
+                eprintln!("[finish_invitation_mint] failed to spawn waiter: {e}");
+            }
+        }
+    }
+}
+
+fn write_invitation_success(
+    stream: &std::net::TcpStream,
+    session_id: &Option<String>,
+    sessions: &SessionStore,
+    code: &str,
+    is_device: bool,
+) {
+    if let Some(id) = session_id {
+        let flash = if is_device {
+            UiFlash::DeviceCode(code.to_string())
+        } else {
+            UiFlash::ContactCode(code.to_string())
+        };
+        sessions.set_flash(id, flash);
+    }
+    respond_redirect_extra(
+        stream,
+        "/invitations",
+        "",
+        &[(INVITE_CODE_HEADER, code)],
+    );
+}
 
 fn respond_html(stream: &std::net::TcpStream, status: u16, html: &str, set_cookie: Option<&str>) {
     use std::io::Write;
@@ -673,6 +750,8 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
              <tr><th>Device UUID</th><td><code>{local}</code></td></tr>\
              <tr><th>Public version</th><td>writer=<code>{w}</code> epoch={e} seq={s}</td></tr>\
              <tr><th>Write log</th><td>{n} entries (retention {ret}d)</td></tr>\
+             <tr><th>Node lock</th><td>global <code>RwLock&lt;Node&gt;</code> \
+               (session/directory split deferred — see locking.md)</td></tr>\
            </table>\
          </div>",
         local = uuid_hex(&local_uuid),

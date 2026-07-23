@@ -192,6 +192,7 @@ fn main() {
         pending_invites: Default::default(),
         sessions:     Arc::new(lib::admin_auth::SessionStore::new()),
         app_rate_limits: Arc::new(std::sync::Mutex::new(lib::app_api::AppRateLimiter::new())),
+        dns_cache:    Arc::new(std::sync::Mutex::new(lib::dns_cache::DnsCache::new())),
     });
 
     // ── 6a. Headless env-driven first-run setup, if requested ────────────────
@@ -295,6 +296,9 @@ mod tests {
             sessions:     Arc::new(crate::lib::admin_auth::SessionStore::new()),
             app_rate_limits: Arc::new(std::sync::Mutex::new(
                 crate::lib::app_api::AppRateLimiter::new(),
+            )),
+            dns_cache: Arc::new(std::sync::Mutex::new(
+                crate::lib::dns_cache::DnsCache::new(),
             )),
         });
         // Retain `ctx` in this scope via Arc::clone, exactly as `main` does.

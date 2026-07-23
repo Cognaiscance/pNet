@@ -66,15 +66,15 @@ pub use bootstrap::{
 pub(crate) use bootstrap::{
     decode_invitation_code, encode_invitation_code, generate_contact_invitation,
     generate_device_invitation, initiate_bootstrap, initiate_contact_exchange,
-    serialize_contact_payload, top_online_sg,
+    serialize_contact_payload, top_online_sg, InvitationMint,
 };
 
 mod routing;
 pub use routing::{WriterTarget, find_writer_sg};
 pub(crate) use routing::{
     best_address_for_device, best_sg_connection, find_pull_source, find_writer_sg_probing,
-    ipv4_from, resolve_host_entry, resolve_hosts, sg_candidates_for_dest,
-    top_ranked_sg_for_device,
+    ipv4_from, refresh_dns_for_known_hosts, resolve_host_entry, resolve_hosts,
+    sg_candidates_for_dest, top_ranked_sg_for_device,
 };
 
 mod sync;
@@ -405,6 +405,9 @@ mod tests {
                 sessions: Arc::new(super::super::admin_auth::SessionStore::new()),
                 app_rate_limits: Arc::new(std::sync::Mutex::new(
                     super::super::app_api::AppRateLimiter::new(),
+                )),
+                dns_cache: Arc::new(std::sync::Mutex::new(
+                    super::super::dns_cache::DnsCache::new(),
                 )),
             };
             TestCtx { ctx, app_socket, _writer_rx, _sched_rx }
@@ -2056,7 +2059,7 @@ mod tests {
     #[test]
     fn generate_invitation_response_fills_waiting_slot() {
         // DG side: a 0x36 reply must fill the rendezvous slot keyed by token and
-        // make the encoded code available to the parked requester.
+        // make the encoded code available to an off-pool waiter (§5.2).
         let t = TestCtx::new();
         let (_conn_id, dg_conn, _dg_socket) = writer_setup_with_capture(&t);
 
@@ -2075,7 +2078,63 @@ mod tests {
 
         let slots = t.ctx.pending_invites.slots.lock().unwrap();
         assert_eq!(slots.get(&token), Some(&Some(Ok("THECODE".to_string()))),
-            "slot must hold the decoded code for the parked requester");
+            "slot must hold the decoded code for the off-pool waiter");
+    }
+
+    #[test]
+    fn pending_invites_wait_result_returns_code_and_timeout() {
+        use super::super::action_queue::PendingInvites;
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let pending = Arc::new(PendingInvites::default());
+        let token = generate_uuid();
+        pending.slots.lock().unwrap().insert(token, None);
+
+        let p2 = Arc::clone(&pending);
+        let waiter = thread::spawn(move || {
+            p2.wait_result(token, Duration::from_secs(2))
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        {
+            let mut slots = pending.slots.lock().unwrap();
+            *slots.get_mut(&token).unwrap() = Some(Ok("OFFPOOL".into()));
+            pending.cv.notify_all();
+        }
+        assert_eq!(waiter.join().unwrap(), Some(Ok("OFFPOOL".into())));
+
+        // Timeout path: slot registered, never filled.
+        let token2 = generate_uuid();
+        pending.slots.lock().unwrap().insert(token2, None);
+        let t0 = Instant::now();
+        let timed_out = pending.wait_result(token2, Duration::from_millis(50));
+        assert!(t0.elapsed() >= Duration::from_millis(40));
+        assert!(timed_out.is_none());
+        assert!(!pending.slots.lock().unwrap().contains_key(&token2));
+    }
+
+    #[test]
+    fn generate_device_invitation_local_sg_is_ready_not_pending() {
+        // Local top-online SG must mint without Pending (no off-pool wait).
+        let t = TestCtx::new();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let local = node.device_uuid;
+            // Make this node a hosted SG so top_online_sg selects it.
+            if let Some(d) = node.owner.user.devices.iter_mut().find(|d| d.uuid == local) {
+                d.grade = DeviceGrade::SG;
+                d.sg_rank = Some(1);
+                d.hosts = vec!["127.0.0.1:9".into()];
+            }
+        }
+        match generate_device_invitation(&t.ctx) {
+            InvitationMint::Ready(code) => {
+                assert!(decode_invitation_code(&code).is_some());
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2839,7 +2898,9 @@ mod tests {
             });
         }
         let node = t.ctx.node.read().unwrap();
-        let addr = best_address_for_device(&node, &dev_uuid).unwrap();
+        let cache = t.ctx.dns_cache.lock().unwrap();
+        // Literals need no cache warm; lookup parses them directly.
+        let addr = best_address_for_device(&node, &cache, &dev_uuid).unwrap();
         assert_eq!(addr.port(), 9002);
     }
 
@@ -2860,8 +2921,45 @@ mod tests {
             // No sg_statuses entry — cold-boot fallback should kick in.
         }
         let node = t.ctx.node.read().unwrap();
-        let addr = best_address_for_device(&node, &dev_uuid).unwrap();
+        let cache = t.ctx.dns_cache.lock().unwrap();
+        let addr = best_address_for_device(&node, &cache, &dev_uuid).unwrap();
         assert_eq!(addr.port(), 9003);
+    }
+
+    #[test]
+    fn best_address_uses_cached_hostname_without_os_resolve() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let t = TestCtx::new();
+        let dev_uuid = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias:        "sg".to_string(),
+                uuid:         dev_uuid,
+                grade:        DeviceGrade::SG,
+                sg_rank:      Some(1),
+                hosts:        vec!["peer.example:9009".into()],
+                applications: Vec::new(),
+            });
+        }
+        // Without cache warm, hostname cannot be used on the hot path.
+        {
+            let node = t.ctx.node.read().unwrap();
+            let cache = t.ctx.dns_cache.lock().unwrap();
+            assert!(best_address_for_device(&node, &cache, &dev_uuid).is_none());
+        }
+        let expected = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 9009);
+        t.ctx.dns_cache.lock().unwrap().insert_for_test(
+            "peer.example:9009",
+            expected,
+            std::time::Duration::from_secs(60),
+        );
+        let node = t.ctx.node.read().unwrap();
+        let cache = t.ctx.dns_cache.lock().unwrap();
+        assert_eq!(
+            best_address_for_device(&node, &cache, &dev_uuid),
+            Some(expected)
+        );
     }
 
     // Packet encrypt/decrypt round-trip lives in `crypto::tests`.

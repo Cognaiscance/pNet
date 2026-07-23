@@ -6,21 +6,54 @@ use std::time::Duration;
 use super::data_models::{Node, Uuid};
 use super::writer::WriteRequest;
 
-/// Rendezvous slots for DG-side invitation requests. When a DG asks an SG to
-/// mint an invitation (op 0x35), the UI worker thread registers its request
-/// token here and parks on `cv`. The `generate_invitation_response` handler
-/// (op 0x36), running on another worker thread, fills the slot keyed by token
-/// and wakes the waiter. `Ok(code)` is the encoded invitation; `Err(())` is an
-/// SG-side failure; a slot left `None` past the timeout means no reply arrived.
+/// Rendezvous slots for DG→SG invitation mint (op 0x35 / 0x36).
+///
+/// The worker that *sends* 0x35 only registers a token and must **not** park
+/// here — that would pin a pool thread for up to the mint RTT (§5.2). The UI
+/// path waits via [`PendingInvites::wait_result`] on a short-lived off-pool
+/// thread that owns the HTTP response. `generate_invitation_response` (0x36)
+/// fills the slot and notifies `cv`.
+///
+/// Slot values: `None` = still waiting; `Some(Ok(code))` = success;
+/// `Some(Err(()))` = SG-side failure. Missing after timeout = no reply.
 #[derive(Default)]
 pub struct PendingInvites {
     pub slots: Mutex<HashMap<Uuid, Option<Result<String, ()>>>>,
     pub cv:    Condvar,
 }
 
+/// Max time a non-pool waiter blocks for an SG mint reply (op 0x36).
+pub const INVITATION_MINT_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl PendingInvites {
+    /// Block until the slot for `token` is filled or `timeout` elapses.
+    ///
+    /// Removes the slot either way. Call from **off-pool** threads only
+    /// (e.g. the invite-mint waiter spawned by the admin UI).
+    pub fn wait_result(
+        &self,
+        token: Uuid,
+        timeout: Duration,
+    ) -> Option<Result<String, ()>> {
+        let slots = self.slots.lock().unwrap();
+        let (mut slots, _) = self
+            .cv
+            .wait_timeout_while(slots, timeout, |s| matches!(s.get(&token), Some(None)))
+            .unwrap();
+        slots.remove(&token).flatten()
+    }
+}
+
 pub const PRIORITY_HIGH:   u8 = 0;
 pub const PRIORITY_NORMAL: u8 = 1;
 pub const PRIORITY_LOW:    u8 = 2;
+
+/// Max actions waiting across all priority buckets.
+///
+/// UDP (high), admin HTTP (normal), and the scheduler (low) share this budget.
+/// Under pressure, [`ActionQueue::push`] drops lower-priority work first so
+/// session/crypto packets keep flowing.
+pub const QUEUE_CAPACITY: usize = 1024;
 
 pub enum Action {
     // From local apps (op byte in first byte of UDP packet)
@@ -107,6 +140,11 @@ pub struct ScheduleRequest {
 }
 
 /// Shared context passed to every action handler.
+///
+/// **Locking (§5.4):** `node` is a single global `RwLock`. Prefer short critical
+/// sections: copy what you need under the lock, then `send` / DNS / disk outside
+/// it. Do not hold `node` across network RTT. Session maps and directory state
+/// stay together for now — see `descriptions/locking.md`.
 pub struct WorkerContext {
     pub node:         Arc<RwLock<Node>>,
     pub udp_socket:   Arc<UdpSocket>,
@@ -118,6 +156,8 @@ pub struct WorkerContext {
     pub sessions: Arc<super::admin_auth::SessionStore>,
     /// Local app API rate limits (register/send token buckets).
     pub app_rate_limits: Arc<std::sync::Mutex<super::app_api::AppRateLimiter>>,
+    /// Host resolve cache (§5.3). Maintain/poll refresh; send/routing look up only.
+    pub dns_cache: Arc<std::sync::Mutex<super::dns_cache::DnsCache>>,
 }
 
 impl WorkerContext {
@@ -130,6 +170,55 @@ impl WorkerContext {
 }
 
 impl Action {
+    /// Short stable name for logs/metrics (not for wire).
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Action::AppRegister { .. } => "AppRegister",
+            Action::AppUpdate { .. } => "AppUpdate",
+            Action::AppGetData { .. } => "AppGetData",
+            Action::AppSendPacket { .. } => "AppSendPacket",
+            Action::UiRequest { .. } => "UiRequest",
+            Action::SgPing { .. } => "SgPing",
+            Action::DgKeepalive { .. } => "DgKeepalive",
+            Action::ConnReset { .. } => "ConnReset",
+            Action::ConnectRequest { .. } => "ConnectRequest",
+            Action::ConnectAck { .. } => "ConnectAck",
+            Action::BootstrapRequest { .. } => "BootstrapRequest",
+            Action::BootstrapResponse { .. } => "BootstrapResponse",
+            Action::DeviceRegistration { .. } => "DeviceRegistration",
+            Action::ContactRequest { .. } => "ContactRequest",
+            Action::ContactResponse { .. } => "ContactResponse",
+            Action::GenerateInvitationRequest { .. } => "GenerateInvitationRequest",
+            Action::GenerateInvitationResponse { .. } => "GenerateInvitationResponse",
+            Action::SyncWriteRequest { .. } => "SyncWriteRequest",
+            Action::SyncWriteAck { .. } => "SyncWriteAck",
+            Action::SyncUpdateAvailable { .. } => "SyncUpdateAvailable",
+            Action::SyncPullRequest { .. } => "SyncPullRequest",
+            Action::SyncPullResponse { .. } => "SyncPullResponse",
+            Action::CrossUserUpdateAvailable { .. } => "CrossUserUpdateAvailable",
+            Action::CrossUserPullRequest { .. } => "CrossUserPullRequest",
+            Action::CrossUserPullResponse { .. } => "CrossUserPullResponse",
+            Action::WatermarkProbeRequest { .. } => "WatermarkProbeRequest",
+            Action::WatermarkProbeResponse { .. } => "WatermarkProbeResponse",
+            Action::MergeProposal { .. } => "MergeProposal",
+            Action::MergeAck { .. } => "MergeAck",
+            Action::RelayPacket { .. } => "RelayPacket",
+            Action::AppPacket { .. } => "AppPacket",
+            Action::TunnelInit { .. } => "TunnelInit",
+            Action::TunnelForward { .. } => "TunnelForward",
+            Action::TunnelDelivery { .. } => "TunnelDelivery",
+            Action::TunnelConnectRequest { .. } => "TunnelConnectRequest",
+            Action::TunnelConnectAck { .. } => "TunnelConnectAck",
+            Action::PollSG => "PollSG",
+            Action::MaintainConnections => "MaintainConnections",
+            Action::KeepAliveDG => "KeepAliveDG",
+            Action::CleanupTunnels => "CleanupTunnels",
+            Action::SyncPull => "SyncPull",
+            Action::PartitionReconcile => "PartitionReconcile",
+            Action::SetupTunnel { .. } => "SetupTunnel",
+        }
+    }
+
     pub fn dispatch(self, ctx: &WorkerContext) {
         use super::handlers;
         match self {
@@ -203,13 +292,64 @@ impl ActionQueue {
         }
     }
 
-    pub fn push(&mut self, priority: u8, action: Action) {
-        assert!(priority <= 7, "priority must be 0–7");
-        self.buckets[priority as usize].push(action);
+    /// Total actions waiting across all priority buckets.
+    pub fn len(&self) -> usize {
+        self.buckets.iter().map(|b| b.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buckets.iter().all(|b| b.is_empty())
+        self.len() == 0
+    }
+
+    /// Enqueue `action` at `priority` (0 = highest).
+    ///
+    /// Returns `true` if the action is waiting in the queue, `false` if it was
+    /// dropped. When at [`QUEUE_CAPACITY`], lower-priority (higher index)
+    /// work is discarded first to make room; if nothing lower-priority exists,
+    /// the **incoming** action is dropped. Every drop is logged.
+    pub fn push(&mut self, priority: u8, action: Action) -> bool {
+        assert!(priority <= 7, "priority must be 0–7");
+
+        if self.len() < QUEUE_CAPACITY {
+            self.buckets[priority as usize].push(action);
+            return true;
+        }
+
+        // At capacity: sacrifice lower-priority work (scan from lowest prio up).
+        if let Some(drop_prio) = self.lowest_priority_strictly_below(priority) {
+            let dropped = self.buckets[drop_prio]
+                .pop()
+                .expect("bucket non-empty after lowest_priority_strictly_below");
+            eprintln!(
+                "[queue] drop existing kind={} prio={} to admit kind={} prio={} depth={}/{}",
+                dropped.kind_name(),
+                drop_prio,
+                action.kind_name(),
+                priority,
+                self.len() + 1, // still full; about to push
+                QUEUE_CAPACITY,
+            );
+            self.buckets[priority as usize].push(action);
+            return true;
+        }
+
+        eprintln!(
+            "[queue] drop incoming kind={} prio={} depth={}/{} (no lower-priority work to shed)",
+            action.kind_name(),
+            priority,
+            self.len(),
+            QUEUE_CAPACITY,
+        );
+        false
+    }
+
+    /// Highest bucket index (lowest priority) that is non-empty and strictly
+    /// worse than `priority` (numerically greater).
+    fn lowest_priority_strictly_below(&self, priority: u8) -> Option<usize> {
+        let start = (priority as usize) + 1;
+        (start..self.buckets.len())
+            .rev()
+            .find(|&i| !self.buckets[i].is_empty())
     }
 
     pub fn pop(&mut self) -> Option<Action> {
@@ -361,5 +501,101 @@ mod tests {
             assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
         }
         assert!(q.pop().is_none());
+    }
+
+    // ── Capacity / drop policy ────────────────────────────────────────────────
+
+    /// Build a full queue using a temporary smaller capacity by filling until
+    /// `len() == QUEUE_CAPACITY` would be expensive in tests — instead exercise
+    /// the policy with a helper that forces the full path via direct bucket
+    /// fills when testing logic unit-style.
+    ///
+    /// We test against real [`QUEUE_CAPACITY`] but only fill it once in a
+    /// dedicated test; smaller synthetic tests use the public API after
+    /// pre-filling via many pushes.
+
+    #[test]
+    fn push_accepts_until_capacity() {
+        let mut q = ActionQueue::new();
+        for i in 0..QUEUE_CAPACITY {
+            assert!(
+                q.push(PRIORITY_LOW, Action::MaintainConnections),
+                "push {i} should succeed under capacity"
+            );
+        }
+        assert_eq!(q.len(), QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn at_capacity_drop_incoming_when_nothing_lower() {
+        let mut q = ActionQueue::new();
+        for _ in 0..QUEUE_CAPACITY {
+            assert!(q.push(PRIORITY_HIGH, reg()));
+        }
+        // Queue is all high priority; another high must be dropped.
+        assert!(!q.push(PRIORITY_HIGH, upd()));
+        assert_eq!(q.len(), QUEUE_CAPACITY);
+        // Still only AppRegister items (the dropped Update never entered).
+        assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+    }
+
+    #[test]
+    fn at_capacity_drop_lower_priority_to_admit_higher() {
+        let mut q = ActionQueue::new();
+        // Fill with low-priority work.
+        for _ in 0..QUEUE_CAPACITY {
+            assert!(q.push(PRIORITY_LOW, Action::MaintainConnections));
+        }
+        // High-priority work must displace a low-priority item.
+        assert!(q.push(PRIORITY_HIGH, reg()));
+        assert_eq!(q.len(), QUEUE_CAPACITY);
+
+        // First pop is the high-priority admit.
+        assert!(matches!(q.pop().unwrap(), Action::AppRegister { .. }));
+        // Remaining are still MaintainConnections (one fewer than capacity).
+        assert_eq!(q.len(), QUEUE_CAPACITY - 1);
+        assert!(matches!(q.pop().unwrap(), Action::MaintainConnections));
+    }
+
+    #[test]
+    fn at_capacity_prefer_dropping_lowest_of_several_low_buckets() {
+        let mut q = ActionQueue::new();
+        // Fill: mostly priority 1, one priority 2 at the end of the low end.
+        for _ in 0..(QUEUE_CAPACITY - 1) {
+            assert!(q.push(PRIORITY_NORMAL, reg()));
+        }
+        assert!(q.push(2, Action::PollSG));
+        assert_eq!(q.len(), QUEUE_CAPACITY);
+
+        // Admit another NORMAL: should shed the priority-2 PollSG, not a NORMAL.
+        assert!(q.push(PRIORITY_NORMAL, upd()));
+        assert_eq!(q.len(), QUEUE_CAPACITY);
+
+        // Drain all NORMAL-register, then should see Update, never PollSG.
+        let mut saw_update = false;
+        let mut saw_poll = false;
+        while let Some(a) = q.pop() {
+            match a {
+                Action::AppUpdate { .. } => saw_update = true,
+                Action::PollSG => saw_poll = true,
+                Action::AppRegister { .. } => {}
+                other => panic!("unexpected {:?}", other.kind_name()),
+            }
+        }
+        assert!(saw_update);
+        assert!(!saw_poll);
+    }
+
+    #[test]
+    fn len_tracks_push_and_pop() {
+        let mut q = ActionQueue::new();
+        assert_eq!(q.len(), 0);
+        q.push(0, reg());
+        q.push(1, upd());
+        assert_eq!(q.len(), 2);
+        q.pop();
+        assert_eq!(q.len(), 1);
+        q.pop();
+        assert_eq!(q.len(), 0);
     }
 }
