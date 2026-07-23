@@ -160,23 +160,35 @@ pub const CONNECTION_LIFETIME: Duration = Duration::from_secs(24 * 3600); // 24 
 /// race with its own device_registration) and other lost-packet scenarios.
 pub const PENDING_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Read 16 cryptographically random bytes from the OS.
+/// Fill `buf` from the OS CSPRNG (`getrandom`). Prefer this over opening
+/// `/dev/urandom` so paths work portably and do not thrash file descriptors.
+///
+/// Returns `Err` only if the OS entropy source fails (extremely rare). Available
+/// for callers that can skip work without panicking; encrypt currently uses
+/// [`fill_random`] because a zero/reused AEAD nonce is worse than aborting.
+pub fn try_fill_random(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    getrandom::getrandom(buf)
+}
+
+/// Fill `buf` from the OS CSPRNG. Panics if entropy is unavailable.
+///
+/// Used for id/key generation and AEAD nonces. A failed CSPRNG is treated as
+/// fatal rather than emitting predictable randomness.
+pub fn fill_random(buf: &mut [u8]) {
+    try_fill_random(buf).expect("OS CSPRNG (getrandom) failed");
+}
+
+/// 16 cryptographically random bytes (app/device/token ids, session salts).
 pub fn generate_uuid() -> Uuid {
-    use std::io::Read;
     let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .expect("failed to read /dev/urandom");
+    fill_random(&mut bytes);
     bytes
 }
 
-/// Read 32 cryptographically random bytes from the OS (for ephemeral key generation).
+/// 32 cryptographically random bytes (ephemeral key seeds, AEAD test keys).
 pub fn generate_key_bytes() -> [u8; 32] {
-    use std::io::Read;
     let mut bytes = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .expect("failed to read /dev/urandom");
+    fill_random(&mut bytes);
     bytes
 }
 
@@ -740,6 +752,26 @@ mod tests {
 
     fn writer_a() -> Uuid { [0xAA; 16] }
     fn writer_b() -> Uuid { [0xBB; 16] }
+
+    #[test]
+    fn try_fill_random_fills_buffer() {
+        let mut buf = [0u8; 32];
+        try_fill_random(&mut buf).expect("getrandom");
+        // CSPRNG output should not be all-zero with overwhelming probability.
+        assert_ne!(buf, [0u8; 32]);
+    }
+
+    #[test]
+    fn generate_uuid_and_key_bytes_are_nonzero_and_vary() {
+        let a = generate_uuid();
+        let b = generate_uuid();
+        assert_ne!(a, [0u8; 16]);
+        assert_ne!(a, b);
+        let k1 = generate_key_bytes();
+        let k2 = generate_key_bytes();
+        assert_ne!(k1, [0u8; 32]);
+        assert_ne!(k1, k2);
+    }
 
     #[test]
     fn zero_is_initial_and_default_matches() {

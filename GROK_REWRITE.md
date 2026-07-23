@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §4.3)* |
-| Last completed | 4.2 Distinct key types (2026-07-22) |
+| Current focus | *(none — next is §5.1)* |
+| Last completed | 4.3 RNG (2026-07-23) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -144,10 +144,9 @@ Data plane is already real; tighten key use and typing.
 **Done:** 2026-07-22 — Replaced flat `KeyPair`/`PublicKey` aliases with `Ed25519{KeyPair,PublicKey,SecretKey}` and `X25519{KeyPair,PublicKey,SecretKey}` in `data_models`. Generators and crypto helpers take/return the matching types (`ed25519_sign/verify` vs `x25519_shared`/`aead_key_from_dh`). Field types: Owner/Contact identity → Ed25519; ActiveConnection/Invitation/Pending*/tunnel ephemerals → X25519. TOML hex shape unchanged. Docs: `Data Models.md`. 235 tests green.
 
 ### 4.3 RNG
-- [ ] Replace ad-hoc `/dev/urandom` opens with `getrandom` (or one shared helper); avoid panic on hot paths where practical
+- [x] Replace ad-hoc `/dev/urandom` opens with `getrandom` (or one shared helper); avoid panic on hot paths where practical
 
-**Done:**  
-
+**Done:** 2026-07-23 — Shared `try_fill_random` / `fill_random` via `getrandom` crate in `data_models`; `generate_uuid` / `generate_key_bytes` and AEAD nonce minting use it (no per-call `/dev/urandom` open). CSPRNG failure still panics rather than emitting a zero/reused nonce (Option-return API deferred). Unit tests for fill + nonce uniqueness. Phase 4 complete.
 ---
 
 ## Phase 5 — Workers, queue, and runtime hygiene
@@ -287,6 +286,7 @@ Add a line per work session (newest at top).
 
 | Date | Item(s) | Notes |
 |------|---------|--------|
+| 2026-07-23 | 4.3 RNG | `getrandom` + shared fill helpers; no `/dev/urandom` in core; tests. |
 | 2026-07-22 | 4.2 Distinct key types | Ed25519 vs X25519 newtypes end-to-end; 235 tests. |
 | 2026-07-22 | 4.1 KDF before AEAD | HKDF-SHA256 + domain labels session/bootstrap/tunnel; 234 tests. |
 | 2026-07-21 | 3.4 push/approval invariants | Approval gate on all push paths; get-data leak tests. |

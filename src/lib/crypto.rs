@@ -9,7 +9,7 @@
 
 use super::data_models::{
     ActiveConnection, Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Node, X25519KeyPair,
-    X25519PublicKey, X25519SecretKey, generate_key_bytes,
+    X25519PublicKey, X25519SecretKey, fill_random, generate_key_bytes,
 };
 use super::wire::ENCRYPTED_BODY_HEADER_LEN;
 
@@ -103,20 +103,17 @@ pub(crate) fn ed25519_verify(
 }
 
 /// XChaCha20-Poly1305 authenticated encryption. Returns (ciphertext, 24-byte nonce).
+///
+/// Nonce bytes come from [`fill_random`] (OS CSPRNG via `getrandom`), not an
+/// ad-hoc `/dev/urandom` open per call. CSPRNG failure panics: a zero or reused
+/// nonce is worse than aborting the encrypt (return-type churn deferred).
 pub(crate) fn xchacha20_encrypt(key: &[u8; 32], plaintext: &[u8]) -> (Vec<u8>, [u8; 24]) {
     use chacha20poly1305::{
         XChaCha20Poly1305, XNonce,
         aead::{Aead, KeyInit},
     };
-    let nonce_bytes: [u8; 24] = {
-        use std::io::Read;
-        let mut b = [0u8; 24];
-        std::fs::File::open("/dev/urandom")
-            .unwrap()
-            .read_exact(&mut b)
-            .unwrap();
-        b
-    };
+    let mut nonce_bytes = [0u8; 24];
+    fill_random(&mut nonce_bytes);
     let cipher = XChaCha20Poly1305::new_from_slice(key).expect("32-byte key");
     let nonce = XNonce::from_slice(&nonce_bytes);
     let ciphertext = cipher.encrypt(nonce, plaintext).expect("encryption failed");
@@ -266,6 +263,15 @@ mod tests {
         let pt = xchacha20_decrypt(&key, &nonce, &ct).expect("decrypt");
         assert_eq!(pt, b"payload");
         assert!(xchacha20_decrypt(&key, &nonce, b"tampered").is_none());
+    }
+
+    #[test]
+    fn xchacha20_nonces_differ_across_encrypts() {
+        let key = generate_key_bytes();
+        let (_, n1) = xchacha20_encrypt(&key, b"a");
+        let (_, n2) = xchacha20_encrypt(&key, b"a");
+        assert_ne!(n1, n2);
+        assert_ne!(n1, [0u8; 24]);
     }
 
     #[test]
