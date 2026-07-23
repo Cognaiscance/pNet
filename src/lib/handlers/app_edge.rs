@@ -4,6 +4,7 @@
 //! fabric routing helpers and sync publish stay in the parent `handlers` module.
 
 use std::net::{SocketAddr, SocketAddrV4};
+use std::time::SystemTime;
 
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{
@@ -464,99 +465,87 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
         let sender_app_id = sender_app.id;
 
-        // ── Tunnel path (if a DG-to-DG tunnel is active for this destination) ──
-        // Only use if the tunnel's ActiveConnection still exists.
-        let tunnel_info: Option<(u16, u16)> = node.owner.dg_tunnel_map.iter()
-            .find(|(tid, conn_id)| {
-                let _ = *tid;
-                node.owner.active_connections.get(*conn_id)
+        // ── Tunnel path (optional) ────────────────────────────────────────────
+        // Prefer an active DG↔DG tunnel when present. If the tunnel session is
+        // gone, incomplete, or no SG can carry TUNNEL_FORWARD, fall through to
+        // direct/relay so teardown never black-holes delivery (§6.4).
+        let tunnel_info: Option<(u16, u16)> = node
+            .owner
+            .dg_tunnel_map
+            .iter()
+            .find(|(_tid, conn_id)| {
+                node.owner
+                    .active_connections
+                    .get(*conn_id)
                     .map(|c| c.device_uuid == dest_device_uuid)
                     .unwrap_or(false)
             })
-            .map(|(tid, cid)| (*tid, *cid))
-            .filter(|(_, cid)| node.owner.active_connections.contains_key(cid));
+            .map(|(tid, cid)| (*tid, *cid));
 
-        if let Some((tunnel_id, dg_dg_conn_id)) = tunnel_info {
-            // Encrypt with the DG-to-DG tunnel AEAD key (HKDF tunnel domain).
-            let Some(dg_dg_conn) = node.owner.active_connections.get(&dg_dg_conn_id) else {
-                unreachable!("filtered above");
+        let tunnel_pkt: Option<(Vec<u8>, SocketAddr)> =
+            if let Some((tunnel_id, dg_dg_conn_id)) = tunnel_info {
+                (|| {
+                    let dg_dg_conn = node.owner.active_connections.get(&dg_dg_conn_id)?;
+                    let aead_key = aead_key_from_dh(
+                        &dg_dg_conn.key_pair.private_key,
+                        &dg_dg_conn.peer_public_key,
+                        aead_domain::TUNNEL,
+                    );
+                    let mut plaintext = Vec::with_capacity(32 + payload.len());
+                    plaintext.extend_from_slice(&dest_app_id);
+                    plaintext.extend_from_slice(&sender_app_id);
+                    plaintext.extend_from_slice(payload);
+                    let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &plaintext);
+                    let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid).or_else(|| {
+                        let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
+                        best_sg_connection(&node, &candidates)
+                    })?;
+                    let sender_sg_conn_id = sg_conn.peer_active_connection_id;
+                    let mut pkt = Vec::with_capacity(4 + 24 + ciphertext.len());
+                    pkt.push(TUNNEL_FORWARD_OP);
+                    pkt.extend_from_slice(&sender_sg_conn_id.to_be_bytes());
+                    pkt.extend_from_slice(&tunnel_id.to_be_bytes());
+                    pkt.extend_from_slice(&nonce);
+                    pkt.extend_from_slice(&ciphertext);
+                    Some((pkt, sg_conn.peer_addr))
+                })()
+            } else {
+                None
             };
-            let aead_key = aead_key_from_dh(
-                &dg_dg_conn.key_pair.private_key,
-                &dg_dg_conn.peer_public_key,
-                aead_domain::TUNNEL,
-            );
 
-            // Plaintext format: [dest_app_id: 16][sender_app_id: 16][payload]
-            let mut plaintext = Vec::with_capacity(32 + payload.len());
-            plaintext.extend_from_slice(&dest_app_id);
-            plaintext.extend_from_slice(&sender_app_id);
-            plaintext.extend_from_slice(payload);
-
-            let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &plaintext);
-
-            // Route the tunnel forward packet via the relay SG.
-            let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid)
-                .or_else(|| {
-                    let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
-                    best_sg_connection(&node, &candidates)
-                });
-            let Some(sg_conn) = sg_conn else {
-                eprintln!("[app_send_packet] no reachable SG for tunnel dest {:?}", dest_device_uuid);
-                return send_error(ctx, src, ERR_NO_ROUTE);
-            };
-
-            // `peer_active_connection_id` is the SG's local conn_id for this DG's connection.
-            let sender_sg_conn_id = sg_conn.peer_active_connection_id;
-
-            // TUNNEL_FORWARD: [op=0x51][sender_sg_conn_id: u16][tunnel_id: u16][nonce: 24][ciphertext]
-            let mut pkt = Vec::with_capacity(4 + 24 + ciphertext.len());
-            pkt.push(TUNNEL_FORWARD_OP);
-            pkt.extend_from_slice(&sender_sg_conn_id.to_be_bytes());
-            pkt.extend_from_slice(&tunnel_id.to_be_bytes());
-            pkt.extend_from_slice(&nonce);
-            pkt.extend_from_slice(&ciphertext);
-
-            Some((pkt, sg_conn.peer_addr))
-        } else if let Some(dest_conn) = node.owner.active_connections.values()
-            .find(|c| c.device_uuid == dest_device_uuid)
-        {
-            // ── Direct path (this node has an active connection to dest) ──────
-            // When the local device is an SG it may already hold a direct
-            // connection to the destination DG.  Skip the relay and send an
-            // AppPacket straight to the destination using the peer's actual
-            // source address (not the potentially-stale d.host).
+        let now = SystemTime::now();
+        if let Some(out) = tunnel_pkt {
+            Some(out)
+        } else if let Some(dest_conn) = node.owner.active_connections.values().find(|c| {
+            // Never AppPacket on a tunnel leg (session AEAD domain ≠ tunnel).
+            // Skip expired sessions (cleanup may leave the conn until renew).
+            c.device_uuid == dest_device_uuid
+                && c.timeout > now
+                && !node.owner.dg_tunnel_map.values().any(|cid| *cid == c.id)
+        }) {
+            // ── Direct path (session to dest that is not the tunnel leg) ─────
             let mut app_body = Vec::with_capacity(32 + payload.len());
             app_body.extend_from_slice(&dest_app_id);
             app_body.extend_from_slice(&sender_app_id);
             app_body.extend_from_slice(payload);
-
-            let pkt  = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
-            let dest = dest_conn.peer_addr;
-            Some((pkt, dest))
+            let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
+            Some((pkt, dest_conn.peer_addr))
         } else {
-            // ── Standard relay path ───────────────────────────────────────────
-            // Prefer the recipient's top-ranked SG (only one with a keep-alive
-            // tunnel to the destination DG). Fall back to lowest-RTT SG.
-            let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid)
-                .or_else(|| {
-                    let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
-                    best_sg_connection(&node, &candidates)
-                });
+            // ── Standard relay path (also the fallback after tunnel teardown) ─
+            let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid).or_else(|| {
+                let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
+                best_sg_connection(&node, &candidates)
+            });
             let Some(sg_conn) = sg_conn else {
                 eprintln!("[app_send_packet] no reachable SG for dest {:?}", dest_device_uuid);
                 return send_error(ctx, src, ERR_NO_ROUTE);
             };
-
-            // RelayPacket body: [dest_device_uuid: 16][dest_app_id: 16][sender_app_id: 16][payload]
             let mut plaintext = Vec::with_capacity(48 + payload.len());
             plaintext.extend_from_slice(&dest_device_uuid);
             plaintext.extend_from_slice(&dest_app_id);
             plaintext.extend_from_slice(&sender_app_id);
             plaintext.extend_from_slice(payload);
-
             let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
-
             Some((pkt, sg_conn.peer_addr))
         }
     };

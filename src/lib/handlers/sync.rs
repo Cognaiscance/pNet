@@ -15,8 +15,8 @@ use super::super::data_models::{
 };
 use super::super::wire::*;
 use super::{
-    find_pull_source, find_writer_sg, find_writer_sg_probing, push_device, read_device, send,
-    WriterTarget,
+    fabric_event, find_pull_source, find_writer_sg, find_writer_sg_probing, push_device, read_device,
+    send, uuid_hex, WriterTarget,
 };
 
 // ── Contact data serialization (cross-user public-scope payload) ─────────────
@@ -617,6 +617,24 @@ fn apply_local_change(
         let node = ctx.node.read().unwrap();
         (node.owner.private_version, node.owner.public_version)
     };
+
+    // §6.2: version writer_sg_uuid change (epoch rollover / new elected writer stamp).
+    for (scope_name, pre, post) in [
+        ("private", pre_priv, post_priv),
+        ("public", pre_pub, post_pub),
+    ] {
+        if pre.writer_sg_uuid != post.writer_sg_uuid {
+            fabric_event(
+                "writer_change",
+                &[
+                    ("scope", scope_name),
+                    ("from", &uuid_hex(&pre.writer_sg_uuid)),
+                    ("to", &uuid_hex(&post.writer_sg_uuid)),
+                    ("epoch", &post.epoch.to_string()),
+                ],
+            );
+        }
+    }
     ctx.save_node();
     // One write-log entry per accepted Change, recorded under the post-bump
     // version for each touched scope (current variants all touch a single

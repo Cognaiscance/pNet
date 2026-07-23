@@ -670,6 +670,16 @@ pub struct Node {
     /// entry in that device's `hosts` list.
     #[serde(skip)]
     pub sg_statuses: HashMap<(Uuid, String), SgStatus>,
+    /// Ephemeral — last computed "own-user SG peer(s) all-down" flag, used to
+    /// emit structured `partition_detect` / `partition_clear` logs on change
+    /// (§6.2) and for diagnostics. Not persisted.
+    #[serde(skip)]
+    pub partition_flag: bool,
+    /// Ephemeral — true while the preferred (lowest `sg_rank`) own SG is
+    /// polled-down and writer/traffic has moved to a lower-rank SG or local
+    /// (§6.3). Used to log `rank_failover` / `rank_recovery` on transition.
+    #[serde(skip)]
+    pub rank1_failover_active: bool,
 }
 
 impl Owner {
@@ -716,6 +726,8 @@ impl Node {
             device_uuid,
             admin_password_hash: None,
             sg_statuses: HashMap::new(),
+            partition_flag: false,
+            rank1_failover_active: false,
             owner: Owner {
                 user: User {
                     alias:   "Owner".to_string(),

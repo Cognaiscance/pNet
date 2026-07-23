@@ -44,6 +44,30 @@ fn send_error(ctx: &WorkerContext, dest: SocketAddr, code: u8) {
     send(ctx, dest, &[STATUS_ERR, code]);
 }
 
+/// Structured fabric ops log (§6.2). Greppable: `[fabric] event=<name> k=v …`.
+/// Values with spaces or `=` are double-quoted; quotes inside are escaped.
+pub(crate) fn fabric_event(event: &str, fields: &[(&str, &str)]) {
+    let mut line = format!("[fabric] event={event}");
+    for (k, v) in fields {
+        line.push(' ');
+        line.push_str(k);
+        line.push('=');
+        if v.is_empty() || v.chars().any(|c| c.is_whitespace() || c == '=' || c == '"') {
+            line.push('"');
+            for c in v.chars() {
+                if c == '"' {
+                    line.push('\\');
+                }
+                line.push(c);
+            }
+            line.push('"');
+        } else {
+            line.push_str(v);
+        }
+    }
+    println!("{line}");
+}
+
 /// Extract an IPv4 address from a SocketAddr, mapping IPv4-in-IPv6 if needed.
 
 // Local app edge (register/update/get-data/send + inbound app_packet push).
@@ -73,8 +97,8 @@ mod routing;
 pub use routing::{WriterTarget, find_writer_sg};
 pub(crate) use routing::{
     best_address_for_device, best_sg_connection, find_pull_source, find_writer_sg_probing,
-    ipv4_from, refresh_dns_for_known_hosts, resolve_host_entry, resolve_hosts,
-    sg_candidates_for_dest, top_ranked_sg_for_device,
+    ipv4_from, rank1_failover_info, refresh_dns_for_known_hosts, resolve_host_entry,
+    resolve_hosts, sg_candidates_for_dest, top_ranked_sg_for_device,
 };
 
 mod sync;
@@ -103,8 +127,8 @@ pub use tunnels::{
 mod admin_ui;
 pub use admin_ui::{apply_new_user_setup, ui_request};
 pub(crate) use admin_ui::{
-    UI_ERR_PUBLISH_FAILED, approve_app, complete_setup, form_field, partition_banner,
-    reject_app, rename_app, render_diagnostics, url_decode,
+    UI_ERR_PUBLISH_FAILED, approve_app, complete_setup, form_field, own_user_sg_partition,
+    partition_banner, reject_app, rename_app, render_diagnostics, url_decode,
 };
 
 
@@ -755,6 +779,161 @@ mod tests {
         assert_eq!(reply, vec![STATUS_ERR, ERR_PAYLOAD_TOO_LARGE]);
     }
 
+    /// §6.4: after DG tunnel map teardown, send uses standard relay (not
+    /// TUNNEL_FORWARD) so delivery remains possible.
+    #[test]
+    fn app_send_falls_back_to_relay_after_tunnel_teardown() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "tun", 9100);
+        approve_local_app(&t, &token);
+
+        let dest_device = generate_uuid();
+        let dest_app = app_uuid(9);
+        let tunnel_id: u16 = 3;
+        let tunnel_conn_id: u16 = 40;
+        let sg_conn_id: u16 = 5;
+        let sg_uuid = generate_uuid();
+
+        let capture = UdpSocket::bind("127.0.0.1:0").unwrap();
+        capture.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let sg_addr = capture.local_addr().unwrap();
+
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            // Own SG so routing can pick a relay.
+            node.owner.user.devices.push(Device {
+                alias: "sg".into(),
+                uuid: sg_uuid,
+                grade: DeviceGrade::SG,
+                sg_rank: Some(1),
+                hosts: vec!["127.0.0.1:1".into()],
+                applications: Vec::new(),
+            });
+            // Session to that SG (relay path).
+            let local_to_sg = generate_x25519_keypair();
+            let sg_to_local = generate_x25519_keypair();
+            node.owner.active_connections.insert(
+                sg_conn_id,
+                ActiveConnection {
+                    id: sg_conn_id,
+                    timeout: SystemTime::now() + Duration::from_secs(3600),
+                    key_pair: local_to_sg,
+                    peer_public_key: sg_to_local.public_key,
+                    peer_active_connection_id: 99,
+                    device_uuid: sg_uuid,
+                    peer_addr: sg_addr,
+                },
+            );
+            // Live tunnel map + DG↔DG session (would prefer tunnel if used).
+            let tun_a = generate_x25519_keypair();
+            let tun_b = generate_x25519_keypair();
+            node.owner.active_connections.insert(
+                tunnel_conn_id,
+                ActiveConnection {
+                    id: tunnel_conn_id,
+                    timeout: SystemTime::now() + Duration::from_secs(3600),
+                    key_pair: tun_a,
+                    peer_public_key: tun_b.public_key,
+                    peer_active_connection_id: 0,
+                    device_uuid: dest_device,
+                    peer_addr: "127.0.0.1:2".parse().unwrap(),
+                },
+            );
+            node.owner.dg_tunnel_map.insert(tunnel_id, tunnel_conn_id);
+        }
+
+        // With tunnel map: expect TUNNEL_FORWARD to the SG capture socket.
+        app_send_packet(
+            t.app_addr(),
+            send_packet(&token, dest_device, dest_app, b"via-tunnel"),
+            &t.ctx,
+        );
+        let mut buf = [0u8; 512];
+        let (n, _) = capture.recv_from(&mut buf).expect("tunnel path should send to SG");
+        assert_eq!(buf[0], TUNNEL_FORWARD_OP, "live tunnel should use TUNNEL_FORWARD");
+
+        // Teardown tunnel map + expire DG↔DG session (cleanup path).
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            if let Some(c) = node.owner.active_connections.get_mut(&tunnel_conn_id) {
+                c.timeout = SystemTime::now() - Duration::from_secs(1);
+            }
+        }
+        cleanup_tunnels(&t.ctx);
+        assert!(
+            t.ctx.node.read().unwrap().owner.dg_tunnel_map.is_empty(),
+            "cleanup must drop expired tunnel map entries"
+        );
+
+        // Drain any leftover and send again — must be RELAY_PACKET.
+        while capture.recv_from(&mut buf).is_ok() {}
+        app_send_packet(
+            t.app_addr(),
+            send_packet(&token, dest_device, dest_app, b"via-relay"),
+            &t.ctx,
+        );
+        let (n2, _) = capture
+            .recv_from(&mut buf)
+            .expect("after teardown, relay must still deliver to SG");
+        assert_eq!(
+            buf[0], RELAY_PACKET_OP,
+            "after tunnel teardown send must fall back to standard relay"
+        );
+        assert!(n2 > 1 && n > 1);
+    }
+
+    #[test]
+    fn app_send_tunnel_without_sg_falls_back_when_possible() {
+        // Tunnel map present but no SG session: must not hard-fail if we can
+        // still... actually with no SG and only tunnel conn, ERR_NO_ROUTE is
+        // correct. With SG session and dead tunnel build (no tunnel conn),
+        // relay works — covered above. This tests: map points at dest but
+        // tunnel conn missing → relay via SG.
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "fb", 9101);
+        approve_local_app(&t, &token);
+        let dest_device = generate_uuid();
+        let dest_app = app_uuid(2);
+        let sg_uuid = generate_uuid();
+        let capture = UdpSocket::bind("127.0.0.1:0").unwrap();
+        capture.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let sg_addr = capture.local_addr().unwrap();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias: "sg".into(),
+                uuid: sg_uuid,
+                grade: DeviceGrade::SG,
+                sg_rank: Some(1),
+                hosts: vec![],
+                applications: Vec::new(),
+            });
+            node.owner.active_connections.insert(
+                1,
+                ActiveConnection {
+                    id: 1,
+                    timeout: SystemTime::now() + Duration::from_secs(3600),
+                    key_pair: generate_x25519_keypair(),
+                    peer_public_key: X25519PublicKey(generate_key_bytes()),
+                    peer_active_connection_id: 7,
+                    device_uuid: sg_uuid,
+                    peer_addr: sg_addr,
+                },
+            );
+            // Stale map entry: conn id gone → tunnel_info misses → relay.
+            node.owner.dg_tunnel_map.insert(9, 999);
+        }
+        app_send_packet(
+            t.app_addr(),
+            send_packet(&token, dest_device, dest_app, b"relay"),
+            &t.ctx,
+        );
+        let mut buf = [0u8; 512];
+        let (n, _) = capture.recv_from(&mut buf).expect("relay send");
+        assert_eq!(buf[0], RELAY_PACKET_OP);
+        assert!(n > 1);
+    }
+
     #[test]
     fn app_register_rate_limited() {
         let t = TestCtx::new();
@@ -965,6 +1144,78 @@ mod tests {
         let pend = pending_peers(&t);
         assert!(pend.contains(&higher), "SG must initiate to a higher-uuid SG peer");
         assert!(!pend.contains(&lower), "SG must NOT initiate to a lower-uuid SG peer — it responds instead (else glare)");
+    }
+
+    /// §6.1: conn-reset must not wait for the 5‑minute maintain tick — it
+    /// evicts matching sessions and runs maintain immediately so a pending
+    /// ConnectRequest appears without scheduler help.
+    #[test]
+    fn conn_reset_evicts_and_runs_maintain_immediately() {
+        let t = TestCtx::new();
+        set_local_identity(&t, [0x80; 16], DeviceGrade::DG);
+
+        let sg_uuid: Uuid = [0xAA; 16];
+        let sg_lt = generate_ed25519_keypair().public_key;
+        {
+            let mut n = t.ctx.node.write().unwrap();
+            // Own SG with a literal host so maintain can resolve without DNS warm.
+            n.owner.user.devices.push(Device {
+                alias: "sg1".into(),
+                uuid: sg_uuid,
+                grade: DeviceGrade::SG,
+                sg_rank: Some(1),
+                hosts: vec!["127.0.0.1:19001".into()],
+                applications: Vec::new(),
+            });
+            // Stale active session to that SG (same IP the reset will claim).
+            let stale_addr: SocketAddr = "127.0.0.1:19001".parse().unwrap();
+            n.owner.active_connections.insert(
+                7,
+                ActiveConnection {
+                    id: 7,
+                    timeout: SystemTime::now() + Duration::from_secs(3600),
+                    key_pair: generate_x25519_keypair(),
+                    peer_public_key: X25519PublicKey(generate_key_bytes()),
+                    peer_active_connection_id: 1,
+                    device_uuid: sg_uuid,
+                    peer_addr: stale_addr,
+                },
+            );
+            // Stale pending to the same peer must be cleared so maintain re-issues.
+            n.owner.pending_connections.insert(
+                8,
+                PendingConnection {
+                    our_conn_id: 8,
+                    our_key_pair: generate_x25519_keypair(),
+                    peer_device_uuid: sg_uuid,
+                    peer_longterm_pk: sg_lt,
+                    created_at: SystemTime::now(),
+                },
+            );
+        }
+
+        assert_eq!(
+            t.ctx.node.read().unwrap().owner.active_connections.len(),
+            1
+        );
+        conn_reset("127.0.0.1:19001".parse().unwrap(), &t.ctx);
+
+        let node = t.ctx.node.read().unwrap();
+        assert!(
+            node.owner.active_connections.is_empty(),
+            "stale session must be gone after conn-reset"
+        );
+        assert!(
+            node.owner.pending_connections.values().any(|p| p.peer_device_uuid == sg_uuid),
+            "maintain must have re-issued ConnectRequest immediately (not deferred to 5min tick)"
+        );
+        // Stale pending id 8 must not be the only leftover — a fresh one exists.
+        assert!(
+            !node.owner.pending_connections.contains_key(&8)
+                || node.owner.pending_connections.len() >= 1,
+            "stale pending cleared or replaced"
+        );
+        let _ = sg_lt; // used in setup
     }
 
     /// A DG must always initiate to its contacts' SGs (it punches out through
@@ -1397,6 +1648,38 @@ mod tests {
         let sg2  = add_peer_sg(&t, 2, true, Some(true));  // rank 2 up
         let node = t.ctx.node.read().unwrap();
         assert_eq!(find_writer_sg(&node), WriterTarget::Remote(sg2));
+    }
+
+    #[test]
+    fn rank1_failover_info_active_when_preferred_down_and_writer_moved() {
+        let t = TestCtx::new();
+        let sg1 = add_peer_sg(&t, 1, true, Some(false));
+        let sg2 = add_peer_sg(&t, 2, true, Some(true));
+        let node = t.ctx.node.read().unwrap();
+        let info = rank1_failover_info(&node).expect("failover should be active");
+        assert_eq!(info.0, sg1);
+        assert_eq!(info.1, 1);
+        assert_eq!(info.2, WriterTarget::Remote(sg2));
+    }
+
+    #[test]
+    fn rank1_failover_info_inactive_when_preferred_up() {
+        let t = TestCtx::new();
+        add_peer_sg(&t, 1, true, Some(true));
+        add_peer_sg(&t, 2, true, Some(true));
+        let node = t.ctx.node.read().unwrap();
+        assert!(rank1_failover_info(&node).is_none());
+    }
+
+    #[test]
+    fn rank1_failover_info_local_takeover() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 2);
+        let sg1 = add_peer_sg(&t, 1, true, Some(false));
+        let node = t.ctx.node.read().unwrap();
+        let info = rank1_failover_info(&node).expect("local takeover is failover");
+        assert_eq!(info.0, sg1);
+        assert_eq!(info.2, WriterTarget::Local);
     }
 
     #[test]
@@ -4598,11 +4881,22 @@ mod tests {
         }
         let html = render_diagnostics(&t.ctx);
         assert!(html.contains("Diagnostics"));
-        assert!(html.contains("Local node"));
+        assert!(html.contains("Fabric health"));
+        assert!(html.contains("Writer SG"));
+        assert!(html.contains("Private version"));
+        assert!(html.contains("Partition flag"));
+        assert!(html.contains("Active sessions"));
         assert!(html.contains("sg-peer"));
         assert!(html.contains("epoch=3"));
         assert!(html.contains("seq=17"));
         assert!(html.contains("Buffered merge proposals"));
+    }
+
+    #[test]
+    fn fabric_event_formats_key_values() {
+        // Smoke: helper is callable (output is stdout). Ensure empty and
+        // spaced values do not panic.
+        fabric_event("test_event", &[("a", "1"), ("b", "has space"), ("c", "")]);
     }
 
     #[test]

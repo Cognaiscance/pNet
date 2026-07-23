@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use lib::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW};
+use lib::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW, PRIORITY_NORMAL};
 use lib::data_models::DeviceGrade;
 use lib::handlers::{apply_new_user_setup, parse_pnet_hosts, start_bootstrap};
 use lib::http_server::{http_bind_ip, http_port, HttpServer};
@@ -203,11 +203,17 @@ fn main() {
 
     let mut pool = ThreadPool::new(WORKER_COUNT, Arc::clone(&queue), Arc::clone(&stop), Arc::clone(&ctx));
 
-    // ── 7. Kick off initial connection maintenance ───────────────────────────
+    // ── 7. Cold-boot: poll SGs first (RTT / up-down), then maintain connections ─
+    // §6.3: until PollSG warms `sg_statuses`, `best_address_for_device` falls
+    // back to the first resolvable host (may not be lowest-RTT). Enqueue poll
+    // ahead of maintain so the first connect pass can use RTT when the poll
+    // worker finishes first; both are still best-effort under the pool.
     {
         let (lock, cvar) = &*queue;
-        lock.lock().unwrap().push(PRIORITY_LOW, Action::MaintainConnections);
-        cvar.notify_one();
+        let mut guard = lock.lock().unwrap();
+        guard.push(PRIORITY_NORMAL, Action::PollSG);
+        guard.push(PRIORITY_LOW, Action::MaintainConnections);
+        cvar.notify_all();
     }
 
     // ── 8. Start HTTP server ─────────────────────────────────────────────────

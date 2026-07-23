@@ -19,13 +19,13 @@ use super::super::admin_auth::{
 };
 use super::super::crypto::generate_ed25519_keypair;
 use super::super::data_models::{
-    Device, DeviceGrade, Node, Uuid, WRITE_LOG_RETENTION, generate_uuid,
+    Device, DeviceGrade, Node, Uuid, CONNECTION_LIFETIME, WRITE_LOG_RETENTION, generate_uuid,
 };
 use super::super::wire::*;
 use super::{
-    generate_contact_invitation, generate_device_invitation, initiate_bootstrap,
+    find_writer_sg, generate_contact_invitation, generate_device_invitation, initiate_bootstrap,
     initiate_contact_exchange, parse_pnet_hosts, request_change, sync_pull, uuid_hex, Change,
-    InvitationMint,
+    InvitationMint, WriterTarget,
 };
 
 // ── UI / HTTP handlers ────────────────────────────────────────────────────────
@@ -735,31 +735,78 @@ fn render_devices(ctx: &WorkerContext) -> String {
 
 // ── Sync v2 diagnostics ───────────────────────────────────────────────────────
 
-/// Render `/diagnostics` — surfaces the ephemeral state that drives sync v2
-/// partition reconciliation: per-peer reachability, last exchanged watermarks,
-/// and buffered inbound merge proposals. Read-only.
+/// Render `/diagnostics` — fabric health (§6.2) plus sync v2 ephemeral state.
+/// Read-only. Surfaces writer election, public/private versions, sessions,
+/// RTT / poll age, keepalive/session refresh proxy, and partition flag.
 pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
     let node = ctx.node.read().unwrap();
     let local_uuid = node.device_uuid;
     let pv = node.owner.public_version;
+    let priv_v = node.owner.private_version;
+    let now = SystemTime::now();
+    let instant_now = Instant::now();
+
+    let writer_target = find_writer_sg(&node);
+    let (writer_label, writer_detail) = match writer_target {
+        WriterTarget::Local => (
+            "Local".to_string(),
+            format!("this node is the writer SG (<code>{}</code>)", uuid_hex(&local_uuid)),
+        ),
+        WriterTarget::Remote(u) => {
+            let alias = node
+                .owner
+                .user
+                .devices
+                .iter()
+                .find(|d| d.uuid == u)
+                .map(|d| d.alias.as_str())
+                .unwrap_or("(unknown)");
+            (
+                format!("Remote — {alias}"),
+                format!("<code>{}</code>", uuid_hex(&u)),
+            )
+        }
+        WriterTarget::Unreachable => (
+            "Unreachable".to_string(),
+            "no reachable own SG (and this node is not an SG writer)".to_string(),
+        ),
+    };
+
+    let partition_now = own_user_sg_partition(&node);
+    let partition_html = if partition_now {
+        "<span style='color:#c0392b;font-weight:bold'>yes — own-user SG peer(s) all-down</span>"
+            .to_string()
+    } else {
+        "<span style='color:#2d7a3b'>no</span>".to_string()
+    };
 
     let local_section = format!(
         "<div class='card'>\
-           <h2 style='margin-top:0'>Local node</h2>\
+           <h2 style='margin-top:0'>Fabric health</h2>\
            <table>\
              <tr><th>Device UUID</th><td><code>{local}</code></td></tr>\
-             <tr><th>Public version</th><td>writer=<code>{w}</code> epoch={e} seq={s}</td></tr>\
+             <tr><th>Writer SG</th><td><strong>{wlabel}</strong><br>\
+               <span style='font-size:.85rem;color:#666'>{wdetail}</span></td></tr>\
+             <tr><th>Public version</th><td>writer=<code>{pw}</code> epoch={pe} seq={ps}</td></tr>\
+             <tr><th>Private version</th><td>writer=<code>{rw}</code> epoch={re} seq={rs}</td></tr>\
+             <tr><th>Partition flag</th><td>{part}</td></tr>\
              <tr><th>Write log</th><td>{n} entries (retention {ret}d)</td></tr>\
              <tr><th>Node lock</th><td>global <code>RwLock&lt;Node&gt;</code> \
                (session/directory split deferred — see locking.md)</td></tr>\
            </table>\
          </div>",
         local = uuid_hex(&local_uuid),
-        w     = uuid_hex(&pv.writer_sg_uuid),
-        e     = pv.epoch,
-        s     = pv.seq,
-        n     = node.owner.write_log.len(),
-        ret   = WRITE_LOG_RETENTION.as_secs() / 86_400,
+        wlabel = html_escape(&writer_label),
+        wdetail = writer_detail,
+        pw = uuid_hex(&pv.writer_sg_uuid),
+        pe = pv.epoch,
+        ps = pv.seq,
+        rw = uuid_hex(&priv_v.writer_sg_uuid),
+        re = priv_v.epoch,
+        rs = priv_v.seq,
+        part = partition_html,
+        n = node.owner.write_log.len(),
+        ret = WRITE_LOG_RETENTION.as_secs() / 86_400,
     );
 
     // Build an alias lookup so peer-uuid keys in the ephemeral maps render
@@ -777,7 +824,55 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
         "(unknown)".to_string()
     };
 
-    // Own-user SG peers + reachability.
+    // Active sessions: peer list with peer_addr, session remaining, refresh age
+    // (CONNECTION_LIFETIME − remaining ≈ time since last timeout refresh /
+    // keepalive on that session).
+    let mut sess_rows = String::new();
+    let mut sessions: Vec<_> = node.owner.active_connections.values().collect();
+    sessions.sort_by_key(|c| c.id);
+    for c in sessions {
+        let remaining = c
+            .timeout
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO);
+        let remaining_s = remaining.as_secs();
+        let refresh_age = CONNECTION_LIFETIME
+            .checked_sub(remaining)
+            .unwrap_or(Duration::ZERO);
+        let refresh_age_s = refresh_age.as_secs();
+        sess_rows.push_str(&format!(
+            "<tr>\
+               <td>{alias}<br><code style='font-size:.75rem;color:#888'>{uuid}</code></td>\
+               <td>{cid}</td>\
+               <td><code>{addr}</code></td>\
+               <td>{rem}s left</td>\
+               <td>~{age}s since refresh</td>\
+             </tr>",
+            alias = html_escape(&alias_of(&c.device_uuid)),
+            uuid = uuid_hex(&c.device_uuid),
+            cid = c.id,
+            addr = html_escape(&c.peer_addr.to_string()),
+            rem = remaining_s,
+            age = refresh_age_s,
+        ));
+    }
+    let sessions_section = if sess_rows.is_empty() {
+        "<div class='card'><h2 style='margin-top:0'>Active sessions</h2>\
+         <p class='empty'>No active connections.</p>\
+         <p style='font-size:.8rem;color:#666'>Refresh age ≈ time since last \
+         connect/keepalive timeout refresh (session lifetime − remaining).</p></div>"
+            .to_string()
+    } else {
+        format!(
+            "<div class='card'><h2 style='margin-top:0'>Active sessions</h2>\
+             <p style='font-size:.85rem;color:#666;margin-top:0'>Peer list with \
+             <code>peer_addr</code>, session remaining, and keepalive/refresh age proxy.</p>\
+             <table><tr><th>Peer</th><th>Conn id</th><th>peer_addr</th>\
+             <th>Session remaining</th><th>Refresh age</th></tr>{sess_rows}</table></div>"
+        )
+    };
+
+    // Own-user SG peers + reachability (last RTT + poll age).
     let mut peer_rows = String::new();
     for d in &node.owner.user.devices {
         if !matches!(d.grade, DeviceGrade::SG) || d.uuid == local_uuid { continue; }
@@ -786,9 +881,16 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
                 Some(s) => {
                     let rtt = s.last_rtt.map(|r| format!("{}ms", r.as_millis()))
                         .unwrap_or_else(|| "—".to_string());
+                    let poll_age = instant_now
+                        .checked_duration_since(s.last_polled)
+                        .map(|d| format!("{}s ago", d.as_secs()))
+                        .unwrap_or_else(|| "—".to_string());
                     let status = if s.up { "<span style='color:#2d7a3b'>up</span>" }
                                  else    { "<span style='color:#c0392b'>down</span>" };
-                    format!("<li><code>{}</code> — {status} (rtt {rtt})</li>", html_escape(h))
+                    format!(
+                        "<li><code>{}</code> — {status} (rtt {rtt}, polled {poll_age})</li>",
+                        html_escape(h)
+                    )
                 }
                 None => format!("<li><code>{}</code> — <span style='color:#888'>not yet polled</span></li>",
                                 html_escape(h)),
@@ -807,7 +909,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
     } else {
         format!(
             "<div class='card'><h2 style='margin-top:0'>Own-user SG peers</h2>\
-             <table><tr><th>Peer</th><th>Hosts</th></tr>{peer_rows}</table></div>"
+             <table><tr><th>Peer</th><th>Hosts (status / RTT / poll age)</th></tr>{peer_rows}</table></div>"
         )
     };
 
@@ -876,7 +978,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
     drop(node);
 
     let body = format!(
-        "<h1>Diagnostics</h1>{local_section}{peers_section}{wm_section}{pp_section}"
+        "<h1>Diagnostics</h1>{local_section}{sessions_section}{peers_section}{wm_section}{pp_section}"
     );
     layout(ctx, "Diagnostics", &body)
 }
@@ -1450,36 +1552,49 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
     html
 }
 
+/// True when at least one **other** own-user SG has only polled-down hosts.
+/// Unpolled peers are not treated as down (avoids false positives at cold boot).
+pub(crate) fn own_user_sg_partition(node: &Node) -> bool {
+    !own_user_sg_down_aliases(node).is_empty()
+}
+
+/// Aliases of own-user SG peers that are unanimously down in `sg_statuses`.
+fn own_user_sg_down_aliases(node: &Node) -> Vec<String> {
+    let local_uuid = node.device_uuid;
+    let mut down = Vec::new();
+    for d in &node.owner.user.devices {
+        if !matches!(d.grade, DeviceGrade::SG) || d.uuid == local_uuid {
+            continue;
+        }
+        let polled: Vec<bool> = node
+            .sg_statuses
+            .iter()
+            .filter(|((u, _), _)| *u == d.uuid)
+            .map(|(_, s)| s.up)
+            .collect();
+        if !polled.is_empty() && polled.iter().all(|up| !*up) {
+            down.push(d.alias.clone());
+        }
+    }
+    down
+}
+
 /// Yellow banner shown on every admin page whenever any own-user SG peer is
 /// currently marked down by poll_sg. Surfaces partition state so a user
 /// looking at any tab knows convergence may be paused. Empty string when all
 /// own-user SG peers (if any) are reachable.
 pub(crate) fn partition_banner(ctx: &WorkerContext) -> String {
     let node = ctx.node.read().unwrap();
-    let local_uuid = node.device_uuid;
-
-    let own_sg_uuids: Vec<(Uuid, &str)> = node.owner.user.devices.iter()
-        .filter(|d| matches!(d.grade, DeviceGrade::SG) && d.uuid != local_uuid)
-        .map(|d| (d.uuid, d.alias.as_str()))
-        .collect();
-    if own_sg_uuids.is_empty() { return String::new(); }
-
-    // A device is "down" iff *every* polled (uuid, host) entry for it is
-    // down. An unpolled device contributes no entries — treat as up so we
-    // don't falsely flag a freshly added peer before poll_sg's first round.
-    let mut down: Vec<&str> = Vec::new();
-    for (uuid, alias) in &own_sg_uuids {
-        let polled: Vec<bool> = node.sg_statuses.iter()
-            .filter(|((u, _), _)| u == uuid)
-            .map(|(_, s)| s.up)
-            .collect();
-        if !polled.is_empty() && polled.iter().all(|up| !*up) {
-            down.push(alias);
-        }
+    let down = own_user_sg_down_aliases(&node);
+    if down.is_empty() {
+        return String::new();
     }
-    if down.is_empty() { return String::new(); }
 
-    let aliases = down.iter().map(|a| html_escape(a)).collect::<Vec<_>>().join(", ");
+    let aliases = down
+        .iter()
+        .map(|a| html_escape(a))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "<div class='card' style='background:#fff4d6;color:#7a5a00;border:1px solid #e0c060'>\
             <strong>Partition detected:</strong> own-user SG peer(s) currently unreachable: {aliases}. \

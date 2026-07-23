@@ -8,9 +8,10 @@ pNet has two independent background systems that run on a schedule. They have di
 
 Every pNet node must hold active encrypted sessions with a set of peer nodes before it can route or receive application packets. The `MaintainConnections` background task keeps this set current and prevents sessions from lapsing unnoticed.
 
-- **Trigger**: enqueued immediately at startup, then by the scheduler every 5 minutes
+- **Trigger**: enqueued immediately at startup, then by the scheduler every 5 minutes; also **immediately** after a DG receives conn-reset (op `0x13`) so reconnect does not wait for the next 5‑minute tick (§6.1)
 - **Interval rationale**: RENEW_THRESHOLD (2 hours) >> 5-minute interval, so a session is always renewed well before it expires
-- **No dependency on**: network activity, SG health polling, or message retry
+- **Also after connect work**: if maintain just issued ConnectRequests, a one-shot follow-up is scheduled ~5.5s later to retry silent failures
+- **No dependency on**: SG health polling or message retry for the periodic path
 
 ### Desired connection set
 
@@ -53,7 +54,7 @@ After the ack, both sides hold an `ActiveConnection` with the peer's ephemeral p
 
 Each pNet node maintains a ranked list of candidate SGs for routing decisions. This list is kept fresh by periodically pinging each candidate SG and recording the round-trip time (RTT).
 
-- **Trigger**: scheduler enqueues a `PollSG` action at a regular interval
+- **Trigger**: scheduler enqueues a `PollSG` action at a regular interval; also **at startup** (before the first `MaintainConnections`) so cold-boot connect can see RTT when poll finishes first (§6.3)
 - **No dependency on**: key rotation or packet send activity
 - **Purpose**: two goals served by one mechanism:
   1. **SG availability** — if an SG does not respond it is marked down and excluded from routing until it recovers
@@ -62,6 +63,12 @@ Each pNet node maintains a ranked list of candidate SGs for routing decisions. T
 **Candidate pool**: for any send operation between user A and user B, the candidate pool is all SGs owned by either user A or user B. The DG selects the candidate with the lowest RTT that is currently marked up.
 
 **Ranking**: candidates are sorted by RTT ascending. The top responsive candidate is used for routing. If it goes down, the next in the list is used automatically.
+
+**Writer rank failover (§6.3):** preferred own SG is the lowest `sg_rank` (rank 1). When poll marks that SG unanimously down, `find_writer_sg` skips it and elects the next reachable own SG (or Local). On that transition the process logs  
+`[fabric] event=rank_failover skipped=… skipped_rank=… reason=polled_down writer_kind=… writer=…`  
+and `rank_recovery` when preferred SG is no longer skipped.
+
+**Cold-boot:** until the first successful poll populates `sg_statuses`, address selection falls back to the first resolvable `Device.hosts` entry (not necessarily lowest RTT). Startup order is PollSG then MaintainConnections to reduce that window.
 
 **Frequency tradeoff**: polling too rarely risks acting on stale RTT data; polling too frequently adds unnecessary background traffic, which matters on mobile connections. An adaptive strategy — polling more aggressively during active send periods and backing off during idle periods — is worth considering.
 

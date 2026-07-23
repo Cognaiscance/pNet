@@ -20,9 +20,9 @@ use super::super::data_models::{
 };
 use super::super::wire::*;
 use super::{
-    cross_user_pull_for_contact, devices_to_cards, form_field, parse_pnet_hosts, push_device,
-    read_device, request_change, request_change_idempotent, resolve_hosts, send, url_decode,
-    Change, WriteError,
+    cross_user_pull_for_contact, devices_to_cards, fabric_event, form_field, parse_pnet_hosts,
+    push_device, read_device, request_change, request_change_idempotent, resolve_hosts, send,
+    url_decode, uuid_hex, Change, WriteError,
 };
 
 /// How long the SG keeps a PendingDeviceAcceptance waiting for DeviceRegistration.
@@ -143,6 +143,14 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         // write lock released here
     };
 
+    fabric_event(
+        "invite_consumed",
+        &[
+            ("kind", "device"),
+            ("invitation_id", &uuid_hex(&invitation_id)),
+            ("addr", &src.to_string()),
+        ],
+    );
     ctx.save_node(); // consumed the device invitation
 
     // Encrypt and send outside the lock.
@@ -442,6 +450,16 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             eprintln!("[contact_request] deserialization failed from {src}");
             return;
         };
+
+        fabric_event(
+            "invite_consumed",
+            &[
+                ("kind", "contact"),
+                ("invitation_id", &uuid_hex(&invitation_id)),
+                ("contact", &data.alias),
+                ("addr", &src.to_string()),
+            ],
+        );
 
         // Build the contact upsert from the handshake payload. Don't mutate
         // contact_users inline — route it through request_change below so the

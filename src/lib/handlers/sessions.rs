@@ -19,8 +19,9 @@ use super::super::data_models::{
 };
 use super::super::wire::*;
 use super::{
-    allocate_conn_id, best_address_for_device, cross_user_pull_on_reconnect, ipv4_from,
-    partition_reconcile_on_reconnect, refresh_dns_for_known_hosts, send, sync_pull,
+    allocate_conn_id, best_address_for_device, cross_user_pull_on_reconnect, fabric_event,
+    ipv4_from, own_user_sg_partition, partition_reconcile_on_reconnect, rank1_failover_info,
+    refresh_dns_for_known_hosts, send, sync_pull, uuid_hex, WriterTarget,
 };
 
 /// Find the device UUID for an incoming connection request, given the peer's
@@ -116,6 +117,16 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         (conn_id, pk_copy, sk_copy)
     };
 
+    fabric_event(
+        "session_up",
+        &[
+            ("role", "responder"),
+            ("peer", &uuid_hex(&initiator_device_uuid)),
+            ("conn_id", &our_conn_id.to_string()),
+            ("addr", &src.to_string()),
+        ],
+    );
+
     // Reply with ConnectAck:
     //   [op=0x21][our_conn_id: u16][initiator_conn_id: u16][our_ephemeral_pk: 32][sig: 64]
     let mut pkt = [0u8; 101];
@@ -174,7 +185,6 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
 
-    println!("[connect_ack] connection established with {src} (peer {:02x?})", &pending.peer_device_uuid[..4]);
     // Evict any stale connections to this device before inserting the new one.
     let peer_uuid = pending.peer_device_uuid;
     node.owner.active_connections.retain(|_, c| c.device_uuid != peer_uuid);
@@ -188,6 +198,16 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         peer_addr:                 src,
     });
     drop(node);
+
+    fabric_event(
+        "session_up",
+        &[
+            ("role", "initiator"),
+            ("peer", &uuid_hex(&peer_uuid)),
+            ("conn_id", &our_conn_id.to_string()),
+            ("addr", &src.to_string()),
+        ],
+    );
 
     // Sync v1: if the freshly-connected peer is our writer SG, immediately
     // catch up on any `SyncUpdateAvailable` notifications missed while
@@ -290,6 +310,10 @@ pub fn poll_sg(ctx: &WorkerContext) {
         };
         record_sg_status(ctx, uuid, host, up);
     }
+
+    // §6.2 / §6.3: partition + rank-1 failover visibility after a full poll pass.
+    update_partition_flag(ctx);
+    update_rank1_failover_flag(ctx);
 }
 
 fn record_sg_status(ctx: &WorkerContext, uuid: Uuid, host: String, rtt: Option<Duration>) {
@@ -299,6 +323,86 @@ fn record_sg_status(ctx: &WorkerContext, uuid: Uuid, host: String, rtt: Option<D
         last_rtt:    rtt,
         last_polled: Instant::now(),
     });
+}
+
+/// Recompute own-user SG partition flag; emit structured log on change.
+fn update_partition_flag(ctx: &WorkerContext) {
+    let (prev, now_flag, down_aliases) = {
+        let node = ctx.node.read().unwrap();
+        let now_flag = own_user_sg_partition(&node);
+        let down: Vec<String> = node
+            .owner
+            .user
+            .devices
+            .iter()
+            .filter(|d| {
+                matches!(d.grade, DeviceGrade::SG)
+                    && d.uuid != node.device_uuid
+                    && {
+                        let polled: Vec<bool> = node
+                            .sg_statuses
+                            .iter()
+                            .filter(|((u, _), _)| *u == d.uuid)
+                            .map(|(_, s)| s.up)
+                            .collect();
+                        !polled.is_empty() && polled.iter().all(|up| !*up)
+                    }
+            })
+            .map(|d| d.alias.clone())
+            .collect();
+        (node.partition_flag, now_flag, down)
+    };
+    if prev == now_flag {
+        return;
+    }
+    {
+        let mut node = ctx.node.write().unwrap();
+        node.partition_flag = now_flag;
+    }
+    if now_flag {
+        fabric_event(
+            "partition_detect",
+            &[("peers", &down_aliases.join(","))],
+        );
+    } else {
+        fabric_event("partition_clear", &[]);
+    }
+}
+
+/// §6.3: when preferred (rank-1) own SG is polled-down and writer/traffic
+/// moved off it, log once on transition (and once on recovery).
+fn update_rank1_failover_flag(ctx: &WorkerContext) {
+    let (prev, info) = {
+        let node = ctx.node.read().unwrap();
+        (node.rank1_failover_active, rank1_failover_info(&node))
+    };
+    let now_active = info.is_some();
+    if prev == now_active {
+        return;
+    }
+    {
+        let mut node = ctx.node.write().unwrap();
+        node.rank1_failover_active = now_active;
+    }
+    if let Some((skipped, rank, writer)) = info {
+        let (writer_kind, writer_id) = match writer {
+            WriterTarget::Local => ("local", uuid_hex(&ctx.node.read().unwrap().device_uuid)),
+            WriterTarget::Remote(u) => ("remote", uuid_hex(&u)),
+            WriterTarget::Unreachable => ("unreachable", String::new()),
+        };
+        fabric_event(
+            "rank_failover",
+            &[
+                ("skipped", &uuid_hex(&skipped)),
+                ("skipped_rank", &rank.to_string()),
+                ("reason", "polled_down"),
+                ("writer_kind", writer_kind),
+                ("writer", &writer_id),
+            ],
+        );
+    } else {
+        fabric_event("rank_recovery", &[("reason", "preferred_sg_up_or_elected")]);
+    }
 }
 
 /// Ensure active connections exist to all peers that require them.
@@ -565,33 +669,59 @@ pub fn dg_keepalive_receive(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) 
 /// Op 0x13 — SG conn-reset, received on the DG side.
 ///
 /// The SG couldn't decrypt our keepalive, meaning it has no record of this
-/// connection (e.g. it restarted).  Evict all active connections whose device
-/// lives at the SG's IP so that `maintain_connections` can establish fresh ones.
+/// connection (e.g. it restarted). Evict all active connections whose
+/// `peer_addr` matches the reset source IP, then **run connection maintenance
+/// immediately** (§6.1) so reconnect does not wait for the next 5‑minute
+/// maintain tick (or even the next 1s scheduler wake).
 pub fn conn_reset(src: SocketAddr, ctx: &WorkerContext) {
     let src_ip = match ipv4_from(src) {
         Some(ip) => ip,
         None => return,
     };
 
-    let evicted = {
+    let (evicted, peer_uuids) = {
         let mut node = ctx.node.write().unwrap();
         // Evict any connection whose peer_addr matches the reset source IP.
         // This is strictly more correct than matching on a stored Device host
         // — the connection already knows what address it's talking to.
-        let before = node.owner.active_connections.len();
+        let mut dropped_peers = Vec::new();
         node.owner.active_connections.retain(|_, c| {
             match c.peer_addr {
-                SocketAddr::V4(a) => *a.ip() != src_ip,
+                SocketAddr::V4(a) if *a.ip() == src_ip => {
+                    dropped_peers.push(c.device_uuid);
+                    false
+                }
                 _ => true,
             }
         });
-        node.owner.active_connections.len() < before
+        // Drop half-open handshakes to the same peers so maintain can re-issue
+        // ConnectRequest instead of treating them as already in flight.
+        if !dropped_peers.is_empty() {
+            node.owner.pending_connections.retain(|_, p| {
+                !dropped_peers.iter().any(|u| *u == p.peer_device_uuid)
+            });
+        }
+        let evicted = !dropped_peers.is_empty();
+        (evicted, dropped_peers)
     };
 
-    if evicted {
-        ctx.scheduler_tx.send(ScheduleRequest {
-            action: Action::MaintainConnections,
-            delay: Duration::ZERO,
-        }).ok();
+    if !evicted {
+        eprintln!("[conn_reset] from {src} — no matching active connection");
+        return;
     }
+
+    for peer in &peer_uuids {
+        fabric_event(
+            "session_down",
+            &[
+                ("reason", "conn_reset"),
+                ("peer", &uuid_hex(peer)),
+                ("addr", &src.to_string()),
+            ],
+        );
+    }
+    // Same worker, no scheduler delay: issue fresh ConnectRequests now.
+    // `maintain_connections` still schedules a short follow-up if it issued
+    // any requests (silent SG rejection / lost ack path).
+    maintain_connections(ctx);
 }

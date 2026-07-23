@@ -412,6 +412,10 @@ pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 }
 
 /// Recurring cleanup: remove idle tunnels and stale counters.
+///
+/// After teardown, send path must still deliver via standard relay (§6.4):
+/// DG drops `dg_tunnel_map` when the DG↔DG session expires; SG drops idle
+/// `active_tunnels`. Neither blocks `app_send_packet` relay fallback.
 pub fn cleanup_tunnels(ctx: &WorkerContext) {
     const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
     let now     = Instant::now();
@@ -420,26 +424,72 @@ pub fn cleanup_tunnels(ctx: &WorkerContext) {
     let mut node = ctx.node.write().unwrap();
 
     // SG: remove idle ActiveTunnels.
+    let before_sg = node.owner.active_tunnels.len();
     node.owner.active_tunnels.retain(|_, t| {
         now.duration_since(t.last_used_at) < TUNNEL_IDLE_TIMEOUT
     });
+    let removed_sg = before_sg.saturating_sub(node.owner.active_tunnels.len());
+
+    // SG: drop pending setups when either leg connection is gone.
+    let stale_pending: Vec<u16> = node
+        .owner
+        .pending_tunnels
+        .iter()
+        .filter(|(_, p)| {
+            let a = node
+                .owner
+                .active_connections
+                .values()
+                .any(|c| c.device_uuid == p.sender_device_uuid);
+            let b = node
+                .owner
+                .active_connections
+                .values()
+                .any(|c| c.device_uuid == p.dest_device_uuid);
+            !(a && b)
+        })
+        .map(|(&id, _)| id)
+        .collect();
+    for id in stale_pending {
+        node.owner.pending_tunnels.remove(&id);
+    }
 
     // SG: clear stale tunnel counters (window expired).
     node.owner.tunnel_counters.retain(|_, c| {
         now.duration_since(c.window_start) < TUNNEL_COUNTER_WINDOW
     });
 
-    // DG: remove dg_tunnel_map entries whose ActiveConnection has expired.
-    let expired_tunnels: Vec<u16> = node.owner.dg_tunnel_map.iter()
+    // DG: remove dg_tunnel_map entries whose ActiveConnection has expired
+    // or vanished — after this, app_send uses relay (§6.4).
+    let expired_tunnels: Vec<u16> = node
+        .owner
+        .dg_tunnel_map
+        .iter()
         .filter(|(_, conn_id)| {
-            !node.owner.active_connections.get(*conn_id)
+            !node
+                .owner
+                .active_connections
+                .get(*conn_id)
                 .map(|c| c.timeout > now_sys)
                 .unwrap_or(false)
         })
         .map(|(&tid, _)| tid)
         .collect();
-    for tid in expired_tunnels {
-        node.owner.dg_tunnel_map.remove(&tid);
+    let removed_dg = expired_tunnels.len();
+    for tid in &expired_tunnels {
+        node.owner.dg_tunnel_map.remove(tid);
+        node.owner.pending_tunnel_connections.remove(tid);
+    }
+
+    if removed_sg > 0 || removed_dg > 0 {
+        drop(node);
+        super::fabric_event(
+            "tunnel_teardown",
+            &[
+                ("sg_idle_removed", &removed_sg.to_string()),
+                ("dg_map_removed", &removed_dg.to_string()),
+            ],
+        );
     }
 }
 

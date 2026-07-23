@@ -11,7 +11,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use super::super::action_queue::WorkerContext;
 use super::super::data_models::{ActiveConnection, Device, DeviceGrade, Node, Uuid};
 use super::super::dns_cache::{resolve_host_uncached, DnsCache};
-use super::poll_sg;
+use super::{fabric_event, poll_sg, uuid_hex};
 
 pub(crate) fn ipv4_from(addr: SocketAddr) -> Option<Ipv4Addr> {
     match addr {
@@ -68,8 +68,13 @@ pub(crate) fn refresh_dns_for_known_hosts(ctx: &WorkerContext) {
 /// lowest recorded RTT in `sg_statuses`. Falls back to the first **cached**
 /// host when no poll data exists yet.
 ///
-/// Uses the DNS cache only — never blocks on OS resolve. Cold-boot: maintain
-/// and poll warm the cache (or hosts are IPv4 literals).
+/// Uses the DNS cache only — never blocks on OS resolve.
+///
+/// **Cold-boot (§6.3):** until `PollSG` has populated `sg_statuses` with RTT,
+/// selection falls back to the first resolvable host entry (order in
+/// `Device.hosts`), which may not be the lowest-RTT path. Startup enqueues
+/// `PollSG` before the first maintain cycle so warm data arrives quickly;
+/// until then connect may use a non-optimal host.
 pub(crate) fn best_address_for_device(
     node: &Node,
     cache: &DnsCache,
@@ -220,6 +225,41 @@ pub(crate) fn is_polled_down(node: &Node, uuid: &Uuid) -> bool {
     any_entry && !any_up
 }
 
+/// Preferred own-user SG: lowest `sg_rank` (rank 1 = most preferred).
+pub(crate) fn preferred_own_sg<'a>(node: &'a Node) -> Option<&'a Device> {
+    node.owner
+        .user
+        .devices
+        .iter()
+        .filter(|d| matches!(d.grade, DeviceGrade::SG))
+        .min_by_key(|d| d.sg_rank.unwrap_or(u32::MAX))
+}
+
+/// §6.3: rank-1 failover is active when the preferred own SG is polled-down
+/// and the elected writer is **not** that device (writer moved to next rank
+/// or local, or is unreachable after rank-1 dropped).
+///
+/// Returns `Some((rank1_uuid, rank1_rank, writer_target))` when active.
+pub(crate) fn rank1_failover_info(node: &Node) -> Option<(Uuid, u32, WriterTarget)> {
+    let rank1 = preferred_own_sg(node)?;
+    let rank = rank1.sg_rank.unwrap_or(u32::MAX);
+    if !is_polled_down(node, &rank1.uuid) {
+        return None;
+    }
+    let writer = find_writer_sg(node);
+    let still_on_rank1 = match writer {
+        WriterTarget::Local => rank1.uuid == node.device_uuid,
+        WriterTarget::Remote(u) => u == rank1.uuid,
+        WriterTarget::Unreachable => false,
+    };
+    if still_on_rank1 {
+        // Rank-1 is down but election still points at it (e.g. local is rank-1
+        // and Local) — not a "moved to next rank" case.
+        return None;
+    }
+    Some((rank1.uuid, rank, writer))
+}
+
 /// Permissive variant of `find_writer_sg` for the pull path. Returns the
 /// best reachable own SG without requiring it to be the actual writer —
 /// `sync_pull` just needs *some* peer's state to bootstrap `writer_sg_uuid`
@@ -329,6 +369,28 @@ pub(crate) fn find_writer_sg_probing(ctx: &WorkerContext) -> WriterTarget {
         return first;
     }
     poll_sg(ctx);
-    let node = ctx.node.read().unwrap();
-    find_writer_sg(&node)
+    let second = {
+        let node = ctx.node.read().unwrap();
+        find_writer_sg(&node)
+    };
+    // §6.2: elected writer became reachable (or self-elect) after on-demand poll.
+    match second {
+        WriterTarget::Local => {
+            fabric_event(
+                "writer_change",
+                &[("reason", "probe_self_elect"), ("to", "local")],
+            );
+        }
+        WriterTarget::Remote(u) => {
+            fabric_event(
+                "writer_change",
+                &[
+                    ("reason", "probe_recovery"),
+                    ("to", &uuid_hex(&u)),
+                ],
+            );
+        }
+        WriterTarget::Unreachable => {}
+    }
+    second
 }

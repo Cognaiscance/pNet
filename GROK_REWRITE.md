@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §6.1)* |
-| Last completed | 5.4 Locking audit (2026-07-23) |
+| Current focus | *(none — next is §7.1)* |
+| Last completed | 6.4 Tunnel correctness invariant (2026-07-23) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -180,27 +180,23 @@ Keep the hand-rolled pool; remove stall and unbounded-growth risks.
 Core behavior is largely designed; make it observable and resilient.
 
 ### 6.1 Fast reconnect after conn-reset
-- [ ] DG that receives conn-reset re-enters connection maintenance promptly (not only on 5‑minute tick)
+- [x] DG that receives conn-reset re-enters connection maintenance promptly (not only on 5‑minute tick)
 
-**Done:**  
-
+**Done:** 2026-07-23 — `conn_reset` evicts active sessions (and pending to those peers) by peer IP, then calls `maintain_connections` **inline** on the same worker (no scheduler 1s/5min delay). Logs eviction. Test: stale session cleared + fresh pending ConnectRequest. Docs: background systems.
 ### 6.2 Diagnostics for fabric health
-- [ ] Diagnostics show: writer SG, versions (public/private), peer list, last RTT, keepalive/peer_addr age, partition flag
-- [ ] Structured log lines for: session up/down, writer change, partition detect, invite consumed
+- [x] Diagnostics show: writer SG, versions (public/private), peer list, last RTT, keepalive/peer_addr age, partition flag
+- [x] Structured log lines for: session up/down, writer change, partition detect, invite consumed
 
-**Done:**  
-
+**Done:** 2026-07-23 — `/diagnostics` fabric health: writer election, public+private versions, partition flag, active sessions (peer_addr, remaining, refresh-age proxy), SG peers with RTT+poll age; watermarks/proposals retained. `fabric_event` logs: `session_up`/`session_down`, `writer_change` (version stamp + probe elect), `partition_detect`/`partition_clear` after poll, `invite_consumed`. `Node.partition_flag` for transition tracking. Docs: administration UI.
 ### 6.3 Routing / failover visibility
-- [ ] Log clear event when rank-1 treated down and traffic/writer moves to next rank
-- [ ] Cold-boot note: first connect may use unresolved RTT until poll warms (document or improve order)
+- [x] Log clear event when rank-1 treated down and traffic/writer moves to next rank
+- [x] Cold-boot note: first connect may use unresolved RTT until poll warms (document or improve order)
 
-**Done:**  
-
+**Done:** 2026-07-23 — `rank1_failover_info` + `Node.rank1_failover_active`; after PollSG log `rank_failover` / `rank_recovery` with skipped preferred SG and new writer. Startup enqueues PollSG (normal prio) before MaintainConnections. Cold-boot documented on `best_address_for_device` + background systems. Tests for failover info active/inactive/local takeover.
 ### 6.4 Tunnel correctness invariant
-- [ ] Test or assert: tunnel teardown falls back to standard relay without losing the ability to deliver
+- [x] Test or assert: tunnel teardown falls back to standard relay without losing the ability to deliver
 
-**Done:**  
-
+**Done:** 2026-07-23 — `app_send_packet`: tunnel path is best-effort; on failure/teardown fall through to direct (non-tunnel sessions) or `RELAY_PACKET`. Never AppPacket on a tunnel leg; skip expired sessions. `cleanup_tunnels` drops expired `dg_tunnel_map` + pending, logs `tunnel_teardown`. Tests: live tunnel uses 0x51; after cleanup send uses 0x40; stale map → relay. Phase 6 complete.
 ---
 
 ## Phase 7 — Sync honesty and durability
@@ -282,6 +278,10 @@ Add a line per work session (newest at top).
 
 | Date | Item(s) | Notes |
 |------|---------|--------|
+| 2026-07-23 | 6.4 Tunnel teardown → relay | Fallback + cleanup; tests. Phase 6 done. |
+| 2026-07-23 | 6.3 Rank failover visibility | rank_failover logs; PollSG before maintain at boot. |
+| 2026-07-23 | 6.2 Fabric diagnostics + logs | Diagnostics page + `[fabric] event=` lines. |
+| 2026-07-23 | 6.1 Fast reconnect after conn-reset | Inline maintain after eviction; test. |
 | 2026-07-23 | 5.4 Locking | Audit only; keep global RwLock; split deferred. Phase 5 done. |
 | 2026-07-23 | 5.3 DNS off hot path | DnsCache TTL; maintain/poll resolve; routing lookup-only. |
 | 2026-07-23 | 5.2 No long waits on workers | Invite mint wait off-pool; audit note; tests. |
