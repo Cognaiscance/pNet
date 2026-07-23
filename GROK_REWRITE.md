@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §7.1)* |
-| Last completed | 6.4 Tunnel correctness invariant (2026-07-23) |
+| Current focus | *(none — next is §8.1)* |
+| Last completed | 7.3 Persistence split (2026-07-23) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -202,23 +202,20 @@ Core behavior is largely designed; make it observable and resilient.
 ## Phase 7 — Sync honesty and durability
 
 ### 7.1 Partition / merge path
-- [ ] v2 merge is the supported concurrent-writer path; no quiet “discard other side” without operator visibility
-- [ ] Pure merge engine covered by union / tombstone / scalar-rank tests (extend if gaps)
-- [ ] `partition_detected` and retention-fallback data-loss path visible in admin diagnostics
+- [x] v2 merge is the supported concurrent-writer path; no quiet “discard other side” without operator visibility
+- [x] Pure merge engine covered by union / tombstone / scalar-rank tests (extend if gaps)
+- [x] `partition_detected` and retention-fallback data-loss path visible in admin diagnostics
 
-**Done:**  
-
+**Done:** 2026-07-23 — Retention gap detection (`retention_gap_for_peer`); MergeProposal `0xFFFF` sentinel instead of incomplete log slice; receiver full-state pull + `MERGE_ACK_RESULT_RETENTION_EXHAUSTED`; `Owner.retention_fallback_*` + red banner + diagnostics row; fabric events `retention_fallback` / `merge_applied` / `merge_ack`. Merge tests: contact LWW by rank + retention sentinel/gap unit tests. Existing union/tombstone/scalar-rank suite retained.
 ### 7.2 Contact/device remove cascade
-- [ ] Remove contact/device: tombstone sync, drop sessions, drop tunnels, stop accepting connect from that identity
+- [x] Remove contact/device: tombstone sync, drop sessions, drop tunnels, stop accepting connect from that identity
 
-**Done:**  
-
+**Done:** 2026-07-23 — `Change::RemoveDevice` / `RemoveContact` (wire 0x06/0x07); apply + merge tombstones; `cascade_remove_fabric_state` drops sessions, pending, tunnels, sg_statuses; connect rejects unknown identities (existing). Logs `identity_removed`. Tests: merge device tombstone + local remove drops sessions.
 ### 7.3 Persistence split (when write_log grows)
-- [ ] Append-only write log (or separate file) vs directory snapshot
-- [ ] Keep atomic rename + fsync discipline from current writer
+- [x] Append-only write log (or separate file) vs directory snapshot
+- [x] Keep atomic rename + fsync discipline from current writer
 
-**Done:**  
-
+**Done:** 2026-07-23 — `write_log` skipped in `node.toml` serialization; separate `write_log.toml` via `WriteRequest::WriteLog` + `save_write_log` / load merge. Legacy embedded log still loads; next save splits. Atomic write uses per-file `.{name}.tmp` + fsync + rename + 0600. `ensure_data_dir` covers write_log.toml. Docs: data persistence. Phase 7 complete.
 ---
 
 ## Phase 8 — Wire and platform contracts
@@ -278,6 +275,9 @@ Add a line per work session (newest at top).
 
 | Date | Item(s) | Notes |
 |------|---------|--------|
+| 2026-07-23 | 7.3 Persistence split | write_log.toml vs node.toml; atomic fsync kept. Phase 7 done. |
+| 2026-07-23 | 7.2 Remove cascade | RemoveDevice/Contact + fabric session/tunnel drop. |
+| 2026-07-23 | 7.1 Partition / merge honesty | Retention sentinel + visibility; contact merge tests. |
 | 2026-07-23 | 6.4 Tunnel teardown → relay | Fallback + cleanup; tests. Phase 6 done. |
 | 2026-07-23 | 6.3 Rank failover visibility | rank_failover logs; PollSG before maintain at boot. |
 | 2026-07-23 | 6.2 Fabric diagnostics + logs | Diagnostics page + `[fabric] event=` lines. |

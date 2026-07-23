@@ -110,15 +110,18 @@ Fabric health snapshot (§6.2):
 * **Writer SG** — result of `find_writer_sg` (Local / Remote / Unreachable)
 * **Public and private** sync versions (writer uuid, epoch, seq)
 * **Partition flag** — own-user SG peer(s) unanimously polled-down
+* **Retention fallback** — write-log pruned past a peer watermark; concurrent writes may have been discarded for full-state adopt (§7.1 data-loss path)
 * **Active sessions** — peer alias/uuid, conn id, `peer_addr`, session remaining, refresh-age proxy (lifetime − remaining; approximates time since last connect/keepalive refresh)
 * **Own-user SG peers** — hosts with up/down, last RTT, poll age
 * Sync v2: last watermarks, buffered merge proposals
+
+Banners on every page: yellow for **partition**; red for **retention fallback**.
 
 Structured process logs (stdout) for operators/grep:
 
 `[fabric] event=<name> key=value …`
 
-Events: `session_up`, `session_down`, `writer_change`, `partition_detect` / `partition_clear`, `invite_consumed`, `rank_failover` / `rank_recovery` (preferred own SG polled-down; writer moved), `tunnel_teardown` (idle/expired tunnel maps cleared; sends fall back to relay).
+Events: `session_up`, `session_down`, `writer_change`, `partition_detect` / `partition_clear`, `invite_consumed`, `rank_failover` / `rank_recovery`, `tunnel_teardown`, `merge_applied`, `merge_ack`, `retention_fallback` (proposer or receiver; never silent discard).
 
 #### Device invitation detail
 

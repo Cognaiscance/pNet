@@ -114,7 +114,8 @@ pub(crate) use sync::{
     build_merge_proposal_body, build_merge_proposal_for_peer, bumped_scopes,
     ContactData, cross_user_pull_for_contact, cross_user_pull_on_reconnect, deserialize_change,
     deserialize_contact_data, devices_to_cards, notify_contacts, parse_merge_ack_body,
-    parse_merge_proposal_body, parse_watermark_map, partition_reconcile_on_reconnect,
+    build_retention_exhausted_proposal_body, parse_merge_proposal_body, parse_watermark_map,
+    partition_reconcile_on_reconnect, retention_gap_for_peer, ParsedMergeProposal,
     serialize_change, serialize_contact_data, serialize_public_state, serialize_watermark_map,
 };
 
@@ -5240,15 +5241,123 @@ mod tests {
             sample_entry([0x22; 16], 3, 9, b"hello"),
         ];
         let body = build_merge_proposal_body(Scope::Public, sender_v, &entries);
-        let (scope, sender, parsed) =
-            parse_merge_proposal_body(&body).expect("parse");
-        assert_eq!(scope, Scope::Public);
-        assert_eq!(sender, sender_v);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].version, entries[0].version);
-        assert_eq!(parsed[0].change_payload, entries[0].change_payload);
-        assert_eq!(parsed[1].version, entries[1].version);
-        assert_eq!(parsed[1].change_payload, entries[1].change_payload);
+        match parse_merge_proposal_body(&body).expect("parse") {
+            ParsedMergeProposal::Entries {
+                scope,
+                sender_version,
+                entries: parsed,
+            } => {
+                assert_eq!(scope, Scope::Public);
+                assert_eq!(sender_version, sender_v);
+                assert_eq!(parsed.len(), 2);
+                assert_eq!(parsed[0].version, entries[0].version);
+                assert_eq!(parsed[0].change_payload, entries[0].change_payload);
+                assert_eq!(parsed[1].version, entries[1].version);
+                assert_eq!(parsed[1].change_payload, entries[1].change_payload);
+            }
+            ParsedMergeProposal::RetentionExhausted { .. } => {
+                panic!("expected Entries proposal")
+            }
+        }
+    }
+
+    #[test]
+    fn merge_proposal_retention_sentinel_roundtrips() {
+        let v = SyncVersion {
+            writer_sg_uuid: [0xCC; 16],
+            epoch: 1,
+            seq: 1,
+        };
+        let body = build_retention_exhausted_proposal_body(Scope::Private, v);
+        match parse_merge_proposal_body(&body).expect("parse") {
+            ParsedMergeProposal::RetentionExhausted {
+                scope,
+                sender_version,
+            } => {
+                assert_eq!(scope, Scope::Private);
+                assert_eq!(sender_version, v);
+            }
+            ParsedMergeProposal::Entries { .. } => panic!("expected RetentionExhausted"),
+        }
+    }
+
+    #[test]
+    fn retention_gap_detects_pruned_watermark() {
+        let t = TestCtx::new();
+        let peer = generate_uuid();
+        let writer = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            // Peer thinks it last saw writer at (1,2); we only retain (1,10)+.
+            let mut wm = HashMap::new();
+            wm.insert(
+                writer,
+                SyncVersion {
+                    writer_sg_uuid: writer,
+                    epoch: 1,
+                    seq: 2,
+                },
+            );
+            node.owner.last_watermarks.insert(peer, wm);
+            node.owner.write_log.push(WriteLogEntry {
+                version: SyncVersion {
+                    writer_sg_uuid: writer,
+                    epoch: 1,
+                    seq: 10,
+                },
+                scope: Scope::Public,
+                change_payload: vec![1],
+                committed_at: SystemTime::now(),
+            });
+        }
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(
+            retention_gap_for_peer(&node, peer, Scope::Public),
+            Some(writer)
+        );
+    }
+
+    #[test]
+    fn retention_gap_absent_when_continuous() {
+        let t = TestCtx::new();
+        let peer = generate_uuid();
+        let writer = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let mut wm = HashMap::new();
+            wm.insert(
+                writer,
+                SyncVersion {
+                    writer_sg_uuid: writer,
+                    epoch: 1,
+                    seq: 5,
+                },
+            );
+            node.owner.last_watermarks.insert(peer, wm);
+            // We still have the watermark entry itself.
+            node.owner.write_log.push(WriteLogEntry {
+                version: SyncVersion {
+                    writer_sg_uuid: writer,
+                    epoch: 1,
+                    seq: 5,
+                },
+                scope: Scope::Public,
+                change_payload: vec![1],
+                committed_at: SystemTime::now(),
+            });
+            node.owner.write_log.push(WriteLogEntry {
+                version: SyncVersion {
+                    writer_sg_uuid: writer,
+                    epoch: 1,
+                    seq: 6,
+                },
+                scope: Scope::Public,
+                change_payload: vec![2],
+                committed_at: SystemTime::now(),
+            });
+        }
+        let node = t.ctx.node.read().unwrap();
+        assert!(retention_gap_for_peer(&node, peer, Scope::Public).is_none());
     }
 
     #[test]
@@ -5950,6 +6059,159 @@ mod tests {
         let out = merge_logs(&local, &peer, &ranks);
         assert!(matches!(out.changes_to_apply[0], Change::AddDevice { .. }));
         assert!(matches!(out.changes_to_apply[1], Change::AddApplication { .. }));
+    }
+
+    #[test]
+    fn merge_logs_remove_device_tombstone_wins() {
+        let wa = merge_writer_a();
+        let wb = merge_writer_b();
+        let local = vec![change_entry(
+            wa,
+            1,
+            1,
+            &Change::AddDevice {
+                uuid: merge_dev_a(),
+                alias: "phone".into(),
+                grade: DeviceGrade::DG,
+                sg_rank: None,
+                hosts: vec![],
+            },
+        )];
+        let peer = vec![change_entry(
+            wb,
+            2,
+            1,
+            &Change::RemoveDevice {
+                uuid: merge_dev_a(),
+            },
+        )];
+        let out = merge_logs(&local, &peer, &HashMap::new());
+        assert_eq!(
+            out.changes_to_apply,
+            vec![Change::RemoveDevice {
+                uuid: merge_dev_a()
+            }]
+        );
+    }
+
+    #[test]
+    fn remove_device_cascade_drops_sessions() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 1);
+        let peer = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias: "other".into(),
+                uuid: peer,
+                grade: DeviceGrade::DG,
+                sg_rank: None,
+                hosts: vec![],
+                applications: Vec::new(),
+            });
+            node.owner.active_connections.insert(
+                3,
+                ActiveConnection {
+                    id: 3,
+                    timeout: SystemTime::now() + Duration::from_secs(3600),
+                    key_pair: generate_x25519_keypair(),
+                    peer_public_key: X25519PublicKey(generate_key_bytes()),
+                    peer_active_connection_id: 1,
+                    device_uuid: peer,
+                    peer_addr: "127.0.0.1:9".parse().unwrap(),
+                },
+            );
+        }
+        request_change(
+            Change::RemoveDevice { uuid: peer },
+            &t.ctx,
+        )
+        .expect("remove ok");
+        let node = t.ctx.node.read().unwrap();
+        assert!(!node.owner.user.devices.iter().any(|d| d.uuid == peer));
+        assert!(
+            !node.owner.active_connections.values().any(|c| c.device_uuid == peer),
+            "sessions to removed device must be dropped"
+        );
+    }
+
+    #[test]
+    fn merge_logs_contact_upsert_higher_rank_wins() {
+        let wa = merge_writer_a(); // rank 1
+        let wb = merge_writer_b(); // rank 2
+        let contact = [0xC1; 16];
+        let pk_a = Ed25519PublicKey([0x11; 32]);
+        let pk_b = Ed25519PublicKey([0x22; 32]);
+        let local = vec![change_entry(
+            wa,
+            1,
+            1,
+            &Change::UpsertContact {
+                uuid: contact,
+                alias: "alice-local".into(),
+                public_key: pk_a,
+                devices: vec![],
+            },
+        )];
+        let peer = vec![change_entry(
+            wb,
+            9,
+            9,
+            &Change::UpsertContact {
+                uuid: contact,
+                alias: "alice-peer".into(),
+                public_key: pk_b,
+                devices: vec![],
+            },
+        )];
+        let mut ranks = HashMap::new();
+        ranks.insert(wa, 1);
+        ranks.insert(wb, 2);
+        let out = merge_logs(&local, &peer, &ranks);
+        assert_eq!(out.new_entries.len(), 1);
+        // Higher rank (wa) already has the contact; lower-rank peer upsert must not win.
+        assert!(
+            out.changes_to_apply.is_empty(),
+            "higher-rank contact snapshot wins; no apply of lower-rank upsert"
+        );
+    }
+
+    #[test]
+    fn merge_logs_contact_upsert_peer_higher_rank_applies() {
+        let wa = merge_writer_a(); // rank 2 locally
+        let wb = merge_writer_b(); // rank 1 peer
+        let contact = [0xC2; 16];
+        let local = vec![change_entry(
+            wa,
+            1,
+            1,
+            &Change::UpsertContact {
+                uuid: contact,
+                alias: "bob-local".into(),
+                public_key: Ed25519PublicKey([0x33; 32]),
+                devices: vec![],
+            },
+        )];
+        let peer = vec![change_entry(
+            wb,
+            1,
+            1,
+            &Change::UpsertContact {
+                uuid: contact,
+                alias: "bob-peer".into(),
+                public_key: Ed25519PublicKey([0x44; 32]),
+                devices: vec![],
+            },
+        )];
+        let mut ranks = HashMap::new();
+        ranks.insert(wa, 2);
+        ranks.insert(wb, 1);
+        let out = merge_logs(&local, &peer, &ranks);
+        assert_eq!(out.changes_to_apply.len(), 1);
+        match &out.changes_to_apply[0] {
+            Change::UpsertContact { alias, .. } => assert_eq!(alias, "bob-peer"),
+            other => panic!("expected UpsertContact, got {other:?}"),
+        }
     }
 
     #[test]

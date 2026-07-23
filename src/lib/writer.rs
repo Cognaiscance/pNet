@@ -5,8 +5,12 @@ use std::sync::mpsc;
 use std::thread;
 
 pub enum WriteRequest {
+    /// Directory snapshot (`node.toml`) — identity, devices, contacts, versions.
     NodeData(String),
     AppData(String),
+    /// Sync v2 write log (`write_log.toml`), separate so it can grow without
+    /// bloating the directory snapshot (§7.3).
+    WriteLog(String),
 }
 
 pub struct WriterThread {
@@ -23,6 +27,7 @@ impl WriterThread {
                 let (filename, content) = match request {
                     WriteRequest::NodeData(s) => ("node.toml", s),
                     WriteRequest::AppData(s)  => ("apps.toml", s),
+                    WriteRequest::WriteLog(s) => ("write_log.toml", s),
                 };
                 let path = data_dir.join(filename);
                 if let Err(e) = write_atomic(&path, &content) {
@@ -57,11 +62,17 @@ impl WriterThread {
 ///
 /// On Unix the file is mode `0600` (owner read/write only) both on the temp
 /// file and again after rename, matching `descriptions/data persistence.md`.
+/// Temp name is derived from the final file name so concurrent directory /
+/// write-log flushes never share one global temp path.
 pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
     })?;
-    let tmp = dir.join(".pnet_write_tmp");
+    let base = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("pnet");
+    let tmp = dir.join(format!(".{base}.tmp"));
 
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -158,6 +169,7 @@ mod tests {
 
         tx.send(WriteRequest::NodeData("node = true\n".into())).unwrap();
         tx.send(WriteRequest::AppData("app = true\n".into())).unwrap();
+        tx.send(WriteRequest::WriteLog("entries = []\n".into())).unwrap();
 
         // Drop tx before joining — join() closes the internal sender, but the
         // channel stays open until all clones are dropped too.
@@ -166,5 +178,9 @@ mod tests {
 
         assert_eq!(fs::read_to_string(dir.join("node.toml")).unwrap(), "node = true\n");
         assert_eq!(fs::read_to_string(dir.join("apps.toml")).unwrap(), "app = true\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("write_log.toml")).unwrap(),
+            "entries = []\n"
+        );
     }
 }

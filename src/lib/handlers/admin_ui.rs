@@ -780,6 +780,16 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
         "<span style='color:#2d7a3b'>no</span>".to_string()
     };
 
+    let retention_html = if node.owner.retention_fallback_active {
+        format!(
+            "<span style='color:#c0392b;font-weight:bold'>yes — data-loss path</span><br>\
+             <span style='font-size:.85rem;color:#666'>{}</span>",
+            html_escape(&node.owner.retention_fallback_detail)
+        )
+    } else {
+        "<span style='color:#2d7a3b'>no</span>".to_string()
+    };
+
     let local_section = format!(
         "<div class='card'>\
            <h2 style='margin-top:0'>Fabric health</h2>\
@@ -790,6 +800,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
              <tr><th>Public version</th><td>writer=<code>{pw}</code> epoch={pe} seq={ps}</td></tr>\
              <tr><th>Private version</th><td>writer=<code>{rw}</code> epoch={re} seq={rs}</td></tr>\
              <tr><th>Partition flag</th><td>{part}</td></tr>\
+             <tr><th>Retention fallback</th><td>{ret_fb}</td></tr>\
              <tr><th>Write log</th><td>{n} entries (retention {ret}d)</td></tr>\
              <tr><th>Node lock</th><td>global <code>RwLock&lt;Node&gt;</code> \
                (session/directory split deferred — see locking.md)</td></tr>\
@@ -805,6 +816,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
         re = priv_v.epoch,
         rs = priv_v.seq,
         part = partition_html,
+        ret_fb = retention_html,
         n = node.owner.write_log.len(),
         ret = WRITE_LOG_RETENTION.as_secs() / 86_400,
     );
@@ -1579,29 +1591,40 @@ fn own_user_sg_down_aliases(node: &Node) -> Vec<String> {
     down
 }
 
-/// Yellow banner shown on every admin page whenever any own-user SG peer is
-/// currently marked down by poll_sg. Surfaces partition state so a user
-/// looking at any tab knows convergence may be paused. Empty string when all
-/// own-user SG peers (if any) are reachable.
+/// Yellow/orange banners for partition and retention-fallback data-loss (§7.1).
 pub(crate) fn partition_banner(ctx: &WorkerContext) -> String {
     let node = ctx.node.read().unwrap();
+    let mut out = String::new();
+
     let down = own_user_sg_down_aliases(&node);
-    if down.is_empty() {
-        return String::new();
+    if !down.is_empty() {
+        let aliases = down
+            .iter()
+            .map(|a| html_escape(a))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "<div class='card' style='background:#fff4d6;color:#7a5a00;border:1px solid #e0c060'>\
+                <strong>Partition detected:</strong> own-user SG peer(s) currently unreachable: {aliases}. \
+                Sync v2 will reconcile automatically when the peer comes back. \
+                See <a href='/diagnostics'>Diagnostics</a> for watermarks and pending proposals.\
+            </div>"
+        ));
     }
 
-    let aliases = down
-        .iter()
-        .map(|a| html_escape(a))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "<div class='card' style='background:#fff4d6;color:#7a5a00;border:1px solid #e0c060'>\
-            <strong>Partition detected:</strong> own-user SG peer(s) currently unreachable: {aliases}. \
-            Sync v2 will reconcile automatically when the peer comes back. \
-            See <a href='/diagnostics'>Diagnostics</a> for watermarks and pending proposals.\
-        </div>"
-    )
+    if node.owner.retention_fallback_active {
+        let detail = html_escape(&node.owner.retention_fallback_detail);
+        out.push_str(&format!(
+            "<div class='card' style='background:#fde8e8;color:#7a1f1f;border:1px solid #e08080'>\
+                <strong>Retention fallback (possible data loss):</strong> write-log history was pruned \
+                past a peer watermark; concurrent local-only writes may have been discarded in favor of \
+                full-state adopt. {detail} \
+                See <a href='/diagnostics'>Diagnostics</a>.\
+            </div>"
+        ));
+    }
+
+    out
 }
 
 const SETUP_CSS: &str = "

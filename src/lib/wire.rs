@@ -131,6 +131,11 @@ pub(crate) const MERGE_ACK_RESULT_APPLIED: u8 = 0;
 pub(crate) const MERGE_ACK_RESULT_RETENTION_EXHAUSTED: u8 = 1;
 pub(crate) const MERGE_ACK_RESULT_MALFORMED: u8 = 2;
 
+/// `MergeProposal` entry_count sentinel: proposer cannot supply a complete
+/// log slice (peer watermark lies in pruned range). Receiver must fall back
+/// to full-state adopt and surface data-loss (§7.1).
+pub(crate) const MERGE_PROPOSAL_RETENTION_SENTINEL: u16 = 0xFFFF;
+
 // ── Change kind bytes (sync write payload) ────────────────────────────────────
 
 pub(crate) const CHANGE_KIND_ADD_APPLICATION: u8 = 0x01;
@@ -138,6 +143,8 @@ pub(crate) const CHANGE_KIND_REMOVE_APPLICATION: u8 = 0x02;
 pub(crate) const CHANGE_KIND_ADD_DEVICE: u8 = 0x03;
 pub(crate) const CHANGE_KIND_UPDATE_APPLICATION_ALIAS: u8 = 0x04;
 pub(crate) const CHANGE_KIND_UPSERT_CONTACT: u8 = 0x05;
+pub(crate) const CHANGE_KIND_REMOVE_DEVICE: u8 = 0x06;
+pub(crate) const CHANGE_KIND_REMOVE_CONTACT: u8 = 0x07;
 
 // ── Shared min lengths (unencrypted headers / common envelopes) ───────────────
 

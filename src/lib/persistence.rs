@@ -2,13 +2,15 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use super::data_models::Node;
+use serde::{Deserialize, Serialize};
+
+use super::data_models::{Node, WriteLogEntry};
 
 /// Ensure the data directory exists with private permissions and tighten
 /// known data files if they already exist.
 ///
 /// * Directory: `0700` (owner rwx only)
-/// * Files `node.toml` / `apps.toml`: `0600` (owner rw only)
+/// * Files `node.toml` / `apps.toml` / `write_log.toml`: `0600` (owner rw only)
 /// * If the immediate parent is named `.pnet`, it is also set to `0700`
 ///
 /// Mode bits are applied on Unix only. Wrong owner / unwritable path still
@@ -29,7 +31,7 @@ pub fn ensure_data_dir(data_dir: &Path) -> io::Result<()> {
                 set_mode(parent, 0o700)?;
             }
         }
-        for name in ["node.toml", "apps.toml"] {
+        for name in ["node.toml", "apps.toml", "write_log.toml"] {
             let path = data_dir.join(name);
             if path.is_file() {
                 set_mode(&path, 0o600)?;
@@ -46,29 +48,85 @@ fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
 
-/// Load node state from `data_dir/node.toml`.
-/// Falls back to a fresh `Node::new()` if the file doesn't exist or can't be parsed.
+/// On-disk envelope for `write_log.toml` (§7.3).
+#[derive(Default, Serialize, Deserialize)]
+struct WriteLogFile {
+    #[serde(default)]
+    entries: Vec<WriteLogEntry>,
+}
+
+/// Load node state from `data_dir/node.toml` plus optional `write_log.toml`.
+///
+/// * Directory / identity: `node.toml` (write_log field skipped on new saves).
+/// * Write log: `write_log.toml` when present; otherwise any `write_log` still
+///   embedded in a legacy `node.toml` is kept (one-time migration on next save).
+///
+/// Falls back to a fresh `Node::new()` if the directory snapshot is missing.
 pub fn load(data_dir: &Path) -> Node {
     let path = data_dir.join("node.toml");
-    if path.exists() {
+    let mut node = if path.exists() {
         match std::fs::read_to_string(&path) {
             Ok(content) => match toml::from_str::<Node>(&content) {
                 Ok(node) => {
                     println!("[persistence] loaded node from {}", path.display());
-                    return node;
+                    node
                 }
-                Err(e) => eprintln!("[persistence] failed to parse node.toml: {e}"),
+                Err(e) => {
+                    eprintln!("[persistence] failed to parse node.toml: {e}");
+                    println!("[persistence] no saved state — creating new node");
+                    Node::new()
+                }
             },
-            Err(e) => eprintln!("[persistence] failed to read node.toml: {e}"),
+            Err(e) => {
+                eprintln!("[persistence] failed to read node.toml: {e}");
+                println!("[persistence] no saved state — creating new node");
+                Node::new()
+            }
         }
+    } else {
+        println!("[persistence] no saved state — creating new node");
+        Node::new()
+    };
+
+    let log_path = data_dir.join("write_log.toml");
+    if log_path.exists() {
+        match std::fs::read_to_string(&log_path) {
+            Ok(content) => match toml::from_str::<WriteLogFile>(&content) {
+                Ok(file) => {
+                    println!(
+                        "[persistence] loaded write log ({} entries) from {}",
+                        file.entries.len(),
+                        log_path.display()
+                    );
+                    // Prefer split file over any legacy embedded log.
+                    node.owner.write_log = file.entries;
+                }
+                Err(e) => eprintln!("[persistence] failed to parse write_log.toml: {e}"),
+            },
+            Err(e) => eprintln!("[persistence] failed to read write_log.toml: {e}"),
+        }
+    } else if !node.owner.write_log.is_empty() {
+        println!(
+            "[persistence] write_log present in node.toml ({} entries); \
+             next save will split to write_log.toml",
+            node.owner.write_log.len()
+        );
     }
-    println!("[persistence] no saved state — creating new node");
-    Node::new()
+
+    node
 }
 
-/// Serialize `node` to a TOML string for writing to disk.
+/// Serialize directory snapshot (`node.toml`) — **without** the write log.
 pub fn save(node: &Node) -> String {
     toml::to_string(node).expect("node serialization failed")
+}
+
+/// Serialize the write log for `write_log.toml`.
+pub fn save_write_log(node: &Node) -> String {
+    let file = WriteLogFile {
+        entries: node.owner.write_log.clone(),
+    };
+    toml::to_string(&file).expect("write_log serialization failed")
 }
 
 #[cfg(test)]
@@ -163,6 +221,60 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let node = load(&dir);
         assert_eq!(node.owner.user.alias, "Owner");
+    }
+
+    #[test]
+    fn save_omits_write_log_from_directory_snapshot() {
+        use super::super::data_models::{Scope, SyncVersion, WriteLogEntry};
+        use std::time::SystemTime;
+
+        let mut node = Node::new();
+        node.owner.write_log.push(WriteLogEntry {
+            version: SyncVersion::zero(),
+            scope: Scope::Public,
+            change_payload: vec![1, 2, 3],
+            committed_at: SystemTime::now(),
+        });
+        let dir_toml = save(&node);
+        assert!(
+            !dir_toml.contains("write_log") && !dir_toml.contains("change_payload"),
+            "node.toml snapshot must not embed write_log"
+        );
+        let log_toml = save_write_log(&node);
+        assert!(log_toml.contains("entries") || log_toml.contains("change_payload"));
+        let file: WriteLogFile = toml::from_str(&log_toml).unwrap();
+        assert_eq!(file.entries.len(), 1);
+    }
+
+    #[test]
+    fn load_prefers_split_write_log_file() {
+        use super::super::data_models::{Scope, SyncVersion, WriteLogEntry};
+        use std::time::SystemTime;
+
+        let dir = unique_dir("split_log");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut original = Node::new();
+        original.owner.user.alias = "SplitUser".to_string();
+        original.owner.write_log.push(WriteLogEntry {
+            version: SyncVersion {
+                writer_sg_uuid: [0xAB; 16],
+                epoch: 2,
+                seq: 9,
+            },
+            scope: Scope::Public,
+            change_payload: vec![0xCA, 0xFE],
+            committed_at: SystemTime::now(),
+        });
+
+        fs::write(dir.join("node.toml"), save(&original)).unwrap();
+        fs::write(dir.join("write_log.toml"), save_write_log(&original)).unwrap();
+
+        let restored = load(&dir);
+        assert_eq!(restored.owner.user.alias, "SplitUser");
+        assert_eq!(restored.owner.write_log.len(), 1);
+        assert_eq!(restored.owner.write_log[0].change_payload, vec![0xCA, 0xFE]);
+        assert_eq!(restored.owner.write_log[0].version.epoch, 2);
     }
 
     #[test]

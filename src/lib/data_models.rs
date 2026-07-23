@@ -550,7 +550,11 @@ pub struct Owner {
     /// the writer's history to a returning peer SG. Empty on non-writer
     /// nodes (they receive `WriteLogEntry`s during merge but don't persist
     /// their own log).
-    #[serde(default)]
+    ///
+    /// **Persistence (§7.3):** not written into `node.toml` (directory snapshot).
+    /// Stored separately as `write_log.toml` so the snapshot stays small as the
+    /// log grows. Still deserialized from legacy `node.toml` if present.
+    #[serde(default, skip_serializing)]
     pub write_log: Vec<WriteLogEntry>,
     /// Ephemeral — not persisted; rebuilt as connections are established.
     #[serde(skip)]
@@ -567,6 +571,14 @@ pub struct Owner {
     /// the entries the peer reported as missing on our side.
     #[serde(skip)]
     pub received_merge_proposals: HashMap<Uuid, Vec<WriteLogEntry>>,
+    /// Ephemeral — true after a retention-exhausted merge path (write log
+    /// pruned past a peer's watermark). Operator-visible data-loss signal
+    /// (§7.1); cleared when a normal merge applies cleanly.
+    #[serde(skip)]
+    pub retention_fallback_active: bool,
+    /// Ephemeral — short human detail for diagnostics (peer / writer uuids).
+    #[serde(skip)]
+    pub retention_fallback_detail: String,
     /// Ephemeral — not persisted; cleared when ConnectAck arrives.
     #[serde(skip)]
     pub pending_connections: HashMap<u16, PendingConnection>,
@@ -744,6 +756,8 @@ impl Node {
                 active_connections:         HashMap::new(),
                 last_watermarks:            HashMap::new(),
                 received_merge_proposals:   HashMap::new(),
+                retention_fallback_active:  false,
+                retention_fallback_detail:  String::new(),
                 pending_connections:        HashMap::new(),
                 pending_contact_exchange:   None,
                 pending_bootstrap:          None,

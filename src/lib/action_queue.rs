@@ -163,9 +163,15 @@ pub struct WorkerContext {
 impl WorkerContext {
     /// Serialize the current node state and queue it for writing to disk.
     /// Call this after any mutation that affects persistent data.
+    /// Persist directory snapshot and write log as **two** atomic files
+    /// (`node.toml` + `write_log.toml`) so the log can grow independently (§7.3).
     pub fn save_node(&self) {
-        let toml_str = super::persistence::save(&*self.node.read().unwrap());
-        let _ = self.writer_tx.send(WriteRequest::NodeData(toml_str));
+        let node = self.node.read().unwrap();
+        let dir_toml = super::persistence::save(&*node);
+        let log_toml = super::persistence::save_write_log(&*node);
+        drop(node);
+        let _ = self.writer_tx.send(WriteRequest::NodeData(dir_toml));
+        let _ = self.writer_tx.send(WriteRequest::WriteLog(log_toml));
     }
 }
 

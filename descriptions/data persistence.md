@@ -12,13 +12,17 @@ Data is stored in human-readable files on disk. Changes are written through to d
 
 Data files live in a dedicated directory (e.g. `~/.pnet/data/`). The directory and all files within it are owned by the user running pnet, with permissions set to `700` (directory) and `600` (files) so that only that user (and root) can read or write them. The pnet process, running as that user, has full access.
 
-**Enforced on create/load (Unix):** at startup `ensure_data_dir` creates `~/.pnet/data` if needed, sets the data directory (and parent `.pnet` when present) to mode `0700`, and sets existing `node.toml` / `apps.toml` to `0600` if they exist. The writer thread (and any other durable write of node state) uses atomic temp + rename and always sets file mode `0600`. Wrong ownership or an unwritable path still fails as a normal I/O error — the process does not ask the user to run `chmod` for mode-only drift.
+**Enforced on create/load (Unix):** at startup `ensure_data_dir` creates `~/.pnet/data` if needed, sets the data directory (and parent `.pnet` when present) to mode `0700`, and sets existing `node.toml` / `apps.toml` / `write_log.toml` to `0600` if they exist. The writer thread (and any other durable write of node state) uses atomic temp + rename (per-file temp name + fsync) and always sets file mode `0600`. Wrong ownership or an unwritable path still fails as a normal I/O error — the process does not ask the user to run `chmod` for mode-only drift.
 
 ## Decisions
 
 - **File format** — TOML
-- **File layout** — one file per model type (e.g. `nodes.toml`, `apps.toml`)
-- **Write strategy** — write on every change. To avoid corrupt files on crash, write to a temp file first then rename it into place (on Linux, rename is atomic).
+- **File layout** — split by growth rate (§7.3):
+  - `node.toml` — directory snapshot (identity, devices, contacts, versions; **no** write log)
+  - `write_log.toml` — sync v2 write-log entries (`entries = [...]`)
+  - `apps.toml` — reserved / app-side data
+- **Write strategy** — write on every change. To avoid corrupt files on crash, write to a temp file first (`.{filename}.tmp`), fsync, then rename into place (on Linux, rename is atomic). `save_node` enqueues **both** directory and write-log flushes.
+- **Migration** — older builds embedded `write_log` inside `node.toml`. Load still accepts that; the next save writes the split layout.
 
 ## Thread safety and disk writes
 

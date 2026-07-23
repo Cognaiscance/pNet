@@ -172,6 +172,12 @@ pub enum Change {
         public_key: Ed25519PublicKey,
         devices:    Vec<ContactDeviceCard>,
     },
+    /// Public-scope: remove own-user device by uuid (and all its apps).
+    /// Tombstone for merge: concurrent AddDevice of the same uuid loses.
+    RemoveDevice { uuid: Uuid },
+    /// Public-scope: remove a contact user by uuid (and all their devices).
+    /// Tombstone for merge: concurrent UpsertContact of the same uuid loses.
+    RemoveContact { uuid: Uuid },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
@@ -186,6 +192,8 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
         Change::AddDevice { .. }               => &[Scope::Public],
         Change::UpdateApplicationAlias { .. }  => &[Scope::Public],
         Change::UpsertContact { .. }           => &[Scope::Public],
+        Change::RemoveDevice { .. }            => &[Scope::Public],
+        Change::RemoveContact { .. }           => &[Scope::Public],
     }
 }
 
@@ -247,6 +255,14 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
                 }
             }
         }
+        Change::RemoveDevice { uuid } => {
+            buf.push(CHANGE_KIND_REMOVE_DEVICE);
+            buf.extend_from_slice(uuid);
+        }
+        Change::RemoveContact { uuid } => {
+            buf.push(CHANGE_KIND_REMOVE_CONTACT);
+            buf.extend_from_slice(uuid);
+        }
     }
     buf
 }
@@ -304,6 +320,14 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
                 });
             }
             Some(Change::UpsertContact { uuid, alias, public_key, devices })
+        }
+        CHANGE_KIND_REMOVE_DEVICE => {
+            let uuid: Uuid = read_arr(data, &mut pos)?;
+            Some(Change::RemoveDevice { uuid })
+        }
+        CHANGE_KIND_REMOVE_CONTACT => {
+            let uuid: Uuid = read_arr(data, &mut pos)?;
+            Some(Change::RemoveContact { uuid })
         }
         _ => None,
     }
@@ -425,8 +449,155 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
                 }
             }
         }
+        Change::RemoveDevice { uuid } => {
+            let before = owner.user.devices.len();
+            owner.user.devices.retain(|d| d.uuid != *uuid);
+            before != owner.user.devices.len()
+        }
+        Change::RemoveContact { uuid } => {
+            let before = owner.contact_users.len();
+            owner.contact_users.retain(|c| c.user.uuid != *uuid);
+            before != owner.contact_users.len()
+        }
     };
     Ok(applied)
+}
+
+/// After a successful RemoveDevice / RemoveContact, drop fabric state that
+/// referenced the removed identity (§7.2): sessions, tunnels, pending maps.
+pub(crate) fn cascade_remove_fabric_state(ctx: &WorkerContext, change: &Change) {
+    let device_uuids: Vec<Uuid> = match change {
+        Change::RemoveDevice { uuid } => vec![*uuid],
+        Change::RemoveContact { uuid } => {
+            // Contact already removed from directory; drop sessions to any
+            // device uuid we still have connections for that matched the
+            // contact. Collect from active_connections that no longer map to
+            // a known own device or remaining contact device.
+            let node = ctx.node.read().unwrap();
+            let known: HashSet<Uuid> = node
+                .owner
+                .user
+                .devices
+                .iter()
+                .map(|d| d.uuid)
+                .chain(
+                    node.owner
+                        .contact_users
+                        .iter()
+                        .flat_map(|c| c.user.devices.iter().map(|d| d.uuid)),
+                )
+                .collect();
+            let _ = uuid; // contact user uuid — connections use device uuids
+            node.owner
+                .active_connections
+                .values()
+                .filter(|c| !known.contains(&c.device_uuid) && c.device_uuid != node.device_uuid)
+                .map(|c| c.device_uuid)
+                .collect()
+        }
+        _ => return,
+    };
+    if device_uuids.is_empty() && !matches!(change, Change::RemoveContact { .. }) {
+        return;
+    }
+
+    let mut node = ctx.node.write().unwrap();
+    match change {
+        Change::RemoveDevice { uuid } => {
+            drop_sessions_and_tunnels_for_device(&mut node, *uuid);
+            fabric_event(
+                "identity_removed",
+                &[("kind", "device"), ("uuid", &uuid_hex(uuid))],
+            );
+        }
+        Change::RemoveContact { uuid } => {
+            // Drop any connection to devices no longer in the directory.
+            let known: HashSet<Uuid> = node
+                .owner
+                .user
+                .devices
+                .iter()
+                .map(|d| d.uuid)
+                .chain(
+                    node.owner
+                        .contact_users
+                        .iter()
+                        .flat_map(|c| c.user.devices.iter().map(|d| d.uuid)),
+                )
+                .collect();
+            let orphaned: Vec<Uuid> = node
+                .owner
+                .active_connections
+                .values()
+                .map(|c| c.device_uuid)
+                .filter(|u| *u != node.device_uuid && !known.contains(u))
+                .collect();
+            for u in &orphaned {
+                drop_sessions_and_tunnels_for_device(&mut node, *u);
+            }
+            // Also clear SG status rows for those devices.
+            let local = node.device_uuid;
+            node.sg_statuses
+                .retain(|(u, _), _| known.contains(u) || *u == local);
+            fabric_event(
+                "identity_removed",
+                &[
+                    ("kind", "contact"),
+                    ("uuid", &uuid_hex(uuid)),
+                    ("sessions_dropped", &orphaned.len().to_string()),
+                ],
+            );
+        }
+        _ => {}
+    }
+}
+
+fn drop_sessions_and_tunnels_for_device(node: &mut Node, device_uuid: Uuid) {
+    node.owner
+        .active_connections
+        .retain(|_, c| c.device_uuid != device_uuid);
+    node.owner
+        .pending_connections
+        .retain(|_, p| p.peer_device_uuid != device_uuid);
+
+    // SG tunnel maps that reference those connection ids.
+    let dead_conn_ids: HashSet<u16> = node
+        .owner
+        .active_connections
+        .keys()
+        .copied()
+        .collect();
+    // Recompute: connections already retained — remove tunnels whose legs are gone.
+    let dead_tunnels: Vec<u16> = node
+        .owner
+        .active_tunnels
+        .iter()
+        .filter(|(_, t)| {
+            !node.owner.active_connections.contains_key(&t.connection_a_id)
+                || !node.owner.active_connections.contains_key(&t.connection_b_id)
+        })
+        .map(|(&id, _)| id)
+        .collect();
+    for id in dead_tunnels {
+        node.owner.active_tunnels.remove(&id);
+    }
+    node.owner.pending_tunnels.retain(|_, p| {
+        p.sender_device_uuid != device_uuid && p.dest_device_uuid != device_uuid
+    });
+    // DG tunnel map: drop entries whose conn was for this device (already gone).
+    let map_dead: Vec<u16> = node
+        .owner
+        .dg_tunnel_map
+        .iter()
+        .filter(|(_, cid)| !dead_conn_ids.contains(cid))
+        .map(|(&tid, _)| tid)
+        .collect();
+    for tid in map_dead {
+        node.owner.dg_tunnel_map.remove(&tid);
+        node.owner.pending_tunnel_connections.remove(&tid);
+    }
+    node.sg_statuses.retain(|(u, _), _| *u != device_uuid);
+    let _ = dead_conn_ids;
 }
 
 /// Build `Application` stubs (public fields only — private fields zeroed) from
@@ -555,7 +726,13 @@ fn request_change_inner(
 ) -> Result<(), WriteError> {
     let target = find_writer_sg_probing(ctx);
     match target {
-        WriterTarget::Local => apply_local_change(change, ctx, force_bump_on_noop),
+        WriterTarget::Local => {
+            let result = apply_local_change(change.clone(), ctx, force_bump_on_noop);
+            if result.is_ok() {
+                cascade_remove_fabric_state(ctx, &change);
+            }
+            result
+        }
         WriterTarget::Remote(writer_uuid) => {
             send_sync_write_request(&change, writer_uuid, ctx);
             Ok(())
@@ -2061,9 +2238,52 @@ pub fn watermark_probe_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
     };
     if !send_proposal { return; }
 
-    let (sender_version, entries) =
-        build_merge_proposal_for_peer(peer_uuid, scope, ctx);
-    let body = build_merge_proposal_body(scope, sender_version, &entries);
+    // §7.1: never ship an incomplete log slice past a pruned watermark —
+    // signal retention-exhausted so the peer adopts full state with visibility.
+    let gap_writer = {
+        let node = ctx.node.read().unwrap();
+        retention_gap_for_peer(&node, peer_uuid, scope)
+    };
+    let (sender_version, body) = if let Some(writer) = gap_writer {
+        let detail = format!(
+            "peer={} writer={} scope={scope:?}",
+            uuid_hex(&peer_uuid),
+            uuid_hex(&writer)
+        );
+        {
+            let mut node = ctx.node.write().unwrap();
+            node.owner.retention_fallback_active = true;
+            node.owner.retention_fallback_detail = detail.clone();
+        }
+        fabric_event(
+            "retention_fallback",
+            &[
+                ("role", "proposer"),
+                ("peer", &uuid_hex(&peer_uuid)),
+                ("writer", &uuid_hex(&writer)),
+                ("scope", &format!("{scope:?}")),
+            ],
+        );
+        let sender_version = {
+            let node = ctx.node.read().unwrap();
+            match scope {
+                Scope::Public => node.owner.public_version,
+                Scope::Private => node.owner.private_version,
+            }
+        };
+        (
+            sender_version,
+            build_retention_exhausted_proposal_body(scope, sender_version),
+        )
+    } else {
+        let (sender_version, entries) =
+            build_merge_proposal_for_peer(peer_uuid, scope, ctx);
+        (
+            sender_version,
+            build_merge_proposal_body(scope, sender_version, &entries),
+        )
+    };
+    let _ = sender_version;
     let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
         let node = ctx.node.read().unwrap();
         node.owner.active_connections.get(&conn_id).map(|conn| (
@@ -2101,7 +2321,7 @@ pub(crate) fn build_merge_proposal_body(
     sender_version: SyncVersion,
     entries: &[WriteLogEntry],
 ) -> Vec<u8> {
-    let count = entries.len().min(u16::MAX as usize) as u16;
+    let count = entries.len().min((MERGE_PROPOSAL_RETENTION_SENTINEL - 1) as usize) as u16;
     let mut buf = Vec::with_capacity(1 + SYNC_VERSION_WIRE_LEN + 2);
     write_scope(&mut buf, scope);
     write_sync_version(&mut buf, &sender_version);
@@ -2120,14 +2340,46 @@ pub(crate) fn build_merge_proposal_body(
     buf
 }
 
-pub(crate) fn parse_merge_proposal_body(
-    data: &[u8],
-) -> Option<(Scope, SyncVersion, Vec<WriteLogEntry>)> {
+/// Merge proposal body with retention-exhausted sentinel (no entries).
+pub(crate) fn build_retention_exhausted_proposal_body(
+    scope: Scope,
+    sender_version: SyncVersion,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + SYNC_VERSION_WIRE_LEN + 2);
+    write_scope(&mut buf, scope);
+    write_sync_version(&mut buf, &sender_version);
+    buf.extend_from_slice(&MERGE_PROPOSAL_RETENTION_SENTINEL.to_be_bytes());
+    buf
+}
+
+/// Parsed merge proposal: normal entry list, or peer signaled retention gap.
+#[derive(Debug)]
+pub(crate) enum ParsedMergeProposal {
+    Entries {
+        scope: Scope,
+        sender_version: SyncVersion,
+        entries: Vec<WriteLogEntry>,
+    },
+    /// Peer's log cannot fill the gap to our watermark — full-state fallback.
+    RetentionExhausted {
+        scope: Scope,
+        sender_version: SyncVersion,
+    },
+}
+
+pub(crate) fn parse_merge_proposal_body(data: &[u8]) -> Option<ParsedMergeProposal> {
     let mut pos = 0usize;
     let scope = read_scope(data, &mut pos)?;
     let sender_version = read_sync_version(data, &mut pos)?;
     let cnt_bytes: [u8; 2] = read_arr(data, &mut pos)?;
-    let cnt = u16::from_be_bytes(cnt_bytes) as usize;
+    let cnt_u16 = u16::from_be_bytes(cnt_bytes);
+    if cnt_u16 == MERGE_PROPOSAL_RETENTION_SENTINEL {
+        return Some(ParsedMergeProposal::RetentionExhausted {
+            scope,
+            sender_version,
+        });
+    }
+    let cnt = cnt_u16 as usize;
     let mut entries = Vec::with_capacity(cnt);
     for _ in 0..cnt {
         let version = read_sync_version(data, &mut pos)?;
@@ -2146,7 +2398,56 @@ pub(crate) fn parse_merge_proposal_body(
             committed_at,
         });
     }
-    Some((scope, sender_version, entries))
+    Some(ParsedMergeProposal::Entries {
+        scope,
+        sender_version,
+        entries,
+    })
+}
+
+/// True when peer's agreed watermark for some writer sits **below** the oldest
+/// retained log entry for that writer — we pruned history the peer still needs.
+pub(crate) fn retention_gap_for_peer(
+    node: &Node,
+    peer_uuid: Uuid,
+    scope: Scope,
+) -> Option<Uuid> {
+    let wms = node.owner.last_watermarks.get(&peer_uuid)?;
+    for (writer, peer_v) in wms {
+        if peer_v.is_initial() {
+            continue;
+        }
+        let mut oldest: Option<&WriteLogEntry> = None;
+        for e in &node.owner.write_log {
+            if e.scope != scope || e.version.writer_sg_uuid != *writer {
+                continue;
+            }
+            let older = oldest
+                .map(|o| {
+                    (e.version.epoch, e.version.seq) < (o.version.epoch, o.version.seq)
+                })
+                .unwrap_or(true);
+            if older {
+                oldest = Some(e);
+            }
+        }
+        let Some(oldest) = oldest else {
+            continue;
+        };
+        // Peer watermark behind our oldest retained entry for this writer.
+        if (peer_v.epoch, peer_v.seq) < (oldest.version.epoch, oldest.version.seq) {
+            let peer_exact = node.owner.write_log.iter().any(|e| {
+                e.scope == scope
+                    && e.version.writer_sg_uuid == *writer
+                    && e.version.epoch == peer_v.epoch
+                    && e.version.seq == peer_v.seq
+            });
+            if !peer_exact {
+                return Some(*writer);
+            }
+        }
+    }
+    None
 }
 
 pub(crate) fn build_merge_ack_body(scope: Scope, new_watermark: SyncVersion, result: u8) -> Vec<u8> {
@@ -2216,7 +2517,7 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
     };
 
-    let Some((scope, sender_version, entries)) = parse_merge_proposal_body(&plaintext) else {
+    let Some(parsed) = parse_merge_proposal_body(&plaintext) else {
         eprintln!("[merge_proposal] malformed body from {src}");
         return;
     };
@@ -2232,6 +2533,70 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
     };
 
+    let is_own_sg = {
+        let node = ctx.node.read().unwrap();
+        is_own_user_sg(&node.owner, peer_uuid)
+    };
+
+    // §7.1 retention-exhausted signal from peer: adopt full state via pull;
+    // never silently discard local-only concurrent writes without visibility.
+    if let ParsedMergeProposal::RetentionExhausted {
+        scope,
+        sender_version,
+    } = &parsed
+    {
+        if !is_own_sg {
+            send_merge_ack(
+                conn_id,
+                *scope,
+                SyncVersion::zero(),
+                MERGE_ACK_RESULT_MALFORMED,
+                ctx,
+            );
+            return;
+        }
+        {
+            let mut node = ctx.node.write().unwrap();
+            node.owner.retention_fallback_active = true;
+            node.owner.retention_fallback_detail = format!(
+                "peer signaled retention-exhausted scope={scope:?} \
+                 peer_version=(epoch={},seq={})",
+                sender_version.epoch, sender_version.seq
+            );
+        }
+        fabric_event(
+            "retention_fallback",
+            &[
+                ("role", "receiver"),
+                ("peer", &uuid_hex(&peer_uuid)),
+                ("scope", &format!("{scope:?}")),
+                ("action", "full_state_pull"),
+            ],
+        );
+        let local_v = {
+            let node = ctx.node.read().unwrap();
+            node.owner.version(*scope)
+        };
+        send_pull_request(*scope, local_v, conn_id, ctx);
+        send_merge_ack(
+            conn_id,
+            *scope,
+            local_v,
+            MERGE_ACK_RESULT_RETENTION_EXHAUSTED,
+            ctx,
+        );
+        return;
+    }
+
+    let ParsedMergeProposal::Entries {
+        scope,
+        sender_version,
+        entries,
+    } = parsed
+    else {
+        return;
+    };
+
     println!(
         "[merge_proposal] {} entries from peer {:02x?} (scope={scope:?}, sender_version epoch={}, seq={})",
         entries.len(),
@@ -2242,10 +2607,6 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     // 7c.6: actually run the merge. Receiving a proposal from a non-own-user
     // SG is a protocol violation — store nothing, ack malformed.
-    let is_own_sg = {
-        let node = ctx.node.read().unwrap();
-        is_own_user_sg(&node.owner, peer_uuid)
-    };
     if !is_own_sg {
         eprintln!("[merge_proposal] from non-own-user-SG peer {:02x?}; replying malformed",
                   &peer_uuid[..4]);
@@ -2328,8 +2689,38 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
     };
 
+    // §7.2: drop sessions/tunnels after directory removes (needs Node lock).
+    for change in &merged.changes_to_apply {
+        if matches!(
+            change,
+            Change::RemoveDevice { .. } | Change::RemoveContact { .. }
+        ) {
+            cascade_remove_fabric_state(ctx, change);
+        }
+    }
+
     if !merged.new_entries.is_empty() || any_state_change {
         ctx.save_node();
+    }
+
+    // Successful log merge clears any prior retention-fallback warning.
+    if !merged.new_entries.is_empty() || any_state_change {
+        {
+            let mut node = ctx.node.write().unwrap();
+            if node.owner.retention_fallback_active {
+                node.owner.retention_fallback_active = false;
+                node.owner.retention_fallback_detail.clear();
+            }
+        }
+        fabric_event(
+            "merge_applied",
+            &[
+                ("peer", &uuid_hex(&peer_uuid)),
+                ("scope", &format!("{scope:?}")),
+                ("new_entries", &merged.new_entries.len().to_string()),
+                ("changes", &merged.changes_to_apply.len().to_string()),
+            ],
+        );
     }
 
     // Notify own peers + contacts so they pull the merged state. notify_own_peers
@@ -2393,10 +2784,23 @@ pub fn merge_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         MERGE_ACK_RESULT_MALFORMED          => "malformed",
         _ => "unknown",
     };
-    println!(
-        "[merge_ack] result={result_str} scope={scope:?} new_watermark=(epoch={}, seq={})",
-        new_watermark.epoch, new_watermark.seq,
+    fabric_event(
+        "merge_ack",
+        &[
+            ("result", result_str),
+            ("scope", &format!("{scope:?}")),
+            ("epoch", &new_watermark.epoch.to_string()),
+            ("seq", &new_watermark.seq.to_string()),
+        ],
     );
+    if result == MERGE_ACK_RESULT_RETENTION_EXHAUSTED {
+        let mut node = ctx.node.write().unwrap();
+        node.owner.retention_fallback_active = true;
+        if node.owner.retention_fallback_detail.is_empty() {
+            node.owner.retention_fallback_detail =
+                "peer reported retention-exhausted on our merge proposal".into();
+        }
+    }
 }
 
 // ── Sync v2 merge engine (7c.5) ──────────────────────────────────────────────
@@ -2543,12 +2947,21 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
     };
 
     // First pass: collect tombstones. Tombstone wins globally for its target,
-    // regardless of `(epoch, seq)` of any conflicting Add.
+    // regardless of `(epoch, seq)` of any conflicting Add/Upsert.
+    let mut device_tombstones: HashSet<Uuid> = HashSet::new();
+    let mut contact_tombstones: HashSet<Uuid> = HashSet::new();
     for e in &entries {
-        if let Some(Change::RemoveApplication { device_uuid, app_id }) =
-            deserialize_change(&e.change_payload)
-        {
-            state.tombstones.insert((device_uuid, app_id));
+        match deserialize_change(&e.change_payload) {
+            Some(Change::RemoveApplication { device_uuid, app_id }) => {
+                state.tombstones.insert((device_uuid, app_id));
+            }
+            Some(Change::RemoveDevice { uuid }) => {
+                device_tombstones.insert(uuid);
+            }
+            Some(Change::RemoveContact { uuid }) => {
+                contact_tombstones.insert(uuid);
+            }
+            _ => {}
         }
     }
 
@@ -2572,11 +2985,17 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
                              new_alias, prio, false);
             }
             Change::AddDevice { uuid, alias, grade, sg_rank, hosts } => {
+                if device_tombstones.contains(&uuid) {
+                    continue;
+                }
                 state.devices.entry(uuid).or_insert(MergedDevice {
                     alias, grade, sg_rank, hosts,
                 });
             }
             Change::UpsertContact { uuid, alias, public_key, devices } => {
+                if contact_tombstones.contains(&uuid) {
+                    continue;
+                }
                 // Whole-contact last-writer-wins: the highest-priority upsert's
                 // snapshot replaces any lower-priority one outright.
                 let win = match state.contacts.get(&uuid) {
@@ -2592,7 +3011,17 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
                     });
                 }
             }
+            Change::RemoveDevice { .. } | Change::RemoveContact { .. } => {}
         }
+    }
+
+    // Devices tombstoned must not appear even if only Adds were seen first.
+    for u in &device_tombstones {
+        state.devices.remove(u);
+        state.apps.retain(|(d, _), _| d != u);
+    }
+    for u in &contact_tombstones {
+        state.contacts.remove(u);
     }
 
     // Drop apps that only ever appeared via an Update (no Add to establish
@@ -2689,9 +3118,19 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
         out.push(Change::RemoveApplication { device_uuid: d, app_id: id });
     }
 
-    // Contacts: emit an UpsertContact for any target contact that's new or
-    // whose snapshot differs from current. No contact removal Change exists
-    // yet, so contacts are never diffed out.
+    // Devices present locally but absent in target (RemoveDevice tombstone).
+    let mut removed_devs: Vec<Uuid> = current
+        .devices
+        .keys()
+        .filter(|u| !target.devices.contains_key(*u))
+        .copied()
+        .collect();
+    removed_devs.sort();
+    for uuid in removed_devs {
+        out.push(Change::RemoveDevice { uuid });
+    }
+
+    // Contacts: upsert new/changed; remove those tombstoned away.
     let mut target_contacts: Vec<(&Uuid, &MergedContact)> = target.contacts.iter().collect();
     target_contacts.sort_by_key(|(u, _)| **u);
     for (uuid, c) in target_contacts {
@@ -2709,6 +3148,17 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
                 devices:    c.devices.clone(),
             });
         }
+    }
+
+    let mut removed_contacts: Vec<Uuid> = current
+        .contacts
+        .keys()
+        .filter(|u| !target.contacts.contains_key(*u))
+        .copied()
+        .collect();
+    removed_contacts.sort();
+    for uuid in removed_contacts {
+        out.push(Change::RemoveContact { uuid });
     }
 
     out
