@@ -103,8 +103,8 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         eprintln!("[bootstrap_request] packet too short ({}) from {src}", buf.len());
         return;
     }
-    let invitation_id:    Uuid      = buf[0..16].try_into().unwrap();
-    let new_dev_ephem_pk = X25519PublicKey(buf[16..48].try_into().unwrap());
+    let Some(invitation_id) = slice_arr::<16>(&buf, 0) else { return; };
+    let Some(new_dev_ephem_pk) = slice_arr::<32>(&buf, 16).map(X25519PublicKey) else { return; };
 
     // Validate invitation, derive shared secret, serialize payload — all under write lock.
     let (shared_secret, payload) = {
@@ -175,7 +175,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         eprintln!("[bootstrap_response] packet too short ({}) from {src}", buf.len());
         return;
     }
-    let nonce:      [u8; 24] = buf[0..24].try_into().unwrap();
+    let Some(nonce) = slice_arr::<24>(&buf, 0) else { return; };
     let ciphertext: &[u8]    = &buf[24..];
 
     // Retrieve pending bootstrap state — we need it before taking the write lock.
@@ -286,8 +286,8 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         eprintln!("[device_registration] packet too short ({}) from {src}", buf.len());
         return;
     }
-    let invitation_id: Uuid    = buf[0..16].try_into().unwrap();
-    let nonce:         [u8; 24] = buf[16..40].try_into().unwrap();
+    let Some(invitation_id) = slice_arr::<16>(&buf, 0) else { return; };
+    let Some(nonce) = slice_arr::<24>(&buf, 16) else { return; };
     let ciphertext:    &[u8]   = &buf[40..];
 
     // Look up and consume the pending acceptance under write lock.
@@ -413,9 +413,9 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
 
-    let invitation_id:   Uuid      = buf[0..16].try_into().unwrap();
-    let requester_ephem_pk = X25519PublicKey(buf[16..48].try_into().unwrap());
-    let nonce:           [u8; 24]  = buf[48..72].try_into().unwrap();
+    let Some(invitation_id) = slice_arr::<16>(&buf, 0) else { return; };
+    let Some(requester_ephem_pk) = slice_arr::<32>(&buf, 16).map(X25519PublicKey) else { return; };
+    let Some(nonce) = slice_arr::<24>(&buf, 48) else { return; };
     let ciphertext:      &[u8]     = &buf[72..];
 
     let (shared_secret, response_payload, contact_uuid, contact_change) = {
@@ -519,7 +519,7 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
 
-    let nonce:      [u8; 24] = buf[0..24].try_into().unwrap();
+    let Some(nonce) = slice_arr::<24>(&buf, 0) else { return; };
     let ciphertext: &[u8]    = &buf[24..];
 
     let shared_secret = {
@@ -868,7 +868,7 @@ pub fn generate_invitation_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
         return;
     }
     let kind = plaintext[0];
-    let token: Uuid = plaintext[1..17].try_into().unwrap();
+    let Some(token) = slice_arr::<16>(&plaintext, 1) else { return; };
 
     // Any SG can mint: invitations are device-local, so the requesting DG's
     // code points here and this node will receive the BootstrapRequest.
@@ -922,7 +922,7 @@ pub fn generate_invitation_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerC
         eprintln!("[generate_invitation_response] body too short from {src}");
         return;
     }
-    let token: Uuid = plaintext[0..16].try_into().unwrap();
+    let Some(token) = slice_arr::<16>(&plaintext, 0) else { return; };
     let outcome: Result<String, ()> = if plaintext[16] == INVITE_RESULT_OK {
         match std::str::from_utf8(&plaintext[17..]) {
             Ok(code) => Ok(code.to_string()),

@@ -27,6 +27,12 @@ Admin session cookies are always issued as:
 
 Prefer loopback bind (`127.0.0.1`) whenever possible. Remote admin (`PNET_HTTP_BIND=0.0.0.0`) relies on this SameSite policy plus password auth — do not disable cookies or proxy in ways that strip `SameSite`.
 
+## Fabric address family (v1)
+
+The pNet **UDP fabric is IPv4-only** in v1 (device hosts, peer sessions, DNS
+resolve). Admin HTTP also binds IPv4 addresses only (`PNET_HTTP_BIND`). See
+`descriptions/wire-versioning.md` and `pnet to pnet communication.md`.
+
 ## HTTP bind policy
 
 The admin UI binds to **loopback only** by default (`127.0.0.1`), for every device grade (SG and DG). That keeps the control plane off the LAN/WAN unless the operator opts in.

@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — next is §8.1)* |
-| Last completed | 7.3 Persistence split (2026-07-23) |
+| Current focus | *(none — next is §9.1)* |
+| Last completed | 8.3 Wire versioning note (2026-07-23) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -221,22 +221,21 @@ Core behavior is largely designed; make it observable and resilient.
 ## Phase 8 — Wire and platform contracts
 
 ### 8.1 IPv4 contract
-- [ ] Document “IPv4 only” as v1 fabric contract **or** schedule dual-stack work
-- [ ] If documenting only: one short section in a core description + admin note
+- [x] Document “IPv4 only” as v1 fabric contract **or** schedule dual-stack work
+- [x] If documenting only: one short section in a core description + admin note
 
-**Done:**  
+**Done:** 2026-07-23 — Documented IPv4-only v1 (no dual-stack schedule): `wire-versioning.md`, `pnet to pnet communication.md`, admin UI note. Dual-stack deferred to a later design.
 
 ### 8.2 Parser robustness
-- [ ] Untrusted UDP paths return errors instead of `unwrap` on slice conversion where practical
+- [x] Untrusted UDP paths return errors instead of `unwrap` on slice conversion where practical
 - [ ] Optional: fuzz bootstrap / directory encode / change payloads
 
-**Done:**  
+**Done:** 2026-07-23 — `wire::slice_arr` (no panic on short buffers); production parse sites in udp_listener, sessions, bootstrap, tunnels, app_edge, relay use `Option` early-return. Fuzz optional deferred. Unit test for `slice_arr`.
 
 ### 8.3 Wire versioning note
-- [ ] Short design note: how the next breaking wire change will be signaled (capability byte / op range)
+- [x] Short design note: how the next breaking wire change will be signaled (capability byte / op range)
 
-**Done:**  
-
+**Done:** 2026-07-23 — `descriptions/wire-versioning.md`: prefer new ops; handshake capability / V2 connect ops; AEAD domain `v1` → `v2` labels. Phase 8 complete (fuzz optional left unchecked intentionally).
 ---
 
 ## Phase 9 — Core test harness hygiene
@@ -275,6 +274,7 @@ Add a line per work session (newest at top).
 
 | Date | Item(s) | Notes |
 |------|---------|--------|
+| 2026-07-23 | 8.1–8.3 Wire/platform contracts | IPv4 docs; slice_arr parse; wire-versioning.md. Phase 8 done. |
 | 2026-07-23 | 7.3 Persistence split | write_log.toml vs node.toml; atomic fsync kept. Phase 7 done. |
 | 2026-07-23 | 7.2 Remove cascade | RemoveDevice/Contact + fabric session/tunnel drop. |
 | 2026-07-23 | 7.1 Partition / merge honesty | Retention sentinel + visibility; contact merge tests. |

@@ -184,6 +184,13 @@ pub(crate) fn read_arr<const N: usize>(data: &[u8], pos: &mut usize) -> Option<[
     Some(slice)
 }
 
+/// Fixed-width array at absolute offset. Returns `None` if the buffer is too
+/// short — never panics on untrusted UDP/plaintext slices (§8.2).
+#[inline]
+pub(crate) fn slice_arr<const N: usize>(data: &[u8], off: usize) -> Option<[u8; N]> {
+    data.get(off..off + N)?.try_into().ok()
+}
+
 /// 32-char lowercase hex of a 16-byte uuid (UI form values / logs).
 pub(crate) fn uuid_hex(uuid: &Uuid) -> String {
     uuid.iter().map(|b| format!("{b:02x}")).collect()
@@ -247,6 +254,14 @@ mod tests {
         let mut pos = 0;
         assert_eq!(read_str(&buf, &mut pos).as_deref(), Some("hello"));
         assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn slice_arr_rejects_short_buffer() {
+        let buf = [1u8, 2, 3];
+        assert!(slice_arr::<4>(&buf, 0).is_none());
+        assert_eq!(slice_arr::<2>(&buf, 1), Some([2, 3]));
+        assert!(slice_arr::<2>(&buf, 2).is_none());
     }
 
     #[test]

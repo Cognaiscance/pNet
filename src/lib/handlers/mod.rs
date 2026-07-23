@@ -276,10 +276,13 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             eprintln!("[relay_packet] plaintext too short from {src}");
             return;
         }
-        let dest_device_uuid: Uuid = plaintext[0..16].try_into().unwrap();
-        let dest_app_id:      Uuid = plaintext[16..32].try_into().unwrap();
-        let sender_app_id:    Uuid = plaintext[32..48].try_into().unwrap();
-        let payload                = plaintext[48..].to_vec();
+        let Some(dest_device_uuid) = slice_arr::<16>(&plaintext, 0) else {
+            eprintln!("[relay_packet] plaintext too short from {src}");
+            return;
+        };
+        let Some(dest_app_id) = slice_arr::<16>(&plaintext, 16) else { return; };
+        let Some(sender_app_id) = slice_arr::<16>(&plaintext, 32) else { return; };
+        let payload = plaintext[48..].to_vec();
         if payload.len() > MAX_APP_PAYLOAD {
             eprintln!(
                 "[relay_packet] app payload too large ({} > {MAX_APP_PAYLOAD}) from {src}",

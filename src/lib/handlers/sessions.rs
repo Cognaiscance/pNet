@@ -71,11 +71,15 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
 
-    let initiator_conn_id                   = u16::from_be_bytes([buf[0], buf[1]]);
-    let initiator_device_uuid: Uuid         = buf[2..18].try_into().unwrap();
-    let initiator_ephemeral_pk = X25519PublicKey(buf[18..50].try_into().unwrap());
-    let initiator_longterm_pk = Ed25519PublicKey(buf[50..82].try_into().unwrap());
-    let signature: [u8; 64]                 = buf[82..146].try_into().unwrap();
+    let initiator_conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+    let Some(initiator_device_uuid) = slice_arr::<16>(&buf, 2) else { return; };
+    let Some(initiator_ephemeral_pk) = slice_arr::<32>(&buf, 18).map(X25519PublicKey) else {
+        return;
+    };
+    let Some(initiator_longterm_pk) = slice_arr::<32>(&buf, 50).map(Ed25519PublicKey) else {
+        return;
+    };
+    let Some(signature) = slice_arr::<64>(&buf, 82) else { return; };
 
     // Verify Ed25519 signature over [op=0x20] || buf[0..82].
     let mut signed_msg = [0u8; 83];
@@ -163,10 +167,12 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
 
-    let responder_conn_id               = u16::from_be_bytes([buf[0], buf[1]]);
-    let our_conn_id                     = u16::from_be_bytes([buf[2], buf[3]]);
-    let responder_ephemeral_pk = X25519PublicKey(buf[4..36].try_into().unwrap());
-    let signature: [u8; 64]             = buf[36..100].try_into().unwrap();
+    let responder_conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+    let our_conn_id = u16::from_be_bytes([buf[2], buf[3]]);
+    let Some(responder_ephemeral_pk) = slice_arr::<32>(&buf, 4).map(X25519PublicKey) else {
+        return;
+    };
+    let Some(signature) = slice_arr::<64>(&buf, 36) else { return; };
 
     let mut node = ctx.node.write().unwrap();
     let Some(pending) = node.owner.pending_connections.remove(&our_conn_id) else {

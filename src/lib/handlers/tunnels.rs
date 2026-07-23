@@ -83,7 +83,7 @@ pub fn tunnel_init(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
     let tunnel_id        = u16::from_be_bytes([buf[0], buf[1]]);
-    let dest_device_uuid: Uuid = buf[2..18].try_into().unwrap();
+    let Some(dest_device_uuid) = slice_arr::<16>(&buf, 2) else { return; };
 
     let (our_conn_id, our_ephem_pk) = {
         let mut node = ctx.node.write().unwrap();
@@ -128,7 +128,7 @@ pub fn tunnel_connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext
         return;
     }
     let tunnel_id       = u16::from_be_bytes([buf[0], buf[1]]);
-    let sender_ephem_pk = X25519PublicKey(buf[2..34].try_into().unwrap());
+    let Some(sender_ephem_pk) = slice_arr::<32>(&buf, 2).map(X25519PublicKey) else { return; };
 
     // Determine role by checking which pending map has this tunnel_id.
     let is_sg_relay = ctx.node.read().unwrap()
@@ -163,7 +163,7 @@ pub fn tunnel_connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext
         }
     } else if buf.len() >= 50 {
         // ── DG_dest path ──────────────────────────────────────────────────────
-        let sender_device_uuid: Uuid = buf[34..50].try_into().unwrap();
+        let Some(sender_device_uuid) = slice_arr::<16>(&buf, 34) else { return; };
 
         let (conn_id, our_ephem_pk) = {
             let mut node    = ctx.node.write().unwrap();
@@ -217,7 +217,7 @@ pub fn tunnel_connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
     let tunnel_id    = u16::from_be_bytes([buf[0], buf[1]]);
-    let dest_ephem_pk = X25519PublicKey(buf[2..34].try_into().unwrap());
+    let Some(dest_ephem_pk) = slice_arr::<32>(&buf, 2).map(X25519PublicKey) else { return; };
 
     let is_sg_relay = ctx.node.read().unwrap()
         .owner.pending_tunnels.contains_key(&tunnel_id);
@@ -352,7 +352,7 @@ pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
     let tunnel_id       = u16::from_be_bytes([buf[0], buf[1]]);
-    let nonce: [u8; 24] = buf[2..26].try_into().unwrap();
+    let Some(nonce) = slice_arr::<24>(&buf, 2) else { return; };
     let ciphertext      = &buf[26..];
 
     let (push_pkt, app_host) = {
@@ -381,8 +381,8 @@ pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         }
 
-        let dest_app_id:   Uuid = plaintext[0..16].try_into().unwrap();
-        let sender_app_id: Uuid = plaintext[16..32].try_into().unwrap();
+        let Some(dest_app_id) = slice_arr::<16>(&plaintext, 0) else { return; };
+        let Some(sender_app_id) = slice_arr::<16>(&plaintext, 16) else { return; };
         let payload             = &plaintext[32..];
         if payload.len() > MAX_APP_PAYLOAD {
             eprintln!(

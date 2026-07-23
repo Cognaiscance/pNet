@@ -171,7 +171,9 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 17 {
         return send_error(ctx, src, ERR_BAD_PACKET);
     }
-    let token: [u8; 16] = buf[0..16].try_into().unwrap();
+    let Some(token) = slice_arr::<16>(&buf, 0) else {
+        return send_error(ctx, src, ERR_BAD_PACKET);
+    };
     let flags = buf[16];
     let mut pos = 17usize;
 
@@ -326,7 +328,9 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 16 {
         return send_error(ctx, src, ERR_BAD_PACKET);
     }
-    let token: [u8; 16] = buf[0..16].try_into().unwrap();
+    let Some(token) = slice_arr::<16>(&buf, 0) else {
+        return send_error(ctx, src, ERR_BAD_PACKET);
+    };
 
     let node = ctx.node.read().unwrap();
     let device_uuid = node.device_uuid;
@@ -425,10 +429,16 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return send_error(ctx, src, ERR_BAD_PACKET);
     }
 
-    let token: Uuid            = buf[0..16].try_into().unwrap();
-    let dest_device_uuid: Uuid = buf[16..32].try_into().unwrap();
-    let dest_app_id: Uuid      = buf[32..48].try_into().unwrap();
-    let payload                = &buf[48..];
+    let Some(token) = slice_arr::<16>(&buf, 0) else {
+        return send_error(ctx, src, ERR_BAD_PACKET);
+    };
+    let Some(dest_device_uuid) = slice_arr::<16>(&buf, 16) else {
+        return send_error(ctx, src, ERR_BAD_PACKET);
+    };
+    let Some(dest_app_id) = slice_arr::<16>(&buf, 32) else {
+        return send_error(ctx, src, ERR_BAD_PACKET);
+    };
+    let payload = &buf[48..];
 
     if !ctx
         .app_rate_limits
@@ -577,8 +587,8 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             eprintln!("[app_packet] plaintext too short from {src}");
             return;
         }
-        let dest_app_id:   Uuid = plaintext[0..16].try_into().unwrap();
-        let sender_app_id: Uuid = plaintext[16..32].try_into().unwrap();
+        let Some(dest_app_id) = slice_arr::<16>(&plaintext, 0) else { return; };
+        let Some(sender_app_id) = slice_arr::<16>(&plaintext, 16) else { return; };
         let payload             = &plaintext[32..];
         if payload.len() > MAX_APP_PAYLOAD {
             eprintln!(

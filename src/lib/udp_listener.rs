@@ -8,7 +8,7 @@ use super::action_queue::{Action, PRIORITY_HIGH};
 use super::app_api::app_api_source_allowed;
 use super::thread_pool::SharedQueue;
 use super::wire::{
-    APP_GET_DATA_OP, APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_PACKET_OP, APP_UPDATE_OP,
+    slice_arr, APP_GET_DATA_OP, APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_PACKET_OP, APP_UPDATE_OP,
     BOOTSTRAP_REQUEST_OP, BOOTSTRAP_RESPONSE_OP, CONNECT_ACK_OP, CONNECT_REQUEST_OP,
     CONTACT_REQUEST_OP, CONTACT_RESPONSE_OP, CONN_RESET_OP, CROSS_USER_PULL_REQUEST_OP,
     CROSS_USER_PULL_RESPONSE_OP, CROSS_USER_UPDATE_AVAILABLE_OP, DEVICE_REGISTER_OP,
@@ -92,11 +92,10 @@ impl UdpListener {
                     APP_GET_DATA_OP => Action::AppGetData { src, buf: payload },
                     APP_SEND_PACKET_OP => Action::AppSendPacket { src, buf: payload },
                     SG_PING_OP => {
-                        if payload.len() < 16 {
+                        let Some(nonce) = slice_arr::<16>(&payload, 0) else {
                             eprintln!("[udp] sg_ping too short from {src}");
                             continue;
-                        }
-                        let nonce: [u8; 16] = payload[..16].try_into().unwrap();
+                        };
                         Action::SgPing { src, nonce }
                     }
                     // DG encrypted keepalive: SG verifies the connection is still

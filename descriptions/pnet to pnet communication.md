@@ -2,6 +2,13 @@
 
 This document describes how two pNet nodes communicate with each other directly — distinct from how apps communicate with their local pNet node.
 
+## Platform contract: IPv4 only (v1)
+
+The fabric is **IPv4-only** in v1: peer hosts, UDP fabric sockets, session
+`peer_addr`, and host resolution all target `SocketAddrV4`. IPv6 is out of
+scope for this version (see `descriptions/wire-versioning.md`). Dual-stack
+would be a later design, not a silent extension of these layouts.
+
 ## Active Connections
 
 Before two pNet nodes can exchange encrypted messages, they must establish an ActiveConnection. Each side holds an `ActiveConnection` struct containing a locally assigned `u16` ID, an ephemeral key pair, the peer's ephemeral public key, and the peer's corresponding `u16` ID.
