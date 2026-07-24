@@ -440,6 +440,7 @@ mod tests {
                 dns_cache: Arc::new(std::sync::Mutex::new(
                     super::super::dns_cache::DnsCache::new(),
                 )),
+                app_web: Arc::new(super::super::app_web::AppWebRegistry::new()),
             };
             TestCtx { ctx, app_socket, _writer_rx, _sched_rx }
         }

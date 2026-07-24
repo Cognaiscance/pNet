@@ -8,10 +8,23 @@ portal **Home** page (see `descriptions/app-web-surfaces.md`).
 |------|------|
 | `/` | Portal home — app page links (when registered) + entry to Config |
 | `/config` | Config hub — overview stats and links to control sections |
+| `/apps/<slug>/…` | Reverse-proxy to a local app HTTP port (owner session required) |
+| `/api/app-web/register` | **Loopback only** — app process registers `slug` + `port` (+ optional `title`) |
+| `/api/app-web/unregister` | **Loopback only** — remove a mount by `slug` |
 | `/devices`, `/invitations`, … | Config section pages (same capabilities as the classic admin UI) |
 | `/dashboard` | Redirects to `/` (legacy) |
 
-Accessible only after owner sign-in (admin password session today).
+Owner portal pages require sign-in (admin password session today). Mount
+registration is authenticated by **loopback source address** (local apps), not
+by the owner cookie.
+
+Example (app on this host, after it starts listening on port 9080):
+
+```bash
+curl -sS -X POST http://127.0.0.1:8777/api/app-web/register \
+  --data 'slug=hello&port=9080&title=Hello'
+# Then open /apps/hello/ while signed in to the portal.
+```
 
 ## Access & Authentication
 

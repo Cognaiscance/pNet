@@ -22,6 +22,9 @@ use super::super::admin_auth::{
     set_session_cookie_header, validate_new_password, verify_password, SessionStore, UiFlash,
     INVITE_CODE_HEADER, MIN_PASSWORD_LEN,
 };
+use super::super::app_web::{
+    is_loopback_addr, parse_apps_path, proxy_to_loopback, validate_slug, AppWebMount,
+};
 use super::super::crypto::generate_ed25519_keypair;
 use super::super::data_models::{
     Device, DeviceGrade, Node, Uuid, CONNECTION_LIFETIME, WRITE_LOG_RETENTION, generate_uuid,
@@ -67,11 +70,21 @@ pub fn ui_request(
     let is_login_route = matches!(path.as_str(), "/login");
     let is_set_password_route = matches!(path.as_str(), "/set-password");
     let is_logout = method == "POST" && path == "/logout";
+    // Local apps register mounts without a browser session (loopback only).
+    let is_app_web_api = matches!(
+        path.as_str(),
+        "/api/app-web/register" | "/api/app-web/unregister"
+    );
+    let peer_loopback = stream
+        .peer_addr()
+        .map(is_loopback_addr)
+        .unwrap_or(false);
 
     // ── Access gates ─────────────────────────────────────────────────────────
     // 1. Uninitialized → setup only.
     // 2. Initialized without password (upgrade path) → set-password only.
-    // 3. Initialized with password → login public; everything else needs session.
+    // 3. Initialized with password → login public; everything else needs session
+    //    (except loopback app-web mount API).
     if !initialized {
         if !is_setup_route {
             return respond_redirect(&stream, "/setup");
@@ -91,7 +104,7 @@ pub fn ui_request(
             // Password already set — no open reset without auth (out of scope for 1.1).
             return respond_redirect(&stream, if authed { "/" } else { "/login" });
         }
-        if !authed && !is_login_route {
+        if !authed && !is_login_route && !(is_app_web_api && peer_loopback) {
             return respond_redirect(&stream, "/login");
         }
         if authed && is_login_route && method == "GET" {
@@ -101,7 +114,9 @@ pub fn ui_request(
 
     // CSRF: SameSite=Strict on the session cookie is the primary defence.
     // When Origin/Referer is present, require it to match Host.
-    if method == "POST" && !csrf_post_ok(&host, &origin, &referer) {
+    // Loopback app-web API uses no browser cookie; skip CSRF for that path only.
+    if method == "POST" && !(is_app_web_api && peer_loopback) && !csrf_post_ok(&host, &origin, &referer)
+    {
         return respond_html(
             &stream,
             403,
@@ -109,6 +124,11 @@ pub fn ui_request(
              <p>Origin/Referer does not match this host.</p>"),
             None,
         );
+    }
+
+    // Reverse-proxy app web mounts (owner session required).
+    if path.starts_with("/apps/") {
+        return handle_app_web_proxy(stream, &method, &path, &query, &body, ctx);
     }
 
     match (method.as_str(), path.as_str()) {
@@ -173,6 +193,13 @@ pub fn ui_request(
         ("GET",  "/")            => respond_html(&stream, 200, &render_portal_home(ctx), None),
         ("GET",  "/dashboard")   => respond_redirect(&stream, "/"),
         ("GET",  "/config")      => respond_html(&stream, 200, &render_config_hub(ctx), None),
+        // Local app mount registration (loopback only; no owner session).
+        ("POST", "/api/app-web/register") => {
+            handle_app_web_register(&stream, peer_loopback, &body, ctx);
+        }
+        ("POST", "/api/app-web/unregister") => {
+            handle_app_web_unregister(&stream, peer_loopback, &body, ctx);
+        }
         ("GET",  "/pending-apps")         => respond_html(&stream, 200, &render_pending_apps(ctx, &query), None),
         ("POST", "/pending-apps/approve") => {
             let target = redirect_with_error("/pending-apps", approve_app(&body, ctx));
@@ -334,6 +361,7 @@ fn respond_html(stream: &std::net::TcpStream, status: u16, html: &str, set_cooki
         200 => "OK",
         403 => "Forbidden",
         404 => "Not Found",
+        502 => "Bad Gateway",
         _ => "OK",
     };
     let body = html.as_bytes();
@@ -501,7 +529,7 @@ pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 
 // ── Page renders ─────────────────────────────────────────────────────────────
 
-/// Portal home: app web links (placeholder until mounts) + Config entry.
+/// Portal home: app web links from the mount registry + Config entry.
 fn render_portal_home(ctx: &WorkerContext) -> String {
     let (owner_alias, device_alias, grade_label) = {
         let node = ctx.node.read().unwrap();
@@ -517,16 +545,39 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
         )
     };
 
-    // Future: list registered `/apps/<slug>` mounts. Empty until mount registry lands.
-    let apps_section = "\
+    let mounts = ctx.app_web.list();
+    let apps_section = if mounts.is_empty() {
+        "\
          <div class=\"card\">\
            <h2 style=\"margin-top:0;font-size:1.1rem\">Apps</h2>\
            <p class=\"empty\" style=\"margin:0\">No app pages registered yet. \
-           When apps mount a web UI on this node, they will appear here as links \
-           under <code>/apps/&lt;slug&gt;/</code>.</p>\
+           Local apps can register a mount via \
+           <code>POST /api/app-web/register</code> (loopback only).</p>\
            <p style=\"font-size:.85rem;color:#666;margin:.75rem 0 0\">\
            App store (discover &amp; install across devices) is a future project.</p>\
-         </div>";
+         </div>".to_string()
+    } else {
+        let mut rows = String::new();
+        for m in &mounts {
+            let title = if m.title.is_empty() {
+                html_escape(&m.slug)
+            } else {
+                html_escape(&m.title)
+            };
+            let slug = html_escape(&m.slug);
+            rows.push_str(&format!(
+                "<li style=\"margin:.4rem 0\"><a class=\"portal-btn\" href=\"/apps/{slug}/\">\
+                 {title}</a> \
+                 <span style=\"color:#888;font-size:.85rem\">/apps/{slug}/</span></li>"
+            ));
+        }
+        format!(
+            "<div class=\"card\">\
+               <h2 style=\"margin-top:0;font-size:1.1rem\">Apps</h2>\
+               <ul style=\"margin:0;padding-left:1.1rem\">{rows}</ul>\
+             </div>"
+        )
+    };
 
     let body = format!(
         "<h1>Home</h1>\
@@ -542,6 +593,145 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
          </div>"
     );
     layout(ctx, "Home", &body)
+}
+
+/// Proxy `/apps/<slug>/…` to the registered loopback upstream (owner session).
+fn handle_app_web_proxy(
+    mut stream: std::net::TcpStream,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+    ctx: &WorkerContext,
+) {
+    let Some((slug, upstream_path)) = parse_apps_path(path) else {
+        return respond_html(
+            &stream,
+            404,
+            &layout(ctx, "Not Found", "<h1>404 — Invalid app path</h1>"),
+            None,
+        );
+    };
+    let Some(mount) = ctx.app_web.get(slug) else {
+        return respond_html(
+            &stream,
+            404,
+            &layout(
+                ctx,
+                "Not Found",
+                &format!(
+                    "<h1>404 — App not mounted</h1>\
+                     <p>No web mount for <code>{}</code>. \
+                     <a href=\"/\">Back to Home</a></p>",
+                    html_escape(slug)
+                ),
+            ),
+            None,
+        );
+    };
+    if let Err(e) = proxy_to_loopback(
+        &mut stream,
+        method,
+        &upstream_path,
+        query,
+        body,
+        mount.port,
+    ) {
+        eprintln!("[app-web] proxy /apps/{slug}/ → :{} failed: {e}", mount.port);
+        // Client may already have received partial bytes; best-effort error page.
+        let _ = respond_html(
+            &stream,
+            502,
+            &layout(
+                ctx,
+                "Bad Gateway",
+                &format!(
+                    "<h1>502 — App unavailable</h1>\
+                     <p>Could not reach the app on localhost:{} ({}).</p>\
+                     <p><a href=\"/\">Back to Home</a></p>",
+                    mount.port,
+                    html_escape(&e)
+                ),
+            ),
+            None,
+        );
+    }
+}
+
+/// `POST /api/app-web/register` — form: `slug`, `port`, optional `title`. Loopback only.
+fn handle_app_web_register(
+    stream: &std::net::TcpStream,
+    peer_loopback: bool,
+    body: &[u8],
+    ctx: &WorkerContext,
+) {
+    if !peer_loopback {
+        return respond_plain(stream, 403, "forbidden: loopback only\n");
+    }
+    let slug = form_field(body, "slug").map(url_decode).unwrap_or_default();
+    let title = form_field(body, "title").map(url_decode).unwrap_or_default();
+    let port_s = form_field(body, "port").map(url_decode).unwrap_or_default();
+    if let Err(code) = validate_slug(&slug) {
+        return respond_plain(stream, 400, &format!("error: {code}\n"));
+    }
+    let Ok(port) = port_s.parse::<u16>() else {
+        return respond_plain(stream, 400, "error: port\n");
+    };
+    if port == 0 {
+        return respond_plain(stream, 400, "error: port\n");
+    }
+    ctx.app_web.upsert(AppWebMount {
+        slug: slug.clone(),
+        port,
+        title,
+    });
+    println!("[app-web] registered mount /apps/{slug}/ → 127.0.0.1:{port}");
+    respond_plain(stream, 200, &format!("ok slug={slug} port={port}\n"));
+}
+
+/// `POST /api/app-web/unregister` — form: `slug`. Loopback only.
+fn handle_app_web_unregister(
+    stream: &std::net::TcpStream,
+    peer_loopback: bool,
+    body: &[u8],
+    ctx: &WorkerContext,
+) {
+    if !peer_loopback {
+        return respond_plain(stream, 403, "forbidden: loopback only\n");
+    }
+    let slug = form_field(body, "slug").map(url_decode).unwrap_or_default();
+    if slug.is_empty() {
+        return respond_plain(stream, 400, "error: slug\n");
+    }
+    if ctx.app_web.remove(&slug) {
+        println!("[app-web] unregistered mount /apps/{slug}/");
+        respond_plain(stream, 200, "ok\n")
+    } else {
+        respond_plain(stream, 404, "error: not_found\n")
+    }
+}
+
+fn respond_plain(stream: &std::net::TcpStream, status: u16, body: &str) {
+    use std::io::Write;
+    let status_text = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        502 => "Bad Gateway",
+        _ => "OK",
+    };
+    let bytes = body.as_bytes();
+    let header = format!(
+        "HTTP/1.1 {status} {status_text}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        bytes.len()
+    );
+    let mut s = stream;
+    let _ = s.write_all(header.as_bytes());
+    let _ = s.write_all(bytes);
 }
 
 /// Config hub: node overview stats + links into control-plane pages.

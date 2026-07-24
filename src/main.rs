@@ -191,6 +191,7 @@ fn main() {
         sessions:     Arc::new(pnet::admin_auth::SessionStore::new()),
         app_rate_limits: Arc::new(std::sync::Mutex::new(pnet::app_api::AppRateLimiter::new())),
         dns_cache:    Arc::new(std::sync::Mutex::new(pnet::dns_cache::DnsCache::new())),
+        app_web:      Arc::new(pnet::app_web::AppWebRegistry::new()),
     });
 
     // ── 6a. Headless env-driven first-run setup, if requested ────────────────
@@ -304,6 +305,7 @@ mod tests {
             dns_cache: Arc::new(std::sync::Mutex::new(
                 pnet::dns_cache::DnsCache::new(),
             )),
+            app_web: Arc::new(pnet::app_web::AppWebRegistry::new()),
         });
         // Retain `ctx` in this scope via Arc::clone, exactly as `main` does.
         // This is what makes the test faithful: the lingering `WorkerContext`

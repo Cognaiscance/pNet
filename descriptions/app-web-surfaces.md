@@ -298,11 +298,12 @@ Do not conflate those with the owner dashboard + config + app links.
 
 ## Suggested implementation phases
 
-1. **Portal shell** — **started:** `GET /` home (apps empty state + Config
-   entry), `GET /config` hub, nav Home/Config, login → `/`, legacy
-   `/dashboard` → `/`. Control pages keep existing paths with a Config subnav.
-2. **Mounts + reverse proxy** — apps register localhost upstream + slug;
-   dashboard lists live mounts; `/apps/<slug>/…` proxies.
+1. **Portal shell** — **done:** `GET /` home, `GET /config` hub, nav
+   Home/Config, login → `/`, legacy `/dashboard` → `/`.
+2. **Mounts + reverse proxy** — **started:** in-memory registry;
+   `POST /api/app-web/register` / `unregister` (loopback only);
+   `GET|POST /apps/<slug>/…` reverse-proxies to `127.0.0.1:<port>`; Home lists
+   mounts.
 3. **Owner portal auth hardening** — password session already gates the
    portal; next: passkeys/2FA and optional step-up for dangerous config.
 4. **Sample / flagship app page** — hello or filesync browse under a mount.

@@ -158,6 +158,8 @@ pub struct WorkerContext {
     pub app_rate_limits: Arc<std::sync::Mutex<super::app_api::AppRateLimiter>>,
     /// Host resolve cache (§5.3). Maintain/poll refresh; send/routing look up only.
     pub dns_cache: Arc<std::sync::Mutex<super::dns_cache::DnsCache>>,
+    /// Portal app web mounts (`/apps/<slug>/` → loopback). Node-local.
+    pub app_web: Arc<super::app_web::AppWebRegistry>,
 }
 
 impl WorkerContext {
