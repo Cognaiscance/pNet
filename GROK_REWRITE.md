@@ -24,8 +24,8 @@ Branch: `grok-rewrite`.
 
 | Field | Value |
 |-------|--------|
-| Current focus | *(none — Phase 9 complete; rewrite checklist done)* |
-| Last completed | 9.2 Golden vectors (2026-07-23) |
+| Current focus | *(none — rewrite checklist complete including optional §8.2 fuzz)* |
+| Last completed | 8.2 optional wire fuzzer (2026-07-23) |
 | Branch | `grok-rewrite` |
 
 Update this table when you finish a session.
@@ -228,9 +228,11 @@ Core behavior is largely designed; make it observable and resilient.
 
 ### 8.2 Parser robustness
 - [x] Untrusted UDP paths return errors instead of `unwrap` on slice conversion where practical
-- [ ] Optional: fuzz bootstrap / directory encode / change payloads
+- [x] Optional: fuzz bootstrap / directory encode / change payloads
 
-**Done:** 2026-07-23 — `wire::slice_arr` (no panic on short buffers); production parse sites in udp_listener, sessions, bootstrap, tunnels, app_edge, relay use `Option` early-return. Fuzz optional deferred. Unit test for `slice_arr`.
+**Done:** 2026-07-23 — `wire::slice_arr` (no panic on short buffers); production parse sites in udp_listener, sessions, bootstrap, tunnels, app_edge, relay use `Option` early-return. Unit test for `slice_arr`.
+
+**Fuzz (optional, completed 2026-07-23):** Pure-Rust mutational fuzzer (no clang/libFuzzer on this host). `pnet::fuzz` entry points for bootstrap / public directory / contact data+card / change payloads; seed corpus + mutate campaign; CI tests (`mutational_campaign_does_not_panic`); long runs via `cargo run --release --bin pnet_fuzz_wire -- --iters N`. See `fuzz/README.md`. Crate now dual `lib`+`bin` so parsers are linkable.
 
 ### 8.3 Wire versioning note
 - [x] Short design note: how the next breaking wire change will be signaled (capability byte / op range)

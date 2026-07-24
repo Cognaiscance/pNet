@@ -1,18 +1,16 @@
-mod lib;
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use lib::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW, PRIORITY_NORMAL};
-use lib::data_models::DeviceGrade;
-use lib::handlers::{apply_new_user_setup, parse_pnet_hosts, start_bootstrap};
-use lib::http_server::{http_bind_ip, http_port, HttpServer};
-use lib::persistence;
-use lib::scheduler::SchedulerThread;
-use lib::thread_pool::{SharedQueue, ThreadPool};
-use lib::udp_listener::{udp_port, UdpListener};
-use lib::writer::{write_atomic, WriterThread};
+use pnet::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW, PRIORITY_NORMAL};
+use pnet::data_models::DeviceGrade;
+use pnet::handlers::{apply_new_user_setup, parse_pnet_hosts, start_bootstrap};
+use pnet::http_server::{http_bind_ip, http_port, HttpServer};
+use pnet::persistence;
+use pnet::scheduler::SchedulerThread;
+use pnet::thread_pool::{SharedQueue, ThreadPool};
+use pnet::udp_listener::{udp_port, UdpListener};
+use pnet::writer::{write_atomic, WriterThread};
 
 const WORKER_COUNT: usize = 4;
 
@@ -25,7 +23,7 @@ fn data_dir() -> PathBuf {
 /// entries, if the node is already set up and the local device is SG-grade.
 /// Called on every startup — `PNET_HOSTS` is authoritative when set.
 /// On fresh containers, `complete_setup` re-applies after initialization.
-fn apply_pnet_hosts(node: &Arc<RwLock<lib::data_models::Node>>, hosts: &[String]) {
+fn apply_pnet_hosts(node: &Arc<RwLock<pnet::data_models::Node>>, hosts: &[String]) {
     if hosts.is_empty() { return; }
     let mut n = node.write().unwrap();
     if !n.is_initialized() { return; }
@@ -122,14 +120,14 @@ fn apply_env_admin_password(ctx: &WorkerContext) {
         let node = ctx.node.read().unwrap();
         if node.admin_password_hash.is_some() { return; }
     }
-    if password.len() < lib::admin_auth::MIN_PASSWORD_LEN {
+    if password.len() < pnet::admin_auth::MIN_PASSWORD_LEN {
         eprintln!(
             "[apply_env_admin_password] PNET_ADMIN_PASSWORD shorter than {} chars; ignored",
-            lib::admin_auth::MIN_PASSWORD_LEN
+            pnet::admin_auth::MIN_PASSWORD_LEN
         );
         return;
     }
-    let hash = lib::admin_auth::hash_password(&password);
+    let hash = pnet::admin_auth::hash_password(&password);
     ctx.node.write().unwrap().admin_password_hash = Some(hash);
     ctx.save_node();
     println!("[apply_env_admin_password] admin password hash stored from env");
@@ -175,7 +173,7 @@ fn main() {
     let port = udp_port();
     let udp = UdpListener::start(port, Arc::clone(&queue), Arc::clone(&stop));
     println!("[main] UDP listening on port {}", udp.local_addr.port());
-    if lib::app_api::app_api_remote_enabled() {
+    if pnet::app_api::app_api_remote_enabled() {
         println!(
             "[main] app API accepts non-loopback sources (PNET_APP_API_REMOTE=1) — multi-user risk"
         );
@@ -190,9 +188,9 @@ fn main() {
         writer_tx:    writer.sender(),
         scheduler_tx,
         pending_invites: Default::default(),
-        sessions:     Arc::new(lib::admin_auth::SessionStore::new()),
-        app_rate_limits: Arc::new(std::sync::Mutex::new(lib::app_api::AppRateLimiter::new())),
-        dns_cache:    Arc::new(std::sync::Mutex::new(lib::dns_cache::DnsCache::new())),
+        sessions:     Arc::new(pnet::admin_auth::SessionStore::new()),
+        app_rate_limits: Arc::new(std::sync::Mutex::new(pnet::app_api::AppRateLimiter::new())),
+        dns_cache:    Arc::new(std::sync::Mutex::new(pnet::dns_cache::DnsCache::new())),
     });
 
     // ── 6a. Headless env-driven first-run setup, if requested ────────────────
@@ -272,7 +270,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lib::data_models::Node;
+    use pnet::data_models::Node;
     use std::time::Duration;
 
     #[test]
@@ -299,12 +297,12 @@ mod tests {
             writer_tx:    writer.sender(),
             scheduler_tx,
             pending_invites: Default::default(),
-            sessions:     Arc::new(crate::lib::admin_auth::SessionStore::new()),
+            sessions:     Arc::new(pnet::admin_auth::SessionStore::new()),
             app_rate_limits: Arc::new(std::sync::Mutex::new(
-                crate::lib::app_api::AppRateLimiter::new(),
+                pnet::app_api::AppRateLimiter::new(),
             )),
             dns_cache: Arc::new(std::sync::Mutex::new(
-                crate::lib::dns_cache::DnsCache::new(),
+                pnet::dns_cache::DnsCache::new(),
             )),
         });
         // Retain `ctx` in this scope via Arc::clone, exactly as `main` does.

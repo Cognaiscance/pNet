@@ -403,6 +403,16 @@ fn deserialize_contact_payload(data: &[u8]) -> Option<ContactPayload> {
     Some(ContactPayload { alias, uuid, public_key: pk, devices })
 }
 
+/// True if `data` is a well-formed bootstrap payload (no panic on junk). §8.2 fuzz entry.
+pub(crate) fn bootstrap_payload_well_formed(data: &[u8]) -> bool {
+    deserialize_bootstrap_payload(data).is_some()
+}
+
+/// True if `data` is a well-formed contact-card payload. §8.2 fuzz entry.
+pub(crate) fn contact_payload_well_formed(data: &[u8]) -> bool {
+    deserialize_contact_payload(data).is_some()
+}
+
 // ── Contact exchange handlers ─────────────────────────────────────────────────
 
 /// Op 0x33 — Contact request (requester → target's SG).

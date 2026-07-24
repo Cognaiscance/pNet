@@ -132,7 +132,7 @@ pub fn save_write_log(node: &Node) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lib::data_models::{
+    use crate::data_models::{
         DeviceGrade, Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Invitation,
         X25519KeyPair, X25519PublicKey, X25519SecretKey, generate_uuid,
     };

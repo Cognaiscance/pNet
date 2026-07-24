@@ -74,6 +74,58 @@ pub(crate) fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
     Some(ContactData { user_uuid, devices })
 }
 
+/// True if `data` is a well-formed cross-user contact directory blob. §8.2 fuzz.
+pub(crate) fn contact_data_well_formed(data: &[u8]) -> bool {
+    deserialize_contact_data(data).is_some()
+}
+
+/// True if `data` is a well-formed write-log `Change` payload. §8.2 fuzz.
+pub(crate) fn change_payload_well_formed(data: &[u8]) -> bool {
+    deserialize_change(data).is_some()
+}
+
+/// True if `state` is a well-formed public directory snapshot (parse only, no apply).
+/// Layout matches [`serialize_public_state`] / [`apply_public_state`]. §8.2 fuzz.
+pub(crate) fn public_state_well_formed(state: &[u8]) -> bool {
+    fn walk(state: &[u8]) -> Option<()> {
+        let mut pos = 0usize;
+        let _ = read_str(state, &mut pos)?;
+        let _: [u8; 16] = read_arr(state, &mut pos)?;
+        let dev_count = *state.get(pos)? as usize;
+        pos += 1;
+        for _ in 0..dev_count {
+            let _ = read_device(state, &mut pos)?;
+            let app_count = *state.get(pos)? as usize;
+            pos += 1;
+            for _ in 0..app_count {
+                let _: [u8; 16] = read_arr(state, &mut pos)?;
+                let _ = read_str(state, &mut pos)?;
+            }
+        }
+        let contact_count = *state.get(pos)? as usize;
+        pos += 1;
+        for _ in 0..contact_count {
+            let _ = read_str(state, &mut pos)?;
+            let _: [u8; 16] = read_arr(state, &mut pos)?;
+            let _: [u8; 32] = read_arr(state, &mut pos)?;
+            let dc = *state.get(pos)? as usize;
+            pos += 1;
+            for _ in 0..dc {
+                let _ = read_device(state, &mut pos)?;
+                let ac = *state.get(pos)? as usize;
+                pos += 1;
+                for _ in 0..ac {
+                    let _: [u8; 16] = read_arr(state, &mut pos)?;
+                    let _ = read_str(state, &mut pos)?;
+                }
+            }
+        }
+        let _ = pos;
+        Some(())
+    }
+    walk(state).is_some()
+}
+
 
 // ── Sync v1 (ops 0x70 – 0x74) ────────────────────────────────────────────────
 //

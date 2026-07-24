@@ -88,8 +88,9 @@ pub use bootstrap::{
 };
 // UI / invite helpers + test-facing wire helpers (handlers-tree private).
 pub(crate) use bootstrap::{
-    decode_invitation_code, encode_invitation_code, generate_contact_invitation,
-    generate_device_invitation, initiate_bootstrap, initiate_contact_exchange,
+    bootstrap_payload_well_formed, contact_payload_well_formed, decode_invitation_code,
+    encode_invitation_code, generate_contact_invitation, generate_device_invitation,
+    initiate_bootstrap, initiate_contact_exchange, serialize_bootstrap_payload,
     serialize_contact_payload, top_online_sg, InvitationMint,
 };
 
@@ -112,11 +113,13 @@ pub use sync::{
 pub(crate) use sync::{
     apply_change_locally, apply_public_state, build_merge_ack_body,
     build_merge_proposal_body, build_merge_proposal_for_peer, bumped_scopes,
-    ContactData, cross_user_pull_for_contact, cross_user_pull_on_reconnect, deserialize_change,
+    change_payload_well_formed, contact_data_well_formed, ContactData,
+    cross_user_pull_for_contact, cross_user_pull_on_reconnect, deserialize_change,
     deserialize_contact_data, devices_to_cards, notify_contacts, parse_merge_ack_body,
     build_retention_exhausted_proposal_body, parse_merge_proposal_body, parse_watermark_map,
-    partition_reconcile_on_reconnect, retention_gap_for_peer, ParsedMergeProposal,
-    serialize_change, serialize_contact_data, serialize_public_state, serialize_watermark_map,
+    partition_reconcile_on_reconnect, public_state_well_formed, retention_gap_for_peer,
+    ParsedMergeProposal, serialize_change, serialize_contact_data, serialize_public_state,
+    serialize_watermark_map,
 };
 
 mod tunnels;
