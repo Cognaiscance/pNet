@@ -229,14 +229,37 @@ wait_for_convergence() {
 # stop_host <ssh_host> : kill any live node/probe/deliverer processes from this
 # harness. The `[p]` bracket prevents pkill from matching its own shell (whose
 # argv contains the pattern) — that self-match SIGKILLs the ssh command and
-# yields a spurious rc=255. The single prefix matches pnet, pnet_test_probe,
-# and pnet_deliverer.
+# yields a spurious rc=255. Match the full bin path prefix so pnet,
+# pnet_test_probe, and pnet_deliverer all die; also fuser kill by common ports.
 stop_host() {
-    ssh "${SSH_OPTS[@]}" "$1" "pkill -9 -f '[p]net-live/bin/pnet' 2>/dev/null; true"
+    local host="$1"
+    ssh "${SSH_OPTS[@]}" "$host" "
+        pkill -9 -f '[p]net-live/bin/pnet' 2>/dev/null || true
+        # DietPi / busy hosts: belt-and-suspenders if pkill pattern misses.
+        for p in 7777 7778 8777 8778 3000 3010 3100 8888 8889; do
+          fuser -k \${p}/tcp \${p}/udp 2>/dev/null || true
+        done
+        sleep 0.5
+        true
+    " || warn "stop_host ssh failed on $host"
 }
 
 # wipe_host <ssh_host> : stop + delete all per-node data dirs (keeps bin/)
 wipe_host() {
-    stop_host "$1"
-    ssh "${SSH_OPTS[@]}" "$1" "find \$HOME/$REMOTE_DIR -mindepth 1 -maxdepth 1 ! -name bin -exec rm -rf {} + 2>/dev/null; true"
+    local host="$1"
+    stop_host "$host"
+    ssh "${SSH_OPTS[@]}" "$host" "
+        set -e
+        base=\"\$HOME/$REMOTE_DIR\"
+        if [ -d \"\$base\" ]; then
+          find \"\$base\" -mindepth 1 -maxdepth 1 ! -name bin -exec rm -rf {} +
+        fi
+        # Verify no leftover node.toml (stale identity breaks WAN re-join).
+        if find \"\$base\" -name node.toml 2>/dev/null | grep -q .; then
+          echo \"[wipe] still have node.toml under \$base\" >&2
+          find \"\$base\" -name node.toml
+          exit 1
+        fi
+        echo \"[wipe] \$base clean (bin kept)\"
+    " || die "wipe_host failed on $host"
 }

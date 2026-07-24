@@ -12,10 +12,11 @@
 #   bash partition.sh heal <ssh_host>
 #   bash partition.sh show <ssh_host>
 #
-# Examples:
-#   LAN: bash partition.sh cut  golden         192.168.1.40         # golden ⊥ n64
-#   WAN: bash partition.sh cut  stealth-bomber <n64_public_ip>      # stealth ⊥ n64
-#   heal: bash partition.sh heal golden
+# Examples (current topology uses public path; tealface has no house-LAN route):
+#   House LAN peer:  bash partition.sh cut  zeus 192.168.1.40 7777
+#   Office "WAN down" is usually: drop UDP to the public IP on tealface, e.g.
+#     bash partition.sh cut tealface $(getent ahostsv4 pnet.thehomegarage.com | awk '{print $1; exit}') 7777
+#   heal: bash partition.sh heal tealface
 
 cd "$(dirname "$0")"
 source hosts.env 2>/dev/null || true

@@ -16,7 +16,7 @@ use super::super::data_models::{
 };
 use super::super::wire::*;
 use super::super::wire::uuid_hex;
-use super::{allocate_conn_id, local_approved_app_host, send};
+use super::{allocate_conn_id, fabric_event, local_approved_app_host, send};
 
 // ── Tunnel handlers ───────────────────────────────────────────────────────────
 
@@ -66,6 +66,15 @@ pub fn setup_tunnel(sender_uuid: Uuid, dest_uuid: Uuid, ctx: &WorkerContext) {
         pkt[0]     = TUNNEL_INIT_OP;
         pkt[1..3].copy_from_slice(&tunnel_id.to_be_bytes());
         pkt[3..19].copy_from_slice(&dest_uuid);
+        fabric_event(
+            "tunnel_init",
+            &[
+                ("tunnel_id", &tunnel_id.to_string()),
+                ("sender", &uuid_hex(&sender_uuid)),
+                ("dest", &uuid_hex(&dest_uuid)),
+                ("to", &dest.to_string()),
+            ],
+        );
         send(ctx, dest, &pkt);
     }
 }
@@ -181,6 +190,14 @@ pub fn tunnel_connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext
                 peer_addr:                 src,
             });
             node.owner.dg_tunnel_map.insert(tunnel_id, conn_id);
+            fabric_event(
+                "tunnel_ready",
+                &[
+                    ("role", "dg_dest"),
+                    ("tunnel_id", &tunnel_id.to_string()),
+                    ("peer", &uuid_hex(&sender_device_uuid)),
+                ],
+            );
             (conn_id, pk_copy)
         };
 
@@ -245,6 +262,21 @@ pub fn tunnel_connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                     connection_b_id: b,
                     last_used_at:    Instant::now(),
                 });
+                fabric_event(
+                    "tunnel_up",
+                    &[
+                        ("role", "sg"),
+                        ("tunnel_id", &tunnel_id.to_string()),
+                        ("sender", &uuid_hex(&pending.sender_device_uuid)),
+                        ("dest", &uuid_hex(&pending.dest_device_uuid)),
+                        ("conn_a", &a.to_string()),
+                        ("conn_b", &b.to_string()),
+                    ],
+                );
+            } else {
+                eprintln!(
+                    "[tunnel_connect_ack] tunnel {tunnel_id} missing conn for sender/dest on SG"
+                );
             }
 
             node.owner.active_connections.values()
@@ -264,6 +296,7 @@ pub fn tunnel_connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         // ── DG_sender path ────────────────────────────────────────────────────
         let mut node = ctx.node.write().unwrap();
         let Some(ptc) = node.owner.pending_tunnel_connections.remove(&tunnel_id) else { return; };
+        let dest_uuid = ptc.dest_device_uuid;
 
         node.owner.active_connections.insert(ptc.our_conn_id, ActiveConnection {
             id:                        ptc.our_conn_id,
@@ -275,6 +308,14 @@ pub fn tunnel_connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             peer_addr:                 src,
         });
         node.owner.dg_tunnel_map.insert(tunnel_id, ptc.our_conn_id);
+        fabric_event(
+            "tunnel_ready",
+            &[
+                ("role", "dg_sender"),
+                ("tunnel_id", &tunnel_id.to_string()),
+                ("peer", &uuid_hex(&dest_uuid)),
+            ],
+        );
     } else {
         eprintln!("[tunnel_connect_ack] unknown tunnel_id {tunnel_id} from {src}");
     }
@@ -333,6 +374,15 @@ pub fn tunnel_forward(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         pkt.push(TUNNEL_DELIVERY_OP);
         pkt.extend_from_slice(&tunnel_id.to_be_bytes());
         pkt.extend_from_slice(payload);
+        fabric_event(
+            "tunnel_forward",
+            &[
+                ("tunnel_id", &tunnel_id.to_string()),
+                ("from", &src.to_string()),
+                ("to", &dest.to_string()),
+                ("blob_len", &payload.len().to_string()),
+            ],
+        );
         send(ctx, dest, &pkt);
     }
 }
