@@ -18,12 +18,19 @@ Owner portal pages require sign-in (admin password session today). Mount
 registration is authenticated by **loopback source address** (local apps), not
 by the owner cookie.
 
-Example (app on this host, after it starts listening on port 9080):
+Example (manual register after an app listens on port 9080):
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8777/api/app-web/register \
   --data 'slug=hello&port=9080&title=Hello'
 # Then open /apps/hello/ while signed in to the portal.
+```
+
+Sample app that self-registers:
+
+```bash
+cargo run -p pnet_web_hello
+# See apps/pnet_web_hello/README.md
 ```
 
 ## Access & Authentication

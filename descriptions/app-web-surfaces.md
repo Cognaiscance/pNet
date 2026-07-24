@@ -306,7 +306,8 @@ Do not conflate those with the owner dashboard + config + app links.
    mounts.
 3. **Owner portal auth hardening** — password session already gates the
    portal; next: passkeys/2FA and optional step-up for dangerous config.
-4. **Sample / flagship app page** — hello or filesync browse under a mount.
+4. **Sample / flagship app page** — **started:** `apps/pnet_web_hello` serves
+   loopback HTML and auto-registers `/apps/hello/` with the portal.
 5. **Discovery** — publish slug / base URL hints in metadata.
 6. **Polish** — domains, TLS automation, hosted-SG product, capability links.
 7. **(Future project)** App store — discover + install across devices.
