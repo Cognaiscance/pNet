@@ -1,7 +1,12 @@
-//! Admin HTTP UI: pages, forms, setup wizard, app approve/reject/rename.
+//! Owner portal HTTP UI: dashboard home, Config (node control plane), setup.
 //!
 //! Served via `ui_request`. Auth lives in `admin_auth`; fabric mutations go
 //! through `request_change` / invitation helpers on sibling modules.
+//!
+//! Product shape (`descriptions/app-web-surfaces.md`):
+//! - `GET /` — portal home (app links placeholder + Config entry)
+//! - `GET /config` — Config hub; existing control pages stay under their paths
+//! - `GET /apps/<slug>/…` — future reverse-proxy mounts (not in this module yet)
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
@@ -80,17 +85,17 @@ pub fn ui_request(
         }
     } else {
         if is_setup_route {
-            return respond_redirect(&stream, if authed { "/dashboard" } else { "/login" });
+            return respond_redirect(&stream, if authed { "/" } else { "/login" });
         }
         if is_set_password_route {
             // Password already set — no open reset without auth (out of scope for 1.1).
-            return respond_redirect(&stream, if authed { "/dashboard" } else { "/login" });
+            return respond_redirect(&stream, if authed { "/" } else { "/login" });
         }
         if !authed && !is_login_route {
             return respond_redirect(&stream, "/login");
         }
         if authed && is_login_route && method == "GET" {
-            return respond_redirect(&stream, "/dashboard");
+            return respond_redirect(&stream, "/");
         }
     }
 
@@ -111,7 +116,7 @@ pub fn ui_request(
         ("POST", "/setup/create") => {
             match complete_setup(&body, ctx) {
                 Ok(sid) => respond_redirect_cookie(
-                    &stream, "/dashboard", &set_session_cookie_header(&sid),
+                    &stream, "/", &set_session_cookie_header(&sid),
                 ),
                 Err(err) => respond_redirect(
                     &stream,
@@ -141,7 +146,7 @@ pub fn ui_request(
         ("POST", "/login") => {
             match try_login(&body, ctx) {
                 Ok(sid) => respond_redirect_cookie(
-                    &stream, "/dashboard", &set_session_cookie_header(&sid),
+                    &stream, "/", &set_session_cookie_header(&sid),
                 ),
                 Err(()) => respond_redirect(&stream, "/login?error=bad"),
             }
@@ -153,7 +158,7 @@ pub fn ui_request(
         ("POST", "/set-password") => {
             match complete_set_password(&body, ctx) {
                 Ok(sid) => respond_redirect_cookie(
-                    &stream, "/dashboard", &set_session_cookie_header(&sid),
+                    &stream, "/", &set_session_cookie_header(&sid),
                 ),
                 Err(err) => respond_redirect(&stream, &format!("/set-password?error={err}")),
             }
@@ -164,8 +169,10 @@ pub fn ui_request(
             }
             respond_redirect_cookie(&stream, "/login", &clear_session_cookie_header())
         }
-        ("GET",  "/")                     => respond_redirect(&stream, "/dashboard"),
-        ("GET",  "/dashboard")            => respond_html(&stream, 200, &render_dashboard(ctx), None),
+        // Portal home (app links + Config entry). Legacy /dashboard → home.
+        ("GET",  "/")            => respond_html(&stream, 200, &render_portal_home(ctx), None),
+        ("GET",  "/dashboard")   => respond_redirect(&stream, "/"),
+        ("GET",  "/config")      => respond_html(&stream, 200, &render_config_hub(ctx), None),
         ("GET",  "/pending-apps")         => respond_html(&stream, 200, &render_pending_apps(ctx, &query), None),
         ("POST", "/pending-apps/approve") => {
             let target = redirect_with_error("/pending-apps", approve_app(&body, ctx));
@@ -494,7 +501,51 @@ pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 
 // ── Page renders ─────────────────────────────────────────────────────────────
 
-fn render_dashboard(ctx: &WorkerContext) -> String {
+/// Portal home: app web links (placeholder until mounts) + Config entry.
+fn render_portal_home(ctx: &WorkerContext) -> String {
+    let (owner_alias, device_alias, grade_label) = {
+        let node = ctx.node.read().unwrap();
+        let device = node.owner.user.devices.iter().find(|d| d.uuid == node.device_uuid);
+        (
+            html_escape(&node.owner.user.alias),
+            html_escape(device.map(|d| d.alias.as_str()).unwrap_or("unknown")),
+            match device.map(|d| &d.grade) {
+                Some(DeviceGrade::SG) => "SG",
+                Some(DeviceGrade::DG) => "DG",
+                None => "—",
+            },
+        )
+    };
+
+    // Future: list registered `/apps/<slug>` mounts. Empty until mount registry lands.
+    let apps_section = "\
+         <div class=\"card\">\
+           <h2 style=\"margin-top:0;font-size:1.1rem\">Apps</h2>\
+           <p class=\"empty\" style=\"margin:0\">No app pages registered yet. \
+           When apps mount a web UI on this node, they will appear here as links \
+           under <code>/apps/&lt;slug&gt;/</code>.</p>\
+           <p style=\"font-size:.85rem;color:#666;margin:.75rem 0 0\">\
+           App store (discover &amp; install across devices) is a future project.</p>\
+         </div>";
+
+    let body = format!(
+        "<h1>Home</h1>\
+         <p style=\"color:#555;margin-top:-.5rem\">Signed in as <strong>{owner_alias}</strong> \
+         on <strong>{device_alias}</strong> ({grade_label}).</p>\
+         {apps_section}\
+         <div class=\"card\">\
+           <h2 style=\"margin-top:0;font-size:1.1rem\">Config</h2>\
+           <p style=\"margin:0 0 .75rem;color:#444\">Manage this node: devices, invitations, \
+           applications, contacts, and diagnostics. Requires the same owner sign-in \
+           (password today; passkeys/2FA later).</p>\
+           <p style=\"margin:0\"><a class=\"portal-btn\" href=\"/config\">Open Config</a></p>\
+         </div>"
+    );
+    layout(ctx, "Home", &body)
+}
+
+/// Config hub: node overview stats + links into control-plane pages.
+fn render_config_hub(ctx: &WorkerContext) -> String {
     let node        = ctx.node.read().unwrap();
     let device_uuid = node.device_uuid;
     let device      = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
@@ -514,7 +565,9 @@ fn render_dashboard(ctx: &WorkerContext) -> String {
     };
 
     let body = format!(
-        "<h1>Dashboard</h1>\
+        "<h1>Config</h1>\
+         <p style=\"color:#555;margin-top:-.5rem\">Node and fabric control plane \
+         (same capabilities as the classic administration UI).</p>\
          <div class=\"stats\">\
            <div class=\"stat-card\"><div class=\"stat\">{n_contacts}</div><div class=\"label\">Contacts</div></div>\
            <div class=\"stat-card\"><div class=\"stat\">{n_apps}</div><div class=\"label\">Applications</div></div>\
@@ -524,9 +577,20 @@ fn render_dashboard(ctx: &WorkerContext) -> String {
            <div class=\"label\">Owner</div><div>{owner_alias}</div>\
            <div class=\"label\" style=\"margin-top:.5rem\">Device</div><div>{device_alias}</div>\
            <div class=\"label\" style=\"margin-top:.5rem\">Advertised hosts</div><div>{hosts_line}</div>\
+         </div>\
+         <div class=\"card\">\
+           <h2 style=\"margin-top:0;font-size:1.1rem\">Sections</h2>\
+           <ul class=\"config-links\">\
+             <li><a href=\"/pending-apps\">Pending Apps</a> — approve or reject local app registrations</li>\
+             <li><a href=\"/applications\">Applications</a> — approved apps on this device</li>\
+             <li><a href=\"/contacts\">Contacts</a> — other users you are linked with</li>\
+             <li><a href=\"/devices\">Devices</a> — your devices and advertised hosts</li>\
+             <li><a href=\"/invitations\">Invitations</a> — device and contact invite codes</li>\
+             <li><a href=\"/diagnostics\">Diagnostics</a> — fabric health, sessions, partitions</li>\
+           </ul>\
          </div>"
     );
-    layout(ctx, "Dashboard", &body)
+    layout(ctx, "Config", &body)
 }
 
 /// Render a red banner for the UI error codes emitted by approve_app /
@@ -1337,7 +1401,7 @@ fn render_setup(query: &str) -> String {
     let error   = query_param(query, "error").unwrap_or("");
 
     let body: String = if waiting {
-        // While waiting, allow refresh; once initialized the gate sends to dashboard/login.
+        // While waiting, allow refresh; once initialized the gate sends to home/login.
         "<meta http-equiv=\"refresh\" content=\"3; url=/setup\">\
          <h1>Connecting\u{2026}</h1>\
          <p class=\"swiz-sub\">Waiting for a response from the server.<br>\
@@ -1473,8 +1537,9 @@ fn render_login(error: &str) -> String {
         ""
     };
     setup_layout(&format!(
-        "<h1>Admin login</h1>\
-         <p class=\"swiz-sub\">Enter the admin password for this pNet node.</p>\
+        "<h1>Sign in</h1>\
+         <p class=\"swiz-sub\">Enter your owner password for this pNet node \
+         (Home, Config, and app pages).</p>\
          {error_msg}\
          <form method=\"post\" action=\"/login\" style=\"display:block\">\
            <label class=\"swiz-label\">Password</label>\
@@ -1535,10 +1600,31 @@ button { padding: .3rem .8rem; border: none; border-radius: 4px; cursor: pointer
 .reject { background: #c0392b; color: white; margin-left: .4rem; }
 form { display: inline; }
 .empty { color: #888; font-style: italic; }
+.portal-btn { display: inline-block; background: #1a1a2e; color: #fff; text-decoration: none;
+              padding: .45rem 1rem; border-radius: 5px; font-size: .9rem; }
+.portal-btn:hover { background: #2a2a4e; color: #fff; }
+.config-links { margin: 0; padding-left: 1.2rem; line-height: 1.7; }
+.config-links a { color: #1a1a2e; font-weight: 600; }
+.subnav { display: flex; flex-wrap: wrap; gap: .75rem 1.25rem; margin: 0 0 1.25rem;
+          padding: .6rem 0; border-bottom: 1px solid #e0e0e0; font-size: .9rem; }
+.subnav a { color: #456; text-decoration: none; }
+.subnav a:hover { color: #1a1a2e; }
 ";
 
+/// Top-level portal nav: Home + Config entry + logout. Config section pages
+/// also show a secondary subnav of control-plane links.
 fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
     let banner = partition_banner(ctx);
+    let show_config_subnav = matches!(
+        title,
+        "Config"
+            | "Pending Apps"
+            | "Applications"
+            | "Contacts"
+            | "Devices"
+            | "Invitations"
+            | "Diagnostics"
+    );
     let mut html = String::with_capacity(4096);
     html.push_str("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>pNet \u{2014} ");
     html.push_str(title);
@@ -1547,17 +1633,25 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
     html.push_str("</style>\n</head>\n<body>\n");
     html.push_str("<nav>\n");
     html.push_str("  <span class=\"brand\">pNet</span>\n");
-    html.push_str("  <a href=\"/dashboard\">Dashboard</a>\n");
-    html.push_str("  <a href=\"/pending-apps\">Pending Apps</a>\n");
-    html.push_str("  <a href=\"/applications\">Applications</a>\n");
-    html.push_str("  <a href=\"/contacts\">Contacts</a>\n");
-    html.push_str("  <a href=\"/devices\">Devices</a>\n");
-    html.push_str("  <a href=\"/invitations\">Invitations</a>\n");
-    html.push_str("  <a href=\"/diagnostics\">Diagnostics</a>\n");
+    html.push_str("  <a href=\"/\">Home</a>\n");
+    html.push_str("  <a href=\"/config\">Config</a>\n");
     html.push_str("  <form method=\"post\" action=\"/logout\" style=\"margin-left:auto;display:inline\">\
                    <button type=\"submit\" style=\"background:transparent;color:#aac;border:1px solid #556;\
                    padding:.25rem .6rem;cursor:pointer;font-size:.85rem\">Log out</button></form>\n");
     html.push_str("</nav>\n<main>\n");
+    if show_config_subnav {
+        html.push_str(
+            "<div class=\"subnav\">\
+               <a href=\"/config\">Overview</a>\
+               <a href=\"/pending-apps\">Pending Apps</a>\
+               <a href=\"/applications\">Applications</a>\
+               <a href=\"/contacts\">Contacts</a>\
+               <a href=\"/devices\">Devices</a>\
+               <a href=\"/invitations\">Invitations</a>\
+               <a href=\"/diagnostics\">Diagnostics</a>\
+             </div>",
+        );
+    }
     html.push_str(&banner);
     html.push_str(body);
     html.push_str("\n</main>\n</body>\n</html>");

@@ -298,12 +298,13 @@ Do not conflate those with the owner dashboard + config + app links.
 
 ## Suggested implementation phases
 
-1. **Portal shell** — dashboard page (static list or empty “no apps yet”) +
-   link to Config (reuse or relocate existing admin UI).
+1. **Portal shell** — **started:** `GET /` home (apps empty state + Config
+   entry), `GET /config` hub, nav Home/Config, login → `/`, legacy
+   `/dashboard` → `/`. Control pages keep existing paths with a Config subnav.
 2. **Mounts + reverse proxy** — apps register localhost upstream + slug;
    dashboard lists live mounts; `/apps/<slug>/…` proxies.
-3. **Owner portal auth** — login wall for non-loopback; separate or typed
-   sessions vs raw admin cookie abuse.
+3. **Owner portal auth hardening** — password session already gates the
+   portal; next: passkeys/2FA and optional step-up for dangerous config.
 4. **Sample / flagship app page** — hello or filesync browse under a mount.
 5. **Discovery** — publish slug / base URL hints in metadata.
 6. **Polish** — domains, TLS automation, hosted-SG product, capability links.

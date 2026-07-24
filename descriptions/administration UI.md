@@ -1,6 +1,17 @@
-# Administration UI
+# Administration UI (Config) and owner portal
 
-The administration UI is a web interface accessible only to the owner of the pNet node. It is served over HTTP on port **8777** by default (`PNET_HTTP_PORT` overrides).
+The owner-facing web UI is served over HTTP on port **8777** by default
+(`PNET_HTTP_PORT` overrides). It is the **Config** control plane plus a
+portal **Home** page (see `descriptions/app-web-surfaces.md`).
+
+| Path | Role |
+|------|------|
+| `/` | Portal home — app page links (when registered) + entry to Config |
+| `/config` | Config hub — overview stats and links to control sections |
+| `/devices`, `/invitations`, … | Config section pages (same capabilities as the classic admin UI) |
+| `/dashboard` | Redirects to `/` (legacy) |
+
+Accessible only after owner sign-in (admin password session today).
 
 ## Access & Authentication
 

@@ -214,15 +214,15 @@ fn main() {
         cvar.notify_all();
     }
 
-    // ── 8. Start HTTP server ─────────────────────────────────────────────────
-    // Default bind is loopback for all grades (SG and DG). Opt into remote admin
-    // with PNET_HTTP_BIND=0.0.0.0 (or another IPv4). Docker / live harnesses that
-    // publish the admin port must set this explicitly.
+    // ── 8. Start HTTP server (owner portal: Home + Config + future app mounts)
+    // Default bind is loopback for all grades. Opt into remote access with
+    // PNET_HTTP_BIND=0.0.0.0 (or another IPv4). Docker / live harnesses that
+    // publish the portal must set this explicitly.
     let http_bind = http_bind_ip();
     let hport = http_port();
     let http = HttpServer::start(http_bind, hport, Arc::clone(&queue), Arc::clone(&stop));
 
-    println!("[main] running. HTTP on {http_bind}:{hport}");
+    println!("[main] running. Owner portal HTTP on {http_bind}:{hport}");
 
     // ── Wait for SIGINT / SIGTERM ─────────────────────────────────────────────
     ctrlc::set_handler({
