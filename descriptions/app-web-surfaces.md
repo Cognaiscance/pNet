@@ -194,27 +194,17 @@ Optional later: third-party hosted SG packaging so users get
 
 ## Future: App store (do not implement now)
 
-**Status: future project — note only; out of scope for the current branch’s
-implementation phases.**
+**Status: future project — note only; out of scope for portal MVP.**
 
-Longer-term, the dashboard should grow a surface like an **app store** where
-the owner can:
+Full design: **`descriptions/app-store-installer.md`** (installer agent as a
+pNet app, bootstrap installer, desire sync, signed packages, phased delivery).
 
-- Discover pNet apps (catalog / listings)
-- Install or enable them **across their pNet devices** (push agents or install
-  instructions to DGs/SGs they own)
-- See which devices run which apps
+Short version: portal Home links to an **Installer** app web UI (catalog +
+placement). Installer agents reconcile signed packages locally; target apps
+**self-register** with pNet. Core does not download or exec packages.
 
-That work is product + distribution + possibly packaging/signing. It must not
-block:
-
-- Dashboard shell
-- Config link / UI
-- App mounts and reverse proxy
-- A few real hybrid apps (e.g. filesync)
-
-When the app store is scheduled, give it its own design doc and branch; do not
-fold catalog/install orchestration into early portal PRs.
+Do not fold catalog/install orchestration into early portal PRs beyond this
+pointer.
 
 ## Comparison: pure models vs hybrid
 
