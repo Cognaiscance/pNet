@@ -137,6 +137,15 @@ pub fn ui_request(
         );
     }
 
+    // Catalog detail: /store/<id>
+    if method == "GET" {
+        if let Some(id) = path.strip_prefix("/store/") {
+            if super::super::app_catalog::valid_id(id) {
+                return respond_html(&stream, 200, &render_store_detail(ctx, id), None);
+            }
+        }
+    }
+
     // Reverse-proxy app web mounts (owner session required).
     if path.starts_with("/apps/") {
         return handle_app_web_proxy(stream, &method, &path, &query, &body, ctx);
@@ -242,6 +251,7 @@ pub fn ui_request(
         // Portal home (app links + Config entry). Legacy /dashboard → home.
         ("GET",  "/")            => respond_html(&stream, 200, &render_portal_home(ctx), None),
         ("GET",  "/dashboard")   => respond_redirect(&stream, "/"),
+        ("GET",  "/store")       => respond_html(&stream, 200, &render_store_list(ctx), None),
         ("GET",  "/config")      => respond_html(&stream, 200, &render_config_hub(ctx), None),
         ("GET",  "/security")    => {
             let err = query_param(&query, "error").unwrap_or("");
@@ -967,7 +977,8 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
            Local apps can register a mount via \
            <code>POST /api/app-web/register</code> (loopback only).</p>\
            <p style=\"font-size:.85rem;color:#666;margin:.75rem 0 0\">\
-           App store (discover &amp; install across devices) is a future project.</p>\
+           Browse verified apps on <a href=\"/store\">Store</a> \
+           (copy-install; nothing is auto-installed).</p>\
          </div>".to_string()
     } else {
         let mut rows = String::new();
@@ -998,6 +1009,13 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
          on <strong>{device_alias}</strong> ({grade_label}).</p>\
          {apps_section}\
          <div class=\"card\">\
+           <h2 style=\"margin-top:0;font-size:1.1rem\">Store</h2>\
+           <p style=\"margin:0 0 .75rem;color:#444\">Verified apps you can run on this \
+           node (copy the command; pNet does not download or exec packages). \
+           Fleet auto-install is a later installer-agent project.</p>\
+           <p style=\"margin:0\"><a class=\"portal-btn\" href=\"/store\">Open Store</a></p>\
+         </div>\
+         <div class=\"card\">\
            <h2 style=\"margin-top:0;font-size:1.1rem\">Config</h2>\
            <p style=\"margin:0 0 .75rem;color:#444\">Manage this node: devices, invitations, \
            applications, contacts, and diagnostics. Requires the same owner sign-in \
@@ -1006,6 +1024,83 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
          </div>"
     );
     layout(ctx, "Home", &body)
+}
+
+pub(crate) fn render_store_list(ctx: &WorkerContext) -> String {
+    use super::super::app_catalog;
+    let mut cards = String::new();
+    for a in app_catalog::all() {
+        let badge = if a.status == "preview" {
+            " <span class=\"muted\">(preview)</span>"
+        } else {
+            ""
+        };
+        cards.push_str(&format!(
+            "<div class=\"card\">\
+               <h2 style=\"margin-top:0;font-size:1.1rem\">\
+                 <a href=\"/store/{id}\">{name}</a>{badge}</h2>\
+               <p style=\"margin:.2rem 0 .6rem;color:#444\">{summary}</p>\
+               <p class=\"muted\" style=\"margin:0;font-size:.85rem\">Placement: {place}</p>\
+             </div>",
+            id = html_escape(a.id),
+            name = html_escape(a.name),
+            summary = html_escape(a.summary),
+            place = html_escape(a.placement),
+        ));
+    }
+    let body = format!(
+        "<h1>Store</h1>\
+         <p style=\"color:#555;margin-top:-.5rem\">Verified in-tree apps. \
+         Copy the run command onto each device you want — \
+         <strong>nothing is downloaded or auto-installed</strong> by this node. \
+         A later installer agent will own signed packages and placement.</p>\
+         {cards}"
+    );
+    layout(ctx, "Store", &body)
+}
+
+pub(crate) fn render_store_detail(ctx: &WorkerContext, id: &str) -> String {
+    use super::super::app_catalog;
+    let Some(a) = app_catalog::get(id) else {
+        return layout(
+            ctx,
+            "Store",
+            "<h1>Not found</h1><p>Unknown catalog app. <a href=\"/store\">Back to Store</a></p>",
+        );
+    };
+    let slug_line = match a.web_slug {
+        Some(s) => format!(
+            "<p>Portal page (after this process is running): \
+             <a href=\"/apps/{s}/\"><code>/apps/{s}/</code></a></p>"
+        ),
+        None => String::new(),
+    };
+    let cmd = html_escape(a.install_cmd);
+    let body = format!(
+        "<h1>{name}</h1>\
+         <p class=\"muted\" style=\"margin-top:-.4rem\">{status} · {os} · crate <code>{crate_name}</code></p>\
+         <div class=\"card\">\
+           <p>{summary}</p>\
+           <p><strong>Typical placement:</strong> {place}</p>\
+           <p>{notes}</p>\
+           {slug_line}\
+           <p style=\"margin-bottom:.4rem\"><strong>Run on this machine</strong> \
+           (copy; does not execute from the browser):</p>\
+           <pre class=\"install-cmd\" id=\"cmd\">{cmd}</pre>\
+           <p><button type=\"button\" class=\"portal-btn\" onclick=\"\
+             navigator.clipboard.writeText(document.getElementById('cmd').innerText)\
+             .then(()=>this.textContent='Copied').catch(()=>{{}})\">Copy command</button></p>\
+         </div>\
+         <p><a href=\"/store\">\u{2190} All apps</a></p>",
+        name = html_escape(a.name),
+        status = html_escape(a.status),
+        os = html_escape(a.os),
+        crate_name = html_escape(a.crate_name),
+        summary = html_escape(a.summary),
+        place = html_escape(a.placement),
+        notes = html_escape(a.notes),
+    );
+    layout(ctx, "Store", &body)
 }
 
 /// Proxy `/apps/<slug>/…` to the registered loopback upstream (owner session).
@@ -2424,6 +2519,9 @@ form { display: inline; }
 .swiz-btn { background: #1a1a2e; color: white; border: none; border-radius: 5px;
             padding: .55rem 1.4rem; font-size: .95rem; cursor: pointer; }
 .swiz-btn:hover { background: #2a2a4e; }
+.muted { color: #888; }
+.install-cmd { background: #1a1a2e; color: #e8e8f0; padding: .9rem 1rem; border-radius: 6px;
+               overflow-x: auto; font-size: .85rem; white-space: pre-wrap; }
 ";
 
 /// Top-level portal nav: Home + Config entry + logout. Config section pages
@@ -2440,6 +2538,7 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
             | "Invitations"
             | "Diagnostics"
             | "Security"
+            | "Store"
             | "Confirm identity"
     );
     let mut html = String::with_capacity(4096);
@@ -2451,6 +2550,7 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
     html.push_str("<nav>\n");
     html.push_str("  <span class=\"brand\">pNet</span>\n");
     html.push_str("  <a href=\"/\">Home</a>\n");
+    html.push_str("  <a href=\"/store\">Store</a>\n");
     html.push_str("  <a href=\"/config\">Config</a>\n");
     html.push_str("  <form method=\"post\" action=\"/logout\" style=\"margin-left:auto;display:inline\">\
                    <button type=\"submit\" style=\"background:transparent;color:#aac;border:1px solid #556;\

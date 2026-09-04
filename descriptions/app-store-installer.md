@@ -1,8 +1,8 @@
 # App store and installer agent
 
-**Status:** design intent / **future work** — not scheduled for immediate
-implementation. Capture product and architecture decisions so this can resume
-without re-deriving the model.
+**Status:** design intent. **Phase 1 landed** on the owner portal (`GET /store`)
+as a copy-install catalog only — no installer agent, no package exec. Phases
+2+ remain future work.
 
 **Related:** `descriptions/app-web-surfaces.md` (owner portal, app web mounts).  
 **Out of scope for early portal PRs:** do not fold catalog install into core
@@ -297,8 +297,8 @@ shipping `apt` or Docker to the home server.
 
 | Phase | Deliverable | Installs code? |
 |-------|-------------|----------------|
-| **0** (current) | Manual app run + portal mount register (`pnet_web_hello`) | No |
-| **1** | Catalog UI + “copy install command” / docs only | No |
+| **0** | Manual app run + portal mount register (`pnet_web_hello`) | No |
+| **1** (current) | Catalog UI + “copy install command” / docs only (`GET /store`) | No |
 | **2** | Installer agent app + desire schema + status; **notify only** | No auto |
 | **3** | Bootstrap installer installs pNet + agent | Yes (bootstrap) |
 | **4** | Agent auto-installs **signed** packages for matching placement | Yes |
@@ -354,3 +354,4 @@ securable product surface.
 | Date | Note |
 |------|------|
 | 2026-07-24 | Initial design from product discussion (portal + agent + bootstrap + desire sync). |
+| 2026-09-04 | Phase 1: portal `/store` catalog + copy-install; still no agent. |

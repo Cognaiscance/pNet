@@ -307,7 +307,9 @@ Do not conflate those with the owner dashboard + config + app links.
    `apps/pnet_filesync/description.md`.
 5. **Discovery** — publish slug / base URL hints in metadata.
 6. **Polish** — domains, TLS automation, hosted-SG product, capability links.
-7. **(Future project)** App store — discover + install across devices.
+7. **App store** — **phase 1 done:** portal `/store` catalog + copy-install
+   commands (no auto-exec). Installer agent / signed packages remain later
+   (`descriptions/app-store-installer.md`).
 
 None of the near-term phases require pNet core to understand files, rooms, or
 messages. Phase 7 is explicitly deferred.

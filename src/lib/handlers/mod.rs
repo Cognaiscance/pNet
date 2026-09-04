@@ -133,8 +133,9 @@ pub use admin_ui::{apply_new_user_setup, ui_request};
 pub(crate) use admin_ui::{
     UI_ERR_PUBLISH_FAILED, LoginOutcome, approve_app, change_owner_password, complete_setup,
     confirm_totp_enroll, disable_totp, form_field, own_user_sg_partition, partition_banner,
-    reject_app, rename_app, render_diagnostics, safe_next_path, start_totp_enroll,
-    totp_is_enrolled, try_login, try_login_2fa, try_reauth, url_decode, verify_totp_or_recovery,
+    reject_app, rename_app, render_diagnostics, render_store_detail, render_store_list,
+    safe_next_path, start_totp_enroll, totp_is_enrolled, try_login, try_login_2fa, try_reauth,
+    url_decode, verify_totp_or_recovery,
 };
 
 
@@ -4510,6 +4511,20 @@ mod tests {
         assert_eq!(safe_next_path("//evil.example"), "/");
         assert_eq!(safe_next_path("https://evil.example"), "/");
         assert_eq!(safe_next_path("/config"), "/config");
+    }
+
+    #[test]
+    fn store_catalog_lists_copy_install_not_auto_exec() {
+        let t = TestCtx::new();
+        let html = render_store_list(&t.ctx);
+        assert!(html.contains("href=\"/store/filesync\""));
+        assert!(html.contains("href=\"/store/hello\""));
+        assert!(html.contains("nothing is downloaded or auto-installed"));
+        let detail = render_store_detail(&t.ctx, "filesync");
+        assert!(detail.contains("cargo run -p pnet_filesync"));
+        assert!(detail.contains("does not execute from the browser"));
+        let missing = render_store_detail(&t.ctx, "no-such-app");
+        assert!(missing.contains("Unknown catalog app"));
     }
 
     #[test]
