@@ -1,8 +1,9 @@
 # App store and installer agent
 
-**Status:** design intent. **Phase 1** portal `/store` copy-install. **Phase 2
-landed:** `apps/pnet_installer` agent — desire + status, notify only (no
-package exec). Phases 3+ remain future work.
+**Status:** design intent. **Phase 1** portal `/store` copy-install. **Phase 2:**
+`pnet_installer` agent — desire + status, notify only. **Phase 3 landed:**
+`pnet_installer bootstrap` installs pNet + agent from a **local** binary
+directory (no network fetch). Phase 4 (signed catalog packages) remains later.
 
 **Related:** `descriptions/app-web-surfaces.md` (owner portal, app web mounts).  
 **Out of scope for early portal PRs:** do not fold catalog install into core
@@ -299,8 +300,8 @@ shipping `apt` or Docker to the home server.
 |-------|-------------|----------------|
 | **0** | Manual app run + portal mount register (`pnet_web_hello`) | No |
 | **1** | Catalog UI + “copy install command” / docs only (`GET /store`) | No |
-| **2** (current) | Installer agent app + desire schema + status; **notify only** (`pnet_installer`, `/apps/installer/`) | No auto |
-| **3** | Bootstrap installer installs pNet + agent | Yes (bootstrap) |
+| **2** | Installer agent app + desire schema + status; **notify only** (`pnet_installer`, `/apps/installer/`) | No auto |
+| **3** (current) | Bootstrap installer installs pNet + agent (`pnet_installer bootstrap`, local binaries only) | Yes (bootstrap) |
 | **4** | Agent auto-installs **signed** packages for matching placement | Yes |
 | **5** | Updates, uninstall polish, multi-arch, optional multi-publisher | Yes |
 
@@ -356,3 +357,4 @@ securable product surface.
 | 2026-07-24 | Initial design from product discussion (portal + agent + bootstrap + desire sync). |
 | 2026-09-04 | Phase 1: portal `/store` catalog + copy-install; still no agent. |
 | 2026-09-04 | Phase 2: `pnet_installer` desire/status, notify only; rank-1 SG writes desire. |
+| 2026-09-04 | Phase 3: `bootstrap` copies local `pnet` + agent into `~/.pnet`, writes `start.sh`. |

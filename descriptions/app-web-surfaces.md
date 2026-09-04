@@ -309,7 +309,9 @@ Do not conflate those with the owner dashboard + config + app links.
 6. **Polish** — domains, TLS automation, hosted-SG product, capability links.
 7. **App store** — **phase 1:** portal `/store` copy-install. **phase 2:**
    `pnet_installer` agent (`/apps/installer/`) desire + status, notify only.
-   Signed auto-install remains later (`descriptions/app-store-installer.md`).
+   **phase 3:** `pnet_installer bootstrap` installs pNet + agent from local
+   binaries. Signed catalog auto-install remains later
+   (`descriptions/app-store-installer.md`).
 
 None of the near-term phases require pNet core to understand files, rooms, or
 messages. Phase 7 is explicitly deferred.

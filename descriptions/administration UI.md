@@ -38,6 +38,7 @@ Sample apps that self-register:
 cargo run -p pnet_web_hello     # /apps/hello/
 cargo run -p pnet_filesync      # /apps/filesync/  (folder replica)
 cargo run -p pnet_installer     # /apps/installer/ (desire + status, no auto-exec)
+# Empty machine: pnet_installer bootstrap --from DIR --prefix ~/.pnet
 ```
 
 ## Access & Authentication

@@ -30,9 +30,13 @@ const CATALOG: &[CatalogApp] = &[
         placement: "Every pNet device; UI on the rank-1 SG at /apps/installer/.",
         os: "Linux (v1)",
         crate_name: "pnet_installer",
-        install_cmd: "cargo run -p pnet_installer\n# UI: /apps/installer/",
-        notes: "Phase 2 does not download or exec packages. Enable apps, then run \
-                their copy-install command on each desired device.",
+        install_cmd: "\
+# Empty machine (pnet + pnet_installer in the same folder):\n\
+./pnet_installer bootstrap\n\
+# Agent only:\n\
+cargo run -p pnet_installer\n# UI: /apps/installer/",
+        notes: "bootstrap copies local binaries only — no network fetch. \
+                Catalog apps stay notify-only until signed install (phase 4).",
         web_slug: Some("installer"),
         status: "available",
     },

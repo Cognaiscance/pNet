@@ -1,4 +1,4 @@
-//! pnet_installer — catalog, desire, status. Notify only (no package exec).
+//! pnet_installer — catalog, desire, status; `bootstrap` installs pNet + agent.
 //!
 //! See `apps/pnet_installer/description.md`.
 
@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use pnet_installer::bootstrap::{self, Cmd};
 use pnet_installer::fabric::{self, APP_ALIAS};
 use pnet_installer::proto;
 use pnet_installer::state::State;
@@ -27,6 +28,38 @@ fn home_dir() -> PathBuf {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match bootstrap::parse_args(&args) {
+        Ok(Cmd::Help) => {
+            print!("{}", bootstrap::help_text());
+            return;
+        }
+        Ok(Cmd::Bootstrap(mut opts)) => {
+            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pnet_installer"));
+            if let Err(e) = bootstrap::resolve_from(&mut opts, &exe) {
+                eprintln!("[bootstrap] {e}");
+                std::process::exit(1);
+            }
+            match bootstrap::plan(&opts).and_then(|p| bootstrap::execute(&opts, &p)) {
+                Ok(log) => print!("{log}"),
+                Err(e) => {
+                    eprintln!("[bootstrap] {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Ok(Cmd::Run) => {}
+        Err(e) => {
+            eprintln!("[installer] {e}\n");
+            print!("{}", bootstrap::help_text());
+            std::process::exit(1);
+        }
+    }
+    run_agent();
+}
+
+fn run_agent() {
     let web_port: u16 = env_or("PNET_INSTALLER_WEB_PORT", "9091")
         .parse()
         .unwrap_or(9091);

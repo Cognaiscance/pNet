@@ -1,12 +1,16 @@
-# pNet Installer (phase 2)
+# pNet Installer (phases 2–3)
 
 Installer **agent** as a pNet app: catalog, **desired** apps/devices, and
-**status**. **Notify only** — this process never downloads, verifies, or starts
-packages (that is phase 4).
+**status**. Catalog apps are still **notify only** (no signed package exec —
+phase 4).
+
+**Phase 3:** `pnet_installer bootstrap` installs **pNet + this agent** from a
+**local** binary directory (unpacked dist, or `target/debug` after `cargo build`).
+It does not download packages from the network.
 
 pNet stays a dumb pipe. Desire and status are installer↔installer app payloads.
 
-## What it does
+## What the agent does
 
 1. Registers as fabric alias `installer` and portal slug `/apps/installer/`.
 2. Shows the verified catalog (same apps as portal `/store`, plus itself).
@@ -18,7 +22,20 @@ pNet stays a dumb pipe. Desire and status are installer↔installer app payloads
 
 Solo node (no SG in the directory) may write desire locally.
 
-## Run
+## Bootstrap (empty machine)
+
+```bash
+# After cargo build -p pnet -p pnet_installer, both bins sit in target/debug:
+cargo build -p pnet -p pnet_installer
+./target/debug/pnet_installer bootstrap --prefix ~/.pnet --no-start
+# or omit --no-start to launch pnet + agent
+# Create/join: http://127.0.0.1:8777/setup
+```
+
+`--from DIR` if the binaries are not next to `pnet_installer`. Default prefix
+`~/.pnet` (`bin/`, `start.sh`, `logs/`). User-consented: you ran `bootstrap`.
+
+## Run (agent only)
 
 ```bash
 PNET_AUTO_APPROVE_APPS=1 cargo run -p pnet
@@ -38,8 +55,8 @@ Sign in → Home → **Installer** (or **Store** until the agent is up).
 
 ## Non-goals (this phase)
 
-- Signed package fetch / exec / systemd
-- Bootstrap install of pNet
+- Signed package fetch / exec of catalog apps (phase 4)
+- systemd units (start.sh is enough)
 - Contact-shared or public catalogs
 - Auto-approve of target apps
 

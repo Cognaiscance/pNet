@@ -21,10 +21,15 @@ pub const CATALOG: &[CatalogApp] = &[
         summary: "This agent: catalog, desire, and status across your devices.",
         placement: "Every device that runs pNet (especially the rank-1 SG for the UI).",
         crate_name: "pnet_installer",
-        install_cmd: "cargo run -p pnet_installer\n# UI: /apps/installer/",
+        install_cmd: "\
+# Empty machine (pnet + pnet_installer in the same folder):\n\
+./pnet_installer bootstrap --no-start   # or omit --no-start to launch\n\
+# Agent only, pNet already running:\n\
+cargo run -p pnet_installer\n# UI: /apps/installer/",
         fabric_alias: "installer",
         web_slug: Some("installer"),
-        notes: "Phase 2 is notify-only. It never downloads or starts other packages.",
+        notes: "bootstrap copies local binaries only — no network fetch. \
+                Catalog apps stay notify-only until signed install (phase 4).",
     },
     CatalogApp {
         id: "filesync",
