@@ -188,9 +188,13 @@ fn parse_request(reader: &mut BufReader<&TcpStream>) -> Option<ParsedRequest> {
         }
     }
 
-    // Body (cap at 64 KiB — more than enough for a form submission).
+    // Admin forms stay small; proxied app uploads (filesync) need more.
+    let max_body = max_body_for_path(&path);
+    if content_length > max_body {
+        return None;
+    }
     let body = if content_length > 0 {
-        let mut buf = vec![0u8; content_length.min(65_536)];
+        let mut buf = vec![0u8; content_length];
         reader.read_exact(&mut buf).ok()?;
         buf
     } else {
@@ -198,6 +202,15 @@ fn parse_request(reader: &mut BufReader<&TcpStream>) -> Option<ParsedRequest> {
     };
 
     Some((method, path, query, cookie, host, origin, referer, body))
+}
+
+/// Max POST body: 64 KiB for Config/login, 4 MiB for `/apps/<slug>/…` uploads.
+pub(crate) fn max_body_for_path(path: &str) -> usize {
+    if path.starts_with("/apps/") {
+        4 * 1024 * 1024
+    } else {
+        64 * 1024
+    }
 }
 
 fn header_value(trimmed_line: &str) -> String {
@@ -246,5 +259,13 @@ mod tests {
         assert_eq!(parse_http_bind(None, true), Ipv4Addr::UNSPECIFIED);
         // Explicit PNET_HTTP_BIND wins over legacy BIND_ALL.
         assert_eq!(parse_http_bind(Some("127.0.0.1"), true), Ipv4Addr::LOCALHOST);
+    }
+
+    #[test]
+    fn max_body_allows_larger_app_uploads() {
+        assert_eq!(max_body_for_path("/login"), 64 * 1024);
+        assert_eq!(max_body_for_path("/security/password"), 64 * 1024);
+        assert_eq!(max_body_for_path("/apps/filesync/up"), 4 * 1024 * 1024);
+        assert_eq!(max_body_for_path("/apps/hello/"), 4 * 1024 * 1024);
     }
 }

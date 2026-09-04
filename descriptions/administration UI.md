@@ -19,7 +19,8 @@ portal **Home** page (see `descriptions/app-web-surfaces.md`).
 
 Owner portal pages require sign-in (admin password session today). Mount
 registration is authenticated by **loopback source address** (local apps), not
-by the owner cookie.
+by the owner cookie. Proxied `/apps/<slug>/…` POST bodies may be up to **4 MiB**
+(Config/login stay at 64 KiB) so filesync uploads fit through the portal.
 
 Example (manual register after an app listens on port 9080):
 
@@ -29,11 +30,11 @@ curl -sS -X POST http://127.0.0.1:8777/api/app-web/register \
 # Then open /apps/hello/ while signed in to the portal.
 ```
 
-Sample app that self-registers:
+Sample apps that self-register:
 
 ```bash
-cargo run -p pnet_web_hello
-# See apps/pnet_web_hello/README.md
+cargo run -p pnet_web_hello     # /apps/hello/
+cargo run -p pnet_filesync      # /apps/filesync/  (folder replica; see apps/pnet_filesync/)
 ```
 
 ## Access & Authentication

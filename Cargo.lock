@@ -681,6 +681,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pnet_filesync"
+version = "0.1.0"
+dependencies = [
+ "ctrlc",
+ "getrandom",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "pnet_test_probe"
 version = "0.1.0"
 dependencies = [
