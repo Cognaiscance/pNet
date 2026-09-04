@@ -1003,6 +1003,23 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
         )
     };
 
+    let installer_up = mounts.iter().any(|m| m.slug == "installer");
+    let (store_href, store_btn, store_blurb) = if installer_up {
+        (
+            "/apps/installer/",
+            "Open Installer",
+            "Installer agent is running. Enable apps per device and watch status \
+             (notify only — nothing is auto-installed).",
+        )
+    } else {
+        (
+            "/store",
+            "Open Store",
+            "Copy-install catalog. Run pnet_installer on this SG for desire and \
+             status across devices (still no auto-exec).",
+        )
+    };
+
     let body = format!(
         "<h1>Home</h1>\
          <p style=\"color:#555;margin-top:-.5rem\">Signed in as <strong>{owner_alias}</strong> \
@@ -1010,10 +1027,8 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
          {apps_section}\
          <div class=\"card\">\
            <h2 style=\"margin-top:0;font-size:1.1rem\">Store</h2>\
-           <p style=\"margin:0 0 .75rem;color:#444\">Verified apps you can run on this \
-           node (copy the command; pNet does not download or exec packages). \
-           Fleet auto-install is a later installer-agent project.</p>\
-           <p style=\"margin:0\"><a class=\"portal-btn\" href=\"/store\">Open Store</a></p>\
+           <p style=\"margin:0 0 .75rem;color:#444\">{store_blurb}</p>\
+           <p style=\"margin:0\"><a class=\"portal-btn\" href=\"{store_href}\">{store_btn}</a></p>\
          </div>\
          <div class=\"card\">\
            <h2 style=\"margin-top:0;font-size:1.1rem\">Config</h2>\

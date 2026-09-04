@@ -692,6 +692,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pnet_installer"
+version = "0.1.0"
+dependencies = [
+ "ctrlc",
+ "getrandom",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pnet_test_probe"
 version = "0.1.0"
 dependencies = [

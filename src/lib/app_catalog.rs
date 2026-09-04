@@ -24,6 +24,19 @@ pub struct CatalogApp {
 
 const CATALOG: &[CatalogApp] = &[
     CatalogApp {
+        id: "installer",
+        name: "Installer",
+        summary: "Agent for catalog, desired apps, and per-device status (notify only).",
+        placement: "Every pNet device; UI on the rank-1 SG at /apps/installer/.",
+        os: "Linux (v1)",
+        crate_name: "pnet_installer",
+        install_cmd: "cargo run -p pnet_installer\n# UI: /apps/installer/",
+        notes: "Phase 2 does not download or exec packages. Enable apps, then run \
+                their copy-install command on each desired device.",
+        web_slug: Some("installer"),
+        status: "available",
+    },
+    CatalogApp {
         id: "filesync",
         name: "Filesync",
         summary: "Folder replica on each device plus a web viewport on the portal.",
