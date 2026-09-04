@@ -1,6 +1,7 @@
 pub mod action_queue;
 pub mod admin_auth;
 pub mod app_api;
+pub mod totp;
 /// Owner portal app mounts (`/apps/<slug>/`) registry and reverse proxy.
 pub mod app_web;
 pub mod crypto;

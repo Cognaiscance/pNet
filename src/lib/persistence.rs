@@ -160,6 +160,23 @@ mod tests {
         assert_eq!(original.owner.user.alias, restored.owner.user.alias);
         assert_eq!(original.owner.user.uuid, restored.owner.user.uuid);
         assert_eq!(original.owner.user.devices.len(), restored.owner.user.devices.len());
+        assert!(restored.admin_totp_secret.is_none());
+        assert!(restored.admin_totp_recovery_hashes.is_empty());
+    }
+
+    #[test]
+    fn totp_fields_roundtrip_and_stay_node_local() {
+        let mut original = Node::new();
+        original.admin_totp_secret = Some("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".into());
+        original.admin_totp_recovery_hashes = vec!["v1$aa$bb".into()];
+        original.admin_totp_last_step = Some(42);
+        let restored = roundtrip(&original);
+        assert_eq!(restored.admin_totp_secret, original.admin_totp_secret);
+        assert_eq!(
+            restored.admin_totp_recovery_hashes,
+            original.admin_totp_recovery_hashes
+        );
+        assert_eq!(restored.admin_totp_last_step, Some(42));
     }
 
     #[test]

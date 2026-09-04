@@ -49,10 +49,13 @@ or remote browser the same way they open the dashboard—**after authenticating*
   config pages or state-changing APIs.
   - **v1 baseline:** owner password → HttpOnly session cookie (`SameSite=Strict`,
     CSRF host checks as today).
-  - **Stronger (plan for next, not optional forever):** passkeys / WebAuthn;
-    optional TOTP / second factor especially for remote Config; step-up re-auth
-    for invite mint, rank change, password change if app browsing uses a lighter
-    session.
+  - **Hardening (landed):** optional TOTP 2FA (authenticator app + recovery
+    codes); per-IP login rate limit; step-up re-auth for invite mint; password
+    change and 2FA enroll/disable require the current password (and TOTP when
+    enrolled). **v1 session model:** one owner session, not split app vs Config
+    cookies. Fresh login is elevated for 10 minutes.
+  - **Later:** passkeys / WebAuthn; optional step-up for rank change when that
+    UI exists.
 - **Public by design when the portal is public:** opt-in portal bind exposes
   dashboard, app mounts, **and** Config. Security is **auth + TLS + CSRF**, not
   “config stays on loopback forever.” Listener default remains loopback until
@@ -72,10 +75,11 @@ Plumbing (implementation detail):
 
 - **One owner portal login** gates dashboard, app pages (as needed), and
   **Config on the web**.
-- Password session is the minimum; design for **passkeys / 2FA** next so remote
-  Config is not “password only forever.”
-- Optional later: typed sessions or step-up so day-to-day app use is weaker
-  than invite/rank/password changes.
+- Password session is the minimum; **optional TOTP 2FA** is the current
+  hardening so remote Config is not password-only. Passkeys / WebAuthn remain
+  next.
+- **v1:** one owner session. Browsing apps/Home/Config GETs needs sign-in;
+  invite mint needs recent step-up. Not a separate weaker “app only” cookie.
 - Public portal bind is opt-in; with it, Config is intentionally reachable
   remotely **only after sign-in** (plus TLS in production).
 
@@ -294,8 +298,9 @@ Do not conflate those with the owner dashboard + config + app links.
    `POST /api/app-web/register` / `unregister` (loopback only);
    `GET|POST /apps/<slug>/…` reverse-proxies to `127.0.0.1:<port>`; Home lists
    mounts.
-3. **Owner portal auth hardening** — password session already gates the
-   portal; next: passkeys/2FA and optional step-up for dangerous config.
+3. **Owner portal auth hardening** — **done:** optional TOTP 2FA, recovery
+   codes, `/security` (password change + enroll/disable), login rate limit,
+   step-up re-auth for invite mint. Passkeys / WebAuthn still later.
 4. **Sample / flagship app page** — **started:** `apps/pnet_web_hello` serves
    loopback HTML and auto-registers `/apps/hello/` with the portal.
 5. **Discovery** — publish slug / base URL hints in metadata.
@@ -325,9 +330,10 @@ Public portal access needs:
 
 1. Opt-in bind for the portal listener (dashboard + **Config** + app mounts).
 2. Reverse TLS in real deployments (especially because Config is remote).
-3. Owner **sign-in** before Config (and before sensitive portal use); plan for
-   passkeys/2FA rather than password-forever.
-4. Optional: step-up for the most dangerous config actions.
+3. Owner **sign-in** before Config (and before sensitive portal use); enable
+   TOTP 2FA on `/security` for remote Config. Passkeys / WebAuthn still later.
+4. Step-up for invite mint (password + TOTP when enrolled); password and 2FA
+   changes confirm identity on the form.
 
 Stage/live harnesses may bind `0.0.0.0` for tests; that is not a production
 recipe by itself.

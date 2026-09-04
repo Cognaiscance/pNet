@@ -18,10 +18,10 @@ use super::super::action_queue::{
     PendingInvites, WorkerContext, INVITATION_MINT_TIMEOUT,
 };
 use super::super::admin_auth::{
-    clear_session_cookie_header, csrf_post_ok, hash_password, session_id_from_cookie_header,
-    set_session_cookie_header, validate_new_password, verify_password, SessionStore, UiFlash,
-    INVITE_CODE_HEADER, MIN_PASSWORD_LEN,
+    hash_password, path_requires_stepup, unix_now, validate_new_password, verify_password,
+    PendingTotpEnroll, SessionStore, UiFlash, INVITE_CODE_HEADER,
 };
+use super::super::totp;
 use super::super::app_web::{
     is_loopback_addr, parse_apps_path, proxy_to_loopback, validate_slug, AppWebMount,
 };
@@ -65,9 +65,13 @@ pub fn ui_request(
         .as_ref()
         .map(|id| ctx.sessions.is_valid(id))
         .unwrap_or(false);
+    let pending_2fa = session_id
+        .as_ref()
+        .map(|id| ctx.sessions.is_pending_2fa(id))
+        .unwrap_or(false);
 
     let is_setup_route = matches!(path.as_str(), "/setup" | "/setup/create" | "/setup/join");
-    let is_login_route = matches!(path.as_str(), "/login");
+    let is_login_route = matches!(path.as_str(), "/login" | "/login/2fa");
     let is_set_password_route = matches!(path.as_str(), "/set-password");
     let is_logout = method == "POST" && path == "/logout";
     // Local apps register mounts without a browser session (loopback only).
@@ -104,11 +108,18 @@ pub fn ui_request(
             // Password already set — no open reset without auth (out of scope for 1.1).
             return respond_redirect(&stream, if authed { "/" } else { "/login" });
         }
-        if !authed && !is_login_route && !(is_app_web_api && peer_loopback) {
+        if pending_2fa {
+            if !matches!(path.as_str(), "/login/2fa") && !is_logout {
+                return respond_redirect(&stream, "/login/2fa");
+            }
+        } else if !authed && !is_login_route && !(is_app_web_api && peer_loopback) {
             return respond_redirect(&stream, "/login");
         }
         if authed && is_login_route && method == "GET" {
             return respond_redirect(&stream, "/");
+        }
+        if !pending_2fa && path == "/login/2fa" {
+            return respond_redirect(&stream, if authed { "/" } else { "/login" });
         }
     }
 
@@ -129,6 +140,14 @@ pub fn ui_request(
     // Reverse-proxy app web mounts (owner session required).
     if path.starts_with("/apps/") {
         return handle_app_web_proxy(stream, &method, &path, &query, &body, ctx);
+    }
+
+    // Invite mint (and other dangerous POSTs) require recent step-up.
+    if method == "POST"
+        && path_requires_stepup(&path)
+        && !session_is_elevated(&session_id, ctx)
+    {
+        return respond_html(&stream, 200, &render_reauth(ctx, &path, ""), None);
     }
 
     match (method.as_str(), path.as_str()) {
@@ -164,11 +183,42 @@ pub fn ui_request(
             respond_html(&stream, 200, &render_login(err), None)
         }
         ("POST", "/login") => {
+            let peer_ip = stream
+                .peer_addr()
+                .map(|a| a.ip())
+                .unwrap_or_else(|_| std::net::IpAddr::from([0, 0, 0, 0]));
+            if !ctx.sessions.allow_login_attempt(peer_ip) {
+                return respond_redirect(&stream, "/login?error=rate");
+            }
             match try_login(&body, ctx) {
-                Ok(sid) => respond_redirect_cookie(
+                Ok(LoginOutcome::Full(sid)) => respond_redirect_cookie(
                     &stream, "/", &set_session_cookie_header(&sid),
                 ),
+                Ok(LoginOutcome::Need2fa(sid)) => respond_redirect_cookie(
+                    &stream, "/login/2fa", &set_session_cookie_header(&sid),
+                ),
                 Err(()) => respond_redirect(&stream, "/login?error=bad"),
+            }
+        }
+        ("GET", "/login/2fa") => {
+            let err = query_param(&query, "error").unwrap_or("");
+            respond_html(&stream, 200, &render_login_2fa(err), None)
+        }
+        ("POST", "/login/2fa") => {
+            let Some(ref sid) = session_id else {
+                return respond_redirect(&stream, "/login");
+            };
+            let peer_ip = stream
+                .peer_addr()
+                .map(|a| a.ip())
+                .unwrap_or_else(|_| std::net::IpAddr::from([0, 0, 0, 0]));
+            if !ctx.sessions.allow_login_attempt(peer_ip) {
+                return respond_redirect(&stream, "/login/2fa?error=rate");
+            }
+            match try_login_2fa(&body, ctx, sid) {
+                Ok(()) => respond_redirect(&stream, "/"),
+                Err("rate") => respond_redirect(&stream, "/login/2fa?error=rate"),
+                Err(_) => respond_redirect(&stream, "/login/2fa?error=bad"),
             }
         }
         ("GET",  "/set-password") => {
@@ -193,6 +243,98 @@ pub fn ui_request(
         ("GET",  "/")            => respond_html(&stream, 200, &render_portal_home(ctx), None),
         ("GET",  "/dashboard")   => respond_redirect(&stream, "/"),
         ("GET",  "/config")      => respond_html(&stream, 200, &render_config_hub(ctx), None),
+        ("GET",  "/security")    => {
+            let err = query_param(&query, "error").unwrap_or("");
+            let flash = session_id
+                .as_ref()
+                .and_then(|id| ctx.sessions.take_flash(id));
+            respond_html(&stream, 200, &render_security(ctx, session_id.as_deref(), err, flash), None)
+        }
+        ("POST", "/security/password") => {
+            let Some(ref sid) = session_id else {
+                return respond_redirect(&stream, "/login");
+            };
+            match change_owner_password(&body, ctx, sid) {
+                Ok(()) => respond_redirect(&stream, "/security"),
+                Err(err) => respond_redirect(&stream, &format!("/security?error={err}")),
+            }
+        }
+        ("POST", "/security/totp/start") => {
+            let Some(ref sid) = session_id else {
+                return respond_redirect(&stream, "/login");
+            };
+            match start_totp_enroll(&body, ctx, sid) {
+                Ok(()) => respond_redirect(&stream, "/security"),
+                Err(err) => respond_redirect(&stream, &format!("/security?error={err}")),
+            }
+        }
+        ("POST", "/security/totp/confirm") => {
+            let Some(ref sid) = session_id else {
+                return respond_redirect(&stream, "/login");
+            };
+            match confirm_totp_enroll(&body, ctx, sid) {
+                Ok(()) => respond_redirect(&stream, "/security"),
+                Err(err) => respond_redirect(&stream, &format!("/security?error={err}")),
+            }
+        }
+        ("POST", "/security/totp/cancel") => {
+            if let Some(ref sid) = session_id {
+                ctx.sessions.clear_pending_totp(sid);
+            }
+            respond_redirect(&stream, "/security");
+        }
+        ("POST", "/security/totp/disable") => {
+            let Some(ref sid) = session_id else {
+                return respond_redirect(&stream, "/login");
+            };
+            match disable_totp(&body, ctx, sid) {
+                Ok(()) => respond_redirect(&stream, "/security"),
+                Err(err) => respond_redirect(&stream, &format!("/security?error={err}")),
+            }
+        }
+        ("GET", "/reauth") => {
+            let next = query_param(&query, "next").unwrap_or("/config");
+            respond_html(&stream, 200, &render_reauth(ctx, next, ""), None)
+        }
+        ("POST", "/reauth") => {
+            let Some(ref sid) = session_id else {
+                return respond_redirect(&stream, "/login");
+            };
+            let next = form_field(&body, "next")
+                .map(url_decode)
+                .unwrap_or_else(|| "/config".into());
+            match try_reauth(&body, ctx, sid) {
+                Ok(()) => {
+                    if next == "/invitations/device" {
+                        finish_invitation_mint(
+                            stream,
+                            session_id,
+                            Arc::clone(&ctx.sessions),
+                            Arc::clone(&ctx.pending_invites),
+                            generate_device_invitation(ctx),
+                            true,
+                        );
+                    } else if next == "/invitations/contact" {
+                        finish_invitation_mint(
+                            stream,
+                            session_id,
+                            Arc::clone(&ctx.sessions),
+                            Arc::clone(&ctx.pending_invites),
+                            generate_contact_invitation(ctx),
+                            false,
+                        );
+                    } else {
+                        respond_redirect(&stream, safe_next_path(&next));
+                    }
+                }
+                Err(err) => respond_html(
+                    &stream,
+                    200,
+                    &render_reauth(ctx, &next, err),
+                    None,
+                ),
+            }
+        }
         // Local app mount registration (loopback only; no owner session).
         ("POST", "/api/app-web/register") => {
             handle_app_web_register(&stream, peer_loopback, &body, ctx);
@@ -434,7 +576,40 @@ fn store_password_and_session(ctx: &WorkerContext, password: &str) -> String {
     ctx.sessions.create()
 }
 
-fn try_login(body: &[u8], ctx: &WorkerContext) -> Result<String, ()> {
+#[derive(Debug)]
+pub(crate) enum LoginOutcome {
+    Full(String),
+    Need2fa(String),
+}
+
+fn session_is_elevated(session_id: &Option<String>, ctx: &WorkerContext) -> bool {
+    session_id
+        .as_ref()
+        .map(|id| ctx.sessions.is_elevated(id))
+        .unwrap_or(false)
+}
+
+pub(crate) fn totp_is_enrolled(ctx: &WorkerContext) -> bool {
+    ctx.node
+        .read()
+        .unwrap()
+        .admin_totp_secret
+        .as_ref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
+/// Relative path only (`/…`), never protocol-relative or off-site.
+pub(crate) fn safe_next_path(raw: &str) -> &str {
+    let t = raw.trim();
+    if t.starts_with('/') && !t.starts_with("//") && !t.contains('\\') && !t.contains('\n') {
+        t
+    } else {
+        "/"
+    }
+}
+
+pub(crate) fn try_login(body: &[u8], ctx: &WorkerContext) -> Result<LoginOutcome, ()> {
     use super::super::admin_auth::verify_password;
     let password = form_field(body, "password")
         .map(url_decode)
@@ -444,7 +619,245 @@ fn try_login(body: &[u8], ctx: &WorkerContext) -> Result<String, ()> {
     if !verify_password(&password, &stored) {
         return Err(());
     }
-    Ok(ctx.sessions.create())
+    if totp_is_enrolled(ctx) {
+        Ok(LoginOutcome::Need2fa(ctx.sessions.create_pending_2fa()))
+    } else {
+        Ok(LoginOutcome::Full(ctx.sessions.create()))
+    }
+}
+
+pub(crate) fn try_login_2fa(body: &[u8], ctx: &WorkerContext, session_id: &str) -> Result<(), &'static str> {
+    if !ctx.sessions.is_pending_2fa(session_id) {
+        return Err("bad");
+    }
+    let code = form_field(body, "code")
+        .map(url_decode)
+        .unwrap_or_default();
+    if !verify_totp_or_recovery(ctx, &code) {
+        return Err("bad");
+    }
+    if !ctx.sessions.complete_2fa(session_id) {
+        return Err("bad");
+    }
+    Ok(())
+}
+
+pub(crate) fn try_reauth(body: &[u8], ctx: &WorkerContext, session_id: &str) -> Result<(), &'static str> {
+    if !ctx.sessions.is_valid(session_id) {
+        return Err("bad");
+    }
+    let password = form_field(body, "password")
+        .map(url_decode)
+        .unwrap_or_default();
+    let stored = ctx.node.read().unwrap().admin_password_hash.clone();
+    let Some(stored) = stored else { return Err("bad") };
+    if !verify_password(&password, &stored) {
+        return Err("bad");
+    }
+    if totp_is_enrolled(ctx) {
+        let code = form_field(body, "code")
+            .map(url_decode)
+            .unwrap_or_default();
+        if !verify_totp_or_recovery(ctx, &code) {
+            return Err("bad");
+        }
+    }
+    if !ctx.sessions.elevate(session_id) {
+        return Err("bad");
+    }
+    Ok(())
+}
+
+/// TOTP code or a recovery code. Recovery codes are consumed on success.
+pub(crate) fn verify_totp_or_recovery(ctx: &WorkerContext, raw: &str) -> bool {
+    let secret_b32 = ctx.node.read().unwrap().admin_totp_secret.clone();
+    let Some(secret_b32) = secret_b32 else {
+        return false;
+    };
+    let Some(secret) = totp::decode_base32(&secret_b32) else {
+        return false;
+    };
+    let last = ctx.node.read().unwrap().admin_totp_last_step;
+    if let Some(step) = totp::verify_totp(&secret, raw, unix_now(), last) {
+        ctx.node.write().unwrap().admin_totp_last_step = Some(step);
+        ctx.save_node();
+        return true;
+    }
+    consume_recovery_code(ctx, raw)
+}
+
+fn consume_recovery_code(ctx: &WorkerContext, raw: &str) -> bool {
+    let want = totp::normalize_recovery_code(raw);
+    if want.len() != 16 {
+        return false;
+    }
+    // Recovery codes are stored hashed; we must test the submitted value
+    // against each hash. Display form is `xxxxxxxx-xxxxxxxx`.
+    let display = format!("{}-{}", &want[..8], &want[8..]);
+    let hashes = ctx.node.read().unwrap().admin_totp_recovery_hashes.clone();
+    let mut matched: Option<usize> = None;
+    for (i, h) in hashes.iter().enumerate() {
+        if verify_password(&display, h) || verify_password(&want, h) {
+            matched = Some(i);
+            break;
+        }
+    }
+    let Some(i) = matched else {
+        return false;
+    };
+    {
+        let mut node = ctx.node.write().unwrap();
+        if i < node.admin_totp_recovery_hashes.len() {
+            node.admin_totp_recovery_hashes.remove(i);
+        }
+    }
+    ctx.save_node();
+    true
+}
+
+fn verify_current_password(ctx: &WorkerContext, password: &str) -> bool {
+    let stored = ctx.node.read().unwrap().admin_password_hash.clone();
+    match stored {
+        Some(h) => verify_password(password, &h),
+        None => false,
+    }
+}
+
+pub(crate) fn change_owner_password(
+    body: &[u8],
+    ctx: &WorkerContext,
+    session_id: &str,
+) -> Result<(), &'static str> {
+    let current = form_field(body, "current_password")
+        .map(url_decode)
+        .unwrap_or_default();
+    let new = form_field(body, "password")
+        .map(url_decode)
+        .unwrap_or_default();
+    let confirm = form_field(body, "password_confirm")
+        .map(url_decode)
+        .unwrap_or_default();
+    if !verify_current_password(ctx, &current) {
+        return Err("current");
+    }
+    if totp_is_enrolled(ctx) {
+        let code = form_field(body, "code")
+            .map(url_decode)
+            .unwrap_or_default();
+        if !verify_totp_or_recovery(ctx, &code) {
+            return Err("totp");
+        }
+    }
+    validate_new_password(&new, &confirm)?;
+    {
+        let mut node = ctx.node.write().unwrap();
+        node.admin_password_hash = Some(hash_password(&new));
+    }
+    ctx.save_node();
+    ctx.sessions.revoke_all_except(session_id);
+    ctx.sessions.elevate(session_id);
+    ctx.sessions.set_flash(
+        session_id,
+        UiFlash::Notice("Password updated.".into()),
+    );
+    Ok(())
+}
+
+pub(crate) fn start_totp_enroll(
+    body: &[u8],
+    ctx: &WorkerContext,
+    session_id: &str,
+) -> Result<(), &'static str> {
+    if totp_is_enrolled(ctx) {
+        return Err("exists");
+    }
+    let current = form_field(body, "current_password")
+        .map(url_decode)
+        .unwrap_or_default();
+    if !verify_current_password(ctx, &current) {
+        return Err("current");
+    }
+    let secret = totp::generate_secret();
+    let recovery_plain = totp::generate_recovery_codes();
+    let recovery_hashes: Vec<String> = recovery_plain.iter().map(|c| hash_password(c)).collect();
+    ctx.sessions.set_pending_totp(
+        session_id,
+        PendingTotpEnroll {
+            secret,
+            recovery_plain,
+            recovery_hashes,
+        },
+    );
+    ctx.sessions.elevate(session_id);
+    Ok(())
+}
+
+pub(crate) fn confirm_totp_enroll(
+    body: &[u8],
+    ctx: &WorkerContext,
+    session_id: &str,
+) -> Result<(), &'static str> {
+    let Some(pending) = ctx.sessions.pending_totp(session_id) else {
+        return Err("pending");
+    };
+    let code = form_field(body, "code")
+        .map(url_decode)
+        .unwrap_or_default();
+    let Some(step) = totp::verify_totp(&pending.secret, &code, unix_now(), None) else {
+        return Err("totp");
+    };
+    {
+        let mut node = ctx.node.write().unwrap();
+        node.admin_totp_secret = Some(totp::encode_base32(&pending.secret));
+        node.admin_totp_recovery_hashes = pending.recovery_hashes;
+        node.admin_totp_last_step = Some(step);
+    }
+    ctx.save_node();
+    ctx.sessions.take_pending_totp(session_id);
+    ctx.sessions.revoke_all_except(session_id);
+    ctx.sessions.elevate(session_id);
+    ctx.sessions.set_flash(
+        session_id,
+        UiFlash::Notice("Authenticator app enabled. Store the recovery codes.".into()),
+    );
+    Ok(())
+}
+
+pub(crate) fn disable_totp(
+    body: &[u8],
+    ctx: &WorkerContext,
+    session_id: &str,
+) -> Result<(), &'static str> {
+    if !totp_is_enrolled(ctx) {
+        return Err("missing");
+    }
+    let current = form_field(body, "current_password")
+        .map(url_decode)
+        .unwrap_or_default();
+    if !verify_current_password(ctx, &current) {
+        return Err("current");
+    }
+    let code = form_field(body, "code")
+        .map(url_decode)
+        .unwrap_or_default();
+    if !verify_totp_or_recovery(ctx, &code) {
+        return Err("totp");
+    }
+    {
+        let mut node = ctx.node.write().unwrap();
+        node.admin_totp_secret = None;
+        node.admin_totp_recovery_hashes.clear();
+        node.admin_totp_last_step = None;
+    }
+    ctx.save_node();
+    ctx.sessions.clear_pending_totp(session_id);
+    ctx.sessions.revoke_all_except(session_id);
+    ctx.sessions.elevate(session_id);
+    ctx.sessions.set_flash(
+        session_id,
+        UiFlash::Notice("Authenticator app disabled.".into()),
+    );
+    Ok(())
 }
 
 fn complete_set_password(body: &[u8], ctx: &WorkerContext) -> Result<String, &'static str> {
@@ -588,7 +1001,7 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
            <h2 style=\"margin-top:0;font-size:1.1rem\">Config</h2>\
            <p style=\"margin:0 0 .75rem;color:#444\">Manage this node: devices, invitations, \
            applications, contacts, and diagnostics. Requires the same owner sign-in \
-           (password today; passkeys/2FA later).</p>\
+           (password, plus authenticator 2FA when enabled).</p>\
            <p style=\"margin:0\"><a class=\"portal-btn\" href=\"/config\">Open Config</a></p>\
          </div>"
     );
@@ -777,6 +1190,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
              <li><a href=\"/devices\">Devices</a> — your devices and advertised hosts</li>\
              <li><a href=\"/invitations\">Invitations</a> — device and contact invite codes</li>\
              <li><a href=\"/diagnostics\">Diagnostics</a> — fabric health, sessions, partitions</li>\
+             <li><a href=\"/security\">Security</a> — password and authenticator 2FA</li>\
            </ul>\
          </div>"
     );
@@ -1432,7 +1846,7 @@ fn render_invitations(
                 html_escape(&code)
             ),
         ),
-        None => (String::new(), String::new()),
+        Some(UiFlash::Notice(_)) | None => (String::new(), String::new()),
     };
 
     let dev_inv_rows: String = node.owner.device_invitations.iter()
@@ -1720,16 +2134,18 @@ fn render_setup_code_entry(grade: &str, error: &str) -> String {
 }
 
 fn render_login(error: &str) -> String {
-    let error_msg = if error == "bad" {
-        "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
-         Incorrect password.</p>"
-    } else {
-        ""
+    let error_msg = match error {
+        "bad" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+         Incorrect password.</p>",
+        "rate" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+         Too many sign-in attempts. Wait a moment and try again.</p>",
+        _ => "",
     };
     setup_layout(&format!(
         "<h1>Sign in</h1>\
          <p class=\"swiz-sub\">Enter your owner password for this pNet node \
-         (Home, Config, and app pages).</p>\
+         (Home, Config, and app pages). If authenticator 2FA is enabled, \
+         you will be asked for a code next.</p>\
          {error_msg}\
          <form method=\"post\" action=\"/login\" style=\"display:block\">\
            <label class=\"swiz-label\">Password</label>\
@@ -1738,6 +2154,209 @@ fn render_login(error: &str) -> String {
            <button class=\"swiz-btn\" type=\"submit\">Log in</button>\
          </form>"
     ))
+}
+
+fn render_login_2fa(error: &str) -> String {
+    let error_msg = match error {
+        "bad" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+         Invalid authenticator or recovery code.</p>",
+        "rate" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+         Too many attempts. Wait a moment and try again.</p>",
+        _ => "",
+    };
+    setup_layout(&format!(
+        "<h1>Authenticator code</h1>\
+         <p class=\"swiz-sub\">Enter a 6-digit code from your authenticator app, \
+         or a one-time recovery code.</p>\
+         {error_msg}\
+         <form method=\"post\" action=\"/login/2fa\" style=\"display:block\">\
+           <label class=\"swiz-label\">Code</label>\
+           <input class=\"swiz-input\" type=\"text\" name=\"code\" inputmode=\"numeric\" \
+                  autocomplete=\"one-time-code\" required autofocus \
+                  style=\"letter-spacing:.12em;font-size:1.1rem\">\
+           <button class=\"swiz-btn\" type=\"submit\">Continue</button>\
+         </form>"
+    ))
+}
+
+fn totp_field_html(enrolled: bool) -> String {
+    if enrolled {
+        "<label class=\"swiz-label\">Authenticator or recovery code</label>\
+         <input class=\"swiz-input\" type=\"text\" name=\"code\" \
+                autocomplete=\"one-time-code\" required>"
+            .into()
+    } else {
+        String::new()
+    }
+}
+
+fn render_reauth(ctx: &WorkerContext, next: &str, error: &str) -> String {
+    let error_msg = if error == "bad" {
+        "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+         Could not confirm your identity.</p>"
+    } else {
+        ""
+    };
+    let totp = totp_field_html(totp_is_enrolled(ctx));
+    let next_esc = html_escape(safe_next_path(next));
+    let body = format!(
+        "<h1>Confirm identity</h1>\
+         <p style=\"color:#555;margin-top:-.5rem\">This action (invite mint) needs a recent \
+         sign-in. Re-enter your password{}.</p>\
+         {error_msg}\
+         <div class=\"card\">\
+           <form method=\"post\" action=\"/reauth\" style=\"display:block\">\
+             <input type=\"hidden\" name=\"next\" value=\"{next_esc}\">\
+             <label class=\"swiz-label\">Password</label>\
+             <input class=\"swiz-input\" type=\"password\" name=\"password\" \
+                    required autocomplete=\"current-password\">\
+             {totp}\
+             <p style=\"margin:1rem 0 0\"><button class=\"swiz-btn\" type=\"submit\">Confirm</button></p>\
+           </form>\
+         </div>",
+        if totp_is_enrolled(ctx) {
+            " and authenticator code"
+        } else {
+            ""
+        }
+    );
+    layout(ctx, "Confirm identity", &body)
+}
+
+fn render_security(
+    ctx: &WorkerContext,
+    session_id: Option<&str>,
+    error: &str,
+    flash: Option<UiFlash>,
+) -> String {
+    let enrolled = totp_is_enrolled(ctx);
+    let pending = session_id.and_then(|id| ctx.sessions.pending_totp(id));
+    let remaining = ctx.node.read().unwrap().admin_totp_recovery_hashes.len();
+
+    let error_msg = match error {
+        "current" => "<div class=\"card\" style=\"background:#fee;color:#900;border:1px solid #c66\">\
+            Current password is incorrect.</div>",
+        "totp" => "<div class=\"card\" style=\"background:#fee;color:#900;border:1px solid #c66\">\
+            Authenticator or recovery code is invalid.</div>",
+        "password_short" => "<div class=\"card\" style=\"background:#fee;color:#900;border:1px solid #c66\">\
+            New password must be at least 8 characters.</div>",
+        "password_mismatch" => "<div class=\"card\" style=\"background:#fee;color:#900;border:1px solid #c66\">\
+            New passwords do not match.</div>",
+        "exists" => "<div class=\"card\" style=\"background:#fee;color:#900;border:1px solid #c66\">\
+            Authenticator 2FA is already enabled.</div>",
+        "pending" => "<div class=\"card\" style=\"background:#fee;color:#900;border:1px solid #c66\">\
+            Start enrollment first, then confirm with a code.</div>",
+        "missing" => "<div class=\"card\" style=\"background:#fee;color:#900;border:1px solid #c66\">\
+            Authenticator 2FA is not enabled.</div>",
+        _ => "",
+    };
+
+    let notice = match flash {
+        Some(UiFlash::Notice(msg)) => format!(
+            "<div class=\"card\" style=\"background:#eef8ee;color:#1a5a1a;border:1px solid #8c8\">{}</div>",
+            html_escape(&msg)
+        ),
+        _ => String::new(),
+    };
+
+    let totp_on_pw = totp_field_html(enrolled);
+
+    let twofa_card = if let Some(pending) = pending {
+        let secret_b32 = totp::encode_base32(&pending.secret);
+        let owner = ctx.node.read().unwrap().owner.user.alias.clone();
+        let url = totp::otpauth_url(&owner, &secret_b32);
+        let codes: String = pending
+            .recovery_plain
+            .iter()
+            .map(|c| format!("<li><code>{}</code></li>", html_escape(c)))
+            .collect();
+        format!(
+            "<div class=\"card\">\
+               <h2 style=\"margin-top:0;font-size:1.1rem\">Finish authenticator setup</h2>\
+               <p>Add this account in your authenticator app. Scan or paste the URI, \
+               or enter the secret manually.</p>\
+               <p><code style=\"word-break:break-all;font-size:.85rem\">{}</code></p>\
+               <p>Secret: <code>{}</code></p>\
+               <p><strong>Recovery codes</strong> (shown once — store them offline):</p>\
+               <ul>{}</ul>\
+               <form method=\"post\" action=\"/security/totp/confirm\" style=\"display:block;margin-top:1rem\">\
+                 <label class=\"swiz-label\">Code from the app</label>\
+                 <input class=\"swiz-input\" type=\"text\" name=\"code\" \
+                        autocomplete=\"one-time-code\" required inputmode=\"numeric\">\
+                 <p style=\"margin:.75rem 0 0\">\
+                   <button class=\"swiz-btn\" type=\"submit\">Enable 2FA</button>\
+                 </p>\
+               </form>\
+               <form method=\"post\" action=\"/security/totp/cancel\" style=\"margin-top:.5rem\">\
+                 <button type=\"submit\" class=\"reject\">Cancel</button>\
+               </form>\
+             </div>",
+            html_escape(&url),
+            html_escape(&secret_b32),
+            codes
+        )
+    } else if enrolled {
+        format!(
+            "<div class=\"card\">\
+               <h2 style=\"margin-top:0;font-size:1.1rem\">Authenticator 2FA</h2>\
+               <p><strong>Enabled.</strong> Sign-in and dangerous Config actions \
+               require a code. {remaining} recovery code(s) remaining.</p>\
+               <form method=\"post\" action=\"/security/totp/disable\" style=\"display:block\">\
+                 <label class=\"swiz-label\">Current password</label>\
+                 <input class=\"swiz-input\" type=\"password\" name=\"current_password\" \
+                        required autocomplete=\"current-password\">\
+                 <label class=\"swiz-label\">Authenticator or recovery code</label>\
+                 <input class=\"swiz-input\" type=\"text\" name=\"code\" \
+                        autocomplete=\"one-time-code\" required>\
+                 <p style=\"margin:.75rem 0 0\">\
+                   <button type=\"submit\" class=\"reject\">Disable 2FA</button>\
+                 </p>\
+               </form>\
+             </div>"
+        )
+    } else {
+        "<div class=\"card\">\
+           <h2 style=\"margin-top:0;font-size:1.1rem\">Authenticator 2FA</h2>\
+           <p>Optional TOTP (Google Authenticator, Aegis, 1Password, …). \
+           Recommended when this portal is reachable beyond loopback.</p>\
+           <form method=\"post\" action=\"/security/totp/start\" style=\"display:block\">\
+             <label class=\"swiz-label\">Current password</label>\
+             <input class=\"swiz-input\" type=\"password\" name=\"current_password\" \
+                    required autocomplete=\"current-password\">\
+             <p style=\"margin:.75rem 0 0\">\
+               <button class=\"swiz-btn\" type=\"submit\">Start setup</button>\
+             </p>\
+           </form>\
+         </div>"
+            .into()
+    };
+
+    let body = format!(
+        "<h1>Security</h1>\
+         <p style=\"color:#555;margin-top:-.5rem\">Owner password and optional authenticator 2FA \
+         for this node. Secrets stay on this device (not synced).</p>\
+         {notice}{error_msg}\
+         <div class=\"card\">\
+           <h2 style=\"margin-top:0;font-size:1.1rem\">Change password</h2>\
+           <form method=\"post\" action=\"/security/password\" style=\"display:block\">\
+             <label class=\"swiz-label\">Current password</label>\
+             <input class=\"swiz-input\" type=\"password\" name=\"current_password\" \
+                    required autocomplete=\"current-password\">\
+             {totp_on_pw}\
+             <label class=\"swiz-label\">New password</label>\
+             <input class=\"swiz-input\" type=\"password\" name=\"password\" \
+                    required minlength=\"8\" autocomplete=\"new-password\">\
+             <label class=\"swiz-label\">Confirm new password</label>\
+             <input class=\"swiz-input\" type=\"password\" name=\"password_confirm\" \
+                    required minlength=\"8\" autocomplete=\"new-password\">\
+             <p style=\"margin:.75rem 0 0\">\
+               <button class=\"swiz-btn\" type=\"submit\">Update password</button>\
+             </p>\
+           </form>\
+         </div>\
+         {twofa_card}"
+    );
+    layout(ctx, "Security", &body)
 }
 
 fn render_set_password(error: &str) -> String {
@@ -1799,6 +2418,12 @@ form { display: inline; }
           padding: .6rem 0; border-bottom: 1px solid #e0e0e0; font-size: .9rem; }
 .subnav a { color: #456; text-decoration: none; }
 .subnav a:hover { color: #1a1a2e; }
+.swiz-label { display: block; font-size: .85rem; color: #555; margin-bottom: .3rem; }
+.swiz-input { display: block; width: 100%; max-width: 28rem; box-sizing: border-box; padding: .55rem .7rem;
+              border: 1px solid #ccc; border-radius: 5px; font-size: .95rem; margin-bottom: 1rem; }
+.swiz-btn { background: #1a1a2e; color: white; border: none; border-radius: 5px;
+            padding: .55rem 1.4rem; font-size: .95rem; cursor: pointer; }
+.swiz-btn:hover { background: #2a2a4e; }
 ";
 
 /// Top-level portal nav: Home + Config entry + logout. Config section pages
@@ -1814,6 +2439,8 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
             | "Devices"
             | "Invitations"
             | "Diagnostics"
+            | "Security"
+            | "Confirm identity"
     );
     let mut html = String::with_capacity(4096);
     html.push_str("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>pNet \u{2014} ");
@@ -1839,6 +2466,7 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
                <a href=\"/devices\">Devices</a>\
                <a href=\"/invitations\">Invitations</a>\
                <a href=\"/diagnostics\">Diagnostics</a>\
+               <a href=\"/security\">Security</a>\
              </div>",
         );
     }

@@ -131,8 +131,10 @@ pub use tunnels::{
 mod admin_ui;
 pub use admin_ui::{apply_new_user_setup, ui_request};
 pub(crate) use admin_ui::{
-    UI_ERR_PUBLISH_FAILED, approve_app, complete_setup, form_field, own_user_sg_partition,
-    partition_banner, reject_app, rename_app, render_diagnostics, url_decode,
+    UI_ERR_PUBLISH_FAILED, LoginOutcome, approve_app, change_owner_password, complete_setup,
+    confirm_totp_enroll, disable_totp, form_field, own_user_sg_partition, partition_banner,
+    reject_app, rename_app, render_diagnostics, safe_next_path, start_totp_enroll,
+    totp_is_enrolled, try_login, try_login_2fa, try_reauth, url_decode, verify_totp_or_recovery,
 };
 
 
@@ -4342,6 +4344,172 @@ mod tests {
         let body = b"alias=Alice&device_alias=Home&grade=sg&password=short&password_confirm=short";
         assert_eq!(complete_setup(body, &t.ctx), Err("password_short"));
         assert!(!t.ctx.node.read().unwrap().is_initialized());
+    }
+
+    fn setup_with_password(t: &TestCtx) -> String {
+        let body = b"alias=Alice&device_alias=Home&grade=sg&sg_rank=1\
+            &password=secretpass&password_confirm=secretpass";
+        complete_setup(body, &t.ctx).expect("setup")
+    }
+
+    #[test]
+    fn try_login_password_only_issues_full_elevated_session() {
+        let t = TestCtx::new();
+        let sid = setup_with_password(&t);
+        t.ctx.sessions.revoke(&sid);
+        match try_login(b"password=secretpass", &t.ctx) {
+            Ok(LoginOutcome::Full(id)) => {
+                assert!(t.ctx.sessions.is_valid(&id));
+                assert!(t.ctx.sessions.is_elevated(&id));
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+        assert!(try_login(b"password=wrongwrong", &t.ctx).is_err());
+    }
+
+    #[test]
+    fn totp_enroll_confirm_then_login_needs_second_factor() {
+        let t = TestCtx::new();
+        let sid = setup_with_password(&t);
+        start_totp_enroll(b"current_password=secretpass", &t.ctx, &sid)
+            .expect("start enroll");
+        let pending = t.ctx.sessions.pending_totp(&sid).expect("pending secret");
+        let code = super::super::totp::totp_code_string(
+            &pending.secret,
+            super::super::admin_auth::unix_now(),
+        );
+        let body = format!("code={code}");
+        confirm_totp_enroll(body.as_bytes(), &t.ctx, &sid).expect("confirm");
+        assert!(totp_is_enrolled(&t.ctx));
+
+        match try_login(b"password=secretpass", &t.ctx) {
+            Ok(LoginOutcome::Need2fa(pending_id)) => {
+                assert!(!t.ctx.sessions.is_valid(&pending_id));
+                assert!(t.ctx.sessions.is_pending_2fa(&pending_id));
+                let secret = super::super::totp::decode_base32(
+                    t.ctx.node.read().unwrap().admin_totp_secret.as_ref().unwrap(),
+                )
+                .unwrap();
+                let now = super::super::admin_auth::unix_now();
+                let last = t.ctx.node.read().unwrap().admin_totp_last_step;
+                let c0 = super::super::totp::totp_code_string(&secret, now);
+                let code = if super::super::totp::verify_totp(&secret, &c0, now, last).is_some() {
+                    c0
+                } else {
+                    super::super::totp::totp_code_string(&secret, now.saturating_add(30))
+                };
+                let body = format!("code={code}");
+                try_login_2fa(body.as_bytes(), &t.ctx, &pending_id).expect("2fa");
+                assert!(t.ctx.sessions.is_valid(&pending_id));
+                assert!(t.ctx.sessions.is_elevated(&pending_id));
+            }
+            other => panic!("expected Need2fa, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn totp_recovery_code_consumes_and_logs_in() {
+        let t = TestCtx::new();
+        let sid = setup_with_password(&t);
+        start_totp_enroll(b"current_password=secretpass", &t.ctx, &sid).unwrap();
+        let pending = t.ctx.sessions.pending_totp(&sid).unwrap();
+        let recovery = pending.recovery_plain[0].clone();
+        let code = super::super::totp::totp_code_string(
+            &pending.secret,
+            super::super::admin_auth::unix_now(),
+        );
+        confirm_totp_enroll(format!("code={code}").as_bytes(), &t.ctx, &sid).unwrap();
+        assert_eq!(t.ctx.node.read().unwrap().admin_totp_recovery_hashes.len(), 8);
+
+        let Ok(LoginOutcome::Need2fa(pending_id)) = try_login(b"password=secretpass", &t.ctx) else {
+            panic!("need 2fa");
+        };
+        try_login_2fa(format!("code={recovery}").as_bytes(), &t.ctx, &pending_id)
+            .expect("recovery login");
+        assert_eq!(t.ctx.node.read().unwrap().admin_totp_recovery_hashes.len(), 7);
+        // Same recovery code cannot be reused.
+        assert!(!verify_totp_or_recovery(&t.ctx, &recovery));
+    }
+
+    #[test]
+    fn change_password_requires_current_and_revokes_other_sessions() {
+        let t = TestCtx::new();
+        let sid = setup_with_password(&t);
+        let other = t.ctx.sessions.create();
+        change_owner_password(
+            b"current_password=secretpass&password=newsecret1&password_confirm=newsecret1",
+            &t.ctx,
+            &sid,
+        )
+        .expect("change");
+        assert!(t.ctx.sessions.is_valid(&sid));
+        assert!(!t.ctx.sessions.is_valid(&other));
+        assert!(try_login(b"password=secretpass", &t.ctx).is_err());
+        assert!(matches!(
+            try_login(b"password=newsecret1", &t.ctx),
+            Ok(LoginOutcome::Full(_))
+        ));
+    }
+
+    #[test]
+    fn disable_totp_with_password_and_code() {
+        let t = TestCtx::new();
+        let sid = setup_with_password(&t);
+        start_totp_enroll(b"current_password=secretpass", &t.ctx, &sid).unwrap();
+        let pending = t.ctx.sessions.pending_totp(&sid).unwrap();
+        let code = super::super::totp::totp_code_string(
+            &pending.secret,
+            super::super::admin_auth::unix_now(),
+        );
+        confirm_totp_enroll(format!("code={code}").as_bytes(), &t.ctx, &sid).unwrap();
+        // Replay guard: wait is not needed if we use a recovery code to disable.
+        let recovery = {
+            // After confirm, plaintext recovery is gone; enroll a known code by
+            // hashing one into the node for this test... use TOTP again after
+            // advancing is flaky. Generate a code at now — last_step may block
+            // current window, so use next/prev skew or recovery via remaining hashes.
+            // Easiest: compute a code; if replay-blocked, the ±1 window still
+            // has unused steps only if clock moved. Use a leftover recovery hash
+            // by starting from stored hashes — we don't have plaintext. So
+            // compute totp at now±30 if current step was stored.
+            let secret = super::super::totp::decode_base32(
+                t.ctx.node.read().unwrap().admin_totp_secret.as_ref().unwrap(),
+            )
+            .unwrap();
+            let now = super::super::admin_auth::unix_now();
+            let last = t.ctx.node.read().unwrap().admin_totp_last_step;
+            let c0 = super::super::totp::totp_code_string(&secret, now);
+            if super::super::totp::verify_totp(&secret, &c0, now, last).is_some() {
+                c0
+            } else {
+                super::super::totp::totp_code_string(&secret, now.saturating_add(30))
+            }
+        };
+        disable_totp(
+            format!("current_password=secretpass&code={recovery}").as_bytes(),
+            &t.ctx,
+            &sid,
+        )
+        .expect("disable");
+        assert!(!totp_is_enrolled(&t.ctx));
+    }
+
+    #[test]
+    fn reauth_elevates_session() {
+        let t = TestCtx::new();
+        let sid = setup_with_password(&t);
+        assert!(t.ctx.sessions.is_elevated(&sid));
+        try_reauth(b"password=secretpass", &t.ctx, &sid).expect("reauth");
+        assert!(t.ctx.sessions.is_elevated(&sid));
+        assert_eq!(try_reauth(b"password=nope-nope", &t.ctx, &sid), Err("bad"));
+    }
+
+    #[test]
+    fn safe_next_path_rejects_open_redirects() {
+        assert_eq!(safe_next_path("/invitations/device"), "/invitations/device");
+        assert_eq!(safe_next_path("//evil.example"), "/");
+        assert_eq!(safe_next_path("https://evil.example"), "/");
+        assert_eq!(safe_next_path("/config"), "/config");
     }
 
     #[test]

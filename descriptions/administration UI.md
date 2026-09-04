@@ -12,6 +12,9 @@ portal **Home** page (see `descriptions/app-web-surfaces.md`).
 | `/api/app-web/register` | **Loopback only** — app process registers `slug` + `port` (+ optional `title`) |
 | `/api/app-web/unregister` | **Loopback only** — remove a mount by `slug` |
 | `/devices`, `/invitations`, … | Config section pages (same capabilities as the classic admin UI) |
+| `/security` | Password change and optional authenticator 2FA |
+| `/login/2fa` | Second login step when TOTP is enrolled |
+| `/reauth` | Step-up prompt before invite mint (when elevation expired) |
 | `/dashboard` | Redirects to `/` (legacy) |
 
 Owner portal pages require sign-in (admin password session today). Mount
@@ -40,11 +43,22 @@ On first-run setup (new user or join), the owner sets an **admin password** for 
 After setup, every admin page requires a login session:
 
 * `POST /login` with the admin password issues an HttpOnly `pnet_session` cookie (24h, in-memory sessions).
+* If authenticator 2FA is enrolled, login continues at `GET|POST /login/2fa` (TOTP or a one-time recovery code) before the session can browse.
 * Unauthenticated requests redirect to `/login`.
 * `POST /logout` clears the session.
 * Nodes upgraded from a pre-password build (initialized but no hash) are forced through `/set-password` once.
 
-Headless deploys may set `PNET_ADMIN_PASSWORD` at startup to store a hash when none exists yet.
+**Optional TOTP 2FA** (RFC 6238, HMAC-SHA1, 30s, 6 digits) is enrolled per node on **Config → Security** (`/security`). The TOTP secret, recovery-code hashes, and last used time-step are node-local (`admin_totp_secret`, `admin_totp_recovery_hashes`, `admin_totp_last_step` in `node.toml`) and are never synced. Compatible with Google Authenticator, Aegis, 1Password, and other `otpauth://totp` apps.
+
+If you lose the authenticator **and** the recovery codes, remove those three fields from `node.toml` on that device (with the node stopped) to fall back to password-only.
+
+**Step-up:** browsing Home, app mounts, and Config GETs uses the signed-in session. Minting a device or contact invitation requires a **recent re-auth** (password, plus TOTP if enrolled) within the last 10 minutes. Fresh login starts elevated. Password change and 2FA enroll/disable ask for the current password (and TOTP when enabled) on the form itself.
+
+Login attempts are rate-limited per client IP (burst of 8, then about one try every 5 seconds).
+
+Headless deploys may set `PNET_ADMIN_PASSWORD` at startup to store a hash when none exists yet. That does **not** enroll TOTP.
+
+**v1 session model:** one owner session cookie (not a separate “app browsing” cookie). Passkeys / WebAuthn are not implemented yet.
 
 ## CSRF / session cookie policy
 

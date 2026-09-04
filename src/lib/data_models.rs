@@ -677,6 +677,17 @@ pub struct Node {
     /// set yet (first-run or pre-auth upgrade); the UI forces set-password.
     #[serde(default)]
     pub admin_password_hash: Option<String>,
+    /// Optional TOTP secret (unpadded base32). Node-local, never synced.
+    /// `None` means 2FA is not enrolled.
+    #[serde(default)]
+    pub admin_totp_secret: Option<String>,
+    /// Hashed one-time recovery codes (`v1$salt$hash` via `hash_password`).
+    /// Node-local; consumed on use.
+    #[serde(default)]
+    pub admin_totp_recovery_hashes: Vec<String>,
+    /// Last accepted TOTP time-step (replay guard). Node-local.
+    #[serde(default)]
+    pub admin_totp_last_step: Option<u64>,
     /// Ephemeral — not persisted; refreshed by PollSG on each run.
     /// Keyed by `(device_uuid, host_string)` — the host_string matches an
     /// entry in that device's `hosts` list.
@@ -737,6 +748,9 @@ impl Node {
         Node {
             device_uuid,
             admin_password_hash: None,
+            admin_totp_secret: None,
+            admin_totp_recovery_hashes: Vec::new(),
+            admin_totp_last_step: None,
             sg_statuses: HashMap::new(),
             partition_flag: false,
             rank1_failover_active: false,
