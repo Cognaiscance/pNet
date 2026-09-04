@@ -1,8 +1,3 @@
-[workspace]
-members = [".", "apps/*"]
-# cargo-fuzz uses its own workspace when present; keep it out of this one.
-exclude = ["fuzz"]
-
 [package]
 name = "pnet"
 version = "0.1.0"

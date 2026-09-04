@@ -84,8 +84,7 @@ services:
 
   probe-1:
     build:
-      context: .
-      dockerfile: apps/pnet_test_probe/Dockerfile
+      context: ../pnet_test_probe
     networks: [net-side-1]
     ports: ["3821:3000/tcp"]
     environment:
@@ -94,8 +93,7 @@ services:
 
   probe-2:
     build:
-      context: .
-      dockerfile: apps/pnet_test_probe/Dockerfile
+      context: ../pnet_test_probe
     networks: [net-side-2]
     ports: ["3822:3000/tcp"]
     environment:

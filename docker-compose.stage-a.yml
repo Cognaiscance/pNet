@@ -1,5 +1,7 @@
 # Stage A test topology — single user (william) with 2 SGs and 2 DGs.
 #
+# Probe images build from sibling ../pnet_test_probe (pNet_project layout).
+#
 # Goal: exercise intra-user device-to-device messaging (SG↔SG, SG↔DG, DG↔DG),
 # device-list sync, and SG rank-1 → rank-2 failover, all on one docker network.
 #
@@ -91,8 +93,7 @@ services:
 
   probe-sg-1:
     build:
-      context: .
-      dockerfile: apps/pnet_test_probe/Dockerfile
+      context: ../pnet_test_probe
     networks: [net-pnet]
     ports: ["3801:3000/tcp"]
     environment:
@@ -101,8 +102,7 @@ services:
 
   probe-sg-2:
     build:
-      context: .
-      dockerfile: apps/pnet_test_probe/Dockerfile
+      context: ../pnet_test_probe
     networks: [net-pnet]
     ports: ["3802:3000/tcp"]
     environment:
@@ -111,8 +111,7 @@ services:
 
   probe-dg-a:
     build:
-      context: .
-      dockerfile: apps/pnet_test_probe/Dockerfile
+      context: ../pnet_test_probe
     networks: [net-pnet]
     ports: ["3803:3000/tcp"]
     environment:
@@ -121,8 +120,7 @@ services:
 
   probe-dg-b:
     build:
-      context: .
-      dockerfile: apps/pnet_test_probe/Dockerfile
+      context: ../pnet_test_probe
     networks: [net-pnet]
     ports: ["3804:3000/tcp"]
     environment:

@@ -5,7 +5,9 @@
 `pnet_installer bootstrap` installs pNet + agent from a **local** binary
 directory (no network fetch). Phase 4 (signed catalog packages) remains later.
 
-**Related:** `descriptions/app-web-surfaces.md` (owner portal, app web mounts).  
+**Related:** `descriptions/app-web-surfaces.md` (owner portal, app web mounts).
+Apps and the installer live in sibling repos under `pNet_project/` (not in the
+pNet crate).  
 **Out of scope for early portal PRs:** do not fold catalog install into core
 fabric opcodes or into the first `/apps/` reverse-proxy work beyond optional
 manual mounts.
@@ -358,3 +360,4 @@ securable product surface.
 | 2026-09-04 | Phase 1: portal `/store` catalog + copy-install; still no agent. |
 | 2026-09-04 | Phase 2: `pnet_installer` desire/status, notify only; rank-1 SG writes desire. |
 | 2026-09-04 | Phase 3: `bootstrap` copies local `pnet` + agent into `~/.pnet`, writes `start.sh`. |
+| 2026-09-04 | Split apps/installer into sibling repos under `pNet_project/` for independent versioning. |

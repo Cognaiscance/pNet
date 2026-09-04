@@ -92,8 +92,7 @@ services:
 
   probe-sg-alice:
     build:
-      context: .
-      dockerfile: apps/pnet_test_probe/Dockerfile
+      context: ../pnet_test_probe
     networks: [net-pnet]
     ports: ["3811:3000/tcp"]
     environment:
@@ -102,8 +101,7 @@ services:
 
   probe-dg-alice:
     build:
-      context: .
-      dockerfile: apps/pnet_test_probe/Dockerfile
+      context: ../pnet_test_probe
     networks: [net-pnet]
     ports: ["3812:3000/tcp"]
     environment:
@@ -112,8 +110,7 @@ services:
 
   probe-sg-bob:
     build:
-      context: .
-      dockerfile: apps/pnet_test_probe/Dockerfile
+      context: ../pnet_test_probe
     networks: [net-pnet]
     ports: ["3813:3000/tcp"]
     environment:
@@ -122,8 +119,7 @@ services:
 
   probe-dg-bob:
     build:
-      context: .
-      dockerfile: apps/pnet_test_probe/Dockerfile
+      context: ../pnet_test_probe
     networks: [net-pnet]
     ports: ["3814:3000/tcp"]
     environment:

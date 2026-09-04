@@ -302,9 +302,9 @@ Do not conflate those with the owner dashboard + config + app links.
    codes, `/security` (password change + enroll/disable), login rate limit,
    step-up re-auth for invite mint. Passkeys / WebAuthn still later.
 4. **Sample / flagship app page** — **hello done;** **filesync v1 started:**
-   `apps/pnet_filesync` is a hybrid agent (folder replica + `/apps/filesync/`
-   web viewport). Intra-user, LWW, chunked payloads. See
-   `apps/pnet_filesync/description.md`.
+   `pnet_filesync` (sibling repo under `pNet_project/`) is a hybrid agent
+   (folder replica + `/apps/filesync/` web viewport). Intra-user, LWW,
+   chunked payloads. See that crate's `description.md`.
 5. **Discovery** — publish slug / base URL hints in metadata.
 6. **Polish** — domains, TLS automation, hosted-SG product, capability links.
 7. **App store** — **phase 1:** portal `/store` copy-install. **phase 2:**
@@ -318,7 +318,7 @@ messages. Phase 7 is explicitly deferred.
 
 ## Relationship to existing design
 
-- **Dumb pipe** (`apps/pnet_chat/description.md` and app API docs): unchanged;
+- **Dumb pipe** (`pnet_chat` sibling repo `description.md` and app API docs): unchanged;
   web is another client of the *app*, not a new fabric opcode family for
   “websites.”
 - **SG roles** (`Data transport diagram.md`): add “optional owner web portal”

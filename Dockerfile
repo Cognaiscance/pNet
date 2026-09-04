@@ -2,8 +2,7 @@ FROM rust:1-slim AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY apps ./apps
-RUN cargo build --release -p pnet
+RUN cargo build --release --bin pnet
 
 FROM debian:bookworm-slim
 EXPOSE 7777/udp

@@ -24,23 +24,27 @@ source lib.sh
 require ssh
 
 REPO="$(cd ../.. && pwd)"
+# Apps live in sibling repos under pNet_project/ after the split.
+PROJECT="$(cd "$REPO/.." && pwd)"
+PROBE_REPO="${PNET_PROBE_REPO:-$PROJECT/pnet_test_probe}"
+DELIVERER_REPO="${PNET_DELIVERER_REPO:-$PROJECT/pnet_deliverer}"
 BINS=(pnet pnet_test_probe pnet_deliverer)
 STAGE="/tmp/pnet-live-aarch64"
 AARCH64_TRIPLE="aarch64-unknown-linux-gnu"
 AARCH64_OUT="$REPO/target/${AARCH64_TRIPLE}/release"
+AARCH64_PROBE_OUT="$PROBE_REPO/target/${AARCH64_TRIPLE}/release"
+AARCH64_DELIVERER_OUT="$DELIVERER_REPO/target/${AARCH64_TRIPLE}/release"
 # Runtime hosts that need the aarch64 image (build farm + office DG).
 AARCH64_PUSH_HOSTS="${AARCH64_PUSH_HOSTS:-tealface zeus}"
 
-place_local_build() {  # <ssh_host> : copy that host's own ~/pnet-src build into bin/
+place_local_build() {  # <ssh_host> : copy that host's own builds into bin/
     local host="$1"
     say "placing local build on $host -> \$HOME/$REMOTE_DIR/bin"
     ssh "${SSH_OPTS[@]}" "$host" \
-        "set -e; src=\$HOME/pnet-src/target/release; dst=\$HOME/$REMOTE_DIR/bin; \
-         mkdir -p \$dst; \
-         for b in pnet pnet_test_probe pnet_deliverer; do \
-           test -x \$src/\$b || { echo missing \$src/\$b; exit 1; }; \
-           cp -f \$src/\$b \$dst/\$b; \
-         done; \
+        "set -e; dst=\$HOME/$REMOTE_DIR/bin; mkdir -p \$dst
+         cp -f \$HOME/pnet-src/target/release/pnet \$dst/pnet
+         cp -f \$HOME/pnet-project/pnet_test_probe/target/release/pnet_test_probe \$dst/pnet_test_probe
+         cp -f \$HOME/pnet-project/pnet_deliverer/target/release/pnet_deliverer \$dst/pnet_deliverer
          chmod +x \$dst/*; ls -la \$dst" \
         || die "place_local_build failed on $host"
 }
@@ -67,10 +71,9 @@ build_aarch64_native() {
     (
         cd "$REPO"
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-        cargo build --release --target "$AARCH64_TRIPLE" \
-            -p pnet --bin pnet
-        cargo build --release --target "$AARCH64_TRIPLE" \
-            -p pnet_test_probe -p pnet_deliverer
+        cargo build --release --target "$AARCH64_TRIPLE" --bin pnet
+        cargo build --release --target "$AARCH64_TRIPLE" --manifest-path "$PROBE_REPO/Cargo.toml"
+        cargo build --release --target "$AARCH64_TRIPLE" --manifest-path "$DELIVERER_REPO/Cargo.toml"
     ) || die "native aarch64 cargo build failed"
 }
 
@@ -81,6 +84,8 @@ build_aarch64_podman() {
     # may drop image ENV PATH, so set it explicitly. :z for Fedora SELinux.
     podman run --rm \
         -v "$REPO:/src:z" \
+        -v "$PROBE_REPO:/src-apps/pnet_test_probe:z" \
+        -v "$DELIVERER_REPO:/src-apps/pnet_deliverer:z" \
         -w /src \
         -e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
@@ -96,17 +101,23 @@ build_aarch64_podman() {
             # Only the live runtime bins (skip pnet_fuzz_wire).
             # --bin filters the whole invocation, so build pnet bin separately
             # from the probe/deliverer packages.
+            cargo build --release --target aarch64-unknown-linux-gnu --bin pnet
             cargo build --release --target aarch64-unknown-linux-gnu \
-                -p pnet --bin pnet
+                --manifest-path /src-apps/pnet_test_probe/Cargo.toml
             cargo build --release --target aarch64-unknown-linux-gnu \
-                -p pnet_test_probe -p pnet_deliverer
+                --manifest-path /src-apps/pnet_deliverer/Cargo.toml
         ' || die "podman aarch64 build failed"
 }
 
 stage_aarch64_bins() {
     mkdir -p "$STAGE"
+    local -A srcs=(
+        [pnet]="$AARCH64_OUT/pnet"
+        [pnet_test_probe]="$AARCH64_PROBE_OUT/pnet_test_probe"
+        [pnet_deliverer]="$AARCH64_DELIVERER_OUT/pnet_deliverer"
+    )
     for b in "${BINS[@]}"; do
-        local src="$AARCH64_OUT/$b"
+        local src="${srcs[$b]}"
         [[ -x "$src" ]] || die "missing aarch64 binary: $src (build failed?)"
         cp -f "$src" "$STAGE/$b"
         chmod +x "$STAGE/$b"
@@ -124,12 +135,14 @@ if [[ "${SKIP_N64_BUILD:-0}" != "1" ]]; then
     # FORCE_N64_BUILD=0 keeps old bins if present (default: always rebuild).
     if [[ "${FORCE_N64_BUILD:-1}" == "1" ]] || ! ssh "${SSH_OPTS[@]}" n64 \
         'test -x $HOME/pnet-src/target/release/pnet \
-          && test -x $HOME/pnet-src/target/release/pnet_test_probe \
-          && test -x $HOME/pnet-src/target/release/pnet_deliverer'; then
+          && test -x $HOME/pnet-project/pnet_test_probe/target/release/pnet_test_probe \
+          && test -x $HOME/pnet-project/pnet_deliverer/target/release/pnet_deliverer'; then
         # Non-interactive ssh often omits ~/.cargo/bin.
         ssh "${SSH_OPTS[@]}" n64 \
             'export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"
-             cd "$HOME/pnet-src" && cargo build --release -p pnet -p pnet_test_probe -p pnet_deliverer' \
+             cd "$HOME/pnet-src" && cargo build --release --bin pnet
+             cd "$HOME/pnet-project/pnet_test_probe" && cargo build --release
+             cd "$HOME/pnet-project/pnet_deliverer" && cargo build --release' \
             || die "n64 remote build failed (rsync grok-rewrite tree to ~/pnet-src first)"
     fi
     place_local_build n64

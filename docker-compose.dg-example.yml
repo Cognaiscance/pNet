@@ -32,8 +32,7 @@ services:
 
   deliverer:
     build:
-      context: .
-      dockerfile: apps/pnet_deliverer/Dockerfile
+      context: ../pnet_deliverer
     restart: unless-stopped
     networks:
       - net-pnet

@@ -4521,7 +4521,7 @@ mod tests {
         assert!(html.contains("href=\"/store/hello\""));
         assert!(html.contains("nothing is downloaded or auto-installed"));
         let detail = render_store_detail(&t.ctx, "filesync");
-        assert!(detail.contains("cargo run -p pnet_filesync"));
+        assert!(detail.contains("pnet_filesync"));
         assert!(detail.contains("does not execute from the browser"));
         let missing = render_store_detail(&t.ctx, "no-such-app");
         assert!(missing.contains("Unknown catalog app"));

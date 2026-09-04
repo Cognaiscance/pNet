@@ -32,12 +32,13 @@ curl -sS -X POST http://127.0.0.1:8777/api/app-web/register \
 # Then open /apps/hello/ while signed in to the portal.
 ```
 
-Sample apps that self-register:
+Sample apps live in sibling repos under `~/code/pNet_project/` (not in this
+crate). From that directory:
 
 ```bash
-cargo run -p pnet_web_hello     # /apps/hello/
-cargo run -p pnet_filesync      # /apps/filesync/  (folder replica)
-cargo run -p pnet_installer     # /apps/installer/ (desire + status, no auto-exec)
+cargo run --manifest-path pnet_web_hello/Cargo.toml     # /apps/hello/
+cargo run --manifest-path pnet_filesync/Cargo.toml      # /apps/filesync/
+cargo run --manifest-path pnet_installer/Cargo.toml     # /apps/installer/
 # Empty machine: pnet_installer bootstrap --from DIR --prefix ~/.pnet
 ```
 

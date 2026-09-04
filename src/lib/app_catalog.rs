@@ -33,8 +33,8 @@ const CATALOG: &[CatalogApp] = &[
         install_cmd: "\
 # Empty machine (pnet + pnet_installer in the same folder):\n\
 ./pnet_installer bootstrap\n\
-# Agent only:\n\
-cargo run -p pnet_installer\n# UI: /apps/installer/",
+# Agent only (sibling crate under pNet_project):\n\
+cargo run --manifest-path ../pnet_installer/Cargo.toml\n# UI: /apps/installer/",
         notes: "bootstrap copies local binaries only — no network fetch. \
                 Catalog apps stay notify-only until signed install (phase 4).",
         web_slug: Some("installer"),
@@ -50,7 +50,7 @@ cargo run -p pnet_installer\n# UI: /apps/installer/",
         crate_name: "pnet_filesync",
         install_cmd: "\
 # On each device that should hold the folder (and on the SG for always-on web):\n\
-cargo run -p pnet_filesync\n\
+cargo run --manifest-path ../pnet_filesync/Cargo.toml\n\
 # Folder: ~/pnet-filesync   UI: /apps/filesync/",
         notes: "Approve the app in Config → Pending Apps unless \
                 PNET_AUTO_APPROVE_APPS=1. Intra-user only; not a contact share.",
@@ -64,7 +64,7 @@ cargo run -p pnet_filesync\n\
         placement: "Any node whose portal you want to demo; usually the SG.",
         os: "Linux (v1)",
         crate_name: "pnet_web_hello",
-        install_cmd: "cargo run -p pnet_web_hello\n# UI: /apps/hello/",
+        install_cmd: "cargo run --manifest-path ../pnet_web_hello/Cargo.toml\n# UI: /apps/hello/",
         notes: "Smoke-test for portal mounts. Not a real product app.",
         web_slug: Some("hello"),
         status: "available",
@@ -76,7 +76,7 @@ cargo run -p pnet_filesync\n\
         placement: "Room host on rank-1 SG when rooms land; agents on member devices.",
         os: "Linux (preview)",
         crate_name: "pnet_chat",
-        install_cmd: "cargo run -p pnet_chat\n# Dev HTTP UI default :3100 (not a portal mount yet).",
+        install_cmd: "cargo run --manifest-path ../pnet_chat/Cargo.toml\n# Dev HTTP UI default :3100 (not a portal mount yet).",
         notes: "Phase-1 skeleton: register / get-data / send / push only. \
                 Not a full Discord-style product yet.",
         web_slug: None,
