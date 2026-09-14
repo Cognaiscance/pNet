@@ -3,7 +3,9 @@
 **Status:** design intent. **Phase 1** portal `/store` copy-install. **Phase 2:**
 `pnet_installer` agent — desire + status, notify only. **Phase 3 landed:**
 `pnet_installer bootstrap` installs pNet + agent from a **local** binary
-directory (no network fetch). Phase 4 (signed catalog packages) remains later.
+directory (no network fetch). **Phase 3b landed:** catalog is a directory of
+GitHub URL lists (`app_sources/`); the store shows summaries fetched from those
+repos (cached). Phase 4 (signed catalog packages) remains later.
 
 **Related:** `descriptions/app-web-surfaces.md` (owner portal, app web mounts).
 Apps and the installer live in sibling repos under `pNet_project/` (not in the
@@ -130,6 +132,92 @@ Portal Home  (core)
 
 **Critical rule:** desired state is **data**. Packages are **not** synced as
 untrusted fabric payloads as the primary install path.
+
+---
+
+## Catalog sources (`app_sources/`)
+
+The store listing is **not** a hardcoded table in pNet. After the installer is
+on a machine, it owns:
+
+```text
+~/.pnet/installer/app_sources/     # 0700
+  pnet.list                        # managed official GitHub URLs
+  acme.list                        # org/user extra lists; never overwritten
+```
+
+Same idea as apt `sources.list.d`: each **regular file** is a list of GitHub
+repo URLs. The store is the **union** of every file (`pnet.list` first, then
+other files in filename order). Duplicate URLs keep the first occurrence
+(so extra files only add).
+
+### Managed default
+
+`pnet.list` is written by the installer (bootstrap and agent start). It is
+**managed**: if missing, or if its `# managed-revision: N` does not match this
+installer, it is rewritten to the current official set. Do not edit it — add
+another file instead. Extra files are never created or overwritten by us.
+
+Official v1 set (Cognaiscance):
+
+- `https://github.com/Cognaiscance/pnet_filesync`
+- `https://github.com/Cognaiscance/pnet_web_hello`
+- `https://github.com/Cognaiscance/pnet_chat`
+- `https://github.com/Cognaiscance/pnet_installer`
+
+### File format
+
+```text
+# comments and blank lines ignored
+https://github.com/acme/pnet-timesheets
+https://github.com/acme/pnet-badge
+```
+
+- One `https://github.com/owner/repo` URL per line (optional `.git` / trailing slash)
+- Bad lines are skipped and logged; they do not blank the store
+- Dotfiles, `*.bak` / `*.tmp` / `*.swp` / `*~` are ignored
+- Files `0600`, directory `0700` (writing a file here is “add a software source”)
+
+An organization adds apps by dropping `acme.list` into `app_sources/` (image,
+bootstrap, or copy). No installer rebuild.
+
+### Store cards (listing only — no auto-install)
+
+The **installer agent** (rank-1 SG UI at `/apps/installer/`) reads the source
+files and builds cards:
+
+1. Prefer `pnet-app.json` at `HEAD` in the repo (id, name, summary, placement,
+   fabric alias, web slug).
+2. Else GitHub repo API `description` / name.
+3. Else last on-disk cache (`~/.pnet/installer/catalog-cache/`).
+4. Else a baked fallback for official URLs, or a minimal card from the repo name.
+
+Cache so GitHub being down does not empty the page. Refresh on agent start and
+about every six hours. pNet core does **not** fetch GitHub. Portal `/store`
+redirects to the installer mount when it is up; otherwise it shows the baked
+official list as a copy-install fallback.
+
+`app_sources` is **local config**, not fabric-synced. Desire still syncs
+“enable this catalog id on these devices” and now also carries `github_url` /
+`fabric_alias` so a DG can report pending without a copy of `acme.list`. To
+**see** extra apps on a laptop’s own store UI, copy the extra file there too.
+
+Auto-install from those GitHub URLs is **not** this phase (see phase 4).
+
+### `pnet-app.json` (in each app repo)
+
+```json
+{
+  "id": "filesync",
+  "name": "Filesync",
+  "summary": "Folder replica plus portal web viewport.",
+  "placement": "Desktops you want in the set; also the rank-1 SG for always-on web.",
+  "os": "Linux (v1)",
+  "fabric_alias": "filesync",
+  "web_slug": "filesync",
+  "notes": "Approve in Config → Pending Apps unless PNET_AUTO_APPROVE_APPS=1."
+}
+```
 
 ---
 
@@ -303,7 +391,8 @@ shipping `apt` or Docker to the home server.
 | **0** | Manual app run + portal mount register (`pnet_web_hello`) | No |
 | **1** | Catalog UI + “copy install command” / docs only (`GET /store`) | No |
 | **2** | Installer agent app + desire schema + status; **notify only** (`pnet_installer`, `/apps/installer/`) | No auto |
-| **3** (current) | Bootstrap installer installs pNet + agent (`pnet_installer bootstrap`, local binaries only) | Yes (bootstrap) |
+| **3** | Bootstrap installer installs pNet + agent (`pnet_installer bootstrap`, local binaries only) | Yes (bootstrap) |
+| **3b** (current) | `app_sources/` GitHub URL lists + store cards from `pnet-app.json` / API / cache | No auto |
 | **4** | Agent auto-installs **signed** packages for matching placement | Yes |
 | **5** | Updates, uninstall polish, multi-arch, optional multi-publisher | Yes |
 
@@ -317,7 +406,8 @@ Phase 4 is the first “true” multi-device app store install.
 1. **Package format v1:** tarball+systemd vs Docker-first.  
 2. **Desire writer:** rank-1 SG only vs any device with conflict rules.  
 3. **First-install UX:** fully automatic after enable vs confirm per device.  
-4. **Catalog hosting:** static signed JSON on project CDN vs self-hosted only.  
+4. **Catalog hosting:** GitHub URL lists in `app_sources/` (3b). Signed package
+   registry still open for phase 4.  
 5. **Relation to fabric app approval:** auto-approve store-installed apps on
    the installing user’s devices?  
 6. **Agent web slug:** e.g. `installer` or `store`.
@@ -361,3 +451,4 @@ securable product surface.
 | 2026-09-04 | Phase 2: `pnet_installer` desire/status, notify only; rank-1 SG writes desire. |
 | 2026-09-04 | Phase 3: `bootstrap` copies local `pnet` + agent into `~/.pnet`, writes `start.sh`. |
 | 2026-09-04 | Split apps/installer into sibling repos under `pNet_project/` for independent versioning. |
+| 2026-09-14 | Phase 3b: `app_sources/` GitHub URL lists; store cards from repo manifest/API/cache. |

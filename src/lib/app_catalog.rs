@@ -1,10 +1,10 @@
-//! Phase-1 app catalog (docs + copy-install only).
+//! Fallback catalog when the installer agent is not mounted.
 //!
-//! No package fetch, no exec, no desire sync. The owner portal lists these
-//! entries on `/store` so people can run apps by hand. Phase 2+ moves this
-//! UI into the installer agent (`descriptions/app-store-installer.md`).
+//! The live store is the installer (`/apps/installer/`), fed by GitHub URL
+//! lists in `~/.pnet/installer/app_sources/`. Portal `/store` redirects there
+//! when the agent is up. These entries are the official baked set only.
 
-/// One verified catalog entry (in-tree apps the project is willing to name).
+/// One verified catalog entry (official GitHub apps the project is willing to name).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CatalogApp {
     pub id: &'static str,
@@ -14,6 +14,7 @@ pub struct CatalogApp {
     pub placement: &'static str,
     pub os: &'static str,
     pub crate_name: &'static str,
+    pub github_url: &'static str,
     pub install_cmd: &'static str,
     pub notes: &'static str,
     /// Portal slug once the process self-registers, if any.
@@ -30,11 +31,12 @@ const CATALOG: &[CatalogApp] = &[
         placement: "Every pNet device; UI on the rank-1 SG at /apps/installer/.",
         os: "Linux (v1)",
         crate_name: "pnet_installer",
+        github_url: "https://github.com/Cognaiscance/pnet_installer",
         install_cmd: "\
-# Empty machine (pnet + pnet_installer in the same folder):\n\
-./pnet_installer bootstrap\n\
-# Agent only (sibling crate under pNet_project):\n\
-cargo run --manifest-path ../pnet_installer/Cargo.toml\n# UI: /apps/installer/",
+git clone https://github.com/Cognaiscance/pnet_installer\n\
+cd pnet_installer\n\
+cargo run\n# UI: /apps/installer/\n\
+# Extra apps: drop a GitHub URL list in ~/.pnet/installer/app_sources/",
         notes: "bootstrap copies local binaries only — no network fetch. \
                 Catalog apps stay notify-only until signed install (phase 4).",
         web_slug: Some("installer"),
@@ -48,9 +50,11 @@ cargo run --manifest-path ../pnet_installer/Cargo.toml\n# UI: /apps/installer/",
                     so the site still has files when laptops are off.",
         os: "Linux (v1)",
         crate_name: "pnet_filesync",
+        github_url: "https://github.com/Cognaiscance/pnet_filesync",
         install_cmd: "\
-# On each device that should hold the folder (and on the SG for always-on web):\n\
-cargo run --manifest-path ../pnet_filesync/Cargo.toml\n\
+git clone https://github.com/Cognaiscance/pnet_filesync\n\
+cd pnet_filesync\n\
+cargo run\n\
 # Folder: ~/pnet-filesync   UI: /apps/filesync/",
         notes: "Approve the app in Config → Pending Apps unless \
                 PNET_AUTO_APPROVE_APPS=1. Intra-user only; not a contact share.",
@@ -64,7 +68,11 @@ cargo run --manifest-path ../pnet_filesync/Cargo.toml\n\
         placement: "Any node whose portal you want to demo; usually the SG.",
         os: "Linux (v1)",
         crate_name: "pnet_web_hello",
-        install_cmd: "cargo run --manifest-path ../pnet_web_hello/Cargo.toml\n# UI: /apps/hello/",
+        github_url: "https://github.com/Cognaiscance/pnet_web_hello",
+        install_cmd: "\
+git clone https://github.com/Cognaiscance/pnet_web_hello\n\
+cd pnet_web_hello\n\
+cargo run\n# UI: /apps/hello/",
         notes: "Smoke-test for portal mounts. Not a real product app.",
         web_slug: Some("hello"),
         status: "available",
@@ -76,7 +84,11 @@ cargo run --manifest-path ../pnet_filesync/Cargo.toml\n\
         placement: "Room host on rank-1 SG when rooms land; agents on member devices.",
         os: "Linux (preview)",
         crate_name: "pnet_chat",
-        install_cmd: "cargo run --manifest-path ../pnet_chat/Cargo.toml\n# Dev HTTP UI default :3100 (not a portal mount yet).",
+        github_url: "https://github.com/Cognaiscance/pnet_chat",
+        install_cmd: "\
+git clone https://github.com/Cognaiscance/pnet_chat\n\
+cd pnet_chat\n\
+cargo run\n# Dev HTTP UI default :3100 (not a portal mount yet).",
         notes: "Phase-1 skeleton: register / get-data / send / push only. \
                 Not a full Discord-style product yet.",
         web_slug: None,
@@ -113,6 +125,7 @@ mod tests {
             assert!(seen.insert(a.id), "duplicate {}", a.id);
             assert!(!a.install_cmd.is_empty());
             assert!(a.crate_name.starts_with("pnet_"));
+            assert!(a.github_url.starts_with("https://github.com/Cognaiscance/"));
         }
         assert!(get("filesync").is_some());
         assert!(get("nope").is_none());

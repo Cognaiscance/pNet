@@ -137,10 +137,13 @@ pub fn ui_request(
         );
     }
 
-    // Catalog detail: /store/<id>
+    // Catalog detail: /store/<id> (redirect to installer when the agent is up)
     if method == "GET" {
         if let Some(id) = path.strip_prefix("/store/") {
             if super::super::app_catalog::valid_id(id) {
+                if let Some(loc) = store_redirect_target(ctx, path.as_str()) {
+                    return respond_redirect(&stream, &loc);
+                }
                 return respond_html(&stream, 200, &render_store_detail(ctx, id), None);
             }
         }
@@ -251,7 +254,13 @@ pub fn ui_request(
         // Portal home (app links + Config entry). Legacy /dashboard → home.
         ("GET",  "/")            => respond_html(&stream, 200, &render_portal_home(ctx), None),
         ("GET",  "/dashboard")   => respond_redirect(&stream, "/"),
-        ("GET",  "/store")       => respond_html(&stream, 200, &render_store_list(ctx), None),
+        ("GET",  "/store")       => {
+            if let Some(loc) = store_redirect_target(ctx, "/store") {
+                respond_redirect(&stream, &loc)
+            } else {
+                respond_html(&stream, 200, &render_store_list(ctx), None)
+            }
+        }
         ("GET",  "/config")      => respond_html(&stream, 200, &render_config_hub(ctx), None),
         ("GET",  "/security")    => {
             let err = query_param(&query, "error").unwrap_or("");
@@ -1041,6 +1050,22 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
     layout(ctx, "Home", &body)
 }
 
+/// When the installer agent is mounted, `/store` is its UI.
+pub(crate) fn store_redirect_target(ctx: &WorkerContext, path: &str) -> Option<String> {
+    if ctx.app_web.get("installer").is_none() {
+        return None;
+    }
+    if path == "/store" {
+        return Some("/apps/installer/".into());
+    }
+    if let Some(id) = path.strip_prefix("/store/") {
+        if super::super::app_catalog::valid_id(id) {
+            return Some(format!("/apps/installer/app?id={id}"));
+        }
+    }
+    None
+}
+
 pub(crate) fn render_store_list(ctx: &WorkerContext) -> String {
     use super::super::app_catalog;
     let mut cards = String::new();
@@ -1055,20 +1080,22 @@ pub(crate) fn render_store_list(ctx: &WorkerContext) -> String {
                <h2 style=\"margin-top:0;font-size:1.1rem\">\
                  <a href=\"/store/{id}\">{name}</a>{badge}</h2>\
                <p style=\"margin:.2rem 0 .6rem;color:#444\">{summary}</p>\
-               <p class=\"muted\" style=\"margin:0;font-size:.85rem\">Placement: {place}</p>\
+               <p class=\"muted\" style=\"margin:0;font-size:.85rem\">Placement: {place} · \
+               <a href=\"{gh}\">GitHub</a></p>\
              </div>",
             id = html_escape(a.id),
             name = html_escape(a.name),
             summary = html_escape(a.summary),
             place = html_escape(a.placement),
+            gh = html_escape(a.github_url),
         ));
     }
     let body = format!(
         "<h1>Store</h1>\
-         <p style=\"color:#555;margin-top:-.5rem\">Verified in-tree apps. \
-         Copy the run command onto each device you want — \
-         <strong>nothing is downloaded or auto-installed</strong> by this node. \
-         A later installer agent will own signed packages and placement.</p>\
+         <p style=\"color:#555;margin-top:-.5rem\">Official apps (installer agent is not running). \
+         Start <code>pnet_installer</code> on this node to load GitHub lists from \
+         <code>app_sources/</code> and enable apps per device. Until then, copy a clone command — \
+         <strong>nothing is downloaded or auto-installed</strong> by this node.</p>\
          {cards}"
     );
     layout(ctx, "Store", &body)
@@ -1097,6 +1124,7 @@ pub(crate) fn render_store_detail(ctx: &WorkerContext, id: &str) -> String {
          <div class=\"card\">\
            <p>{summary}</p>\
            <p><strong>Typical placement:</strong> {place}</p>\
+           <p><a href=\"{gh}\">{gh}</a></p>\
            <p>{notes}</p>\
            {slug_line}\
            <p style=\"margin-bottom:.4rem\"><strong>Run on this machine</strong> \
@@ -1113,6 +1141,7 @@ pub(crate) fn render_store_detail(ctx: &WorkerContext, id: &str) -> String {
         crate_name = html_escape(a.crate_name),
         summary = html_escape(a.summary),
         place = html_escape(a.placement),
+        gh = html_escape(a.github_url),
         notes = html_escape(a.notes),
     );
     layout(ctx, "Store", &body)

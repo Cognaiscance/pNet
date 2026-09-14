@@ -7,8 +7,8 @@ portal **Home** page (see `descriptions/app-web-surfaces.md`).
 | Path | Role |
 |------|------|
 | `/` | Portal home — app page links (when registered) + Store + Config |
-| `/store` | Phase-1 catalog: verified apps with copy-install commands (no auto-exec) |
-| `/store/<id>` | Catalog detail + run command for one app |
+| `/store` | Catalog: redirects to `/apps/installer/` when the agent is mounted; otherwise official baked apps (copy-install, no auto-exec) |
+| `/store/<id>` | Catalog detail, or redirect to the installer app page when mounted |
 | `/config` | Config hub — overview stats and links to control sections |
 | `/apps/<slug>/…` | Reverse-proxy to a local app HTTP port (owner session required) |
 | `/api/app-web/register` | **Loopback only** — app process registers `slug` + `port` (+ optional `title`) |

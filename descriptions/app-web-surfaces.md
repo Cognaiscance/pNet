@@ -310,8 +310,11 @@ Do not conflate those with the owner dashboard + config + app links.
 7. **App store** — **phase 1:** portal `/store` copy-install. **phase 2:**
    `pnet_installer` agent (`/apps/installer/`) desire + status, notify only.
    **phase 3:** `pnet_installer bootstrap` installs pNet + agent from local
-   binaries. Signed catalog auto-install remains later
-   (`descriptions/app-store-installer.md`).
+   binaries. **phase 3b:** catalog is GitHub URL lists in
+   `~/.pnet/installer/app_sources/` (managed `pnet.list` + extra org files);
+   store cards from `pnet-app.json` / GitHub API / cache. `/store` redirects
+   to the installer when it is mounted. Signed catalog auto-install remains
+   later (`descriptions/app-store-installer.md`).
 
 None of the near-term phases require pNet core to understand files, rooms, or
 messages. Phase 7 is explicitly deferred.
