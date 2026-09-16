@@ -3,10 +3,12 @@
 **Status:** design intent. **Phase 2:**
 `pnet_installer` agent — desire + status, notify only. **Phase 3 landed:**
 `pnet_installer bootstrap` installs pNet + agent from a **local** binary
-directory (no network fetch). **Phase 3b landed:** catalog is a directory of
-GitHub URL lists (`app_sources/`); the store shows summaries fetched from those
-repos (cached) on `/apps/installer/` only. Core has no `/store` route. Phase 4
-(signed catalog packages) remains later.
+directory (no network fetch). **Phase 3b landed (current code):** catalog is a
+directory of GitHub URL lists (`app_sources/`); the store shows summaries
+fetched from those repos (cached) on `/apps/installer/` only. Core has no
+`/store` route. **Phase 4 decisions locked** (signed GitHub Release tarball +
+`systemd --user`; Save desire installs official apps; installer attests fabric
+approve) — not implemented yet. Extra org lists stay notify-only until phase 5.
 
 **Related:** `descriptions/app-web-surfaces.md` (owner portal, app web mounts).
 Apps and the installer live in sibling repos under `pNet_project/` (not in the
@@ -93,8 +95,10 @@ Portal Home  (core)
 1. Install pNet (+ agent) via bootstrap package or existing install path.
 2. Open portal → **Installer**.
 3. Pick a verified app → choose machines (e.g. rank-1 SG + this laptop).
-4. Installer agents on those machines install the signed package and start it.
-5. Each target app registers with its local node; routing/approval work as today.
+4. Installer agents on those machines fetch the signed GitHub Release, verify
+   it, unpack, and start a `systemd --user` unit (Save desire is consent).
+5. Each target app registers with its local node; the installer attests fabric
+   approval for what it just started (manual `cargo run` still uses Config).
 6. Optional: app mounts a web UI on the SG (`/apps/<slug>/`).
 
 ---
@@ -127,7 +131,7 @@ Portal Home  (core)
 | Layer | Content | Transport |
 |--------|---------|-----------|
 | **Desire / policy** | Which apps, versions, which devices, enabled | Installer↔installer over pNet (private app messages / app-level sync) |
-| **Packages** | Bytes + version + signature + OS/arch | HTTPS (or later airgap import) from trusted registry |
+| **Packages** | Bytes + version + signature + OS/arch | HTTPS GitHub Releases on the catalog repo (airgap import later) |
 | **Runtime** | Process up, register, portal mount | Local agent + existing app API |
 | **Directory** | Who is running what for routing | Existing pNet register + directory sync |
 
@@ -203,7 +207,9 @@ Until that agent is running, Home lists no installer page.
 `fabric_alias` so a DG can report pending without a copy of `acme.list`. To
 **see** extra apps on a laptop’s own store UI, copy the extra file there too.
 
-Auto-install from those GitHub URLs is **not** this phase (see phase 4).
+Auto-install from those GitHub URLs is **not** phase 3b. Phase 4 installs
+**signed GitHub Release tarballs** for official `pnet.list` apps only (see
+below). Extra `app_sources/` files stay notify-only until phase 5.
 
 ### `pnet-app.json` (in each app repo)
 
@@ -216,7 +222,7 @@ Auto-install from those GitHub URLs is **not** this phase (see phase 4).
   "os": "Linux (v1)",
   "fabric_alias": "filesync",
   "web_slug": "filesync",
-  "notes": "Approve in Config → Pending Apps unless PNET_AUTO_APPROVE_APPS=1."
+  "notes": "Store install (phase 4): installer attests fabric approve. Manual cargo run: Config → Pending Apps."
 }
 ```
 
@@ -240,14 +246,16 @@ Auto-install from those GitHub URLs is **not** this phase (see phase 4).
 - On each device: reconcile local reality to desire (install/update/remove)
 - Verify package signatures before install
 - Report **status** back into shared installer state
-- Never require core to understand Docker/apt/systemd details
+- Never require core to understand packages or systemd
 
 ### What it does *not* do
 
 - Replace Config / admin for invites and ranks
 - Become a general remote shell
-- Auto-approve fabric apps unless product policy says so (still use approval
-  or `PNET_AUTO_APPROVE_APPS` only in test)
+- Auto-approve **arbitrary** local apps. Phase 4: it attests fabric approval
+  only for aliases **it just installed** (loopback, installer app token).
+  Manual `cargo run` still uses Config → Pending Apps.
+  `PNET_AUTO_APPROVE_APPS` remains test-only.
 
 ---
 
@@ -303,10 +311,10 @@ InstallStatus {               // per device, reported by local agent
 }
 ```
 
-### Source of truth (v1 recommendation)
+### Source of truth
 
-- **Rank-1 SG installer** (or single elected “policy writer”) is authoritative
-  for the desire list.
+- **Rank-1 SG installer** (lowest `sg_rank` among own-user SGs) is
+  authoritative for the desire list. Solo node (no SG) may write locally.
 - Other agents **pull / accept** desire and **push** local status.
 - Avoid dual-writer CRDTs until there is a real need for offline multi-edit.
 
@@ -339,30 +347,35 @@ beat raw UUID lists for UX, with UUID override for power users.
 
 ## Package trust and install mechanics
 
-### Catalog
+### Catalog listing vs packages
 
-- List of verified apps: id, name, description, versions, supported OS/arch,
-  default placement hints, package URLs, **signatures**.
-- Hosted by the project (or user-configured registry URL in agent config).
-- Agent ships **pinned public keys** for catalog/package verification.
+- **Listing (3b):** GitHub URL lists in `app_sources/`; cards from
+  `pnet-app.json` / API / cache. Not a hardcoded table in core.
+- **Packages (phase 4):** GitHub **Releases** on that same repo. Assets are a
+  signed tarball for the local OS/arch plus a detached signature. Docker is
+  not the v1 install path.
+- Agent ships **pinned public keys**. Unsigned, wrong key, or extra-list
+  apps: **no exec** (extra lists stay notify-only until phase 5).
 
-### Install pipeline (per device)
+### Install pipeline (per device, phase 4)
 
-1. See desire: enabled for **this** device.  
-2. Skip if already at requested version and healthy.  
-3. Fetch package for **local OS/arch**.  
-4. Verify signature (fail closed).  
-5. Install via **one** v1 mechanism (choose at implementation time), e.g.:
-   - signed tarball + systemd **user** unit, or  
-   - Docker image + compose fragment  
-6. Start process; wait for fabric **register** (or document if agent registers
-   a stub).  
-7. Publish `InstallStatus`.
+1. See desire: enabled for **this** device (Save desire on the rank-1 SG is
+   consent; no per-device confirm). New devices are not included until their
+   UUID is added to the desire list.
+2. Skip if already at requested version and healthy.
+3. Fetch the GitHub Release tarball + signature for **local OS/arch**.
+   Official `pnet.list` only.
+4. Verify signature against the pinned project key (fail closed).
+5. Unpack under `~/.pnet/apps/<id>/` (versioned). Write a systemd **user**
+   unit and start it. Headless SGs need linger so the unit survives logout.
+6. Wait for fabric **register**. Installer attests approve for that local
+   alias (loopback, installer app token). Core does not learn about packages.
+7. Publish `InstallStatus`: Pending → Downloading → Installed / Failed.
 
 ### Uninstall / disable
 
 1. Desire `enabled: false` or removed for this device.  
-2. Stop process; unregister fabric app / portal mount if applicable.  
+2. Stop the user unit; unregister fabric app / portal mount if applicable.  
 3. Optionally remove package files; **prompt or policy** for user data dirs.  
 4. Status → `Removed`.
 
@@ -372,8 +385,8 @@ beat raw UUID lists for UX, with UUID override for power users.
 
 | Risk | Mitigation |
 |------|------------|
-| Malicious “install this” desire | Signed packages only; agent ignores unsigned |
-| Compromised SG pushes malware | Same: signature + pin keys; optional user confirm on first install |
+| Malicious “install this” desire | Signed packages only; agent ignores unsigned and extra-list apps |
+| Compromised SG pushes malware | Same: signature + pin keys. Save desire is fleet consent; extra lists cannot exec |
 | Over-broad placement | Explicit device/label selection; safe defaults |
 | Agent as root | Prefer non-root; clear escalation if required |
 | Secrets in desire sync | Never put tokens/passwords in desire; local config only |
@@ -394,24 +407,28 @@ shipping `apt` or Docker to the home server.
 | **2** | Installer agent app + desire schema + status; **notify only** (`pnet_installer`, `/apps/installer/`) | No auto |
 | **3** | Bootstrap installer installs pNet + agent (`pnet_installer bootstrap`, local binaries only) | Yes (bootstrap) |
 | **3b** (current) | `app_sources/` GitHub URL lists + store cards from `pnet-app.json` / API / cache | No auto |
-| **4** | Agent auto-installs **signed** packages for matching placement | Yes |
+| **4** | Agent auto-installs **signed GitHub Release tarballs** via `systemd --user` for matching placement (official `pnet.list` only) | Yes |
 | **5** | Updates, uninstall polish, multi-arch, optional multi-publisher | Yes |
 
 Phase 1’s portal `/store` fallback was removed; catalog requires the installer agent.  
-Phase 4 is the first “true” multi-device app store install.
+Phase 4 is the first “true” multi-device app store install. Decisions below are
+locked; code is still phase 3b.
 
 ---
 
-## Open decisions (resolve at implementation)
+## Phase 4 decisions (locked 2026-09-16)
 
-1. **Package format v1:** tarball+systemd vs Docker-first.  
-2. **Desire writer:** rank-1 SG only vs any device with conflict rules.  
-3. **First-install UX:** fully automatic after enable vs confirm per device.  
-4. **Catalog hosting:** GitHub URL lists in `app_sources/` (3b). Signed package
-   registry still open for phase 4.  
-5. **Relation to fabric app approval:** auto-approve store-installed apps on
-   the installing user’s devices?  
-6. **Agent web slug:** e.g. `installer` or `store`.
+Not implemented yet. Current agent is still notify-only (phase 3b).
+
+| Topic | Decision |
+|--------|----------|
+| **Package format** | Signed tarball + `systemd --user` unit. Not Docker. Headless SGs need linger so the unit survives logout. Unpack under `~/.pnet/apps/<id>/`. |
+| **Registry** | GitHub Releases on the same repo URL as `app_sources/`. Assets: tarball + signature. Verify against the pinned project public key (fail closed). |
+| **Who auto-installs** | Official `pnet.list` apps only, when the signature matches. Extra org lists (`acme.list`) stay **notify-only** until phase 5 (multi-publisher keys). |
+| **Consent** | Save desire on the rank-1 SG (enable + device list) is enough. Matching agents fetch, verify, unpack, and start. No per-device confirm. New devices are not included until their UUID is added. |
+| **Fabric approval** | After the started process registers, the installer auto-approves that local alias (loopback-only attest with the installer app token). Core stays dumb: no package knowledge. `cargo run` and anything not started by the installer still need Config → Pending Apps. `PNET_AUTO_APPROVE_APPS` remains test-only. |
+| **Desire writer** | Rank-1 SG (lowest `sg_rank` among own-user SGs). Solo node may write. Already in 3b. |
+| **Web slug** | `installer` (`/apps/installer/`). Already in 3b. |
 
 ---
 
@@ -421,9 +438,9 @@ Phase 4 is the first “true” multi-device app store install.
 |--------------|--------------|
 | **Dumb pipe / app API** | Unchanged; target apps still register/send/push |
 | **App web surfaces** | Store UI is an app mount; portal Home lists it |
-| **Config / admin UI** | Fabric control plane; not the package manager |
+| **Config / admin UI** | Fabric control plane (invites, ranks, manual app approve); not the package manager |
 | **Directory / sync** | Running apps only; desire stays in installer app |
-| **Lazy tunnels** | Optional for large package mirrors later; not required for HTTPS registry |
+| **Lazy tunnels** | Optional for large package mirrors later; not required for GitHub Releases |
 
 ---
 
@@ -435,8 +452,9 @@ Phase 4 is the first “true” multi-device app store install.
   install, and status.  
 - A **bootstrap installer** installs pNet then the agent; the agent is also
   part of normal pNet install.  
-- **Desire** syncs installer→installer; **packages** come from a trusted
-  registry; **directory** still reflects only running apps.  
+- **Desire** syncs installer→installer; **packages** come from GitHub
+  Releases on the catalog repo (signed tarball + `systemd --user`);
+  **directory** still reflects only running apps.  
 
 This keeps pNet a dumb pipe while making multi-device app install a deliberate,
 securable product surface.
@@ -454,3 +472,4 @@ securable product surface.
 | 2026-09-04 | Split apps/installer into sibling repos under `pNet_project/` for independent versioning. |
 | 2026-09-14 | Phase 3b: `app_sources/` GitHub URL lists; store cards from repo manifest/API/cache. |
 | 2026-09-14 | Removed portal `/store`. Catalog is only `/apps/installer/` (installer agent). |
+| 2026-09-16 | Phase 4 decisions locked: signed tarball + systemd user unit; GitHub Releases; Save desire installs official apps; installer attests fabric approve; extra lists notify-only until phase 5. |
