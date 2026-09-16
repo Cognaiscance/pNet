@@ -137,18 +137,6 @@ pub fn ui_request(
         );
     }
 
-    // Catalog detail: /store/<id> (redirect to installer when the agent is up)
-    if method == "GET" {
-        if let Some(id) = path.strip_prefix("/store/") {
-            if super::super::app_catalog::valid_id(id) {
-                if let Some(loc) = store_redirect_target(ctx, path.as_str()) {
-                    return respond_redirect(&stream, &loc);
-                }
-                return respond_html(&stream, 200, &render_store_detail(ctx, id), None);
-            }
-        }
-    }
-
     // Reverse-proxy app web mounts (owner session required).
     if path.starts_with("/apps/") {
         return handle_app_web_proxy(stream, &method, &path, &query, &body, ctx);
@@ -254,13 +242,6 @@ pub fn ui_request(
         // Portal home (app links + Config entry). Legacy /dashboard → home.
         ("GET",  "/")            => respond_html(&stream, 200, &render_portal_home(ctx), None),
         ("GET",  "/dashboard")   => respond_redirect(&stream, "/"),
-        ("GET",  "/store")       => {
-            if let Some(loc) = store_redirect_target(ctx, "/store") {
-                respond_redirect(&stream, &loc)
-            } else {
-                respond_html(&stream, 200, &render_store_list(ctx), None)
-            }
-        }
         ("GET",  "/config")      => respond_html(&stream, 200, &render_config_hub(ctx), None),
         ("GET",  "/security")    => {
             let err = query_param(&query, "error").unwrap_or("");
@@ -962,7 +943,7 @@ pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 // ── Page renders ─────────────────────────────────────────────────────────────
 
 /// Portal home: app web links from the mount registry + Config entry.
-fn render_portal_home(ctx: &WorkerContext) -> String {
+pub(crate) fn render_portal_home(ctx: &WorkerContext) -> String {
     let (owner_alias, device_alias, grade_label) = {
         let node = ctx.node.read().unwrap();
         let device = node.owner.user.devices.iter().find(|d| d.uuid == node.device_uuid);
@@ -985,9 +966,6 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
            <p class=\"empty\" style=\"margin:0\">No app pages registered yet. \
            Local apps can register a mount via \
            <code>POST /api/app-web/register</code> (loopback only).</p>\
-           <p style=\"font-size:.85rem;color:#666;margin:.75rem 0 0\">\
-           Browse verified apps on <a href=\"/store\">Store</a> \
-           (copy-install; nothing is auto-installed).</p>\
          </div>".to_string()
     } else {
         let mut rows = String::new();
@@ -1012,33 +990,11 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
         )
     };
 
-    let installer_up = mounts.iter().any(|m| m.slug == "installer");
-    let (store_href, store_btn, store_blurb) = if installer_up {
-        (
-            "/apps/installer/",
-            "Open Installer",
-            "Installer agent is running. Enable apps per device and watch status \
-             (notify only — nothing is auto-installed).",
-        )
-    } else {
-        (
-            "/store",
-            "Open Store",
-            "Copy-install catalog. Run pnet_installer on this SG for desire and \
-             status across devices (still no auto-exec).",
-        )
-    };
-
     let body = format!(
         "<h1>Home</h1>\
          <p style=\"color:#555;margin-top:-.5rem\">Signed in as <strong>{owner_alias}</strong> \
          on <strong>{device_alias}</strong> ({grade_label}).</p>\
          {apps_section}\
-         <div class=\"card\">\
-           <h2 style=\"margin-top:0;font-size:1.1rem\">Store</h2>\
-           <p style=\"margin:0 0 .75rem;color:#444\">{store_blurb}</p>\
-           <p style=\"margin:0\"><a class=\"portal-btn\" href=\"{store_href}\">{store_btn}</a></p>\
-         </div>\
          <div class=\"card\">\
            <h2 style=\"margin-top:0;font-size:1.1rem\">Config</h2>\
            <p style=\"margin:0 0 .75rem;color:#444\">Manage this node: devices, invitations, \
@@ -1048,103 +1004,6 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
          </div>"
     );
     layout(ctx, "Home", &body)
-}
-
-/// When the installer agent is mounted, `/store` is its UI.
-pub(crate) fn store_redirect_target(ctx: &WorkerContext, path: &str) -> Option<String> {
-    if ctx.app_web.get("installer").is_none() {
-        return None;
-    }
-    if path == "/store" {
-        return Some("/apps/installer/".into());
-    }
-    if let Some(id) = path.strip_prefix("/store/") {
-        if super::super::app_catalog::valid_id(id) {
-            return Some(format!("/apps/installer/app?id={id}"));
-        }
-    }
-    None
-}
-
-pub(crate) fn render_store_list(ctx: &WorkerContext) -> String {
-    use super::super::app_catalog;
-    let mut cards = String::new();
-    for a in app_catalog::all() {
-        let badge = if a.status == "preview" {
-            " <span class=\"muted\">(preview)</span>"
-        } else {
-            ""
-        };
-        cards.push_str(&format!(
-            "<div class=\"card\">\
-               <h2 style=\"margin-top:0;font-size:1.1rem\">\
-                 <a href=\"/store/{id}\">{name}</a>{badge}</h2>\
-               <p style=\"margin:.2rem 0 .6rem;color:#444\">{summary}</p>\
-               <p class=\"muted\" style=\"margin:0;font-size:.85rem\">Placement: {place} · \
-               <a href=\"{gh}\">GitHub</a></p>\
-             </div>",
-            id = html_escape(a.id),
-            name = html_escape(a.name),
-            summary = html_escape(a.summary),
-            place = html_escape(a.placement),
-            gh = html_escape(a.github_url),
-        ));
-    }
-    let body = format!(
-        "<h1>Store</h1>\
-         <p style=\"color:#555;margin-top:-.5rem\">Official apps (installer agent is not running). \
-         Start <code>pnet_installer</code> on this node to load GitHub lists from \
-         <code>app_sources/</code> and enable apps per device. Until then, copy a clone command — \
-         <strong>nothing is downloaded or auto-installed</strong> by this node.</p>\
-         {cards}"
-    );
-    layout(ctx, "Store", &body)
-}
-
-pub(crate) fn render_store_detail(ctx: &WorkerContext, id: &str) -> String {
-    use super::super::app_catalog;
-    let Some(a) = app_catalog::get(id) else {
-        return layout(
-            ctx,
-            "Store",
-            "<h1>Not found</h1><p>Unknown catalog app. <a href=\"/store\">Back to Store</a></p>",
-        );
-    };
-    let slug_line = match a.web_slug {
-        Some(s) => format!(
-            "<p>Portal page (after this process is running): \
-             <a href=\"/apps/{s}/\"><code>/apps/{s}/</code></a></p>"
-        ),
-        None => String::new(),
-    };
-    let cmd = html_escape(a.install_cmd);
-    let body = format!(
-        "<h1>{name}</h1>\
-         <p class=\"muted\" style=\"margin-top:-.4rem\">{status} · {os} · crate <code>{crate_name}</code></p>\
-         <div class=\"card\">\
-           <p>{summary}</p>\
-           <p><strong>Typical placement:</strong> {place}</p>\
-           <p><a href=\"{gh}\">{gh}</a></p>\
-           <p>{notes}</p>\
-           {slug_line}\
-           <p style=\"margin-bottom:.4rem\"><strong>Run on this machine</strong> \
-           (copy; does not execute from the browser):</p>\
-           <pre class=\"install-cmd\" id=\"cmd\">{cmd}</pre>\
-           <p><button type=\"button\" class=\"portal-btn\" onclick=\"\
-             navigator.clipboard.writeText(document.getElementById('cmd').innerText)\
-             .then(()=>this.textContent='Copied').catch(()=>{{}})\">Copy command</button></p>\
-         </div>\
-         <p><a href=\"/store\">\u{2190} All apps</a></p>",
-        name = html_escape(a.name),
-        status = html_escape(a.status),
-        os = html_escape(a.os),
-        crate_name = html_escape(a.crate_name),
-        summary = html_escape(a.summary),
-        place = html_escape(a.placement),
-        gh = html_escape(a.github_url),
-        notes = html_escape(a.notes),
-    );
-    layout(ctx, "Store", &body)
 }
 
 /// Proxy `/apps/<slug>/…` to the registered loopback upstream (owner session).
@@ -2564,8 +2423,6 @@ form { display: inline; }
             padding: .55rem 1.4rem; font-size: .95rem; cursor: pointer; }
 .swiz-btn:hover { background: #2a2a4e; }
 .muted { color: #888; }
-.install-cmd { background: #1a1a2e; color: #e8e8f0; padding: .9rem 1rem; border-radius: 6px;
-               overflow-x: auto; font-size: .85rem; white-space: pre-wrap; }
 ";
 
 /// Top-level portal nav: Home + Config entry + logout. Config section pages
@@ -2582,7 +2439,6 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
             | "Invitations"
             | "Diagnostics"
             | "Security"
-            | "Store"
             | "Confirm identity"
     );
     let mut html = String::with_capacity(4096);
@@ -2594,7 +2450,6 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
     html.push_str("<nav>\n");
     html.push_str("  <span class=\"brand\">pNet</span>\n");
     html.push_str("  <a href=\"/\">Home</a>\n");
-    html.push_str("  <a href=\"/store\">Store</a>\n");
     html.push_str("  <a href=\"/config\">Config</a>\n");
     html.push_str("  <form method=\"post\" action=\"/logout\" style=\"margin-left:auto;display:inline\">\
                    <button type=\"submit\" style=\"background:transparent;color:#aac;border:1px solid #556;\

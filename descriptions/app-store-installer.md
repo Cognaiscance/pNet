@@ -1,11 +1,12 @@
 # App store and installer agent
 
-**Status:** design intent. **Phase 1** portal `/store` copy-install. **Phase 2:**
+**Status:** design intent. **Phase 2:**
 `pnet_installer` agent — desire + status, notify only. **Phase 3 landed:**
 `pnet_installer bootstrap` installs pNet + agent from a **local** binary
 directory (no network fetch). **Phase 3b landed:** catalog is a directory of
 GitHub URL lists (`app_sources/`); the store shows summaries fetched from those
-repos (cached). Phase 4 (signed catalog packages) remains later.
+repos (cached) on `/apps/installer/` only. Core has no `/store` route. Phase 4
+(signed catalog packages) remains later.
 
 **Related:** `descriptions/app-web-surfaces.md` (owner portal, app web mounts).
 Apps and the installer live in sibling repos under `pNet_project/` (not in the
@@ -193,9 +194,9 @@ files and builds cards:
 4. Else a baked fallback for official URLs, or a minimal card from the repo name.
 
 Cache so GitHub being down does not empty the page. Refresh on agent start and
-about every six hours. pNet core does **not** fetch GitHub. Portal `/store`
-redirects to the installer mount when it is up; otherwise it shows the baked
-official list as a copy-install fallback.
+about every six hours. pNet core does **not** fetch GitHub and has no `/store`
+route. The catalog lives only on the installer mount (`/apps/installer/`).
+Until that agent is running, Home lists no installer page.
 
 `app_sources` is **local config**, not fabric-synced. Desire still syncs
 “enable this catalog id on these devices” and now also carries `github_url` /
@@ -389,14 +390,14 @@ shipping `apt` or Docker to the home server.
 | Phase | Deliverable | Installs code? |
 |-------|-------------|----------------|
 | **0** | Manual app run + portal mount register (`pnet_web_hello`) | No |
-| **1** | Catalog UI + “copy install command” / docs only (`GET /store`) | No |
+| **1** | Catalog UI + “copy install command” (was portal `/store`; removed — catalog is installer-only) | No |
 | **2** | Installer agent app + desire schema + status; **notify only** (`pnet_installer`, `/apps/installer/`) | No auto |
 | **3** | Bootstrap installer installs pNet + agent (`pnet_installer bootstrap`, local binaries only) | Yes (bootstrap) |
 | **3b** (current) | `app_sources/` GitHub URL lists + store cards from `pnet-app.json` / API / cache | No auto |
 | **4** | Agent auto-installs **signed** packages for matching placement | Yes |
 | **5** | Updates, uninstall polish, multi-arch, optional multi-publisher | Yes |
 
-Phase 1 can live mostly in portal/docs without a fleet agent.  
+Phase 1’s portal `/store` fallback was removed; catalog requires the installer agent.  
 Phase 4 is the first “true” multi-device app store install.
 
 ---
@@ -452,3 +453,4 @@ securable product surface.
 | 2026-09-04 | Phase 3: `bootstrap` copies local `pnet` + agent into `~/.pnet`, writes `start.sh`. |
 | 2026-09-04 | Split apps/installer into sibling repos under `pNet_project/` for independent versioning. |
 | 2026-09-14 | Phase 3b: `app_sources/` GitHub URL lists; store cards from repo manifest/API/cache. |
+| 2026-09-14 | Removed portal `/store`. Catalog is only `/apps/installer/` (installer agent). |

@@ -133,8 +133,7 @@ pub use admin_ui::{apply_new_user_setup, ui_request};
 pub(crate) use admin_ui::{
     UI_ERR_PUBLISH_FAILED, LoginOutcome, approve_app, change_owner_password, complete_setup,
     confirm_totp_enroll, disable_totp, form_field, own_user_sg_partition, partition_banner,
-    reject_app, rename_app, render_diagnostics, render_store_detail, render_store_list,
-    store_redirect_target,
+    reject_app, rename_app, render_diagnostics, render_portal_home,
     safe_next_path, start_totp_enroll, totp_is_enrolled, try_login, try_login_2fa, try_reauth,
     url_decode, verify_totp_or_recovery,
 };
@@ -4515,32 +4514,21 @@ mod tests {
     }
 
     #[test]
-    fn store_catalog_lists_copy_install_not_auto_exec() {
+    fn portal_home_has_no_store_route() {
         let t = TestCtx::new();
-        let html = render_store_list(&t.ctx);
-        assert!(html.contains("href=\"/store/filesync\""));
-        assert!(html.contains("href=\"/store/hello\""));
-        assert!(html.contains("nothing is downloaded or auto-installed"));
-        assert!(html.contains("github.com/Cognaiscance/pnet_filesync"));
-        let detail = render_store_detail(&t.ctx, "filesync");
-        assert!(detail.contains("pnet_filesync"));
-        assert!(detail.contains("does not execute from the browser"));
-        let missing = render_store_detail(&t.ctx, "no-such-app");
-        assert!(missing.contains("Unknown catalog app"));
-        assert!(store_redirect_target(&t.ctx, "/store").is_none());
+        let html = render_portal_home(&t.ctx);
+        assert!(!html.contains("href=\"/store\""));
+        assert!(html.contains("href=\"/config\""));
+        assert!(!html.contains(">Store</a>"));
         t.ctx.app_web.upsert(super::super::app_web::AppWebMount {
             slug: "installer".into(),
             port: 9091,
             title: "Installer".into(),
         });
-        assert_eq!(
-            store_redirect_target(&t.ctx, "/store").as_deref(),
-            Some("/apps/installer/")
-        );
-        assert_eq!(
-            store_redirect_target(&t.ctx, "/store/filesync").as_deref(),
-            Some("/apps/installer/app?id=filesync")
-        );
+        let html = render_portal_home(&t.ctx);
+        assert!(html.contains("href=\"/apps/installer/\""));
+        assert!(!html.contains("href=\"/store\""));
+        assert!(!html.contains(">Store</a>"));
     }
 
     #[test]
