@@ -65,11 +65,11 @@ On startup, the program:
 4. Starts the writer thread (disk persistence channel)
 5. Starts the scheduler thread
 6. Starts the UDP listener
-7. Starts the HTTP server
+7. Starts the HTTP server **only when this node is server-grade** (or is still joining and was started with `PNET_GRADE=sg`). A device-grade node does not listen. First-run setup is not an HTTP route; it is the installer dialog or `PNET_*` variables applied before this step.
 
 On shutdown (SIGTERM/SIGINT), threads are stopped in reverse startup order:
 
-1. **Stop producers** — the UDP listener, HTTP server, and scheduler are signaled to stop. They finish any in-flight operation and go quiet. The queue may still have items.
+1. **Stop producers** — the UDP listener, the HTTP server when one was started, and the scheduler are signaled to stop. They finish any in-flight operation and go quiet. The queue may still have items.
 2. **Drain the queue** — worker threads keep running until the queue is empty.
 3. **Stop worker threads** — workers are signaled to exit. Each finishes its current action, checks the signal on its next iteration, and exits. Main thread joins all worker threads.
 4. **Stop the writer thread** — the channel sender is closed. The writer processes any remaining queued writes, then exits when the channel is empty and closed. Main thread joins the writer thread.

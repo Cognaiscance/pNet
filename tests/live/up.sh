@@ -51,9 +51,7 @@ say "minting device invitation on alice_n64 + starting alice_tealface (DG)"
 CODE_AT=$(mint_device_invitation alice_n64)
 start_node alice_tealface "$CODE_AT"
 
-say "waiting for alice_tealface admin UI (office LAN)..."
-wait_for_url "$(admin_url alice_tealface)/" "$ADMIN_WAIT" \
-    || warn "alice_tealface admin UI not up yet (bootstrap may still be in flight)"
+say "alice_tealface is device grade: no portal to wait for (bootstrap runs over UDP)"
 
 # ── probes ─────────────────────────────────────────────────────────────────
 say "starting probes"
@@ -69,7 +67,6 @@ wait_for_convergence "$CONVERGE_WAIT" p_alice_n64 p_alice_tealface \
     || die "alice did not converge (check tealface can dial ${N64_PUBLIC}:7777 UDP)"
 
 say "TOPOLOGY UP — alice SG (n64/public) + DG (tealface/office) converged."
-printf '  alice admin: %s (n64) | %s (tealface)\n' \
-    "$(admin_url alice_n64)" "$(admin_url alice_tealface)"
+printf '  alice portal (SG only): %s (n64)\n' "$(admin_url alice_n64)"
 printf '  probes: '; for p in "${PROBES[@]}"; do printf '%s ' "$(probe_url "$p")"; done; echo
 printf '  data plane: SG advertises %s (no VPN/Tailscale hosts)\n' "${N64_PUBLIC}:7777"

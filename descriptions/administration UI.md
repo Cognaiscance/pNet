@@ -1,8 +1,13 @@
 # Administration UI (Config) and owner portal
 
-The owner-facing web UI is served over HTTP on port **8777** by default
-(`PNET_HTTP_PORT` overrides). It is the **Config** control plane plus a
-portal **Home** page (see `descriptions/app-web-surfaces.md`).
+The owner-facing website is the **Config** control plane plus a portal
+**Home** page (see `descriptions/app-web-surfaces.md`). It is served over
+HTTP on port **8777** by default (`PNET_HTTP_PORT` overrides).
+
+**Only a server-grade (SG) node binds this port.** A device-grade (DG) node
+does not host the website at all — not on port 80, and not on 8777. Phones,
+laptops, and other DG nodes reach the portal by opening it on one of their
+SG devices. `PNET_HTTP_BIND` is ignored on a DG.
 
 | Path | Role |
 |------|------|
@@ -42,7 +47,7 @@ cargo run --manifest-path pnet_installer/Cargo.toml     # /apps/installer/
 
 ## Access & Authentication
 
-On first-run setup (new user or join), the owner sets an **admin password** for this node. The password is stored as a salted hash on the local node only (`admin_password_hash` in `node.toml`) and is never synced to peers.
+On first-run setup of an **SG** (new user or join), the installer or `PNET_ADMIN_PASSWORD` sets an **admin password** for this node's portal. The password is stored as a salted hash on the local node only (`admin_password_hash` in `node.toml`) and is never synced to peers. A DG has no portal, so it does not ask for one.
 
 After setup, every admin page requires a login session:
 
@@ -84,9 +89,9 @@ resolve). Admin HTTP also binds IPv4 addresses only (`PNET_HTTP_BIND`). See
 
 ## HTTP bind policy
 
-The admin UI binds to **loopback only** by default (`127.0.0.1`), for every device grade (SG and DG). That keeps the control plane off the LAN/WAN unless the operator opts in.
+When the portal runs (SG only), it binds to **loopback only** by default (`127.0.0.1`). That keeps the control plane off the LAN/WAN unless the operator opts in. A DG never binds, so there is no DG website to expose.
 
-To expose the UI beyond the host (Docker port publish, remote admin, etc.), set:
+To expose an SG portal beyond the host (Docker port publish, remote admin, etc.), set:
 
 ```
 PNET_HTTP_BIND=0.0.0.0
@@ -99,12 +104,27 @@ Password auth alone is not a full substitute for network exposure controls — b
 ## Pages
 
 ### Setup (first run)
-Shown only on first access, before the password is set.
-* Set admin password
-* Set owner alias
-* Set device alias
 
-SG-grade devices advertise their reachable addresses via the `PNET_HOSTS` environment variable rather than through the setup form — `PNET_HOSTS` is read at every startup and overwrites the local device's `hosts` list when set. DG-grade devices leave `hosts` empty; their peer address is learned from the source of incoming packets.
+The website does not collect first-run setup. `pnet_installer bootstrap` asks
+in a terminal dialog, then starts `pnet` with the parameters below. If those
+parameters are already on the command line, the dialog is skipped.
+
+| Grade | Dialog / flags | Variables passed to `pnet` |
+|-------|----------------|----------------------------|
+| DG | device name, connection code | `PNET_GRADE=dg`, `PNET_DEVICE_ALIAS`, `PNET_INVITATION_CODE` |
+| SG, new user | name, device name, rank, reachable addresses, portal password | `PNET_GRADE=sg`, `PNET_USER_ALIAS`, `PNET_DEVICE_ALIAS`, `PNET_SG_RANK`, `PNET_HOSTS`, `PNET_ADMIN_PASSWORD` |
+| SG, join | device name, connection code, rank, reachable addresses, portal password | same as new, with `PNET_INVITATION_CODE` instead of `PNET_USER_ALIAS` |
+
+Headless installs set the same variables directly (no dialog). They are
+ignored once the node is initialized, except `PNET_HOSTS`, which stays
+authoritative for the local SG device on every startup. DG devices leave
+`hosts` empty; their peer address is learned from the source of incoming
+packets.
+
+A DG has no portal password to type. An SG stores `PNET_ADMIN_PASSWORD` as
+the portal hash when none exists yet. After an SG join is accepted, the
+portal (already listening because `PNET_GRADE=sg`) shows a short waiting
+page and then the normal sign-in. There is no `/setup` form.
 
 ### Dashboard
 An overview of the node's current state.
@@ -186,4 +206,4 @@ When the owner generates a device invitation, the node:
 3. Stores the invitation in `owner.device_invitations` on that SG. Invitations are device-local (never synced); having the top-ranked SG mint it is what closes the lookup gap when the new device bootstraps.
 4. Displays a shareable code (once, via flash / response header): base64 of `invitation_id (16) || invitation_public_key (32) || host_len (1) || host_bytes (host_len) || port (2)`, where `host_bytes` is the first entry from the target SG's `hosts` list (hostname or IP, no port suffix). Variable-length, suitable for copy-paste or QR code.
 
-On the new, unconfigured device, the owner enters the invitation code. The node parses out the invitation ID, public key, and SG host, then begins the bootstrap exchange (see pnet to pnet communication.md — Device Bootstrap). After the exchange completes, the owner is prompted to set an alias and grade for the new device before it registers with the SG.
+On the new device, `pnet_installer bootstrap` (or the command-line variables above) supplies the device alias, grade, and connection code before `pnet` starts. The node parses the invitation ID, public key, and SG host out of that code, then begins the bootstrap exchange (see pnet to pnet communication.md — Device Bootstrap). The new device does not show a setup page. A DG never serves the portal; an SG serves it after the parameters say it is server grade.

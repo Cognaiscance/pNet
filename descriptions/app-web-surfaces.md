@@ -6,8 +6,10 @@ standing product + architecture reference for the owner-facing web portal.
 
 ## Product shape (owner web portal)
 
-The primary browser experience is a **pNet-hosted dashboard** on the rank-1 SG
-(opt-in public HTTP(S), not the default loopback admin bind alone).
+The primary browser experience is a **pNet-hosted dashboard** on an **SG**
+(the rank-1 SG is the usual one people open). A **DG does not host this
+website** — it does not bind the portal port. Opt-in public HTTP(S) is an SG
+bind, not the default loopback bind, and it is never a DG bind.
 
 ```text
   https://<your-sg>/                  ←  Dashboard (pNet core)
@@ -263,8 +265,8 @@ SG as a normal pNet app and listens on localhost; pNet mounts that port under
   say so and rely on password/passkey quality + TLS.
 - Object access: authorize every download; no “secret URL = capability” unless
   that is an explicit, time-limited feature.
-- Public bind for the portal is opt-in and **SG-oriented**; do not open DG
-  public portals by default.
+- The portal listener exists only on SG nodes. A DG does not bind it, so
+  there is no DG website to publish. Public bind on an SG is opt-in.
 
 ### Data placement for web
 
@@ -324,9 +326,10 @@ messages. Phase 7 is explicitly deferred.
 - **Dumb pipe** (`pnet_chat` sibling repo `description.md` and app API docs): unchanged;
   web is another client of the *app*, not a new fabric opcode family for
   “websites.”
-- **SG roles** (`Data transport diagram.md`): add “optional owner web portal”
-  (dashboard + config entry + app mounts) alongside keepalive hub, relay,
-  writer, invite minting, always-on app hosts.
+- **SG roles** (`Data transport diagram.md`): the owner web portal
+  (dashboard + config entry + app mounts) is an SG responsibility, alongside
+  keepalive hub, relay, writer, invite minting, and always-on app hosts.
+  DG nodes do not serve it.
 - **Admin UI** (`administration UI.md`): becomes the **Config** surface linked
   from the dashboard; keep security defaults (loopback default, password,
   CSRF). Product navigation: dashboard first, config second.

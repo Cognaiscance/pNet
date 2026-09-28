@@ -1,4 +1,8 @@
-//! Owner portal HTTP UI: dashboard home, Config (node control plane), setup.
+//! Owner portal HTTP UI: dashboard home and Config (node control plane).
+//!
+//! First-run setup is not served here. The installer dialog, or `PNET_*`
+//! parameters, configures the node before this process listens. Only a
+//! server-grade node binds this server.
 //!
 //! Served via `ui_request`. Auth lives in `admin_auth`; fabric mutations go
 //! through `request_change` / invitation helpers on sibling modules.
@@ -55,9 +59,13 @@ pub fn ui_request(
         set_session_cookie_header, UiFlash, INVITE_CODE_HEADER,
     };
 
-    let (initialized, has_password) = {
+    let (initialized, has_password, joining) = {
         let node = ctx.node.read().unwrap();
-        (node.is_initialized(), node.admin_password_hash.is_some())
+        (
+            node.is_initialized(),
+            node.admin_password_hash.is_some(),
+            node.owner.pending_bootstrap.is_some(),
+        )
     };
 
     let session_id = session_id_from_cookie_header(&cookie);
@@ -70,6 +78,7 @@ pub fn ui_request(
         .map(|id| ctx.sessions.is_pending_2fa(id))
         .unwrap_or(false);
 
+    // The website wizard is retired. Old bookmarks redirect once the node exists.
     let is_setup_route = matches!(path.as_str(), "/setup" | "/setup/create" | "/setup/join");
     let is_login_route = matches!(path.as_str(), "/login" | "/login/2fa");
     let is_set_password_route = matches!(path.as_str(), "/set-password");
@@ -85,14 +94,12 @@ pub fn ui_request(
         .unwrap_or(false);
 
     // ── Access gates ─────────────────────────────────────────────────────────
-    // 1. Uninitialized → setup only.
+    // 1. Uninitialized → status only (setup is the installer or PNET_* vars).
     // 2. Initialized without password (upgrade path) → set-password only.
     // 3. Initialized with password → login public; everything else needs session
     //    (except loopback app-web mount API).
     if !initialized {
-        if !is_setup_route {
-            return respond_redirect(&stream, "/setup");
-        }
+        return respond_html(&stream, 200, &render_not_ready(joining), None);
     } else if !has_password {
         if is_setup_route {
             return respond_redirect(&stream, "/set-password");
@@ -151,33 +158,6 @@ pub fn ui_request(
     }
 
     match (method.as_str(), path.as_str()) {
-        ("GET",  "/setup") => respond_html(&stream, 200, &render_setup(&query), None),
-        ("POST", "/setup/create") => {
-            match complete_setup(&body, ctx) {
-                Ok(sid) => respond_redirect_cookie(
-                    &stream, "/", &set_session_cookie_header(&sid),
-                ),
-                Err(err) => respond_redirect(
-                    &stream,
-                    &format!("/setup?grade=sg&role=new&error={err}"),
-                ),
-            }
-        }
-        ("POST", "/setup/join") => {
-            match complete_join_setup(&body, ctx) {
-                Ok(sid) => respond_redirect_cookie(
-                    &stream, "/setup?waiting=1", &set_session_cookie_header(&sid),
-                ),
-                Err(err) => {
-                    let grade = form_field(&body, "grade").unwrap_or("dg");
-                    let role_q = if grade == "sg" { "&role=join" } else { "" };
-                    respond_redirect(
-                        &stream,
-                        &format!("/setup?grade={grade}{role_q}&error={err}"),
-                    )
-                }
-            }
-        }
         ("GET",  "/login") => {
             let err = query_param(&query, "error").unwrap_or("");
             respond_html(&stream, 200, &render_login(err), None)
@@ -1913,8 +1893,10 @@ fn render_invitations(
 
 // ── Setup wizard ─────────────────────────────────────────────────────────────
 
-/// Apply first-run setup from the new-user form.
-/// On success returns a new session id (password stored, user logged in).
+/// Apply a new-user form body: identity plus portal password, then a session.
+/// The website no longer posts this. Tests use it to stand up an SG with a
+/// password the same way `PNET_ADMIN_PASSWORD` plus `apply_new_user_setup` do.
+#[cfg(test)]
 pub(crate) fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Result<String, &'static str> {
     use super::super::admin_auth::validate_new_password;
 
@@ -1942,23 +1924,8 @@ pub(crate) fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Result<String,
     Ok(store_password_and_session(ctx, &password))
 }
 
-/// First-run join path: set admin password, then kick off bootstrap.
-/// Returns a session so the waiting page (and dashboard after init) stay authed.
-pub(crate) fn complete_join_setup(body: &[u8], ctx: &WorkerContext) -> Result<String, &'static str> {
-    use super::super::admin_auth::validate_new_password;
-
-    let password = form_field(body, "password").map(url_decode).unwrap_or_default();
-    let confirm  = form_field(body, "password_confirm").map(url_decode).unwrap_or_default();
-    validate_new_password(&password, &confirm)?;
-
-    // Stash password before bootstrap so a completed join is never passwordless.
-    let session = store_password_and_session(ctx, &password);
-    initiate_bootstrap(body, ctx);
-    Ok(session)
-}
-
-/// Typed entry point for first-run new-user setup. Used by both the HTTP form
-/// handler and `main`'s env-driven startup path.
+/// Typed entry point for first-run new-user setup. Used by `main`'s
+/// env-driven startup path (and by tests of that same field set).
 pub fn apply_new_user_setup(
     alias: &str,
     device_alias: &str,
@@ -1996,139 +1963,22 @@ pub fn apply_new_user_setup(
     None
 }
 
-fn render_setup(query: &str) -> String {
-    let grade   = query_param(query, "grade").unwrap_or("");
-    let role    = query_param(query, "role").unwrap_or("");
-    let waiting = query_param(query, "waiting").is_some();
-    let error   = query_param(query, "error").unwrap_or("");
-
-    let body: String = if waiting {
-        // While waiting, allow refresh; once initialized the gate sends to home/login.
-        "<meta http-equiv=\"refresh\" content=\"3; url=/setup\">\
-         <h1>Connecting\u{2026}</h1>\
-         <p class=\"swiz-sub\">Waiting for a response from the server.<br>\
-         This page will refresh automatically.</p>\
-         <p style=\"color:#888;font-size:.8rem\">Make sure the invitation code was valid \
-         and that the server is reachable.</p>"
-            .to_string()
+/// Shown only when an SG is listening before first-run setup has finished
+/// (a join started from the installer or from `PNET_*` variables).
+fn render_not_ready(joining: bool) -> String {
+    let body = if joining {
+        "<meta http-equiv=\"refresh\" content=\"3\">\
+         <h1>Joining the network</h1>\
+         <p class=\"swiz-sub\">This server is waiting to be accepted. \
+         The portal will be here after that. Identity and the connection code \
+         were supplied before this process started.</p>"
     } else {
-        match (grade, role) {
-            ("", _) => render_setup_grade_step(),
-            ("sg", "") => render_setup_role_step(),
-            ("sg", "new") => render_setup_new_user_form(error),
-            ("sg", "join") | ("dg", _) => render_setup_code_entry(grade, error),
-            _ => render_setup_grade_step(),
-        }
+        "<h1>This node is not set up</h1>\
+         <p class=\"swiz-sub\">First-run setup is the pNet installer dialog, \
+         or the <code>PNET_GRADE</code> variables on the command line. \
+         A device-grade node does not serve this website.</p>"
     };
-    setup_layout(&body)
-}
-
-fn render_setup_grade_step() -> String {
-    "<h1>Welcome to pNet</h1>\
-     <p class=\"swiz-sub\">Let\u{2019}s get your node configured. \
-     First, what type of device is this?</p>\
-     <a class=\"choice-btn\" href=\"/setup?grade=sg\">\
-       <span class=\"choice-title\">Server Grade (SG)</span>\
-       <span class=\"choice-desc\">A server with a static IP or domain. \
-       Acts as a relay for your other devices.</span>\
-     </a>\
-     <a class=\"choice-btn\" href=\"/setup?grade=dg\">\
-       <span class=\"choice-title\">Device Grade (DG)</span>\
-       <span class=\"choice-desc\">A laptop, phone, or any device behind a home router. \
-       Requires a server to relay connections.</span>\
-     </a>"
-        .to_string()
-}
-
-fn render_setup_role_step() -> String {
-    "<h1>Server Grade Setup</h1>\
-     <p class=\"swiz-sub\">Is this the first device for a new user, \
-     or are you adding it to an existing account?</p>\
-     <a class=\"choice-btn\" href=\"/setup?grade=sg&role=new\">\
-       <span class=\"choice-title\">New User</span>\
-       <span class=\"choice-desc\">Create a new pNet identity on this server.</span>\
-     </a>\
-     <a class=\"choice-btn\" href=\"/setup?grade=sg&role=join\">\
-       <span class=\"choice-title\">Join Existing</span>\
-       <span class=\"choice-desc\">Add this server to an existing user\u{2019}s pNet \
-       using an invitation code.</span>\
-     </a>\
-     <a class=\"swiz-back\" href=\"/setup\">\u{2190} Back</a>"
-        .to_string()
-}
-
-fn render_setup_new_user_form(error: &str) -> String {
-    let error_msg = match error {
-        "fields" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
-                     Name and device name are required.</p>",
-        "password_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
-                     Admin password must be at least 8 characters.</p>",
-        "password_mismatch" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
-                     Passwords do not match.</p>",
-        _ => "",
-    };
-    format!(
-        "<h1>Create Your Identity</h1>\
-         <p class=\"swiz-sub\">Set your name and give this server a label. \
-         Reachable addresses are configured at startup via the <code>PNET_HOSTS</code> environment variable.</p>\
-         {error_msg}\
-         <form method=\"post\" action=\"/setup/create\" style=\"display:block\">\
-           <input type=\"hidden\" name=\"grade\" value=\"sg\">\
-           <label class=\"swiz-label\">Your name or alias</label>\
-           <input class=\"swiz-input\" type=\"text\" name=\"alias\" \
-                  placeholder=\"e.g. Alice\" required autocomplete=\"off\">\
-           <label class=\"swiz-label\">Device name</label>\
-           <input class=\"swiz-input\" type=\"text\" name=\"device_alias\" \
-                  placeholder=\"e.g. Home Server\" required autocomplete=\"off\">\
-           <label class=\"swiz-label\">SG rank (1 = highest priority relay)</label>\
-           <input class=\"swiz-input\" type=\"number\" name=\"sg_rank\" \
-                  value=\"1\" min=\"1\" max=\"255\" autocomplete=\"off\">\
-           <label class=\"swiz-label\">Admin password</label>\
-           <input class=\"swiz-input\" type=\"password\" name=\"password\" \
-                  required minlength=\"8\" autocomplete=\"new-password\">\
-           <label class=\"swiz-label\">Confirm admin password</label>\
-           <input class=\"swiz-input\" type=\"password\" name=\"password_confirm\" \
-                  required minlength=\"8\" autocomplete=\"new-password\">\
-           <button class=\"swiz-btn\" type=\"submit\">Create Identity</button>\
-         </form>\
-         <a class=\"swiz-back\" href=\"/setup?grade=sg\">\u{2190} Back</a>"
-    )
-}
-
-fn render_setup_code_entry(grade: &str, error: &str) -> String {
-    let back = if grade == "sg" { "/setup?grade=sg" } else { "/setup" };
-    let form_grade = if grade == "sg" { "sg" } else { "dg" };
-    let error_msg = match error {
-        "password_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
-                     Admin password must be at least 8 characters.</p>",
-        "password_mismatch" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
-                     Passwords do not match.</p>",
-        _ => "",
-    };
-    format!(
-        "<h1>Enter Invitation Code</h1>\
-         <p class=\"swiz-sub\">Paste the invitation code generated on your existing device. \
-         Also set an admin password for this device\u{2019}s web UI.</p>\
-         {error_msg}\
-         <form method=\"post\" action=\"/setup/join\" style=\"display:block\">\
-           <input type=\"hidden\" name=\"grade\" value=\"{form_grade}\">\
-           <label class=\"swiz-label\">Device name</label>\
-           <input class=\"swiz-input\" name=\"device_alias\" type=\"text\" \
-             placeholder=\"e.g. My Laptop\" required autocomplete=\"off\">\
-           <label class=\"swiz-label\">Invitation code</label>\
-           <textarea name=\"code\" rows=\"4\" class=\"swiz-input\" \
-             style=\"font-family:monospace;font-size:.8rem;resize:vertical\" \
-             placeholder=\"Paste code here\u{2026}\" required></textarea>\
-           <label class=\"swiz-label\">Admin password</label>\
-           <input class=\"swiz-input\" type=\"password\" name=\"password\" \
-                  required minlength=\"8\" autocomplete=\"new-password\">\
-           <label class=\"swiz-label\">Confirm admin password</label>\
-           <input class=\"swiz-input\" type=\"password\" name=\"password_confirm\" \
-                  required minlength=\"8\" autocomplete=\"new-password\">\
-           <button class=\"swiz-btn\" type=\"submit\">Connect</button>\
-         </form>\
-         <a class=\"swiz-back\" href=\"{back}\">\u{2190} Back</a>"
-    )
+    setup_layout(body)
 }
 
 fn render_login(error: &str) -> String {

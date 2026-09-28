@@ -70,7 +70,7 @@ preference sync.
 | Piece | Role |
 |--------|------|
 | **Bootstrap installer** | First-run / recovery: install pNet + agent; help create/join user |
-| **Installer agent (app)** | Long-running; store UI (on SG), desire sync, local reconcile |
+| **Installer agent (app)** | Long-running; store UI on an SG portal, desire sync, local reconcile. No website on a DG. |
 | **Target apps** | Normal pNet apps (filesync, chat host, …); register themselves |
 
 Same codebase can serve bootstrap and agent modes.
@@ -92,8 +92,8 @@ Portal Home  (core)
 
 ### Happy path (user mental model)
 
-1. Install pNet (+ agent) via bootstrap package or existing install path.
-2. Open portal → **Installer**.
+1. Run `pnet_installer bootstrap`. The dialog (or the command-line flags) configures the node, then the installer starts `pnet` and the agent. A DG is done when it has joined; open the portal on an SG. An SG's portal is `http://<bind>:8777/`.
+2. On that SG portal, open **Installer**.
 3. Pick a verified app → choose machines (e.g. rank-1 SG + this laptop).
 4. Installer agents on those machines fetch the signed GitHub Release, verify
    it, unpack, and start a `systemd --user` unit (Save desire is consent).
@@ -265,8 +265,8 @@ below). Extra `app_sources/` files stay notify-only until phase 5.
 
 1. Install **pNet** if missing or outdated (user-consented).
 2. Install/start **installer agent**.
-3. Help **create user or join** (invite), or hand off to portal Config.
-4. Register agent with local pNet; on SG, register portal mount for store UI.
+3. **Collect node parameters before `pnet` starts**, unless they are already on the command line. A DG supplies a device name and a connection code. An SG supplies either a new-user identity or a connection code, plus rank, reachable addresses, and the portal password. The installer writes those into `node.env` and the launcher exports them (`PNET_GRADE`, `PNET_DEVICE_ALIAS`, `PNET_INVITATION_CODE` or `PNET_USER_ALIAS`, `PNET_SG_RANK`, `PNET_HOSTS`, `PNET_ADMIN_PASSWORD`).
+4. Register agent with local pNet. On an SG, register the portal mount for the store UI. On a DG, the agent does not bind its own website; the catalog page is the SG portal's `/apps/installer/`.
 
 ### Relationship to normal install
 
@@ -473,3 +473,4 @@ securable product surface.
 | 2026-09-14 | Phase 3b: `app_sources/` GitHub URL lists; store cards from repo manifest/API/cache. |
 | 2026-09-14 | Removed portal `/store`. Catalog is only `/apps/installer/` (installer agent). |
 | 2026-09-16 | Phase 4 decisions locked: signed tarball + systemd user unit; GitHub Releases; Save desire installs official apps; installer attests fabric approve; extra lists notify-only until phase 5. |
+| 2026-09-28 | Owner website is SG-only. DG does not bind the portal. First-run setup moves from `/setup` to the bootstrap dialog (or command-line parameters) before `pnet` starts. |

@@ -59,10 +59,14 @@ pub fn parse_http_bind(bind: Option<&str>, bind_all: bool) -> Ipv4Addr {
 
 /// Admin-UI HTTP bind address.
 ///
-/// **Default:** `127.0.0.1` (loopback) for all grades — SG and DG alike.
+/// **Default:** `127.0.0.1` (loopback) when the portal is running.
 ///
-/// **Opt-in remote admin:** set `PNET_HTTP_BIND` to an IPv4 address, typically
-/// `0.0.0.0` for container port-publish or LAN access. Examples:
+/// The portal runs only on a server-grade node. A device-grade node does not
+/// bind this port, even if `PNET_HTTP_BIND` is set. See
+/// [`owner_portal_enabled`].
+///
+/// **Opt-in remote admin (SG only):** set `PNET_HTTP_BIND` to an IPv4 address,
+/// typically `0.0.0.0` for container port-publish or LAN access. Examples:
 /// `PNET_HTTP_BIND=0.0.0.0`, `PNET_HTTP_BIND=192.168.1.10`.
 ///
 /// **Legacy:** `PNET_HTTP_BIND_ALL=1` (or `true`) is still accepted as an alias
@@ -73,6 +77,25 @@ pub fn http_bind_ip() -> Ipv4Addr {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     parse_http_bind(bind.as_deref(), bind_all)
+}
+
+/// Whether this process should bind the owner portal.
+///
+/// * An initialized node listens only when the local device is server-grade.
+/// * A node that is still joining listens only when startup declared
+///   `PNET_GRADE=sg` (the website comes up while the invitation is in flight).
+/// * A device-grade node, and a node with no setup parameters, does not listen.
+pub fn owner_portal_enabled(
+    initialized: bool,
+    local_grade_is_sg: bool,
+    declared_grade: Option<&str>,
+) -> bool {
+    if initialized {
+        return local_grade_is_sg;
+    }
+    declared_grade
+        .map(|g| g.trim().eq_ignore_ascii_case("sg"))
+        .unwrap_or(false)
 }
 
 impl HttpServer {
@@ -259,6 +282,19 @@ mod tests {
         assert_eq!(parse_http_bind(None, true), Ipv4Addr::UNSPECIFIED);
         // Explicit PNET_HTTP_BIND wins over legacy BIND_ALL.
         assert_eq!(parse_http_bind(Some("127.0.0.1"), true), Ipv4Addr::LOCALHOST);
+    }
+
+    #[test]
+    fn portal_listens_only_for_server_grade() {
+        assert!(owner_portal_enabled(true, true, None));
+        assert!(owner_portal_enabled(true, true, Some("dg")));
+        assert!(!owner_portal_enabled(true, false, Some("sg")));
+        assert!(!owner_portal_enabled(true, false, None));
+        assert!(owner_portal_enabled(false, false, Some("sg")));
+        assert!(owner_portal_enabled(false, false, Some(" SG ")));
+        assert!(!owner_portal_enabled(false, false, Some("dg")));
+        assert!(!owner_portal_enabled(false, true, None));
+        assert!(!owner_portal_enabled(false, false, Some("nope")));
     }
 
     #[test]

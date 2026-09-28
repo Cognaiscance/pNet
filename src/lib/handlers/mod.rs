@@ -131,12 +131,14 @@ pub use tunnels::{
 mod admin_ui;
 pub use admin_ui::{apply_new_user_setup, ui_request};
 pub(crate) use admin_ui::{
-    UI_ERR_PUBLISH_FAILED, LoginOutcome, approve_app, change_owner_password, complete_setup,
+    UI_ERR_PUBLISH_FAILED, LoginOutcome, approve_app, change_owner_password,
     confirm_totp_enroll, disable_totp, form_field, own_user_sg_partition, partition_banner,
     reject_app, rename_app, render_diagnostics, render_portal_home,
     safe_next_path, start_totp_enroll, totp_is_enrolled, try_login, try_login_2fa, try_reauth,
     url_decode, verify_totp_or_recovery,
 };
+#[cfg(test)]
+pub(crate) use admin_ui::complete_setup;
 
 
 // ── Peer pNet node handlers ───────────────────────────────────────────────────

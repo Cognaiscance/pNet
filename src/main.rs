@@ -22,7 +22,7 @@ fn data_dir() -> PathBuf {
 /// Overwrite the local device's `hosts` list with the parsed `PNET_HOSTS`
 /// entries, if the node is already set up and the local device is SG-grade.
 /// Called on every startup — `PNET_HOSTS` is authoritative when set.
-/// On fresh containers, `complete_setup` re-applies after initialization.
+/// On fresh containers, new-user setup re-applies hosts after initialization.
 fn apply_pnet_hosts(node: &Arc<RwLock<pnet::data_models::Node>>, hosts: &[String]) {
     if hosts.is_empty() { return; }
     let mut n = node.write().unwrap();
@@ -111,6 +111,45 @@ fn apply_env_setup(ctx: &WorkerContext) {
     }
 }
 
+fn local_device_is_sg(node: &pnet::data_models::Node) -> bool {
+    node.owner
+        .user
+        .devices
+        .iter()
+        .find(|d| d.uuid == node.device_uuid)
+        .is_some_and(|d| matches!(d.grade, DeviceGrade::SG))
+}
+
+/// Portal listens for an initialized SG, or for a not-yet-initialized process
+/// that was started with `PNET_GRADE=sg` (join still in flight).
+fn owner_portal_should_listen(node: &pnet::data_models::Node) -> bool {
+    let declared = std::env::var("PNET_GRADE").ok();
+    pnet::http_server::owner_portal_enabled(
+        node.is_initialized(),
+        local_device_is_sg(node),
+        declared.as_deref(),
+    )
+}
+
+/// One-line grade file next to the data directory (`~/.pnet/grade`) so the
+/// installer agent can skip its own website on a device-grade node even when
+/// it is started without `PNET_GRADE` in the environment.
+fn publish_grade_file(data_dir: &std::path::Path, node: &pnet::data_models::Node) {
+    let grade = if node.is_initialized() {
+        if local_device_is_sg(node) { "sg" } else { "dg" }
+    } else {
+        match std::env::var("PNET_GRADE") {
+            Ok(g) if g.trim().eq_ignore_ascii_case("sg") => "sg",
+            Ok(g) if g.trim().eq_ignore_ascii_case("dg") => "dg",
+            _ => return,
+        }
+    };
+    let Some(prefix) = data_dir.parent() else { return };
+    if let Err(e) = std::fs::write(prefix.join("grade"), grade) {
+        eprintln!("[main] could not write grade file: {e}");
+    }
+}
+
 /// If `PNET_ADMIN_PASSWORD` is set and the node has no admin hash yet, store it.
 /// Used by headless deploys so the UI is not left passwordless after env setup.
 fn apply_env_admin_password(ctx: &WorkerContext) {
@@ -159,7 +198,8 @@ fn main() {
     let stop = Arc::new(AtomicBool::new(false));
 
     // ── 3. Start writer thread ───────────────────────────────────────────────
-    let mut writer = WriterThread::start(dir);
+    // `dir` is still needed to publish ~/.pnet/grade after setup.
+    let mut writer = WriterThread::start(dir.clone());
 
     // ── 4. Start scheduler ───────────────────────────────────────────────────
     let (scheduler, scheduler_tx) = SchedulerThread::start(
@@ -215,15 +255,26 @@ fn main() {
         cvar.notify_all();
     }
 
-    // ── 8. Start HTTP server (owner portal: Home + Config + future app mounts)
-    // Default bind is loopback for all grades. Opt into remote access with
+    // ── 8. Owner portal HTTP — server-grade nodes only.
+    // A device-grade node does not host the website. Setup is the installer
+    // dialog or PNET_* variables, applied above, not a page on this port.
+    // Default bind is loopback. Opt into remote access with
     // PNET_HTTP_BIND=0.0.0.0 (or another IPv4). Docker / live harnesses that
     // publish the portal must set this explicitly.
-    let http_bind = http_bind_ip();
-    let hport = http_port();
-    let http = HttpServer::start(http_bind, hport, Arc::clone(&queue), Arc::clone(&stop));
-
-    println!("[main] running. Owner portal HTTP on {http_bind}:{hport}");
+    let http = if owner_portal_should_listen(&node.read().unwrap()) {
+        let http_bind = http_bind_ip();
+        let hport = http_port();
+        let http = HttpServer::start(http_bind, hport, Arc::clone(&queue), Arc::clone(&stop));
+        println!("[main] running. Owner portal HTTP on {http_bind}:{hport}");
+        Some(http)
+    } else {
+        println!(
+            "[main] running. No website on this node (device grade, or not set up as a server). \
+             The portal is served by a server-grade device."
+        );
+        None
+    };
+    publish_grade_file(&dir, &node.read().unwrap());
 
     // ── Wait for SIGINT / SIGTERM ─────────────────────────────────────────────
     ctrlc::set_handler({
@@ -248,7 +299,9 @@ fn main() {
 
     println!("[main] stopping producers...");
     udp.join();
-    http.join();
+    if let Some(http) = http {
+        http.join();
+    }
     scheduler.join();
 
     println!("[main] draining queue and stopping workers...");

@@ -7,6 +7,8 @@ Every user on the pNet system must have at least one SG.  This is required becau
 
 ### SG server Responsibilities and Priorities
 
+The owner website (portal Home, Config, and `/apps/…` mounts) is served only by an SG. A DG does not bind that HTTP port. First-run setup — a connection code on a DG, or identity, rank, hosts, and portal password on an SG — is collected by `pnet_installer bootstrap` (or passed on the command line) before the node process starts.
+
 The SG has a job to be the only device to which the DG devices owned by the user do their keep-alive communications. If a user has more than one SG device they will be ranked, so that the top-ranking SG is the one used for keep-alive. If that machine goes down (meaning it doesn't respond to keep-alive signals), the DG devices start sending their keep-alive signals to the next SG in the list.
 
 Because only the top-ranked SG is able to send packets to the DG of that user, the rank number needs to be included in the device data of an SG.

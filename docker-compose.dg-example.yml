@@ -12,18 +12,15 @@ services:
     # also collides with the container's outbound src_port=7777 under
     # rootless podman (pasta) and causes outgoing bootstrap packets to be
     # dropped on the host.
-    ports:
-      - "8777:8777/tcp"
+    # No HTTP publish: a device-grade node does not serve the portal.
     # Headless first-run setup: when present, on first boot the container
     # joins an existing user using the supplied invitation code. After
     # initialization these vars are ignored. Generate the code from an
-    # existing SG via /invitations.
+    # existing SG portal (/invitations).
     environment:
       - PNET_GRADE=dg
       - PNET_DEVICE_ALIAS=${PNET_DEVICE_ALIAS:-}
       - PNET_INVITATION_CODE=${PNET_INVITATION_CODE:-}
-      # Admin UI is loopback-only by default; required for host port publish.
-      - PNET_HTTP_BIND=0.0.0.0
       # Testing only: auto-approves any app that registers, skipping the UI step.
       - PNET_AUTO_APPROVE_APPS=1
       - PNET_APP_API_REMOTE=1

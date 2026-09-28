@@ -23,8 +23,8 @@ behavior across sites — real NAT, real WAN latency, public DNS. Complements
 
 | User | Device | Host | Grade | UDP/HTTP | Advertised hosts |
 |------|--------|------|-------|----------|------------------|
-| alice | alice-n64 | n64 | SG rank1 | 7777 / 8777 | `pnet.thehomegarage.com:7777` |
-| alice | alice-tealface | tealface | DG | 7777 / 8777 | *(none — joiner)* |
+| alice | alice-n64 | n64 | SG rank1 | 7777 / 8777 (portal) | `pnet.thehomegarage.com:7777` |
+| alice | alice-tealface | tealface | DG | 7777 (no portal) | *(none — joiner)* |
 
 Probes: `alice-n64-app` on n64, `alice-tealface-app` on tealface.
 
@@ -49,7 +49,7 @@ syncs through the public SG without a private path to the house LAN.
    - `gcc-aarch64-linux-gnu` + `rustup target add aarch64-unknown-linux-gnu`, or
    - **podman** (used automatically; pulls `rust:1-bookworm`, no root install).
 3. House router: UDP **7777** (and 7778 if you add a second public SG) → n64.
-4. sanosuke can curl n64 admin/probe (via VPN) and tealface admin/probe (office LAN).
+4. sanosuke can curl n64 admin/probe (via VPN) and the tealface probe (office LAN). The tealface DG does not serve the portal.
 5. `curl`, `jq` on sanosuke.
 
 ## Run
