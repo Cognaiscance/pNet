@@ -10,8 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
 use super::super::data_models::{
-    Application, Contact, Device, DeviceGrade, Ed25519PublicKey, Node, Owner, Scope, SyncVersion,
-    User, Uuid, WriteLogEntry, WRITE_LOG_RETENTION,
+    Application, Contact, Device, DeviceGrade, Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey,
+    Ed25519Signature, Node, Owner, Scope, SyncVersion, User, Uuid, WriteLogEntry,
+    X25519PublicKey, WRITE_LOG_RETENTION,
 };
 use super::super::wire::*;
 use super::{
@@ -29,7 +30,95 @@ use super::{
 //     each device: [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8]
 //                  [host_count:u8][each host: u8+bytes]
 //       [app_count: u8]
-//         each approved app: [id: 16][alias: u8+bytes]
+//         each approved app: [id:16][alias lp][signing_pk:32][cert_sig:64]
+//                            [issued_at:u64 le][cert_alias lp]
+
+/// Public app identity carried in directory snapshots and contact cards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactAppCard {
+    pub id: Uuid,
+    pub alias: String,
+    pub signing_pk: Ed25519PublicKey,
+    pub cert_sig: Ed25519Signature,
+    pub cert_issued_at: u64,
+    pub cert_alias: String,
+}
+
+fn push_public_app(buf: &mut Vec<u8>, app: &ContactAppCard) {
+    buf.extend_from_slice(&app.id);
+    push_str(buf, &app.alias);
+    buf.extend_from_slice(app.signing_pk.as_bytes());
+    buf.extend_from_slice(&app.cert_sig.0);
+    buf.extend_from_slice(&app.cert_issued_at.to_le_bytes());
+    push_str(buf, &app.cert_alias);
+}
+
+fn push_public_app_from(buf: &mut Vec<u8>, app: &Application) {
+    push_public_app(buf, &ContactAppCard {
+        id: app.id,
+        alias: app.alias.clone(),
+        signing_pk: app.identity.public_key,
+        cert_sig: app.cert_sig,
+        cert_issued_at: app.cert_issued_at,
+        cert_alias: app.cert_alias.clone(),
+    });
+}
+
+fn read_public_app(data: &[u8], pos: &mut usize) -> Option<ContactAppCard> {
+    let id: Uuid = read_arr(data, pos)?;
+    let alias = read_str(data, pos)?;
+    let signing_pk = Ed25519PublicKey(read_arr(data, pos)?);
+    let cert_sig = Ed25519Signature(read_arr(data, pos)?);
+    let issued: [u8; 8] = read_arr(data, pos)?;
+    let cert_alias = read_str(data, pos)?;
+    Some(ContactAppCard {
+        id,
+        alias,
+        signing_pk,
+        cert_sig,
+        cert_issued_at: u64::from_le_bytes(issued),
+        cert_alias,
+    })
+}
+
+fn application_from_public(app: &ContactAppCard) -> Application {
+    Application {
+        id: app.id,
+        alias: app.alias.clone(),
+        protocol: String::new(),
+        host: "0.0.0.0:0".parse().unwrap(),
+        user_approved: true,
+        token: [0u8; 16],
+        identity: Ed25519KeyPair {
+            public_key: app.signing_pk,
+            private_key: Ed25519SecretKey::ZERO,
+            private_key_sealed: String::new(),
+        },
+        cert_sig: app.cert_sig,
+        cert_issued_at: app.cert_issued_at,
+        cert_alias: app.cert_alias.clone(),
+    }
+}
+
+/// Keep a locally held identity secret when the public key still matches.
+fn merge_app_public(local: &mut Application, incoming: &ContactAppCard, fill_alias: bool) {
+    if fill_alias {
+        local.alias = incoming.alias.clone();
+    }
+    let same_key = local.identity.public_key == incoming.signing_pk;
+    if !same_key && incoming.signing_pk != Ed25519PublicKey::ZERO {
+        local.identity.public_key = incoming.signing_pk;
+        local.identity.private_key = Ed25519SecretKey::ZERO;
+        local.identity.private_key_sealed.clear();
+    }
+    let prefer_incoming = incoming.cert_sig != Ed25519Signature::ZERO
+        && (local.cert_sig == Ed25519Signature::ZERO || !same_key);
+    if prefer_incoming {
+        local.cert_sig = incoming.cert_sig;
+        local.cert_issued_at = incoming.cert_issued_at;
+        local.cert_alias = incoming.cert_alias.clone();
+    }
+}
 
 pub(crate) fn serialize_contact_data(node: &Node) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -43,8 +132,7 @@ pub(crate) fn serialize_contact_data(node: &Node) -> Vec<u8> {
             .collect();
         buf.push(approved.len() as u8);
         for a in approved {
-            buf.extend_from_slice(&a.id);
-            push_str(&mut buf, &a.alias);
+            push_public_app_from(&mut buf, a);
         }
     }
     buf
@@ -52,7 +140,7 @@ pub(crate) fn serialize_contact_data(node: &Node) -> Vec<u8> {
 
 pub(crate) struct ContactData {
     pub(crate) user_uuid: Uuid,
-    pub(crate) devices:   Vec<(Device, Vec<(Uuid, String)>)>, // (device, vec of (app_id, app_alias))
+    pub(crate) devices:   Vec<(Device, Vec<ContactAppCard>)>,
 }
 
 pub(crate) fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
@@ -65,9 +153,7 @@ pub(crate) fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
         let app_count = *data.get(pos)? as usize; pos += 1;
         let mut apps = Vec::new();
         for _ in 0..app_count {
-            let id: Uuid = read_arr(data, &mut pos)?;
-            let alias    = read_str(data, &mut pos)?;
-            apps.push((id, alias));
+            apps.push(read_public_app(data, &mut pos)?);
         }
         devices.push((device, apps));
     }
@@ -98,8 +184,7 @@ pub(crate) fn public_state_well_formed(state: &[u8]) -> bool {
             let app_count = *state.get(pos)? as usize;
             pos += 1;
             for _ in 0..app_count {
-                let _: [u8; 16] = read_arr(state, &mut pos)?;
-                let _ = read_str(state, &mut pos)?;
+                let _ = read_public_app(state, &mut pos)?;
             }
         }
         let contact_count = *state.get(pos)? as usize;
@@ -115,8 +200,7 @@ pub(crate) fn public_state_well_formed(state: &[u8]) -> bool {
                 let ac = *state.get(pos)? as usize;
                 pos += 1;
                 for _ in 0..ac {
-                    let _: [u8; 16] = read_arr(state, &mut pos)?;
-                    let _ = read_str(state, &mut pos)?;
+                    let _ = read_public_app(state, &mut pos)?;
                 }
             }
         }
@@ -169,7 +253,12 @@ pub struct ContactDeviceCard {
     pub grade:   DeviceGrade,
     pub sg_rank: Option<u32>,
     pub hosts:   Vec<String>,
-    pub apps:    Vec<(Uuid, String)>,
+    pub apps:    Vec<ContactAppCard>,
+    pub signing_pk: Ed25519PublicKey,
+    pub dh_pk: X25519PublicKey,
+    pub cert_sig: Ed25519Signature,
+    pub cert_issued_at: u64,
+    pub cert_alias: String,
 }
 
 /// State mutations that flow through the writer SG.
@@ -184,6 +273,10 @@ pub enum Change {
         device_uuid: Uuid,
         app_id:      Uuid,
         app_alias:   String,
+        signing_pk: Ed25519PublicKey,
+        cert_sig: Ed25519Signature,
+        cert_issued_at: u64,
+        cert_alias: String,
     },
     /// Public-scope: remove the app identified by `(device_uuid, app_id)`
     /// from the user's device list. Idempotent — a remove for an app id
@@ -201,6 +294,11 @@ pub enum Change {
         grade:   DeviceGrade,
         sg_rank: Option<u32>,
         hosts:   Vec<String>,
+        signing_pk: Ed25519PublicKey,
+        dh_pk: X25519PublicKey,
+        cert_sig: Ed25519Signature,
+        cert_issued_at: u64,
+        cert_alias: String,
     },
     /// Public-scope: rename app `app_id` on `device_uuid`. No-op if the
     /// alias already matches or the app doesn't exist.
@@ -252,18 +350,22 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
 pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
     let mut buf = Vec::new();
     match c {
-        Change::AddApplication { device_uuid, app_id, app_alias } => {
+        Change::AddApplication { device_uuid, app_id, app_alias, signing_pk, cert_sig, cert_issued_at, cert_alias } => {
             buf.push(CHANGE_KIND_ADD_APPLICATION);
             buf.extend_from_slice(device_uuid);
             buf.extend_from_slice(app_id);
             push_str(&mut buf, app_alias);
+            buf.extend_from_slice(signing_pk.as_bytes());
+            buf.extend_from_slice(&cert_sig.0);
+            buf.extend_from_slice(&cert_issued_at.to_le_bytes());
+            push_str(&mut buf, cert_alias);
         }
         Change::RemoveApplication { device_uuid, app_id } => {
             buf.push(CHANGE_KIND_REMOVE_APPLICATION);
             buf.extend_from_slice(device_uuid);
             buf.extend_from_slice(app_id);
         }
-        Change::AddDevice { uuid, alias, grade, sg_rank, hosts } => {
+        Change::AddDevice { uuid, alias, grade, sg_rank, hosts, signing_pk, dh_pk, cert_sig, cert_issued_at, cert_alias } => {
             buf.push(CHANGE_KIND_ADD_DEVICE);
             // Reuse push_device's layout by constructing a temporary Device.
             // `applications` is empty by design — apps arrive via AddApplication.
@@ -274,6 +376,11 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
                 sg_rank:      *sg_rank,
                 hosts:        hosts.clone(),
                 applications: Vec::new(),
+                signing_pk:   *signing_pk,
+                dh_pk:        *dh_pk,
+                cert_sig:     *cert_sig,
+                cert_issued_at: *cert_issued_at,
+                cert_alias:   cert_alias.clone(),
             };
             push_device(&mut buf, &temp);
         }
@@ -298,12 +405,16 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
                     sg_rank:      card.sg_rank,
                     hosts:        card.hosts.clone(),
                     applications: Vec::new(),
+                    signing_pk:   card.signing_pk,
+                    dh_pk:        card.dh_pk,
+                    cert_sig:     card.cert_sig,
+                    cert_issued_at: card.cert_issued_at,
+                    cert_alias:   card.cert_alias.clone(),
                 };
                 push_device(&mut buf, &temp);
                 buf.push(card.apps.len().min(u8::MAX as usize) as u8);
-                for (id, app_alias) in card.apps.iter().take(u8::MAX as usize) {
-                    buf.extend_from_slice(id);
-                    push_str(&mut buf, app_alias);
+                for app in card.apps.iter().take(u8::MAX as usize) {
+                    push_public_app(&mut buf, app);
                 }
             }
         }
@@ -328,7 +439,14 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
             let device_uuid: Uuid = read_arr(data, &mut pos)?;
             let app_id:      Uuid = read_arr(data, &mut pos)?;
             let app_alias         = read_str(data, &mut pos)?;
-            Some(Change::AddApplication { device_uuid, app_id, app_alias })
+            let signing_pk = Ed25519PublicKey(read_arr(data, &mut pos)?);
+            let cert_sig = Ed25519Signature(read_arr(data, &mut pos)?);
+            let issued_bytes: [u8; 8] = read_arr(data, &mut pos)?;
+            let cert_issued_at = u64::from_le_bytes(issued_bytes);
+            let cert_alias = read_str(data, &mut pos)?;
+            Some(Change::AddApplication {
+                device_uuid, app_id, app_alias, signing_pk, cert_sig, cert_issued_at, cert_alias,
+            })
         }
         CHANGE_KIND_REMOVE_APPLICATION => {
             let device_uuid: Uuid = read_arr(data, &mut pos)?;
@@ -343,6 +461,11 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
                 grade:   d.grade,
                 sg_rank: d.sg_rank,
                 hosts:   d.hosts,
+                signing_pk: d.signing_pk,
+                dh_pk: d.dh_pk,
+                cert_sig: d.cert_sig,
+                cert_issued_at: d.cert_issued_at,
+                cert_alias: d.cert_alias,
             })
         }
         CHANGE_KIND_UPDATE_APPLICATION_ALIAS => {
@@ -362,13 +485,16 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
                 let app_count = *data.get(pos)? as usize; pos += 1;
                 let mut apps = Vec::with_capacity(app_count);
                 for _ in 0..app_count {
-                    let id: Uuid = read_arr(data, &mut pos)?;
-                    let a        = read_str(data, &mut pos)?;
-                    apps.push((id, a));
+                    apps.push(read_public_app(data, &mut pos)?);
                 }
                 devices.push(ContactDeviceCard {
                     uuid: d.uuid, alias: d.alias, grade: d.grade,
                     sg_rank: d.sg_rank, hosts: d.hosts, apps,
+                    signing_pk: d.signing_pk,
+                    dh_pk: d.dh_pk,
+                    cert_sig: d.cert_sig,
+                    cert_issued_at: d.cert_issued_at,
+                    cert_alias: d.cert_alias,
                 });
             }
             Some(Change::UpsertContact { uuid, alias, public_key, devices })
@@ -410,25 +536,30 @@ pub enum WriteError {
 /// append; callers stitch those on as appropriate.
 fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, WriteError> {
     let applied = match change {
-        Change::AddApplication { device_uuid, app_id, app_alias } => {
+        Change::AddApplication {
+            device_uuid, app_id, app_alias, signing_pk, cert_sig, cert_issued_at, cert_alias,
+        } => {
             let dev = owner.user.devices.iter_mut()
                 .find(|d| d.uuid == *device_uuid)
                 .ok_or_else(|| WriteError::Validation(format!(
                     "unknown device_uuid {device_uuid:?}"
                 )))?;
-            if dev.applications.iter().any(|a| a.id == *app_id) {
-                false
+            let incoming = ContactAppCard {
+                id: *app_id,
+                alias: app_alias.clone(),
+                signing_pk: *signing_pk,
+                cert_sig: *cert_sig,
+                cert_issued_at: *cert_issued_at,
+                cert_alias: cert_alias.clone(),
+            };
+            if let Some(existing) = dev.applications.iter_mut().find(|a| a.id == *app_id) {
+                let before = (existing.cert_sig, existing.identity.public_key);
+                merge_app_public(existing, &incoming, false);
+                before != (existing.cert_sig, existing.identity.public_key)
             } else {
-                dev.applications.push(Application {
-                    id:            *app_id,
-                    alias:         app_alias.clone(),
-                    protocol:      String::new(),
-                    // Private-scope fields stay zero on the writer SG — the
-                    // originating DG holds the real token/host locally.
-                    host:          "0.0.0.0:0".parse().unwrap(),
-                    user_approved: true,
-                    token:         [0u8; 16],
-                });
+                // Private-scope fields stay zero on the writer SG — the
+                // originating DG holds the real token/host locally.
+                dev.applications.push(application_from_public(&incoming));
                 true
             }
         }
@@ -442,9 +573,20 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
             dev.applications.retain(|a| a.id != *app_id);
             before != dev.applications.len()
         }
-        Change::AddDevice { uuid, alias, grade, sg_rank, hosts } => {
-            if owner.user.devices.iter().any(|d| d.uuid == *uuid) {
-                false
+        Change::AddDevice {
+            uuid, alias, grade, sg_rank, hosts, signing_pk, dh_pk, cert_sig, cert_issued_at, cert_alias,
+        } => {
+            if let Some(existing) = owner.user.devices.iter_mut().find(|d| d.uuid == *uuid) {
+                if existing.cert_sig == Ed25519Signature::ZERO && *cert_sig != Ed25519Signature::ZERO {
+                    existing.signing_pk = *signing_pk;
+                    existing.dh_pk = *dh_pk;
+                    existing.cert_sig = *cert_sig;
+                    existing.cert_issued_at = *cert_issued_at;
+                    existing.cert_alias = cert_alias.clone();
+                    true
+                } else {
+                    false
+                }
             } else {
                 owner.user.devices.push(Device {
                     uuid:         *uuid,
@@ -453,6 +595,11 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
                     sg_rank:      *sg_rank,
                     hosts:        hosts.clone(),
                     applications: Vec::new(),
+                    signing_pk:   *signing_pk,
+                    dh_pk:        *dh_pk,
+                    cert_sig:     *cert_sig,
+                    cert_issued_at: *cert_issued_at,
+                    cert_alias:   cert_alias.clone(),
                 });
                 true
             }
@@ -653,16 +800,9 @@ fn drop_sessions_and_tunnels_for_device(node: &mut Node, device_uuid: Uuid) {
 }
 
 /// Build `Application` stubs (public fields only — private fields zeroed) from
-/// a card's `(app_id, alias)` pairs. Contact apps never carry private fields.
-fn card_apps_to_applications(apps: &[(Uuid, String)]) -> Vec<Application> {
-    apps.iter().map(|(id, alias)| Application {
-        id:            *id,
-        alias:         alias.clone(),
-        protocol:      String::new(),
-        host:          "0.0.0.0:0".parse().unwrap(),
-        user_approved: true,
-        token:         [0u8; 16],
-    }).collect()
+/// a card's public app records. Contact apps never carry private fields.
+fn card_apps_to_applications(apps: &[ContactAppCard]) -> Vec<Application> {
+    apps.iter().map(application_from_public).collect()
 }
 
 /// Convert contact device cards into stored `Device`s.
@@ -674,19 +814,39 @@ fn cards_to_devices(cards: &[ContactDeviceCard]) -> Vec<Device> {
         sg_rank:      c.sg_rank,
         hosts:        c.hosts.clone(),
         applications: card_apps_to_applications(&c.apps),
+        signing_pk:   c.signing_pk,
+        dh_pk:        c.dh_pk,
+        cert_sig:     c.cert_sig,
+        cert_issued_at: c.cert_issued_at,
+        cert_alias:   c.cert_alias.clone(),
     }).collect()
+}
+
+fn app_to_card(app: &Application) -> ContactAppCard {
+    ContactAppCard {
+        id: app.id,
+        alias: app.alias.clone(),
+        signing_pk: app.identity.public_key,
+        cert_sig: app.cert_sig,
+        cert_issued_at: app.cert_issued_at,
+        cert_alias: app.cert_alias.clone(),
+    }
 }
 
 /// Cards for a set of stored devices, in a deterministic order (devices by
 /// uuid, apps by id) so card equality is order-independent.
 pub(crate) fn devices_to_cards(devices: &[Device]) -> Vec<ContactDeviceCard> {
     let mut cards: Vec<ContactDeviceCard> = devices.iter().map(|d| {
-        let mut apps: Vec<(Uuid, String)> = d.applications.iter()
-            .map(|a| (a.id, a.alias.clone())).collect();
-        apps.sort();
+        let mut apps: Vec<ContactAppCard> = d.applications.iter().map(app_to_card).collect();
+        apps.sort_by(|a, b| a.id.cmp(&b.id).then(a.alias.cmp(&b.alias)));
         ContactDeviceCard {
             uuid: d.uuid, alias: d.alias.clone(), grade: d.grade,
             sg_rank: d.sg_rank, hosts: d.hosts.clone(), apps,
+            signing_pk: d.signing_pk,
+            dh_pk: d.dh_pk,
+            cert_sig: d.cert_sig,
+            cert_issued_at: d.cert_issued_at,
+            cert_alias: d.cert_alias.clone(),
         }
     }).collect();
     cards.sort_by_key(|c| c.uuid);
@@ -702,10 +862,15 @@ fn contact_cards(contact: &Contact) -> Vec<ContactDeviceCard> {
 fn normalize_cards(cards: &[ContactDeviceCard]) -> Vec<ContactDeviceCard> {
     let mut out: Vec<ContactDeviceCard> = cards.iter().map(|c| {
         let mut apps = c.apps.clone();
-        apps.sort();
+        apps.sort_by(|a, b| a.id.cmp(&b.id).then(a.alias.cmp(&b.alias)));
         ContactDeviceCard {
             uuid: c.uuid, alias: c.alias.clone(), grade: c.grade,
             sg_rank: c.sg_rank, hosts: c.hosts.clone(), apps,
+            signing_pk: c.signing_pk,
+            dh_pk: c.dh_pk,
+            cert_sig: c.cert_sig,
+            cert_issued_at: c.cert_issued_at,
+            cert_alias: c.cert_alias.clone(),
         }
     }).collect();
     out.sort_by_key(|c| c.uuid);
@@ -1175,15 +1340,16 @@ fn send_pull_request(scope: Scope, last_seen: SyncVersion, conn_id: u16, ctx: &W
 //     each device:
 //       [uuid:16][alias: u8+bytes][grade:u8][sg_rank:u8]
 //       [host_count:u8] each [host: u8+bytes]
-//       [app_count: u8] each [id: 16][alias: u8+bytes]
+//       [app_count: u8] each public app record (id, alias, signing key, cert)
 //   [contact_count: u8]
 //     each contact:
 //       [user_alias: u8+bytes][user_uuid:16][public_key:32]
 //       [device_count: u8] each device (same shape as own devices, apps included)
 //
-// Apps in the Public-scope blob carry only `id` and `alias`; the originating
-// DG's private fields (`token`, `host`, `protocol`) stay local and are
-// merged in by `apply_public_state` rather than overwritten.
+// Apps in the Public-scope blob carry id, alias, the app signing key, and
+// the device-signed certificate. The originating device's private fields
+// (`token`, `host`, `protocol`, app secret) stay local and are merged in
+// by `apply_public_state` rather than overwritten.
 //
 // The Private-scope state blob is intentionally empty in Phase 5 — no
 // Change variant currently bumps Private. Future phases (RemoveApplication,
@@ -1200,8 +1366,7 @@ pub(crate) fn serialize_public_state(node: &Node) -> Vec<u8> {
         push_device(&mut buf, d);
         buf.push(d.applications.len().min(u8::MAX as usize) as u8);
         for a in d.applications.iter().take(u8::MAX as usize) {
-            buf.extend_from_slice(&a.id);
-            push_str(&mut buf, &a.alias);
+            push_public_app_from(&mut buf, a);
         }
     }
 
@@ -1215,8 +1380,7 @@ pub(crate) fn serialize_public_state(node: &Node) -> Vec<u8> {
             push_device(&mut buf, d);
             buf.push(d.applications.len().min(u8::MAX as usize) as u8);
             for a in d.applications.iter().take(u8::MAX as usize) {
-                buf.extend_from_slice(&a.id);
-                push_str(&mut buf, &a.alias);
+                push_public_app_from(&mut buf, a);
             }
         }
     }
@@ -1258,7 +1422,7 @@ pub(crate) fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
     // half-apply.
     struct ParsedDevice {
         device: Device,
-        apps:   Vec<(Uuid, String)>,
+        apps:   Vec<ContactAppCard>,
     }
     let mut devices: Vec<ParsedDevice> = Vec::with_capacity(dev_count as usize);
     for _ in 0..dev_count {
@@ -1267,9 +1431,8 @@ pub(crate) fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
         pos += 1;
         let mut apps = Vec::with_capacity(app_count as usize);
         for _ in 0..app_count {
-            let Some(id)    = read_arr::<16>(state, &mut pos) else { return false; };
-            let Some(alias) = read_str(state, &mut pos)        else { return false; };
-            apps.push((id, alias));
+            let Some(app) = read_public_app(state, &mut pos) else { return false; };
+            apps.push(app);
         }
         devices.push(ParsedDevice { device: d, apps });
     }
@@ -1298,9 +1461,8 @@ pub(crate) fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
             pos += 1;
             let mut apps = Vec::with_capacity(ac as usize);
             for _ in 0..ac {
-                let Some(id)    = read_arr::<16>(state, &mut pos) else { return false; };
-                let Some(alias) = read_str(state, &mut pos)        else { return false; };
-                apps.push((id, alias));
+                let Some(app) = read_public_app(state, &mut pos) else { return false; };
+                apps.push(app);
             }
             devs.push(ParsedDevice { device: d, apps });
         }
@@ -1318,10 +1480,17 @@ pub(crate) fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
         let apps = parsed.apps;
         let is_local = p.uuid == local_uuid;
         if let Some(existing) = node.owner.user.devices.iter_mut().find(|d| d.uuid == p.uuid) {
-            existing.alias   = p.alias;
+            existing.alias   = p.alias.clone();
             existing.grade   = p.grade;
             existing.sg_rank = p.sg_rank;
-            existing.hosts   = p.hosts;
+            existing.hosts   = p.hosts.clone();
+            if existing.cert_sig == Ed25519Signature::ZERO && p.cert_sig != Ed25519Signature::ZERO {
+                existing.signing_pk = p.signing_pk;
+                existing.dh_pk = p.dh_pk;
+                existing.cert_sig = p.cert_sig;
+                existing.cert_issued_at = p.cert_issued_at;
+                existing.cert_alias = p.cert_alias.clone();
+            }
             if is_local {
                 // Local device: strictly additive. Only insert apps the peer
                 // reports that we don't have yet; never overwrite an existing
@@ -1332,89 +1501,52 @@ pub(crate) fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
                 // merge engine (apply_change_to_owner), not via this branch.
                 let existing_ids: HashSet<Uuid> = existing.applications.iter()
                     .map(|a| a.id).collect();
-                for (id, alias) in apps {
-                    if existing_ids.contains(&id) { continue; }
-                    existing.applications.push(Application {
-                        id,
-                        alias,
-                        protocol:      String::new(),
-                        host:          "0.0.0.0:0".parse().unwrap(),
-                        user_approved: true,
-                        token:         [0u8; 16],
-                    });
+                for app in apps {
+                    if existing_ids.contains(&app.id) { continue; }
+                    existing.applications.push(application_from_public(&app));
                 }
             } else {
                 // Peer device: authoritative — drop apps the writer no longer
                 // reports, so RemoveApplication propagates.
-                let incoming_ids: HashSet<Uuid> = apps.iter().map(|(id, _)| *id).collect();
+                let incoming_ids: HashSet<Uuid> = apps.iter().map(|a| a.id).collect();
                 existing.applications.retain(|a| incoming_ids.contains(&a.id));
-                for (id, alias) in apps {
-                    if let Some(local_app) = existing.applications.iter_mut().find(|a| a.id == id) {
-                        local_app.alias = alias;
+                for app in apps {
+                    if let Some(local_app) = existing.applications.iter_mut().find(|a| a.id == app.id) {
+                        merge_app_public(local_app, &app, true);
                     } else {
-                        existing.applications.push(Application {
-                            id,
-                            alias,
-                            protocol:      String::new(),
-                            host:          "0.0.0.0:0".parse().unwrap(),
-                            user_approved: true,
-                            token:         [0u8; 16],
-                        });
+                        existing.applications.push(application_from_public(&app));
                     }
                 }
             }
         } else {
             let mut new_dev = p;
-            for (id, alias) in apps {
-                new_dev.applications.push(Application {
-                    id,
-                    alias,
-                    protocol:      String::new(),
-                    host:          "0.0.0.0:0".parse().unwrap(),
-                    user_approved: true,
-                    token:         [0u8; 16],
-                });
+            for app in apps {
+                new_dev.applications.push(application_from_public(&app));
             }
             node.owner.user.devices.push(new_dev);
         }
     }
 
     for c in contacts {
+        let devs_from = |parsed: Vec<ParsedDevice>| -> Vec<Device> {
+            parsed.into_iter().map(|p| {
+                let mut dev = p.device;
+                for app in p.apps {
+                    dev.applications.push(application_from_public(&app));
+                }
+                dev
+            }).collect()
+        };
         if let Some(existing) = node.owner.contact_users.iter_mut().find(|x| x.user.uuid == c.uuid) {
             existing.user.alias = c.alias;
             existing.public_key = c.public_key;
             // Replace the contact's device list — we don't have local
             // private fields to preserve for contact-owned apps.
-            existing.user.devices = c.devices.into_iter().map(|p| {
-                let mut dev = p.device;
-                for (id, alias) in p.apps {
-                    dev.applications.push(Application {
-                        id, alias,
-                        protocol:      String::new(),
-                        host:          "0.0.0.0:0".parse().unwrap(),
-                        user_approved: true,
-                        token:         [0u8; 16],
-                    });
-                }
-                dev
-            }).collect();
+            existing.user.devices = devs_from(c.devices);
         } else {
-            let devs = c.devices.into_iter().map(|p| {
-                let mut dev = p.device;
-                for (id, alias) in p.apps {
-                    dev.applications.push(Application {
-                        id, alias,
-                        protocol:      String::new(),
-                        host:          "0.0.0.0:0".parse().unwrap(),
-                        user_approved: true,
-                        token:         [0u8; 16],
-                    });
-                }
-                dev
-            }).collect();
             node.owner.contact_users.push(Contact {
                 public_key: c.public_key,
-                user: User { alias: c.alias, uuid: c.uuid, devices: devs },
+                user: User { alias: c.alias, uuid: c.uuid, devices: devs_from(c.devices) },
                 last_seen_public_version: SyncVersion::default(),
             });
         }
@@ -2056,6 +2188,11 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
                     ContactDeviceCard {
                         uuid: d.uuid, alias: d.alias.clone(), grade: d.grade,
                         sg_rank: d.sg_rank, hosts: d.hosts.clone(), apps: apps.clone(),
+                        signing_pk: d.signing_pk,
+                        dh_pk: d.dh_pk,
+                        cert_sig: d.cert_sig,
+                        cert_issued_at: d.cert_issued_at,
+                        cert_alias: d.cert_alias.clone(),
                     }
                 }).collect();
                 // Route the refreshed snapshot through the write log (Gap #2):
@@ -2959,6 +3096,10 @@ struct MergedApp {
     alias:   String,
     alias_priority: EntryPriority,
     alias_from_update: bool,
+    signing_pk: Ed25519PublicKey,
+    cert_sig: Ed25519Signature,
+    cert_issued_at: u64,
+    cert_alias: String,
 }
 
 #[derive(Clone)]
@@ -2967,6 +3108,11 @@ struct MergedDevice {
     grade:   DeviceGrade,
     sg_rank: Option<u32>,
     hosts:   Vec<String>,
+    signing_pk: Ed25519PublicKey,
+    dh_pk: X25519PublicKey,
+    cert_sig: Ed25519Signature,
+    cert_issued_at: u64,
+    cert_alias: String,
 }
 
 /// Comparison key for "who wins" on a scalar update. Tuple ordering gives
@@ -3026,23 +3172,46 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
         let prio = entry_priority(&e.version, ranks);
         match change {
             Change::RemoveApplication { .. } => { /* recorded above */ }
-            Change::AddApplication { device_uuid, app_id, app_alias } => {
+            Change::AddApplication {
+                device_uuid, app_id, app_alias, signing_pk, cert_sig, cert_issued_at, cert_alias,
+            } => {
                 if state.tombstones.contains(&(device_uuid, app_id)) { continue; }
-                upsert_alias(&mut state.apps, (device_uuid, app_id),
-                             app_alias, prio, true);
+                upsert_alias(
+                    &mut state.apps, (device_uuid, app_id), app_alias, prio, true,
+                    signing_pk, cert_sig, cert_issued_at, cert_alias,
+                );
             }
             Change::UpdateApplicationAlias { device_uuid, app_id, new_alias } => {
                 if state.tombstones.contains(&(device_uuid, app_id)) { continue; }
-                upsert_alias(&mut state.apps, (device_uuid, app_id),
-                             new_alias, prio, false);
+                upsert_alias(
+                    &mut state.apps, (device_uuid, app_id), new_alias, prio, false,
+                    Ed25519PublicKey::ZERO, Ed25519Signature::ZERO, 0, String::new(),
+                );
             }
-            Change::AddDevice { uuid, alias, grade, sg_rank, hosts } => {
+            Change::AddDevice {
+                uuid, alias, grade, sg_rank, hosts, signing_pk, dh_pk, cert_sig, cert_issued_at, cert_alias,
+            } => {
                 if device_tombstones.contains(&uuid) {
                     continue;
                 }
-                state.devices.entry(uuid).or_insert(MergedDevice {
-                    alias, grade, sg_rank, hosts,
-                });
+                match state.devices.get_mut(&uuid) {
+                    Some(existing) if existing.cert_sig == Ed25519Signature::ZERO
+                        && cert_sig != Ed25519Signature::ZERO =>
+                    {
+                        existing.signing_pk = signing_pk;
+                        existing.dh_pk = dh_pk;
+                        existing.cert_sig = cert_sig;
+                        existing.cert_issued_at = cert_issued_at;
+                        existing.cert_alias = cert_alias;
+                    }
+                    Some(_) => {}
+                    None => {
+                        state.devices.insert(uuid, MergedDevice {
+                            alias, grade, sg_rank, hosts,
+                            signing_pk, dh_pk, cert_sig, cert_issued_at, cert_alias,
+                        });
+                    }
+                }
             }
             Change::UpsertContact { uuid, alias, public_key, devices } => {
                 if contact_tombstones.contains(&uuid) {
@@ -3090,11 +3259,16 @@ fn upsert_alias(
     alias: String,
     prio:  EntryPriority,
     sets_existence: bool,   // true = Add, false = Update
+    signing_pk: Ed25519PublicKey,
+    cert_sig: Ed25519Signature,
+    cert_issued_at: u64,
+    cert_alias: String,
 ) {
     let is_update = !sets_existence;
     match apps.get_mut(&key) {
         Some(slot) => {
             if sets_existence { slot.existed = true; }
+            let prev_prio = slot.alias_priority;
             // Updates always beat Adds for the alias slot, regardless of
             // writer rank. Among same-kind entries, rank-priority decides.
             let should_overwrite = match (is_update, slot.alias_from_update) {
@@ -3107,6 +3281,15 @@ fn upsert_alias(
                 slot.alias_priority = prio;
                 slot.alias_from_update = is_update || slot.alias_from_update;
             }
+            if sets_existence
+                && cert_sig != Ed25519Signature::ZERO
+                && (slot.cert_sig == Ed25519Signature::ZERO || prio > prev_prio)
+            {
+                slot.signing_pk = signing_pk;
+                slot.cert_sig = cert_sig;
+                slot.cert_issued_at = cert_issued_at;
+                slot.cert_alias = cert_alias;
+            }
         }
         None => {
             apps.insert(key, MergedApp {
@@ -3114,6 +3297,10 @@ fn upsert_alias(
                 alias,
                 alias_priority: prio,
                 alias_from_update: is_update,
+                signing_pk,
+                cert_sig,
+                cert_issued_at,
+                cert_alias,
             });
         }
     }
@@ -3134,6 +3321,11 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
             grade:   dev.grade,
             sg_rank: dev.sg_rank,
             hosts:   dev.hosts.clone(),
+            signing_pk: dev.signing_pk,
+            dh_pk: dev.dh_pk,
+            cert_sig: dev.cert_sig,
+            cert_issued_at: dev.cert_issued_at,
+            cert_alias: dev.cert_alias.clone(),
         });
     }
 
@@ -3146,6 +3338,10 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
                 device_uuid: *d,
                 app_id:      *id,
                 app_alias:   app.alias.clone(),
+                signing_pk:  app.signing_pk,
+                cert_sig:    app.cert_sig,
+                cert_issued_at: app.cert_issued_at,
+                cert_alias:  app.cert_alias.clone(),
             }),
             Some(cur) if cur.alias != app.alias => {
                 out.push(Change::UpdateApplicationAlias {

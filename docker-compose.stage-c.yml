@@ -46,6 +46,7 @@ services:
       - PNET_ADMIN_PASSWORD=stagetest1
       - PNET_AUTO_APPROVE_APPS=1
       - PNET_APP_API_REMOTE=1
+      - PNET_KEY_PASSPHRASE=stage-key-pass
     volumes:
       - pnet-data-sg-alice-1:/root/.pnet
     depends_on: [proxy-sg-1]
@@ -65,6 +66,7 @@ services:
       - PNET_ADMIN_PASSWORD=stagetest1
       - PNET_AUTO_APPROVE_APPS=1
       - PNET_APP_API_REMOTE=1
+      - PNET_KEY_PASSPHRASE=stage-key-pass
     volumes:
       - pnet-data-sg-alice-2:/root/.pnet
     depends_on: [sg-alice-1, proxy-sg-2]

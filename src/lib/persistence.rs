@@ -113,6 +113,7 @@ pub fn load(data_dir: &Path) -> Node {
         );
     }
 
+    super::keystore::restore_secrets(&mut node);
     node
 }
 
@@ -172,13 +173,24 @@ mod tests {
 
     #[test]
     fn key_pair_roundtrips() {
+        crate::keystore::install_passphrase("test-passphrase");
         let mut node = Node::new();
         node.owner.key_pair = Ed25519KeyPair {
-            public_key:  Ed25519PublicKey([0xAB; 32]),
+            public_key: Ed25519PublicKey([0xAB; 32]),
             private_key: Ed25519SecretKey([0xCD; 32]),
+            private_key_sealed: String::new(),
         };
-        let restored = roundtrip(&node);
-        assert_eq!(restored.owner.key_pair.public_key,  Ed25519PublicKey([0xAB; 32]));
+        let toml_str = save(&node);
+        let leaked = "cd".repeat(32);
+        assert!(
+            !toml_str.contains(&leaked),
+            "plaintext user seed must not appear in node.toml"
+        );
+        assert!(toml_str.contains("private_key_sealed"));
+        let mut restored: Node = toml::from_str(&toml_str).expect("roundtrip deserialize failed");
+        assert_eq!(restored.owner.key_pair.private_key, Ed25519SecretKey::ZERO);
+        crate::keystore::restore_secrets(&mut restored);
+        assert_eq!(restored.owner.key_pair.public_key, Ed25519PublicKey([0xAB; 32]));
         assert_eq!(restored.owner.key_pair.private_key, Ed25519SecretKey([0xCD; 32]));
     }
 
@@ -193,7 +205,9 @@ mod tests {
                 private_key: X25519SecretKey([0x34; 32]),
             },
             expires_at: expires,
-        });
+        
+    releases_user_key: false,
+});
         let restored = roundtrip(&node);
         assert_eq!(restored.owner.device_invitations.len(), 1);
         let inv = &restored.owner.device_invitations[0];

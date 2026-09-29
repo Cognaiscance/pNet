@@ -59,7 +59,7 @@ wait_for_url() {
     done
 }
 
-# Shared with stage compose: PNET_ADMIN_PASSWORD on seed SG(s).
+# Shared with stage compose: PNET_ADMIN_PASSWORD and PNET_KEY_PASSPHRASE on pnet nodes.
 ADMIN_PASSWORD="${PNET_TEST_ADMIN_PASSWORD:-stagetest1}"
 
 admin_cookie_jar() {

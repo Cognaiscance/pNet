@@ -59,6 +59,7 @@ start_node() {
     env+=" PNET_HTTP_BIND=0.0.0.0 PNET_AUTO_APPROVE_APPS=1 PNET_APP_API_REMOTE=1"
     # Match harness default; mint/rename helpers log in with this password.
     env+=" PNET_ADMIN_PASSWORD='${PNET_TEST_ADMIN_PASSWORD:-stagetest1}'"
+    env+=" PNET_KEY_PASSPHRASE='${PNET_TEST_KEY_PASSPHRASE:-stage-key-pass}'"
     [[ -n "$hosts" ]] && env+=" PNET_HOSTS='$hosts'"
     if [[ "$role" == "new" ]]; then
         env+=" PNET_USER_ALIAS='$ualias'"

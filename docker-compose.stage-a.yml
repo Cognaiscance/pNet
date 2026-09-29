@@ -43,6 +43,7 @@ services:
       - PNET_ADMIN_PASSWORD=stagetest1
       - PNET_AUTO_APPROVE_APPS=1
       - PNET_APP_API_REMOTE=1
+      - PNET_KEY_PASSPHRASE=stage-key-pass
     volumes:
       - pnet-data-sg-william-1:/root/.pnet
 
@@ -57,6 +58,7 @@ services:
       - PNET_INVITATION_CODE=${INV_SG2:-}
       - PNET_AUTO_APPROVE_APPS=1
       - PNET_APP_API_REMOTE=1
+      - PNET_KEY_PASSPHRASE=stage-key-pass
     volumes:
       - pnet-data-sg-william-2:/root/.pnet
     depends_on: [sg-william-1]
@@ -70,6 +72,7 @@ services:
       - PNET_INVITATION_CODE=${INV_DGA:-}
       - PNET_AUTO_APPROVE_APPS=1
       - PNET_APP_API_REMOTE=1
+      - PNET_KEY_PASSPHRASE=stage-key-pass
     volumes:
       - pnet-data-dg-william-a:/root/.pnet
     depends_on: [sg-william-1]
@@ -83,6 +86,7 @@ services:
       - PNET_INVITATION_CODE=${INV_DGB:-}
       - PNET_AUTO_APPROVE_APPS=1
       - PNET_APP_API_REMOTE=1
+      - PNET_KEY_PASSPHRASE=stage-key-pass
     volumes:
       - pnet-data-dg-william-b:/root/.pnet
     depends_on: [sg-william-1]

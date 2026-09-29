@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use pnet::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW, PRIORITY_NORMAL};
-use pnet::data_models::DeviceGrade;
-use pnet::handlers::{apply_new_user_setup, parse_pnet_hosts, start_bootstrap};
+use pnet::data_models::{DeviceGrade, Ed25519SecretKey};
+use pnet::handlers::{apply_new_user_setup, ensure_local_device_cert, parse_pnet_hosts, start_bootstrap};
+use pnet::keystore;
 use pnet::http_server::{http_bind_ip, http_port, HttpServer};
 use pnet::persistence;
 use pnet::scheduler::SchedulerThread;
@@ -133,13 +134,82 @@ fn apply_env_admin_password(ctx: &WorkerContext) {
     println!("[apply_env_admin_password] admin password hash stored from env");
 }
 
+/// Install the key passphrase before any secret is read or written.
+/// `PNET_KEY_PASSPHRASE` wins. Otherwise ask the controlling terminal.
+fn install_startup_passphrase() {
+    match std::env::var("PNET_KEY_PASSPHRASE") {
+        Ok(p) if p.len() >= keystore::MIN_PASSPHRASE_LEN => {
+            keystore::install_passphrase(&p);
+            return;
+        }
+        Ok(_) => eprintln!(
+            "[main] PNET_KEY_PASSPHRASE shorter than {} characters; ignoring",
+            keystore::MIN_PASSPHRASE_LEN
+        ),
+        Err(_) => {}
+    }
+    if let Some(p) = keystore::prompt_tty() {
+        if p.len() >= keystore::MIN_PASSPHRASE_LEN {
+            keystore::install_passphrase(&p);
+        } else {
+            eprintln!(
+                "[main] key passphrase shorter than {} characters",
+                keystore::MIN_PASSPHRASE_LEN
+            );
+        }
+    }
+}
+
+fn secrets_need_passphrase(node: &pnet::data_models::Node) -> bool {
+    if node.owner.key_pair.private_key != Ed25519SecretKey::ZERO {
+        return true;
+    }
+    if node.device_signing.private_key != Ed25519SecretKey::ZERO {
+        return true;
+    }
+    node.owner.user.devices.iter().any(|d| {
+        d.applications.iter().any(|a| a.identity.private_key != Ed25519SecretKey::ZERO)
+    })
+}
+
+/// Stop when a sealed key did not open, or when a secret is in memory and
+/// nothing is installed to wrap it on the next save.
+fn abort_if_keys_unreadable(node: &pnet::data_models::Node) {
+    if !node.is_initialized() {
+        return;
+    }
+    let user_failed = !node.owner.key_pair.private_key_sealed.is_empty()
+        && node.owner.key_pair.private_key == Ed25519SecretKey::ZERO;
+    let device_failed = !node.device_secrets_sealed.is_empty()
+        && node.device_signing.private_key == Ed25519SecretKey::ZERO;
+    if user_failed || device_failed {
+        eprintln!(
+            "[main] a sealed private key did not open. Set PNET_KEY_PASSPHRASE to the key passphrase and restart."
+        );
+        std::process::exit(1);
+    }
+    // A joiner that never received the user seed has an empty seal and a
+    // zero private key. That is normal. A node that still holds a seed
+    // (including a legacy plaintext file) must have a passphrase before save.
+    if !keystore::is_installed() && secrets_need_passphrase(node) {
+        eprintln!(
+            "[main] this node holds a private key and no key passphrase is installed. Set PNET_KEY_PASSPHRASE and restart."
+        );
+        std::process::exit(1);
+    }
+}
+
 fn main() {
+    install_startup_passphrase();
+
     // ── 1. Load data from disk ───────────────────────────────────────────────
     // Ensure ~/.pnet/data exists at 0700 and tighten existing data files to 0600
     // before reading keys (see descriptions/data persistence.md).
     let dir = data_dir();
     persistence::ensure_data_dir(&dir).expect("could not create or secure data directory");
-    let node = Arc::new(RwLock::new(persistence::load(&dir)));
+    let loaded = persistence::load(&dir);
+    abort_if_keys_unreadable(&loaded);
+    let node = Arc::new(RwLock::new(loaded));
 
     // ── 1a. Apply PNET_HOSTS (authoritative for the local SG device) ─────────
     let pnet_hosts = parse_pnet_hosts();
@@ -199,6 +269,9 @@ fn main() {
     // Optional admin password for headless / first boot (also used when the
     // node was already initialized without a hash — sets it if still missing).
     apply_env_admin_password(&ctx);
+    // Upgrade path: a node that still holds the user seed but has no device
+    // certificate mints one and publishes it.
+    ensure_local_device_cert(&ctx);
 
     let mut pool = ThreadPool::new(WORKER_COUNT, Arc::clone(&queue), Arc::clone(&stop), Arc::clone(&ctx));
 

@@ -13,6 +13,8 @@ will be introduced without silent misparse.
 - Handshake / bootstrap ops use their own fixed layouts (documented per op).
 - No global protocol version field on the wire today.
 
+The user-signs-devices change redefines bootstrap (`0x30`/`0x31`), device and app directory cards, and the public sync records that carry them. ConnectRequest and ConnectAck keep their sizes; the 32-byte identity in them is now the device signing key, and the peer accepts it only when that device's certificate chains to the known user public key. Invitation `0x35` grows an optional trailing flags byte (bit 0 asks an already server-grade peer to release the user private key). Both ends of a mesh have to move together. A later break should follow the capability-byte plan below instead of redefining these layouts again.
+
 Op ranges in use (hex):
 
 | Range | Role |

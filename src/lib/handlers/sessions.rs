@@ -12,6 +12,7 @@ use super::super::crypto::{
     build_encrypted_packet, decrypt_packet_body, ed25519_sign, ed25519_verify,
     generate_x25519_keypair,
 };
+use super::super::certs::device_on_record_verifies;
 use super::super::data_models::{
     ActiveConnection, Device, DeviceGrade, Ed25519PublicKey, Node, PendingConnection, SgStatus,
     Uuid, X25519PublicKey,
@@ -24,20 +25,24 @@ use super::{
     refresh_dns_for_known_hosts, send, sync_pull, uuid_hex, WriterTarget,
 };
 
-/// Find the device UUID for an incoming connection request, given the peer's
-/// long-term public key and claimed device UUID.  Returns `Some(uuid)` if both
-/// the key and the UUID are known (own devices or a contact's devices).
-fn find_device_uuid_for_pk(node: &Node, longterm_pk: &Ed25519PublicKey, device_uuid: &Uuid) -> Option<Uuid> {
-    // Own devices share the owner's long-term public key.
-    if node.owner.key_pair.public_key == *longterm_pk {
-        if node.owner.user.devices.iter().any(|d| d.uuid == *device_uuid) {
+/// The presented key must be that device's signing key, and the device
+/// certificate must chain to the user public key we already trust.
+fn device_key_authed(device: &Device, user_pk: &Ed25519PublicKey, presented: &Ed25519PublicKey) -> bool {
+    device.signing_pk == *presented && device_on_record_verifies(device, user_pk)
+}
+
+/// Find the device UUID for an incoming connection request. The 32-byte key
+/// is the device signing key, not the user key. A removed device is absent
+/// from the directory, so a kept device key cannot authenticate as another UUID.
+fn find_device_uuid_for_pk(node: &Node, device_pk: &Ed25519PublicKey, device_uuid: &Uuid) -> Option<Uuid> {
+    if let Some(device) = node.owner.user.devices.iter().find(|d| d.uuid == *device_uuid) {
+        if device_key_authed(device, &node.owner.key_pair.public_key, device_pk) {
             return Some(*device_uuid);
         }
     }
-    // Contact devices use the contact's public key.
     for contact in &node.owner.contact_users {
-        if contact.public_key == *longterm_pk {
-            if contact.user.devices.iter().any(|d| d.uuid == *device_uuid) {
+        if let Some(device) = contact.user.devices.iter().find(|d| d.uuid == *device_uuid) {
+            if device_key_authed(device, &contact.public_key, device_pk) {
                 return Some(*device_uuid);
             }
         }
@@ -106,7 +111,7 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let conn_id  = allocate_conn_id(&node);
         let key_pair = generate_x25519_keypair();
         let pk_copy  = key_pair.public_key;
-        let sk_copy  = node.owner.key_pair.private_key;
+        let sk_copy  = node.device_signing.private_key;
         // Evict any stale connections to this device before inserting the new one.
         node.owner.active_connections.retain(|_, c| c.device_uuid != initiator_device_uuid);
         node.owner.active_connections.insert(conn_id, ActiveConnection {
@@ -453,8 +458,8 @@ pub fn maintain_connections(ctx: &WorkerContext) {
         let node = ctx.node.read().unwrap();
         let cache = ctx.dns_cache.lock().unwrap();
         let our_device_uuid = node.device_uuid;
-        let our_longterm_pk = node.owner.key_pair.public_key;
-        let our_longterm_sk = node.owner.key_pair.private_key;
+        let our_longterm_pk = node.device_signing.public_key;
+        let our_longterm_sk = node.device_signing.private_key;
 
         let is_sg = node.owner.user.devices.iter()
             .find(|d| d.uuid == our_device_uuid)
@@ -483,7 +488,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
             if d.uuid == our_device_uuid { continue; }
             if want_initiate(d) {
                 if let Some(addr) = best_address_for_device(&node, &cache, &d.uuid) {
-                    desired.push((d.uuid, addr, our_longterm_pk));
+                    desired.push((d.uuid, addr, d.signing_pk));
                 }
             }
         }
@@ -491,7 +496,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
             for d in &contact.user.devices {
                 if want_initiate(d) {
                     if let Some(addr) = best_address_for_device(&node, &cache, &d.uuid) {
-                        desired.push((d.uuid, addr, contact.public_key));
+                        desired.push((d.uuid, addr, d.signing_pk));
                     }
                 }
             }

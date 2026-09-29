@@ -168,10 +168,16 @@ impl WorkerContext {
     /// Persist directory snapshot and write log as **two** atomic files
     /// (`node.toml` + `write_log.toml`) so the log can grow independently (§7.3).
     pub fn save_node(&self) {
-        let node = self.node.read().unwrap();
-        let dir_toml = super::persistence::save(&*node);
-        let log_toml = super::persistence::save_write_log(&*node);
-        drop(node);
+        // Write lock: device secrets are sealed into the snapshot before
+        // serialize. Callers must not already hold `node`.
+        let (dir_toml, log_toml) = {
+            let mut node = self.node.write().unwrap();
+            super::keystore::refresh_device_secrets(&mut node);
+            (
+                super::persistence::save(&*node),
+                super::persistence::save_write_log(&*node),
+            )
+        };
         let _ = self.writer_tx.send(WriteRequest::NodeData(dir_toml));
         let _ = self.writer_tx.send(WriteRequest::WriteLog(log_toml));
     }

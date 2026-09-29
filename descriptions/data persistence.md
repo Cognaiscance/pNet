@@ -23,6 +23,7 @@ Data files live in a dedicated directory (e.g. `~/.pnet/data/`). The directory a
   - `apps.toml` — reserved / app-side data
 - **Write strategy** — write on every change. To avoid corrupt files on crash, write to a temp file first (`.{filename}.tmp`), fsync, then rename into place (on Linux, rename is atomic). `save_node` enqueues **both** directory and write-log flushes.
 - **Migration** — older builds embedded `write_log` inside `node.toml`. Load still accepts that; the next save writes the split layout.
+- **Private keys** — Ed25519 seeds are not written as plaintext. `node.toml` stores `private_key_sealed` (base64 envelope: version, Argon2id salt and parameters, XChaCha20-Poly1305 nonce and ciphertext). The device signing seed and static X25519 secret share one sealed blob, `device_secrets_sealed`. A legacy file that still has a plaintext `private_key` loads, and the next save wraps it. The process passphrase comes from `PNET_KEY_PASSPHRASE` or a terminal prompt; it is not the admin password. Invitation X25519 secrets stay on the device that minted them and are still stored with the invitation. See `descriptions/identity-and-keys.md`.
 
 ## Thread safety and disk writes
 

@@ -3,8 +3,10 @@ pub mod admin_auth;
 pub mod app_api;
 /// Owner portal app mounts (`/apps/<slug>/`) registry and reverse proxy.
 pub mod app_web;
+pub mod certs;
 pub mod crypto;
 pub mod data_models;
+pub mod keystore;
 pub mod dns_cache;
 /// Wire-format fuzz entry points and mutational campaign (§8.2).
 pub mod fuzz;

@@ -77,6 +77,7 @@ pub(crate) fn generate_ed25519_keypair() -> Ed25519KeyPair {
     Ed25519KeyPair {
         private_key: Ed25519SecretKey(seed),
         public_key:  Ed25519PublicKey(*signing_key.verifying_key().as_bytes()),
+        private_key_sealed: String::new(),
     }
 }
 
