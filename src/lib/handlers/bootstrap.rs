@@ -8,14 +8,16 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::time::{Duration, SystemTime};
 
 use super::super::action_queue::{Action, ScheduleRequest, WorkerContext};
+use super::super::certs::{self, sign_device_cert};
 use super::super::crypto::{
     aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body,
-    generate_x25519_keypair, xchacha20_decrypt, xchacha20_encrypt,
+    ed25519_sign, ed25519_verify, generate_ed25519_keypair, generate_x25519_keypair,
+    xchacha20_decrypt, xchacha20_encrypt,
 };
 use super::super::data_models::{
     Contact, Device, DeviceGrade, Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey,
-    Invitation, Node, PendingBootstrap, PendingContactExchange, PendingDeviceAcceptance,
-    SyncVersion, User, Uuid, X25519PublicKey,
+    Ed25519Signature, Invitation, Node, PendingBootstrap, PendingContactExchange,
+    PendingDeviceAcceptance, SyncVersion, User, Uuid, X25519PublicKey,
     generate_uuid,
 };
 use super::super::wire::*;
@@ -28,21 +30,64 @@ use super::{
 /// How long the SG keeps a PendingDeviceAcceptance waiting for DeviceRegistration.
 const PENDING_ACCEPTANCE_TTL: Duration = Duration::from_secs(5 * 60);
 
-/// Serialize owner bootstrap payload (user + keys + devices + contacts).
+/// Device certificate the issuer just signed for the joining device.
+/// It is not yet one of the owner's stored devices.
+#[derive(Clone, Debug)]
+pub(crate) struct IssuedDeviceCert {
+    pub signing_pk: Ed25519PublicKey,
+    pub dh_pk: X25519PublicKey,
+    pub cert_sig: Ed25519Signature,
+    pub cert_issued_at: u64,
+    pub cert_alias: String,
+}
+
+impl IssuedDeviceCert {
+    fn zero() -> Self {
+        Self {
+            signing_pk: Ed25519PublicKey::ZERO,
+            dh_pk: X25519PublicKey::ZERO,
+            cert_sig: Ed25519Signature::ZERO,
+            cert_issued_at: 0,
+            cert_alias: String::new(),
+        }
+    }
+}
+
+/// Serialize owner bootstrap payload (user + devices + contacts).
 ///
 /// Layout (plaintext before AEAD wrap in BootstrapResponse):
-///   `[alias:lp][user_uuid:16][ed25519_pk:32][ed25519_sk:32]
+///   `[alias:lp][user_uuid:16][user_pk:32][user_cert_sig:64][user_cert_issued_at:u64 le]
+///    [user_sk_flag:u8][user_sk:32 if flag==1]
+///    [issued signing_pk:32][issued dh_pk:32][issued sig:64][issued_at:u64 le][alias:lp]
 ///    [device_count:u8][device…][contact_count:u8][contact…]`
-/// Device card: `push_device`. Contact: `[uuid:16][alias:lp][pk:32][dev_count][device…]`.
+///
+/// The user private key is present only when `release_user_key` is set. An
+/// ordinary device invite carries the user public certificate and a device
+/// certificate, not the seed that signs more devices.
 /// Exported for golden-vector tests (§9.2).
-pub(crate) fn serialize_bootstrap_payload(node: &Node) -> Vec<u8> {
+pub(crate) fn serialize_bootstrap_payload(
+    node: &Node,
+    release_user_key: bool,
+    issued: &IssuedDeviceCert,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     let owner = &node.owner;
     let user  = &owner.user;
+    let release = release_user_key && owner.key_pair.private_key != Ed25519SecretKey::ZERO;
     push_str(&mut buf, &user.alias);
     buf.extend_from_slice(&user.uuid);
     buf.extend_from_slice(owner.key_pair.public_key.as_bytes());
-    buf.extend_from_slice(owner.key_pair.private_key.as_bytes());
+    buf.extend_from_slice(&owner.user_cert_sig.0);
+    buf.extend_from_slice(&owner.user_cert_issued_at.to_le_bytes());
+    buf.push(u8::from(release));
+    if release {
+        buf.extend_from_slice(owner.key_pair.private_key.as_bytes());
+    }
+    buf.extend_from_slice(issued.signing_pk.as_bytes());
+    buf.extend_from_slice(issued.dh_pk.as_bytes());
+    buf.extend_from_slice(&issued.cert_sig.0);
+    buf.extend_from_slice(&issued.cert_issued_at.to_le_bytes());
+    push_str(&mut buf, &issued.cert_alias);
     buf.push(user.devices.len() as u8);
     for d in &user.devices { push_device(&mut buf, d); }
     buf.push(owner.contact_users.len() as u8);
@@ -60,6 +105,10 @@ struct BootstrapPayload {
     user_alias: String,
     user_uuid:  Uuid,
     key_pair:   Ed25519KeyPair,
+    user_cert_sig: Ed25519Signature,
+    user_cert_issued_at: u64,
+    release_user_key: bool,
+    issued: IssuedDeviceCert,
     devices:    Vec<Device>,
     contacts:   Vec<Contact>,
 }
@@ -70,10 +119,29 @@ fn deserialize_bootstrap_payload(data: &[u8]) -> Option<BootstrapPayload> {
     let user_alias  = read_str(data, &mut pos)?;
     let user_uuid:  Uuid      = read_arr(data, &mut pos)?;
     let pk: [u8; 32] = read_arr(data, &mut pos)?;
-    let sk: [u8; 32] = read_arr(data, &mut pos)?;
+    let user_cert_sig = Ed25519Signature(read_arr(data, &mut pos)?);
+    let issued_at_bytes: [u8; 8] = read_arr(data, &mut pos)?;
+    let user_cert_issued_at = u64::from_le_bytes(issued_at_bytes);
+    let flag = *data.get(pos)?;
+    pos += 1;
+    let release_user_key = flag == 1;
+    let sk = if release_user_key {
+        let raw: [u8; 32] = read_arr(data, &mut pos)?;
+        Ed25519SecretKey(raw)
+    } else {
+        Ed25519SecretKey::ZERO
+    };
     let key_pair = Ed25519KeyPair {
         public_key:  Ed25519PublicKey(pk),
-        private_key: Ed25519SecretKey(sk),
+        private_key: sk,
+        private_key_sealed: String::new(),
+    };
+    let issued = IssuedDeviceCert {
+        signing_pk: Ed25519PublicKey(read_arr(data, &mut pos)?),
+        dh_pk: X25519PublicKey(read_arr(data, &mut pos)?),
+        cert_sig: Ed25519Signature(read_arr(data, &mut pos)?),
+        cert_issued_at: u64::from_le_bytes(read_arr(data, &mut pos)?),
+        cert_alias: read_str(data, &mut pos)?,
     };
     let device_count = *data.get(pos)? as usize; pos += 1;
     let mut devices = Vec::new();
@@ -93,7 +161,40 @@ fn deserialize_bootstrap_payload(data: &[u8]) -> Option<BootstrapPayload> {
             last_seen_public_version: SyncVersion::default(),
         });
     }
-    Some(BootstrapPayload { user_alias, user_uuid, key_pair, devices, contacts })
+    Some(BootstrapPayload {
+        user_alias, user_uuid, key_pair, user_cert_sig, user_cert_issued_at,
+        release_user_key, issued, devices, contacts,
+    })
+}
+
+struct BootstrapRequestBody {
+    invitation_id: Uuid,
+    ephem_pk: X25519PublicKey,
+    signing_pk: Ed25519PublicKey,
+    dh_pk: X25519PublicKey,
+    alias: String,
+    pop_sig: [u8; 64],
+    signed_prefix: Vec<u8>,
+}
+
+/// BootstrapRequest after the op byte:
+/// `[inv_id:16][ephem:32][device_signing_pk:32][device_dh_pk:32][alias lp][pop:64]`.
+/// The signature covers `op ||` the bytes before the signature.
+fn parse_bootstrap_request(buf: &[u8]) -> Option<BootstrapRequestBody> {
+    let mut pos = 0usize;
+    let invitation_id: Uuid = read_arr(buf, &mut pos)?;
+    let ephem_pk = X25519PublicKey(read_arr(buf, &mut pos)?);
+    let signing_pk = Ed25519PublicKey(read_arr(buf, &mut pos)?);
+    let dh_pk = X25519PublicKey(read_arr(buf, &mut pos)?);
+    let alias = read_str(buf, &mut pos)?;
+    let signed_end = pos;
+    let pop_sig: [u8; 64] = read_arr(buf, &mut pos)?;
+    let mut signed_prefix = Vec::with_capacity(1 + signed_end);
+    signed_prefix.push(BOOTSTRAP_REQUEST_OP);
+    signed_prefix.extend_from_slice(&buf[..signed_end]);
+    Some(BootstrapRequestBody {
+        invitation_id, ephem_pk, signing_pk, dh_pk, alias, pop_sig, signed_prefix,
+    })
 }
 
 // ── Bootstrap handlers ────────────────────────────────────────────────────────
@@ -102,24 +203,33 @@ fn deserialize_bootstrap_payload(data: &[u8]) -> Option<BootstrapPayload> {
 ///
 /// Payload (after op byte):
 ///   [invitation_id: 16][new_device_ephem_pk: 32]
+///   [device_signing_pk: 32][device_dh_pk: 32][alias lp][pop: 64]
 ///
-/// The SG validates the invitation, derives X25519(invitation_sk, new_device_ephem_pk),
-/// encrypts the full user data with that key, and replies with a BootstrapResponse.
+/// The SG validates the invitation and the proof-of-possession signature,
+/// signs a device certificate, and encrypts the user data with
+/// X25519(invitation_sk, new_device_ephem_pk). The user private key is
+/// included only when the invitation was minted with `releases_user_key`.
 /// The invitation is consumed (single-use).
 pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    if buf.len() < 48 {
-        eprintln!("[bootstrap_request] packet too short ({}) from {src}", buf.len());
+    let Some(req) = parse_bootstrap_request(&buf) else {
+        eprintln!("[bootstrap_request] packet too short or malformed ({}) from {src}", buf.len());
+        return;
+    };
+    if !ed25519_verify(&req.signing_pk, &req.signed_prefix, &req.pop_sig) {
+        eprintln!("[bootstrap_request] device key proof failed from {src}");
         return;
     }
-    let Some(invitation_id) = slice_arr::<16>(&buf, 0) else { return; };
-    let Some(new_dev_ephem_pk) = slice_arr::<32>(&buf, 16).map(X25519PublicKey) else { return; };
+    if req.alias.is_empty() {
+        eprintln!("[bootstrap_request] empty device alias from {src}");
+        return;
+    }
 
     // Validate invitation, derive shared secret, serialize payload — all under write lock.
     let (shared_secret, payload) = {
         let mut node = ctx.node.write().unwrap();
         let now = SystemTime::now();
 
-        let pos = match node.owner.device_invitations.iter().position(|inv| inv.id == invitation_id) {
+        let pos = match node.owner.device_invitations.iter().position(|inv| inv.id == req.invitation_id) {
             Some(p) => p,
             None => {
                 eprintln!("[bootstrap_request] unknown invitation from {src}");
@@ -133,18 +243,46 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
 
         let inv: Invitation = node.owner.device_invitations.remove(pos);
+        if node.owner.key_pair.private_key == Ed25519SecretKey::ZERO {
+            eprintln!("[bootstrap_request] this node cannot sign device certificates");
+            return;
+        }
+        if node.owner.user_cert_sig == Ed25519Signature::ZERO {
+            let (sig, issued_at) = certs::sign_user_cert(
+                &node.owner.key_pair.private_key,
+                &node.owner.user.alias,
+                &node.owner.key_pair.public_key,
+            );
+            node.owner.user_cert_sig = sig;
+            node.owner.user_cert_issued_at = issued_at;
+        }
+        let (cert_sig, cert_issued_at) = sign_device_cert(
+            &node.owner.key_pair.private_key,
+            &req.alias,
+            &req.signing_pk,
+            &req.dh_pk,
+            &node.owner.key_pair.public_key,
+        );
+        let issued = IssuedDeviceCert {
+            signing_pk: req.signing_pk,
+            dh_pk: req.dh_pk,
+            cert_sig,
+            cert_issued_at,
+            cert_alias: req.alias.clone(),
+        };
         // AEAD key (HKDF bootstrap domain over X25519), not the raw DH output.
         let shared_secret: [u8; 32] = aead_key_from_dh(
             &inv.key_pair.private_key,
-            &new_dev_ephem_pk,
+            &req.ephem_pk,
             aead_domain::BOOTSTRAP,
         );
-        let payload: Vec<u8> = serialize_bootstrap_payload(&node);
+        let payload: Vec<u8> = serialize_bootstrap_payload(&node, inv.releases_user_key, &issued);
 
         // Remember the AEAD key so we can decrypt the incoming DeviceRegistration.
-        node.owner.pending_device_acceptances.insert(invitation_id, PendingDeviceAcceptance {
+        node.owner.pending_device_acceptances.insert(req.invitation_id, PendingDeviceAcceptance {
             shared_secret,
             expires_at: now + PENDING_ACCEPTANCE_TTL,
+            expected_signing_pk: req.signing_pk,
         });
 
         (shared_secret, payload)
@@ -155,7 +293,7 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         "invite_consumed",
         &[
             ("kind", "device"),
-            ("invitation_id", &uuid_hex(&invitation_id)),
+            ("invitation_id", &uuid_hex(&req.invitation_id)),
             ("addr", &src.to_string()),
         ],
     );
@@ -213,6 +351,34 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         eprintln!("[bootstrap_response] deserialization failed from {src}");
         return;
     };
+    if !certs::verify_user_cert(
+        &data.user_alias,
+        &data.key_pair.public_key,
+        data.user_cert_issued_at,
+        &data.user_cert_sig,
+    ) {
+        eprintln!("[bootstrap_response] user certificate did not verify from {src}");
+        return;
+    }
+    let (our_signing, our_dh) = {
+        let node = ctx.node.read().unwrap();
+        (node.device_signing.public_key, node.device_dh.public_key)
+    };
+    if data.issued.signing_pk != our_signing || data.issued.dh_pk != our_dh {
+        eprintln!("[bootstrap_response] issued device certificate is not for our keys");
+        return;
+    }
+    if !certs::verify_device_cert(
+        &data.issued.cert_alias,
+        &data.issued.signing_pk,
+        &data.issued.dh_pk,
+        &data.key_pair.public_key,
+        data.issued.cert_issued_at,
+        &data.issued.cert_sig,
+    ) {
+        eprintln!("[bootstrap_response] device certificate did not verify from {src}");
+        return;
+    }
 
     // Apply received user data and clear pending bootstrap.
     let device_reg_payload = {
@@ -220,6 +386,9 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let local_uuid = node.device_uuid;
         node.owner.user.alias  = data.user_alias;
         node.owner.user.uuid   = data.user_uuid;
+        node.owner.user_cert_sig = data.user_cert_sig;
+        node.owner.user_cert_issued_at = data.user_cert_issued_at;
+        // The payload already omits the seed unless the invitation released it.
         node.owner.key_pair    = data.key_pair;
         // Add received devices, skipping any that share our local UUID.
         for d in data.devices {
@@ -231,12 +400,20 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         node.owner.pending_bootstrap = None;
 
         // Apply the user-chosen alias, grade, and rank to the local device.
+        // The certificate keeps the alias the issuer signed.
         if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == local_uuid) {
-            if !device_alias.is_empty() {
-                dev.alias = device_alias;
-            }
+            dev.alias = if device_alias.is_empty() {
+                data.issued.cert_alias.clone()
+            } else {
+                device_alias
+            };
             dev.grade   = desired_grade;
             dev.sg_rank = desired_sg_rank;
+            dev.signing_pk = data.issued.signing_pk;
+            dev.dh_pk = data.issued.dh_pk;
+            dev.cert_sig = data.issued.cert_sig;
+            dev.cert_issued_at = data.issued.cert_issued_at;
+            dev.cert_alias = data.issued.cert_alias.clone();
             // For SG joiners, PNET_HOSTS is authoritative for advertised hosts.
             if matches!(dev.grade, DeviceGrade::SG) {
                 let hosts = parse_pnet_hosts();
@@ -299,13 +476,14 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let ciphertext:    &[u8]   = &buf[40..];
 
     // Look up and consume the pending acceptance under write lock.
-    let shared_secret: [u8; 32] = {
+    let (shared_secret, expected_signing_pk, user_pk): ([u8; 32], Ed25519PublicKey, Ed25519PublicKey) = {
         let mut node = ctx.node.write().unwrap();
         let now = SystemTime::now();
         // Evict expired entries while we're here.
         node.owner.pending_device_acceptances.retain(|_, v| v.expires_at > now);
+        let user_pk = node.owner.key_pair.public_key;
         match node.owner.pending_device_acceptances.remove(&invitation_id) {
-            Some(pda) => pda.shared_secret,
+            Some(pda) => (pda.shared_secret, pda.expected_signing_pk, user_pk),
             None => {
                 eprintln!("[device_registration] no pending acceptance for invitation from {src}");
                 return;
@@ -323,12 +501,21 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         eprintln!("[device_registration] deserialization failed from {src}");
         return;
     };
+    if device.signing_pk != expected_signing_pk || !certs::device_on_record_verifies(&device, &user_pk) {
+        eprintln!("[device_registration] device certificate did not match the bootstrap proof from {src}");
+        return;
+    }
 
     let device_uuid = device.uuid;
     let device_alias = device.alias.clone();
     let device_grade = device.grade;
     let device_sg_rank = device.sg_rank;
     let device_hosts = device.hosts.clone();
+    let device_signing_pk = device.signing_pk;
+    let device_dh_pk = device.dh_pk;
+    let device_cert_sig = device.cert_sig;
+    let device_cert_issued_at = device.cert_issued_at;
+    let device_cert_alias = device.cert_alias.clone();
 
     let inserted = {
         let mut node = ctx.node.write().unwrap();
@@ -352,6 +539,11 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             grade:   device_grade,
             sg_rank: device_sg_rank,
             hosts:   device_hosts,
+            signing_pk: device_signing_pk,
+            dh_pk: device_dh_pk,
+            cert_sig: device_cert_sig,
+            cert_issued_at: device_cert_issued_at,
+            cert_alias: device_cert_alias,
         }, ctx) {
             {
                 let mut node = ctx.node.write().unwrap();
@@ -636,15 +828,21 @@ pub(crate) fn top_online_sg(node: &Node) -> Option<Uuid> {
 /// Mint a fresh invitation and store it in the local device/contact vec
 /// according to `kind`. Returns `(id, public_key)` for embedding in the code.
 /// Caller is responsible for `ctx.save_node()`.
-fn store_new_invitation(kind: u8, ctx: &WorkerContext) -> (Uuid, X25519PublicKey) {
+fn store_new_invitation(kind: u8, releases_user_key: bool, ctx: &WorkerContext) -> (Uuid, X25519PublicKey) {
     let mut node = ctx.node.write().unwrap();
     let kp = generate_x25519_keypair();
     let pk = kp.public_key;
     let id = generate_uuid();
+    // A contact invite never carries the user key. A device invite does so
+    // only when the minter asked, and only if this node actually holds it.
+    let releases_user_key = kind == INVITE_TYPE_DEVICE
+        && releases_user_key
+        && node.owner.key_pair.private_key != Ed25519SecretKey::ZERO;
     let inv = Invitation {
         id,
         key_pair:   kp,
         expires_at: SystemTime::now() + Duration::from_secs(24 * 3600),
+        releases_user_key,
     };
     if kind == INVITE_TYPE_CONTACT {
         node.owner.contact_invitations.push(inv);
@@ -717,7 +915,13 @@ pub(crate) enum InvitationMint {
 
 /// Generate a device invitation for the UI. See `generate_invitation`.
 pub(crate) fn generate_device_invitation(ctx: &WorkerContext) -> InvitationMint {
-    generate_invitation(INVITE_TYPE_DEVICE, ctx)
+    generate_device_invitation_with(ctx, false)
+}
+
+/// `releases_user_key` copies the user private key to the joiner so that
+/// server can enroll further devices. Ordinary invites leave it false.
+pub(crate) fn generate_device_invitation_with(ctx: &WorkerContext, releases_user_key: bool) -> InvitationMint {
+    generate_invitation(INVITE_TYPE_DEVICE, releases_user_key, ctx)
 }
 
 /// Produce a shareable invitation code of `kind` (device or contact).
@@ -728,7 +932,7 @@ pub(crate) fn generate_device_invitation(ctx: &WorkerContext) -> InvitationMint 
 /// invitation itself and embeds its own hosts. Otherwise — whether the local
 /// node is a DG or a lower-ranked SG — it asks that SG to mint and returns
 /// [`InvitationMint::Pending`] so the caller can wait **off the pool**.
-fn generate_invitation(kind: u8, ctx: &WorkerContext) -> InvitationMint {
+fn generate_invitation(kind: u8, releases_user_key: bool, ctx: &WorkerContext) -> InvitationMint {
     let (target, local_uuid, hosts) = {
         let node = ctx.node.read().unwrap();
         (top_online_sg(&node), node.device_uuid, local_device_hosts(&node))
@@ -743,11 +947,11 @@ fn generate_invitation(kind: u8, ctx: &WorkerContext) -> InvitationMint {
         // We are the top-ranked online SG: mint locally. `top_online_sg` only
         // returns the local node when it is an SG with hosts, so `hosts` is
         // non-empty here.
-        let (inv_id, inv_pk) = store_new_invitation(kind, ctx);
+        let (inv_id, inv_pk) = store_new_invitation(kind, releases_user_key, ctx);
         ctx.save_node();
         InvitationMint::Ready(encode_invitation_code(&inv_id, &inv_pk, &hosts))
     } else {
-        start_invitation_from_sg(kind, target, ctx)
+        start_invitation_from_sg(kind, target, releases_user_key, ctx)
     }
 }
 
@@ -756,19 +960,20 @@ fn generate_invitation(kind: u8, ctx: &WorkerContext) -> InvitationMint {
 ///
 /// The admin UI waits via [`PendingInvites::wait_result`] on a dedicated
 /// thread (not a pool worker). `generate_invitation_response` fills the slot.
-fn start_invitation_from_sg(kind: u8, sg_uuid: Uuid, ctx: &WorkerContext) -> InvitationMint {
+fn start_invitation_from_sg(kind: u8, sg_uuid: Uuid, releases_user_key: bool, ctx: &WorkerContext) -> InvitationMint {
     let token = generate_uuid();
 
     // Build the 0x35 request to the chosen SG over its active connection.
-    // Body: [kind:1][token:16].
+    // Body: [kind:1][token:16][flags:1]. Bit 0 asks the SG to release the user key.
     let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
         let node = ctx.node.read().unwrap();
         node.owner.active_connections.values()
             .find(|c| c.device_uuid == sg_uuid)
             .map(|conn| {
-                let mut body = Vec::with_capacity(1 + 16);
+                let mut body = Vec::with_capacity(1 + 16 + 1);
                 body.push(kind);
                 body.extend_from_slice(&token);
+                body.push(u8::from(releases_user_key));
                 (build_encrypted_packet(GENERATE_INVITATION_REQUEST_OP, conn, &body), conn.peer_addr)
             })
     };
@@ -832,24 +1037,44 @@ pub fn start_bootstrap(
 
     let ephem_kp = generate_x25519_keypair();
     let ephem_pk = ephem_kp.public_key;
-    {
+    let alias = device_alias.to_string();
+    let (signing_pk, dh_pk, pop) = {
         let mut node = ctx.node.write().unwrap();
+        if node.device_signing.private_key == Ed25519SecretKey::ZERO {
+            node.device_signing = generate_ed25519_keypair();
+            node.device_dh = generate_x25519_keypair();
+        }
+        let signing_pk = node.device_signing.public_key;
+        let dh_pk = node.device_dh.public_key;
+        let mut signed = Vec::new();
+        signed.push(BOOTSTRAP_REQUEST_OP);
+        signed.extend_from_slice(&invitation_id);
+        signed.extend_from_slice(ephem_pk.as_bytes());
+        signed.extend_from_slice(signing_pk.as_bytes());
+        signed.extend_from_slice(dh_pk.as_bytes());
+        push_str(&mut signed, &alias);
+        let pop = ed25519_sign(&node.device_signing.private_key, &signed);
         node.owner.pending_bootstrap = Some(PendingBootstrap {
             invitation_id,
             our_ephem_key_pair: ephem_kp,
             invitation_pk,
             sg_addr,
-            device_alias: device_alias.to_string(),
+            device_alias: alias.clone(),
             desired_grade,
             desired_sg_rank,
         });
-    }
+        (signing_pk, dh_pk, pop)
+    };
 
-    // Send BootstrapRequest: [op=0x30][invitation_id:16][our_ephem_pk:32]
-    let mut pkt = [0u8; 49];
-    pkt[0] = BOOTSTRAP_REQUEST_OP;
-    pkt[1..17].copy_from_slice(&invitation_id);
-    pkt[17..49].copy_from_slice(ephem_pk.as_bytes());
+    // [op][inv_id:16][ephem:32][signing:32][dh:32][alias lp][pop:64]
+    let mut pkt = Vec::new();
+    pkt.push(BOOTSTRAP_REQUEST_OP);
+    pkt.extend_from_slice(&invitation_id);
+    pkt.extend_from_slice(ephem_pk.as_bytes());
+    pkt.extend_from_slice(signing_pk.as_bytes());
+    pkt.extend_from_slice(dh_pk.as_bytes());
+    push_str(&mut pkt, &alias);
+    pkt.extend_from_slice(&pop);
     println!("[start_bootstrap] sending bootstrap request to {sg_addr} (picked {picked_host} from {hosts:?})");
     send(ctx, SocketAddr::V4(sg_addr), &pkt);
     Ok(())
@@ -857,12 +1082,14 @@ pub fn start_bootstrap(
 
 /// Generate a contact invitation code for the UI. See `generate_invitation`.
 pub(crate) fn generate_contact_invitation(ctx: &WorkerContext) -> InvitationMint {
-    generate_invitation(INVITE_TYPE_CONTACT, ctx)
+    generate_invitation(INVITE_TYPE_CONTACT, false, ctx)
 }
 
 /// SG side of the DG→SG invitation request (op 0x35). Mints an invitation,
 /// stores it locally, and replies (op 0x36) with the encoded code embedding
-/// this SG's own hosts. Request body: `[kind:1][token:16]`. Response body:
+/// this SG's own hosts. Request body: `[kind:1][token:16]` plus an optional
+/// flags byte (bit 0 = release the user private key). A device-grade requester
+/// cannot set that bit: only an own server-grade session may ask. Response body:
 /// `[token:16][result:1][code_utf8...]`.
 pub fn generate_invitation_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
@@ -887,18 +1114,23 @@ pub fn generate_invitation_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
     }
     let kind = plaintext[0];
     let Some(token) = slice_arr::<16>(&plaintext, 1) else { return; };
+    let asked_release = plaintext.len() >= 18 && plaintext[17] & 1 != 0;
 
     // Any SG can mint: invitations are device-local, so the requesting DG's
     // code points here and this node will receive the BootstrapRequest.
-    let hosts = {
+    // The user-key flag is honored only for an own server-grade requester.
+    let (hosts, requester_is_sg) = {
         let node = ctx.node.read().unwrap();
-        local_device_hosts(&node)
+        let requester_is_sg = node.owner.active_connections.get(&conn_id)
+            .and_then(|c| node.owner.user.devices.iter().find(|d| d.uuid == c.device_uuid))
+            .is_some_and(|d| matches!(d.grade, DeviceGrade::SG));
+        (local_device_hosts(&node), requester_is_sg)
     };
     let (result_byte, code) = if hosts.is_empty() {
         eprintln!("[generate_invitation_request] this SG has no hosts configured — cannot mint");
         (INVITE_RESULT_ERROR, String::new())
     } else {
-        let (inv_id, inv_pk) = store_new_invitation(kind, ctx);
+        let (inv_id, inv_pk) = store_new_invitation(kind, asked_release && requester_is_sg, ctx);
         ctx.save_node();
         (INVITE_RESULT_OK, encode_invitation_code(&inv_id, &inv_pk, &hosts))
     };
@@ -1026,6 +1258,7 @@ mod golden_tests {
         Ed25519KeyPair {
             private_key: Ed25519SecretKey(seed),
             public_key: Ed25519PublicKey(*signing.verifying_key().as_bytes()),
+            private_key_sealed: String::new(),
         }
     }
 
@@ -1043,7 +1276,13 @@ mod golden_tests {
             sg_rank: None,
             hosts: vec!["127.0.0.1:7777".into()],
             applications: Vec::new(),
-        }];
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}];
         n.owner.contact_users = vec![Contact {
             public_key: keypair_from_seed([0x08; 32]).public_key,
             user: User {
@@ -1056,11 +1295,30 @@ mod golden_tests {
                     sg_rank: Some(1),
                     hosts: vec!["sg.example:7777".into()],
                     applications: Vec::new(),
-                }],
+                
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}],
             },
             last_seen_public_version: SyncVersion::default(),
         }];
         n
+    }
+
+    fn zero_issued() -> IssuedDeviceCert {
+        IssuedDeviceCert::zero()
+    }
+
+    /// Device-card trailer appended by `push_device` (keys, cert, alias).
+    fn push_empty_cert(e: &mut Vec<u8>) {
+        e.extend_from_slice(&[0u8; 32]); // signing pk
+        e.extend_from_slice(&[0u8; 32]); // dh pk
+        e.extend_from_slice(&[0u8; 64]); // cert sig
+        e.extend_from_slice(&0u64.to_le_bytes());
+        e.push(0); // empty cert alias
     }
 
     /// Manually lay out the expected wire bytes (independent of serialize helper
@@ -1072,9 +1330,17 @@ mod golden_tests {
         e.extend_from_slice(b"alice");
         e.extend_from_slice(&[0x11; 16]);
         e.extend_from_slice(node.owner.key_pair.public_key.as_bytes());
-        e.extend_from_slice(node.owner.key_pair.private_key.as_bytes());
+        e.extend_from_slice(&node.owner.user_cert_sig.0);
+        e.extend_from_slice(&node.owner.user_cert_issued_at.to_le_bytes());
+        e.push(0); // user private key withheld
+        // issued device cert (zeros in this fixture)
+        e.extend_from_slice(&[0u8; 32]);
+        e.extend_from_slice(&[0u8; 32]);
+        e.extend_from_slice(&[0u8; 64]);
+        e.extend_from_slice(&0u64.to_le_bytes());
+        e.push(0);
         e.push(1); // one device
-        // push_device: uuid, alias, grade, rank, hosts
+        // push_device: uuid, alias, grade, rank, hosts, cert
         e.extend_from_slice(&[0x22; 16]);
         e.push(5);
         e.extend_from_slice(b"phone");
@@ -1083,6 +1349,7 @@ mod golden_tests {
         e.push(1); // one host
         e.push(14);
         e.extend_from_slice(b"127.0.0.1:7777");
+        push_empty_cert(&mut e);
         e.push(1); // one contact
         e.extend_from_slice(&[0x33; 16]);
         e.push(3);
@@ -1097,13 +1364,15 @@ mod golden_tests {
         e.push(1);
         e.push(15); // "sg.example:7777".len()
         e.extend_from_slice(b"sg.example:7777");
+        push_empty_cert(&mut e);
         e
     }
 
     #[test]
     fn bootstrap_payload_golden_bytes_and_roundtrip() {
         let node = fixture_node();
-        let got = serialize_bootstrap_payload(&node);
+        let issued = zero_issued();
+        let got = serialize_bootstrap_payload(&node, false, &issued);
         let expected = expected_bootstrap_bytes(&node);
         assert_eq!(
             got, expected,
@@ -1114,7 +1383,8 @@ mod golden_tests {
         assert_eq!(parsed.user_alias, "alice");
         assert_eq!(parsed.user_uuid, [0x11; 16]);
         assert_eq!(parsed.key_pair.public_key, node.owner.key_pair.public_key);
-        assert_eq!(parsed.key_pair.private_key, node.owner.key_pair.private_key);
+        assert_eq!(parsed.key_pair.private_key, Ed25519SecretKey::ZERO);
+        assert!(!parsed.release_user_key);
         assert_eq!(parsed.devices.len(), 1);
         assert_eq!(parsed.devices[0].uuid, [0x22; 16]);
         assert_eq!(parsed.devices[0].alias, "phone");
@@ -1135,9 +1405,11 @@ mod golden_tests {
         round.owner.user.alias = parsed.user_alias;
         round.owner.user.uuid = parsed.user_uuid;
         round.owner.key_pair = parsed.key_pair;
+        round.owner.user_cert_sig = parsed.user_cert_sig;
+        round.owner.user_cert_issued_at = parsed.user_cert_issued_at;
         round.owner.user.devices = parsed.devices;
         round.owner.contact_users = parsed.contacts;
-        assert_eq!(serialize_bootstrap_payload(&round), expected);
+        assert_eq!(serialize_bootstrap_payload(&round, false, &parsed.issued), expected);
     }
 
     #[test]
@@ -1148,12 +1420,14 @@ mod golden_tests {
         n.owner.key_pair = keypair_from_seed([1u8; 32]);
         n.owner.user.devices.clear();
         n.owner.contact_users.clear();
-        let bytes = serialize_bootstrap_payload(&n);
-        // [alias_len=0][uuid:16][pk:32][sk:32][devs=0][contacts=0]
-        assert_eq!(bytes.len(), 1 + 16 + 32 + 32 + 1 + 1);
+        let bytes = serialize_bootstrap_payload(&n, false, &zero_issued());
+        // alias, uuid, pk, user cert, flag, issued cert, counts. No private key.
+        let user_prefix = 1 + 16 + 32 + 64 + 8 + 1;
+        let issued_len = 32 + 32 + 64 + 8 + 1;
+        assert_eq!(bytes.len(), user_prefix + issued_len + 1 + 1);
         assert_eq!(bytes[0], 0);
-        assert_eq!(bytes[1 + 16 + 32 + 32], 0); // device count
-        assert_eq!(bytes[1 + 16 + 32 + 32 + 1], 0); // contact count
+        assert_eq!(bytes[user_prefix + issued_len], 0); // device count
+        assert_eq!(bytes[user_prefix + issued_len + 1], 0); // contact count
         let p = deserialize_bootstrap_payload(&bytes).unwrap();
         assert!(p.user_alias.is_empty());
         assert!(p.devices.is_empty());

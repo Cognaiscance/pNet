@@ -10,7 +10,8 @@ use super::super::action_queue::WorkerContext;
 use super::super::crypto::{
     aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body, xchacha20_encrypt,
 };
-use super::super::data_models::{Application, Uuid, generate_uuid};
+use super::super::certs::issue_app_cert;
+use super::super::data_models::{Application, Ed25519PublicKey, Uuid, generate_uuid};
 use super::super::wire::*;
 use super::{
     best_sg_connection, ipv4_from, local_approved_app_host, push_device, request_change, send,
@@ -23,6 +24,7 @@ use super::{
 /// Request body (after op byte):
 ///   [alias_len: u8][alias: alias_len bytes][port: u16 be]
 ///   [protocol_len: u8][protocol: protocol_len bytes]
+///   optional [app_signing_pk: 32] — when absent, this node mints the app key
 ///
 /// Reply on success:  [OK][token: 16 bytes]
 /// Reply on error:    [STATUS_ERR][error_code] — see `wire` ERR_* constants
@@ -66,6 +68,16 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         Ok(s) if !s.is_empty() => s.to_string(),
         _ => return send_error(ctx, src, ERR_BAD_PACKET),
     };
+    pos += protocol_len;
+    let supplied_pk = if buf.len() == pos {
+        None
+    } else if buf.len() == pos + 32 {
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&buf[pos..pos + 32]);
+        Some(Ed25519PublicKey(raw))
+    } else {
+        return send_error(ctx, src, ERR_BAD_PACKET);
+    };
     let ip = match ipv4_from(src) {
         Some(ip) => ip,
         None => return send_error(ctx, src, ERR_BAD_PACKET),
@@ -82,9 +94,10 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let host_addr = SocketAddrV4::new(ip, port);
 
     // Update node.
-    let (token, next_id, device_uuid, is_new) = {
+    let (token, next_id, device_uuid, is_new, published) = {
         let mut node = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
+        let signing = node.device_signing.clone();
 
         let device = node
             .owner
@@ -104,12 +117,16 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             .iter()
             .find(|a| a.alias == alias && a.host == host_addr)
         {
-            (existing.token, existing.id, device_uuid, false)
+            (existing.token, existing.id, device_uuid, false, None)
         } else {
             // App ids are UUIDs (see Application.id docs) — partition-safe by
             // construction. Generate fresh; collision probability is negligible.
             let next_id = generate_uuid();
             let token = generate_uuid();
+            let mut identity = crate::data_models::Ed25519KeyPair::ZERO;
+            if let Some(pk) = supplied_pk {
+                identity.public_key = pk;
+            }
             device.applications.push(Application {
                 id: next_id,
                 alias,
@@ -117,14 +134,31 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 host: host_addr,
                 user_approved: auto_approve,
                 token,
+                identity,
+                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
             });
-            (token, next_id, device_uuid, true)
+            let published = if auto_approve {
+                let app = device.applications.iter_mut().find(|a| a.id == next_id).expect("just inserted");
+                issue_app_cert(&mut *app, &signing.private_key, &signing.public_key);
+                Some((app.identity.public_key, app.cert_sig, app.cert_issued_at, app.cert_alias.clone()))
+            } else {
+                None
+            };
+            (token, next_id, device_uuid, true, published)
         }
         // write lock released here
     };
 
     if auto_approve && is_new {
-        // Sync v1: publish id+alias to peers via the writer SG. A DG without
+        let (signing_pk, cert_sig, cert_issued_at, cert_alias) = published.unwrap_or((
+            Ed25519PublicKey::ZERO,
+            crate::data_models::Ed25519Signature::ZERO,
+            0,
+            String::new(),
+        ));
+        // Sync v1: publish id+alias+cert to peers via the writer SG. A DG without
         // a reachable writer SG cannot publish state changes — roll back the
         // local app and reject the registration. The caller is responsible
         // for retrying when a writer is online.
@@ -132,6 +166,10 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             device_uuid,
             app_id:    next_id,
             app_alias: alias_for_log.clone(),
+            signing_pk,
+            cert_sig,
+            cert_issued_at,
+            cert_alias,
         }, ctx) {
             {
                 let mut node = ctx.node.write().unwrap();

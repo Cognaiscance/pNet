@@ -18,6 +18,8 @@ services:
     # joins an existing user using the supplied invitation code. After
     # initialization these vars are ignored. Generate the code from an
     # existing SG via /invitations.
+    # Set PNET_KEY_PASSPHRASE (at least 8 characters) as well. It seals this
+    # device's private keys and is not the admin password.
     environment:
       - PNET_GRADE=dg
       - PNET_DEVICE_ALIAS=${PNET_DEVICE_ALIAS:-}

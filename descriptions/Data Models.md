@@ -10,7 +10,9 @@ description: the local owner of this node; extends User with contacts and a long
 * contact_users
 	* a list of Contact structs
 * keypair
-	* a more secure long term key used by the user when  establishing ephemeral key connections
+	* User Ed25519 identity. The public key is the user. The private seed signs device certificates and is sealed at rest. It is present on the node that created the user and on servers whose invitation released it. See `descriptions/identity-and-keys.md`.
+* user_cert_sig / user_cert_issued_at
+	* Self-signature on the user certificate (alias, public key, dates). No UUID in the signed payload.
 * contact_invitations
 	* a list of Invitation structs
 * device_invitations
@@ -50,6 +52,8 @@ description: an invitation token used to add a contact or device
 * id
 * key_pair
 * expires_at
+* releases_user_key
+	* When true, bootstrap copies the user private key to the joiner. Default false. Set from the admin checkbox "this device is a server and may enroll other devices", and only honored when this node holds the user seed. A device-grade peer cannot set it by asking over op 0x35.
 
 # Device
 description: holds information specific to a device (laptop, server, phone)
@@ -67,6 +71,8 @@ description: holds information specific to a device (laptop, server, phone)
 	  source address of incoming packets). On SG devices the list is populated at
 	  startup from the `PNET_HOSTS` environment variable.
 * applications
+* signing_pk, dh_pk, cert_sig, cert_issued_at, cert_alias
+	* Device certificate signed by the user key. `cert_alias` is the alias covered by the signature; the display alias may change later. Connect presents `signing_pk`, not the user key.
 
 # Application
 description: data required to handle communication with apps through the app api
@@ -79,18 +85,23 @@ description: data required to handle communication with apps through the app api
 	* true | false
 * token
 	* a UUID used to identify the application on subsequent local app-API requests
+* identity
+	* App Ed25519 key. The private seed is sealed at rest when this device generated it. An app may supply only the public key and keep the seed itself.
+* cert_sig, cert_issued_at, cert_alias
+	* Device signature over the app certificate. Issued when the owner approves the app (or when `PNET_AUTO_APPROVE_APPS` is set), not at mere registration.
 
 # Ed25519KeyPair / Ed25519PublicKey / Ed25519SecretKey
-description: long-term **identity** keys (Ed25519). Used for ConnectRequest/ConnectAck signatures and contact cards. Never used for Diffie–Hellman.
+description: long-term **identity** keys (Ed25519). The user key signs device certificates. Each device key signs app certificates and ConnectRequest/ConnectAck. Never used for Diffie–Hellman.
 * public_key — 32-byte Ed25519 verifying key
-* private_key — 32-byte Ed25519 seed / signing key
+* private_key — 32-byte Ed25519 seed, memory only
+* private_key_sealed — Argon2id + XChaCha20-Poly1305 envelope written instead of the raw seed. A legacy plaintext `private_key` field still loads.
 
 # X25519KeyPair / X25519PublicKey / X25519SecretKey
 description: **ephemeral / invitation** keys (X25519). Used only for DH (sessions, bootstrap/contact invitations, tunnels). Never used for Ed25519 sign/verify.
 * public_key — 32-byte X25519 public key
 * private_key — 32-byte X25519 secret scalar
 
-These are distinct Rust types so identity and DH material cannot be mixed at compile time. On disk and on the wire they remain 32-byte fields (hex in TOML).
+These are distinct Rust types so identity and DH material cannot be mixed at compile time. Public keys are 32-byte hex fields in TOML. Ed25519 private keys are sealed; invitation and session X25519 secrets remain on the device that created them.
 
 # ActiveConnection
 description: represents an active encrypted session with a peer device. Stored in a HashMap<u16, ActiveConnection> on Owner. Incoming packets include the receiver's id in the header, enabling O(1) key lookup for decryption without sending a full UUID.

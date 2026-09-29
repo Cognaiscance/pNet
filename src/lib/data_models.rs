@@ -119,19 +119,106 @@ impl_key_serde!(Ed25519SecretKey);
 impl_key_serde!(X25519PublicKey);
 impl_key_serde!(X25519SecretKey);
 
-/// Long-term user identity key pair (Ed25519). Used for Connect signatures and
-/// contact cards. Never used for X25519 DH.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+/// Ed25519 signature (64 bytes), hex on disk.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Ed25519Signature(pub [u8; 64]);
+
+impl Ed25519Signature {
+    pub const ZERO: Self = Self([0u8; 64]);
+}
+
+impl Default for Ed25519Signature {
+    fn default() -> Self { Self::ZERO }
+}
+
+impl Serialize for Ed25519Signature {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&serde_bytes_32::hex(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Ed25519Signature {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text: String = Deserialize::deserialize(d)?;
+        if text.len() != 128 {
+            return Err(serde::de::Error::custom("expected 128 hex chars for a signature"));
+        }
+        let mut out = [0u8; 64];
+        let bytes = text.as_bytes();
+        for i in 0..64 {
+            let hi = hex_nibble(bytes[i * 2]).map_err(serde::de::Error::custom)?;
+            let lo = hex_nibble(bytes[i * 2 + 1]).map_err(serde::de::Error::custom)?;
+            out[i] = (hi << 4) | lo;
+        }
+        Ok(Self(out))
+    }
+}
+
+fn hex_nibble(b: u8) -> Result<u8, &'static str> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err("invalid hex character"),
+    }
+}
+
+/// Long-term Ed25519 key pair.
+///
+/// `private_key` is memory-only. On disk the seed is `private_key_sealed`
+/// (Argon2id + XChaCha20-Poly1305). A legacy file may still contain a plaintext
+/// `private_key`; load keeps it so the next save can wrap it.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Ed25519KeyPair {
     pub public_key:  Ed25519PublicKey,
     pub private_key: Ed25519SecretKey,
+    pub private_key_sealed: String,
+}
+
+impl Default for Ed25519KeyPair {
+    fn default() -> Self { Self::ZERO }
 }
 
 impl Ed25519KeyPair {
     pub const ZERO: Self = Self {
         public_key:  Ed25519PublicKey::ZERO,
         private_key: Ed25519SecretKey::ZERO,
+        private_key_sealed: String::new(),
     };
+}
+
+impl Serialize for Ed25519KeyPair {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let sealed = if self.private_key != Ed25519SecretKey::ZERO {
+            super::keystore::seal(self.private_key.as_bytes()).map_err(serde::ser::Error::custom)?
+        } else {
+            self.private_key_sealed.clone()
+        };
+        let mut st = serializer.serialize_struct("Ed25519KeyPair", 2)?;
+        st.serialize_field("public_key", &self.public_key)?;
+        st.serialize_field("private_key_sealed", &sealed)?;
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Ed25519KeyPair {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            public_key: Ed25519PublicKey,
+            #[serde(default)]
+            private_key: Ed25519SecretKey,
+            #[serde(default)]
+            private_key_sealed: String,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            public_key: raw.public_key,
+            private_key: raw.private_key,
+            private_key_sealed: raw.private_key_sealed,
+        })
+    }
 }
 
 /// X25519 key pair for DH (sessions, invitations, tunnels). Never used for
@@ -140,6 +227,10 @@ impl Ed25519KeyPair {
 pub struct X25519KeyPair {
     pub public_key:  X25519PublicKey,
     pub private_key: X25519SecretKey,
+}
+
+impl Default for X25519KeyPair {
+    fn default() -> Self { Self::ZERO }
 }
 
 impl X25519KeyPair {
@@ -442,6 +533,18 @@ pub struct Application {
     pub user_approved: bool,
     #[serde(with = "serde_bytes_16")]
     pub token:         Uuid,
+    /// App Ed25519 identity. The private seed is sealed at rest and is not
+    /// part of the public directory. Empty until registration mints a key.
+    #[serde(default)]
+    pub identity:      Ed25519KeyPair,
+    /// Device signature over the app certificate payload.
+    #[serde(default)]
+    pub cert_sig:      Ed25519Signature,
+    #[serde(default)]
+    pub cert_issued_at: u64,
+    /// Alias covered by `cert_sig`. The display `alias` may change later.
+    #[serde(default)]
+    pub cert_alias:    String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -467,6 +570,20 @@ pub struct Device {
     /// elsewhere and is skipped. Empty for DG-grade devices.
     pub hosts:            Vec<String>,
     pub applications:     Vec<Application>,
+    /// Device Ed25519 verifying key. Signs Connect* and app certificates.
+    #[serde(default)]
+    pub signing_pk:       Ed25519PublicKey,
+    /// X25519 static public key attested by the device certificate.
+    #[serde(default)]
+    pub dh_pk:            X25519PublicKey,
+    /// User signature over the device certificate payload.
+    #[serde(default)]
+    pub cert_sig:         Ed25519Signature,
+    #[serde(default)]
+    pub cert_issued_at:   u64,
+    /// Alias covered by `cert_sig`.
+    #[serde(default)]
+    pub cert_alias:       String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -477,7 +594,7 @@ pub struct User {
     pub devices: Vec<Device>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Invitation {
     #[serde(with = "serde_bytes_16")]
     pub id:         Uuid,
@@ -485,6 +602,12 @@ pub struct Invitation {
     pub key_pair:   X25519KeyPair,
     #[serde(with = "serde_system_time")]
     pub expires_at: SystemTime,
+    /// When set, the bootstrap response includes the user private key so the
+    /// joining device can enroll further devices. Ordinary device invites
+    /// leave this false: the joiner receives a device certificate and the
+    /// user public key only.
+    #[serde(default)]
+    pub releases_user_key: bool,
 }
 
 /// State held by a node while waiting for a ContactResponse from the target's SG.
@@ -523,6 +646,9 @@ pub struct PendingDeviceAcceptance {
     /// not the raw shared secret. Used to decrypt DeviceRegistration.
     pub shared_secret: [u8; 32],
     pub expires_at:    SystemTime,
+    /// Device signing key the invitation proved possession of. Registration
+    /// must present this key inside a certificate this SG just signed.
+    pub expected_signing_pk: Ed25519PublicKey,
 }
 
 /// The local owner of this node. Extends User with contacts and a long-term key pair.
@@ -530,8 +656,15 @@ pub struct PendingDeviceAcceptance {
 pub struct Owner {
     pub user:                User,
     pub contact_users:       Vec<Contact>,
-    /// Long-term Ed25519 identity for this user (sign Connect*, contact card).
+    /// User Ed25519 identity. Signs device certificates. The private seed is
+    /// sealed at rest and is present only on devices whose invitation released
+    /// it (enrollment issuers) plus the node that created the user.
     pub key_pair:            Ed25519KeyPair,
+    /// Self-signature on the user certificate. Public; safe to sync.
+    #[serde(default)]
+    pub user_cert_sig:       Ed25519Signature,
+    #[serde(default)]
+    pub user_cert_issued_at: u64,
     pub contact_invitations: Vec<Invitation>,
     pub device_invitations:  Vec<Invitation>,
 
@@ -677,6 +810,17 @@ pub struct Node {
     /// set yet (first-run or pre-auth upgrade); the UI forces set-password.
     #[serde(default)]
     pub admin_password_hash: Option<String>,
+    /// Sealed local device signing seed and static X25519 secret.
+    /// In-memory copies live in `device_signing` / `device_dh`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device_secrets_sealed: String,
+    /// Local device Ed25519 key. Signs Connect* and app certificates.
+    /// Not written directly; `device_secrets_sealed` holds the seed.
+    #[serde(skip)]
+    pub device_signing: Ed25519KeyPair,
+    /// Local device static X25519 key attested by the device certificate.
+    #[serde(skip)]
+    pub device_dh: X25519KeyPair,
     /// Ephemeral — not persisted; refreshed by PollSG on each run.
     /// Keyed by `(device_uuid, host_string)` — the host_string matches an
     /// entry in that device's `hosts` list.
@@ -732,11 +876,20 @@ impl Node {
             sg_rank:      None,
             hosts:        Vec::new(),
             applications: Vec::new(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
 
         Node {
             device_uuid,
             admin_password_hash: None,
+            device_secrets_sealed: String::new(),
+            device_signing: Ed25519KeyPair::ZERO,
+            device_dh: X25519KeyPair::ZERO,
             sg_statuses: HashMap::new(),
             partition_flag: false,
             rank1_failover_active: false,
@@ -748,6 +901,8 @@ impl Node {
                 },
                 contact_users:       Vec::new(),
                 key_pair:            Ed25519KeyPair::ZERO,
+                user_cert_sig:              Ed25519Signature::ZERO,
+                user_cert_issued_at:        0,
                 contact_invitations:        Vec::new(),
                 device_invitations:         Vec::new(),
                 private_version:            SyncVersion::zero(),

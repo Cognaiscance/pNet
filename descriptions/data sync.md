@@ -29,8 +29,8 @@ State is split into two scopes with independent version counters:
 
 | Scope | Visible to | Includes |
 |---|---|---|
-| **Private** | The user's own devices only | Application `token`/`api_key`, application `host`/port, invitations, long-term keypair, active connections, anything else that must never leave the user's device set. |
-| **Public** | The user's own devices and the user's contacts | User `alias` and `uuid`, devices' `uuid`/`grade`/`sg_rank`/`hosts`, application `id` and `alias`. |
+| **Private** | The user's own devices only | Application `token`/`api_key`, application `host`/port, invitations, active connections, anything else that must never leave the user's device set. The user private key is not in this scope: it stays on the node that created the user and on servers whose invitation explicitly released it. |
+| **Public** | The user's own devices and the user's contacts | User `alias`, `uuid`, and user certificate; devices' `uuid`/`grade`/`sg_rank`/`hosts` plus the device certificate (signing key, X25519 static key, signature); application `id`, `alias`, app public key, and app certificate. |
 
 Splitting the scopes means a contact pull never touches private fields, an api-key rotation does not bump the contacts' counters, and a sync bug cannot accidentally leak a token.
 

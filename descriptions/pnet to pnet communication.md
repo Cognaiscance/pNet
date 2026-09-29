@@ -104,7 +104,7 @@ On receipt, the initiator finds the matching `PendingConnection` by the echoed c
 
 ## Device Bootstrap
 
-Before a new device can participate in the network it must receive a copy of the user's full data (identity, long-term key pair, known devices, and contacts). This is done once via a three-message exchange between the new device and an SG.
+Before a new device can participate in the network it receives the user's public certificate, a device certificate signed by that user key, and the known devices and contacts. The user private key is copied only when the invitation says this device may enroll other devices. This is done once via a three-message exchange between the new device and an SG. See `descriptions/identity-and-keys.md`.
 
 ### Prerequisites
 
@@ -124,11 +124,14 @@ Sent by the new device to the SG whose address was in the invitation code.
 │ Operation type (0x30)        │ 1     │
 │ Invitation ID                │ 16    │
 │ New device ephemeral PK      │ 32    │   X25519; used to encrypt the response
+│ Device signing PK            │ 32    │   Ed25519; the key the user will certify
+│ Device static DH PK          │ 32    │   X25519; carried in the device certificate
+│ Device alias                 │ lp    │   length byte + bytes
+│ Proof of possession          │ 64    │   Ed25519 over op || fields before the signature
 └──────────────────────────────┴───────┘
 ```
-Total: 49 bytes.
 
-The new device generates a one-time ephemeral key pair for this exchange. The SG uses the invitation's private key and this public key to derive an X25519 shared secret, then an AEAD key via **HKDF-SHA256** with info label `pnet-aead-v1-bootstrap` (same for contact-invitation handshakes).
+The new device generates its Ed25519 signing key and X25519 static key locally, then a one-time ephemeral X25519 key for this exchange. The signature covers `0x30 || invitation id || ephemeral pk || signing pk || static pk || alias`. The SG rejects the request when that signature does not verify or the alias is empty. The SG uses the invitation's private key and the ephemeral public key to derive an X25519 shared secret, then an AEAD key via **HKDF-SHA256** with info label `pnet-aead-v1-bootstrap` (same for contact-invitation handshakes).
 
 ### BootstrapResponse — op `0x31`
 
@@ -144,11 +147,14 @@ Sent by the SG back to the new device if the invitation is valid and not expired
 └──────────────────────────────┴───────┘
 ```
 
-The encrypted payload contains the full user data needed to configure the new device:
-- User alias and UUID
-- User long-term key pair (public and private, 32 bytes each)
-- All of the user's known devices (alias, UUID, grade, sg_rank, hosts list). Each device encodes its address list as `[host_count:u8]` followed by `host_count` length-prefixed hostname strings.
+The encrypted payload contains the user certificate, a device certificate for the joiner, and the directory the joiner needs:
+- User alias, UUID, user public key, and the self-signed user certificate (signature and issued-at)
+- User private key only when the invitation was minted with "this device is a server and may enroll other devices". Otherwise a flag byte is 0 and the 32-byte seed is omitted. A phone invitation never copies that seed.
+- The device certificate the SG just signed over the joiner's signing key, static X25519 key, and alias
+- All of the user's known devices, including each device certificate. Each device encodes its address list as `[host_count:u8]` followed by `host_count` length-prefixed hostname strings.
 - All of the user's contacts (alias, UUID, public key, devices)
+
+The joiner checks the user self-signature and checks that the issued device certificate matches the keys it just generated. `DeviceRegistration` then repeats that device record. The SG accepts it only when the signing key matches the one it certified.
 
 After sending the response the SG removes the invitation — it is single-use.
 

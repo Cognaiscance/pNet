@@ -10,7 +10,7 @@ use super::crypto::{
 };
 use super::data_models::{
     ActiveConnection, ActiveTunnel, Application, Contact, Device, DeviceGrade,
-    Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Invitation, Owner, PendingBootstrap,
+    Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Invitation, Owner, PendingBootstrap,
     PendingConnection, PendingContactExchange, PendingDeviceAcceptance, PendingTunnel,
     PendingTunnelConnection, Scope, SgStatus, SyncVersion, TunnelCounter, User, Uuid,
     WriteLogEntry, X25519KeyPair, X25519PublicKey, WRITE_LOG_RETENTION,
@@ -90,7 +90,9 @@ pub use bootstrap::{
 pub(crate) use bootstrap::{
     bootstrap_payload_well_formed, contact_payload_well_formed, decode_invitation_code,
     encode_invitation_code, generate_contact_invitation, generate_device_invitation,
+    generate_device_invitation_with,
     initiate_bootstrap, initiate_contact_exchange, serialize_bootstrap_payload,
+    IssuedDeviceCert,
     serialize_contact_payload, top_online_sg, InvitationMint,
 };
 
@@ -104,7 +106,7 @@ pub(crate) use routing::{
 
 mod sync;
 pub use sync::{
-    Change, ContactDeviceCard, MergeOutput, WriteError, cross_user_pull_request,
+    Change, ContactAppCard, ContactDeviceCard, MergeOutput, WriteError, cross_user_pull_request,
     cross_user_pull_response, cross_user_update_available, merge_ack, merge_logs,
     merge_proposal, partition_reconcile_tick, request_change, request_change_idempotent,
     sync_pull, sync_pull_request, sync_pull_response, sync_update_available,
@@ -129,7 +131,7 @@ pub use tunnels::{
 };
 
 mod admin_ui;
-pub use admin_ui::{apply_new_user_setup, ui_request};
+pub use admin_ui::{apply_new_user_setup, ensure_local_device_cert, ui_request};
 pub(crate) use admin_ui::{
     UI_ERR_PUBLISH_FAILED, approve_app, complete_setup, form_field, own_user_sg_partition,
     partition_banner, reject_app, rename_app, render_diagnostics, url_decode,
@@ -190,6 +192,13 @@ fn push_device(buf: &mut Vec<u8>, d: &Device) {
     for h in d.hosts.iter().take(u8::MAX as usize) {
         push_str(buf, h);
     }
+    // Device certificate public fields. The UUID above is a local index;
+    // it is not part of the signed payload.
+    buf.extend_from_slice(d.signing_pk.as_bytes());
+    buf.extend_from_slice(d.dh_pk.as_bytes());
+    buf.extend_from_slice(&d.cert_sig.0);
+    buf.extend_from_slice(&d.cert_issued_at.to_le_bytes());
+    push_str(buf, &d.cert_alias);
 }
 
 /// Local UDP host for a **user-approved** app on this device, if any.
@@ -226,6 +235,12 @@ fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
     for _ in 0..host_count {
         hosts.push(read_str(data, pos)?);
     }
+    let signing_pk = crate::data_models::Ed25519PublicKey(read_arr(data, pos)?);
+    let dh_pk = crate::data_models::X25519PublicKey(read_arr(data, pos)?);
+    let cert_sig = crate::data_models::Ed25519Signature(read_arr(data, pos)?);
+    let issued_bytes: [u8; 8] = read_arr(data, pos)?;
+    let cert_issued_at = u64::from_le_bytes(issued_bytes);
+    let cert_alias = read_str(data, pos)?;
     Some(Device {
         uuid,
         alias,
@@ -233,6 +248,11 @@ fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
         sg_rank,
         hosts,
         applications: Vec::new(),
+        signing_pk,
+        dh_pk,
+        cert_sig,
+        cert_issued_at,
+        cert_alias,
     })
 }
 
@@ -423,6 +443,7 @@ mod tests {
             // pnet replies via this socket.
             let pnet_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
 
+            super::super::keystore::install_passphrase("test-passphrase");
             let node = Arc::new(RwLock::new(Node::new()));
             let (writer_tx, _writer_rx) = mpsc::sync_channel(64);
             let (scheduler_tx, _sched_rx) = mpsc::channel();
@@ -671,6 +692,8 @@ mod tests {
         for _ in 0..host_count {
             let _h = read_str(&reply, &mut pos).unwrap();
         }
+        pos += 32 + 32 + 64 + 8; // signing pk, dh pk, cert sig, issued_at
+        let _cert_alias = read_str(&reply, &mut pos).unwrap();
         let app_count = reply[pos] as usize; pos += 1;
         assert_eq!(app_count, 1); // the app we just registered
         // Skip the one app entry to reach the contact count: [id:16][alias:1+N][ip:4][port:2][approved:1].
@@ -816,7 +839,13 @@ mod tests {
                 sg_rank: Some(1),
                 hosts: vec!["127.0.0.1:1".into()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             // Session to that SG (relay path).
             let local_to_sg = generate_x25519_keypair();
             let sg_to_local = generate_x25519_keypair();
@@ -915,7 +944,13 @@ mod tests {
                 sg_rank: Some(1),
                 hosts: vec![],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.owner.active_connections.insert(
                 1,
                 ActiveConnection {
@@ -962,28 +997,39 @@ mod tests {
 
     // ── ConnectRequest ────────────────────────────────────────────────────────
 
-    /// Add a contact with its own Ed25519 key pair to the node.
-    /// Returns the contact's device UUID and key pair.
+    /// Add a contact whose user key signs one device certificate.
+    /// Returns the device UUID and the device signing key (what ConnectRequest uses).
     fn add_contact_with_device(node: &mut Node) -> (Uuid, Ed25519KeyPair) {
-        let kp          = generate_ed25519_keypair();
+        let user = generate_ed25519_keypair();
+        let device_key = generate_ed25519_keypair();
+        let dh = generate_x25519_keypair();
         let device_uuid = generate_uuid();
+        let mut device = Device {
+            alias:           "peer-device".to_string(),
+            uuid:            device_uuid,
+            grade:           DeviceGrade::SG,
+            sg_rank:         Some(1),
+            hosts:           vec!["127.0.0.1:9999".into()],
+            applications:    Vec::new(),
+            signing_pk:      Ed25519PublicKey::ZERO,
+            dh_pk:           X25519PublicKey::ZERO,
+            cert_sig:        Ed25519Signature::ZERO,
+            cert_issued_at:  0,
+            cert_alias:      String::new(),
+        };
+        crate::certs::issue_device_cert(
+            &mut device, &user.private_key, &user.public_key, &device_key, &dh.public_key,
+        );
         node.owner.contact_users.push(Contact {
-            public_key: kp.public_key,
+            public_key: user.public_key,
             user: User {
                 alias:   "peer".to_string(),
                 uuid:    generate_uuid(),
-                devices: vec![Device {
-                    alias:           "peer-device".to_string(),
-                    uuid:            device_uuid,
-                    grade:           DeviceGrade::SG,
-                    sg_rank:         Some(1),
-                    hosts:           vec!["127.0.0.1:9999".into()],
-                    applications:    Vec::new(),
-                }],
+                devices: vec![device],
             },
             last_seen_public_version: SyncVersion::default(),
         });
-        (device_uuid, kp)
+        (device_uuid, device_key)
     }
 
     // ── DG keepalive (NAT-mapping maintenance) ────────────────────────────────
@@ -1013,7 +1059,13 @@ mod tests {
                 sg_rank:      Some(1),
                 hosts:        vec!["127.0.0.1:7777".into()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             // ...and a contact whose device is an SG.
             let (csg, _kp) = add_contact_with_device(&mut node);
             contact_sg_uuid = csg;
@@ -1174,7 +1226,13 @@ mod tests {
                 sg_rank: Some(1),
                 hosts: vec!["127.0.0.1:19001".into()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             // Stale active session to that SG (same IP the reset will claim).
             let stale_addr: SocketAddr = "127.0.0.1:19001".parse().unwrap();
             n.owner.active_connections.insert(
@@ -1413,7 +1471,13 @@ mod tests {
             sg_rank:         Some(1),
             hosts:           vec!["127.0.0.1:9000".into()],
             applications:    Vec::new(),
-        }
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}
     }
 
     #[test]
@@ -1440,7 +1504,13 @@ mod tests {
                             sg_rank:         None,
                             hosts:           vec!["127.0.0.1:9001".into()],
                             applications:    Vec::new(),
-                        },
+                        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+},
                     ],
                 },
                 last_seen_public_version: SyncVersion::default(),
@@ -1544,7 +1614,13 @@ mod tests {
             sg_rank:      Some(rank),
             hosts:        vec![format!("127.0.0.1:{}", 9000 + rank)],
             applications: Vec::new(),
-        });
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         if with_conn {
             // Insert at a unique connection-ID slot (rank doubles as a stand-in).
             node.owner.active_connections.insert(rank as u16, ActiveConnection {
@@ -1739,7 +1815,12 @@ mod tests {
             device_uuid: dev_uuid,
             app_id:      app_uuid(0xCAFE),
             app_alias:   "messenger".to_string(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let bytes = serialize_change(&original);
         assert_eq!(bytes[0], CHANGE_KIND_ADD_APPLICATION);
         let parsed = deserialize_change(&bytes).expect("parse");
@@ -1761,7 +1842,12 @@ mod tests {
             device_uuid: dev_uuid,
             app_id:      app_uuid(1),
             app_alias:   "foo".to_string(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let mut bytes = serialize_change(&original);
         bytes.truncate(bytes.len() - 1); // chop last byte of alias
         assert!(deserialize_change(&bytes).is_none());
@@ -1777,7 +1863,12 @@ mod tests {
             device_uuid: local,
             app_id:      app_uuid(7),
             app_alias:   "myapp".to_string(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let (priv_v, pub_v) = apply_change_locally(&change, writer, &t.ctx).expect("apply");
 
         // Public bumped, private untouched.
@@ -1806,7 +1897,12 @@ mod tests {
             device_uuid: local,
             app_id:      app_uuid(7),
             app_alias:   "myapp".to_string(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         apply_change_locally(&change, writer, &t.ctx).expect("first apply");
         let pub_after_first = t.ctx.node.read().unwrap().owner.public_version;
 
@@ -1831,7 +1927,12 @@ mod tests {
             device_uuid: bogus_uuid,
             app_id:      app_uuid(1),
             app_alias:   "x".to_string(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let res = apply_change_locally(&change, local, &t.ctx);
         assert!(matches!(res, Err(WriteError::Validation(_))));
 
@@ -1863,7 +1964,12 @@ mod tests {
         apply_change_locally(
             &Change::AddApplication {
                 device_uuid: local, app_id: app_uuid(3), app_alias: "doomed".into(),
-            },
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+},
             writer, &t.ctx,
         ).expect("seed");
         let pub_after_add = t.ctx.node.read().unwrap().owner.public_version;
@@ -1912,7 +2018,13 @@ mod tests {
             grade:   DeviceGrade::DG,
             sg_rank: None,
             hosts:   vec!["10.0.0.5".to_string()],
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let bytes = serialize_change(&original);
         assert_eq!(bytes[0], CHANGE_KIND_ADD_DEVICE);
         let parsed = deserialize_change(&bytes).expect("parse");
@@ -1932,7 +2044,13 @@ mod tests {
             grade:   DeviceGrade::DG,
             sg_rank: None,
             hosts:   Vec::new(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let (priv_v, pub_v) = apply_change_locally(&change, writer, &t.ctx).expect("apply");
 
         assert!(priv_v.is_initial());
@@ -1957,7 +2075,13 @@ mod tests {
             grade:   DeviceGrade::DG,
             sg_rank: None,
             hosts:   Vec::new(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         apply_change_locally(&change, writer, &t.ctx).expect("first apply");
         let pub_after_first = t.ctx.node.read().unwrap().owner.public_version;
 
@@ -1993,7 +2117,12 @@ mod tests {
         apply_change_locally(
             &Change::AddApplication {
                 device_uuid: local, app_id: app_uuid(5), app_alias: "old".into(),
-            },
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+},
             writer, &t.ctx,
         ).expect("seed");
         let pub_after_add = t.ctx.node.read().unwrap().owner.public_version;
@@ -2023,7 +2152,12 @@ mod tests {
         apply_change_locally(
             &Change::AddApplication {
                 device_uuid: local, app_id: app_uuid(5), app_alias: "same".into(),
-            },
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+},
             writer, &t.ctx,
         ).expect("seed");
         let pub_before = t.ctx.node.read().unwrap().owner.public_version;
@@ -2066,7 +2200,12 @@ mod tests {
             device_uuid: local,
             app_id:      app_uuid(9),
             app_alias:   "ui-app".to_string(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         request_change(change, &t.ctx).expect("request_change ok");
 
         let node = t.ctx.node.read().unwrap();
@@ -2084,7 +2223,12 @@ mod tests {
             device_uuid: dev_uuid,
             app_id:      app_uuid(1),
             app_alias:   "x".to_string(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         assert_eq!(request_change(change, &t.ctx), Err(WriteError::Unreachable));
     }
 
@@ -2110,7 +2254,13 @@ mod tests {
                 sg_rank:      Some(1),
                 hosts:        vec![sg_addr.to_string()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             // Active connection to the SG with peer_addr matching the test socket.
             node.owner.active_connections.insert(11, ActiveConnection {
                 id:                        11,
@@ -2127,7 +2277,12 @@ mod tests {
             device_uuid: dg_uuid,
             app_id:      app_uuid(3),
             app_alias:   "x".to_string(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         request_change(change, &t.ctx).expect("request_change ok");
 
         // The SG socket should receive a SyncWriteRequest packet (op 0x70).
@@ -2163,7 +2318,13 @@ mod tests {
                 sg_rank:      None,
                 hosts:        Vec::new(),
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.owner.active_connections.insert(conn_id, ActiveConnection {
                 id: conn_id,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
@@ -2245,7 +2406,13 @@ mod tests {
             node.owner.user.devices.push(Device {
                 alias: "sg1".into(), uuid: rank1_uuid, grade: DeviceGrade::SG,
                 sg_rank: Some(1), hosts: vec!["sg1:7777".into()], applications: vec![],
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.owner.active_connections.insert(7, ActiveConnection {
                 id: 7, timeout: SystemTime::now() + Duration::from_secs(3600),
                 key_pair: generate_x25519_keypair(),
@@ -2276,7 +2443,13 @@ mod tests {
             node.owner.user.devices.push(Device {
                 alias: "sg1".into(), uuid: rank1_uuid, grade: DeviceGrade::SG,
                 sg_rank: Some(1), hosts: vec!["sg1:7777".into()], applications: vec![],
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             local_uuid
         };
         let node = t.ctx.node.read().unwrap();
@@ -2438,7 +2611,12 @@ mod tests {
             device_uuid: dg_uuid,
             app_id:      app_uuid(42),
             app_alias:   "acked".to_string(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let payload = serialize_change(&change);
         let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
 
@@ -2472,7 +2650,12 @@ mod tests {
             device_uuid: bogus,
             app_id:      app_uuid(1),
             app_alias:   "nope".to_string(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let payload = serialize_change(&change);
         let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
         sync_write_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
@@ -2510,7 +2693,12 @@ mod tests {
             device_uuid: dg_uuid,
             app_id:      app_uuid(1),
             app_alias:   "nope".to_string(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let payload = serialize_change(&change);
         let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
         sync_write_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
@@ -2546,8 +2734,18 @@ mod tests {
         // node, and verify both look the same in their public-scope view.
         let src = TestCtx::new();
         let local = promote_local_to_sg(&src, 1);
-        let app1 = Change::AddApplication { device_uuid: local, app_id: app_uuid(11), app_alias: "a1".into() };
-        let app2 = Change::AddApplication { device_uuid: local, app_id: app_uuid(22), app_alias: "a2".into() };
+        let app1 = Change::AddApplication { device_uuid: local, app_id: app_uuid(11), app_alias: "a1".into() ,
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
+        let app2 = Change::AddApplication { device_uuid: local, app_id: app_uuid(22), app_alias: "a2".into() ,
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         apply_change_locally(&app1, local, &src.ctx).unwrap();
         apply_change_locally(&app2, local, &src.ctx).unwrap();
 
@@ -2590,7 +2788,12 @@ mod tests {
                 id: app_uuid(7), alias: "old-alias".into(),
                 protocol: "udp".into(), host: real_host,
                 user_approved: true, token: real_token,
-            });
+            
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         }
 
         // Build a public-state blob that reports the same app id with a new alias.
@@ -2612,9 +2815,9 @@ mod tests {
         blob.push(dev_clone.3.map(|r| r.min(255) as u8).unwrap_or(0));
         blob.push(dev_clone.4.len() as u8);
         for h in &dev_clone.4 { push_str(&mut blob, h); }
+        push_zero_device_cert(&mut blob);
         blob.push(1u8); // 1 app
-        blob.extend_from_slice(&app_uuid(7));
-        push_str(&mut blob, "new-alias");
+        push_zero_public_app(&mut blob, &app_uuid(7), "new-alias");
         blob.push(0u8); // 0 contacts
 
         assert!(apply_public_state(&blob, &t.ctx));
@@ -2656,14 +2859,33 @@ mod tests {
             blob.push(0u8);      // grade = DG (0)
             blob.push(0u8);      // sg_rank = 0
             blob.push(0u8);      // host_count = 0
+            push_zero_device_cert(&mut blob);
             blob.push(apps.len() as u8);
             for (id, app_alias) in apps {
-                blob.extend_from_slice(&id.to_be_bytes());
-                push_str(&mut blob, app_alias);
+                let mut app_id = [0u8; 16];
+                app_id[14..].copy_from_slice(&id.to_be_bytes());
+                push_zero_public_app(&mut blob, &app_id, app_alias);
             }
         }
         blob.push(0u8);          // 0 contacts
         blob
+    }
+
+    fn push_zero_device_cert(buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&[0u8; 32]);
+        buf.extend_from_slice(&[0u8; 32]);
+        buf.extend_from_slice(&[0u8; 64]);
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.push(0);
+    }
+
+    fn push_zero_public_app(buf: &mut Vec<u8>, id: &[u8; 16], alias: &str) {
+        buf.extend_from_slice(id);
+        push_str(buf, alias);
+        buf.extend_from_slice(&[0u8; 32]);
+        buf.extend_from_slice(&[0u8; 64]);
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.push(0);
     }
 
     #[test]
@@ -2685,8 +2907,18 @@ mod tests {
                     id: app_uuid(5), alias: "stale".into(),
                     protocol: "".into(),
                     host: "0.0.0.0:0".parse().unwrap(),
-                    user_approved: true, token: [0u8; 16],
+                    user_approved: true,
+                    token: [0u8; 16],
+                    identity: crate::data_models::Ed25519KeyPair::ZERO,
+                    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                    cert_issued_at: 0,
+                    cert_alias: String::new(),
                 }],
+                signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+                dh_pk: crate::data_models::X25519PublicKey::ZERO,
+                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
             });
         }
 
@@ -2716,7 +2948,12 @@ mod tests {
                 protocol: "udp".into(),
                 host: "10.0.0.1:9999".parse().unwrap(),
                 user_approved: true, token: [0xCC; 16],
-            });
+            
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         }
 
         let blob = build_public_state_blob(&t, &[(local_uuid, "local", vec![])]);
@@ -2741,7 +2978,12 @@ mod tests {
 
         let change = Change::AddApplication {
             device_uuid: dg_uuid, app_id: app_uuid(5), app_alias: "fan".into(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let payload = serialize_change(&change);
         let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
         sync_write_request("127.0.0.1:1".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
@@ -2809,7 +3051,13 @@ mod tests {
                 sg_rank: Some(1),
                 hosts: vec![sg_addr.to_string()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.owner.active_connections.insert(conn_id, ActiveConnection {
                 id: conn_id,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
@@ -2913,7 +3161,12 @@ mod tests {
         let local_uuid = t.ctx.node.read().unwrap().device_uuid;
         apply_change_locally(&Change::AddApplication {
             device_uuid: local_uuid, app_id: app_uuid(1), app_alias: "ax".into(),
-        }, local_uuid, &t.ctx).unwrap();
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}, local_uuid, &t.ctx).unwrap();
 
         let mut body = Vec::new();
         write_scope(&mut body, Scope::Public);
@@ -2955,7 +3208,12 @@ mod tests {
         let local_uuid = t.ctx.node.read().unwrap().device_uuid;
         apply_change_locally(&Change::AddApplication {
             device_uuid: local_uuid, app_id: app_uuid(1), app_alias: "ax".into(),
-        }, local_uuid, &t.ctx).unwrap();
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}, local_uuid, &t.ctx).unwrap();
         let current = t.ctx.node.read().unwrap().owner.public_version;
 
         let mut body = Vec::new();
@@ -2995,7 +3253,12 @@ mod tests {
         let writer_local = promote_local_to_sg(&writer, 1);
         apply_change_locally(&Change::AddApplication {
             device_uuid: writer_local, app_id: app_uuid(99), app_alias: "ww".into(),
-        }, writer_local, &writer.ctx).unwrap();
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}, writer_local, &writer.ctx).unwrap();
         let writer_pub_v = writer.ctx.node.read().unwrap().owner.public_version;
         let blob = serialize_public_state(&writer.ctx.node.read().unwrap());
 
@@ -3041,7 +3304,12 @@ mod tests {
                 host: "127.0.0.1:9000".parse().unwrap(),
                 user_approved: true,
                 token: [0xAB; 16],
-            });
+            
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         }
         assert!(t.ctx.node.read().unwrap().owner.public_version.is_initial());
 
@@ -3049,7 +3317,12 @@ mod tests {
         // returns idempotent no-op, but request_change must still bump.
         request_change(Change::AddApplication {
             device_uuid: local, app_id: app_uuid(17), app_alias: "preadded".into(),
-        }, &t.ctx).expect("request_change ok");
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}, &t.ctx).expect("request_change ok");
 
         let node = t.ctx.node.read().unwrap();
         assert_eq!(node.owner.public_version.writer_sg_uuid, local);
@@ -3176,7 +3449,13 @@ mod tests {
                 sg_rank:      Some(1),
                 hosts:        vec!["127.0.0.1:9001".into(), "127.0.0.1:9002".into()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.sg_statuses.insert((dev_uuid, "127.0.0.1:9001".into()), super::super::data_models::SgStatus {
                 up: true,
                 last_rtt: Some(Duration::from_millis(80)),
@@ -3208,7 +3487,13 @@ mod tests {
                 sg_rank:      Some(1),
                 hosts:        vec!["127.0.0.1:9003".into()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             // No sg_statuses entry — cold-boot fallback should kick in.
         }
         let node = t.ctx.node.read().unwrap();
@@ -3231,7 +3516,13 @@ mod tests {
                 sg_rank:      Some(1),
                 hosts:        vec!["peer.example:9009".into()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         }
         // Without cache warm, hostname cannot be used on the hot path.
         {
@@ -3318,7 +3609,13 @@ mod tests {
                         sg_rank:         None,
                         hosts:           vec![dest_addr.to_string()],
                         applications:    Vec::new(),
-                    }],
+                    
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}],
                 },
                 last_seen_public_version: SyncVersion::default(),
             });
@@ -3438,7 +3735,13 @@ mod tests {
                         sg_rank: None,
                         hosts: vec![dest_addr.to_string()],
                         applications: Vec::new(),
-                    }],
+                    
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}],
                 },
                 last_seen_public_version: SyncVersion::default(),
             });
@@ -3495,7 +3798,12 @@ mod tests {
                 host:          app_addr.to_string().parse().unwrap(),
                 user_approved: true,
                 token:         generate_uuid(),
-            });
+            
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
 
             // Active connection #5: from SG (our peer is the SG).
             node.owner.active_connections.insert(5, ActiveConnection {
@@ -3558,7 +3866,12 @@ mod tests {
                 host: app_addr.to_string().parse().unwrap(),
                 user_approved: true,
                 token: generate_uuid(),
-            });
+            
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.owner.active_connections.insert(5, ActiveConnection {
                 id: 5,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
@@ -3615,7 +3928,12 @@ mod tests {
                 host: app_addr.to_string().parse().unwrap(),
                 user_approved: false, // not approved → no push
                 token: generate_uuid(),
-            });
+            
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.owner.active_connections.insert(5, ActiveConnection {
                 id: 5,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
@@ -3673,7 +3991,12 @@ mod tests {
                 host: app_addr.to_string().parse().unwrap(),
                 user_approved: false,
                 token: generate_uuid(),
-            });
+            
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.owner.active_connections.insert(conn_id, ActiveConnection {
                 id: conn_id,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
@@ -3741,7 +4064,12 @@ mod tests {
                 host: t.app_addr().to_string().parse().unwrap(),
                 user_approved: false,
                 token: generate_uuid(),
-            });
+            
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             local_uuid
         };
 
@@ -3804,6 +4132,10 @@ mod tests {
                                 host: "10.0.0.9:9000".parse().unwrap(),
                                 user_approved: false,
                                 token: foreign_token,
+                                identity: crate::data_models::Ed25519KeyPair::ZERO,
+                                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                                cert_issued_at: 0,
+                                cert_alias: String::new(),
                             },
                             Application {
                                 id: approved_app_id,
@@ -3812,8 +4144,17 @@ mod tests {
                                 host: "10.0.0.9:9001".parse().unwrap(),
                                 user_approved: true,
                                 token: [0xF2u8; 16],
+                                identity: crate::data_models::Ed25519KeyPair::ZERO,
+                                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                                cert_issued_at: 0,
+                                cert_alias: String::new(),
                             },
                         ],
+                        signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+                        dh_pk: crate::data_models::X25519PublicKey::ZERO,
+                        cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                        cert_issued_at: 0,
+                        cert_alias: String::new(),
                     }],
                 },
                 last_seen_public_version: SyncVersion::default(),
@@ -3878,22 +4219,10 @@ mod tests {
             id:         generate_uuid(),
             key_pair:   kp,
             expires_at: SystemTime::now() + Duration::from_secs(3600),
+            releases_user_key: false,
         };
         node.owner.contact_invitations.push(inv.clone());
         inv
-    }
-
-    impl Clone for Invitation {
-        fn clone(&self) -> Self {
-            Invitation {
-                id:         self.id,
-                key_pair:   X25519KeyPair {
-                    public_key:  self.key_pair.public_key,
-                    private_key: self.key_pair.private_key,
-                },
-                expires_at: self.expires_at,
-            }
-        }
     }
 
     #[test]
@@ -3952,7 +4281,9 @@ mod tests {
             id:         generate_uuid(),
             key_pair:   generate_x25519_keypair(),
             expires_at: SystemTime::now() + Duration::from_secs(3600),
-        };
+        
+    releases_user_key: false,
+};
 
         let requester_node = {
             let mut n = Node::new();
@@ -3978,6 +4309,7 @@ mod tests {
                 id:         generate_uuid(),
                 key_pair:   kp,
                 expires_at: SystemTime::now() - Duration::from_secs(1), // already expired
+                releases_user_key: false,
             };
             node.owner.contact_invitations.push(inv.clone());
             inv
@@ -4197,7 +4529,13 @@ mod tests {
                         sg_rank:         Some(1),
                         hosts:           vec![contact_sg_host.to_string()],
                         applications:    Vec::new(),
-                    }],
+                    
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}],
                 },
                 last_seen_public_version: SyncVersion::default(),
             });
@@ -4244,7 +4582,12 @@ mod tests {
                     host:          "127.0.0.1:5000".parse().unwrap(),
                     user_approved: true,
                     token:         generate_uuid(),
-                });
+                
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
                 dev.applications.push(Application {
                     id:            app_uuid(8),
                     alias:         "pending-app".to_string(),
@@ -4252,7 +4595,12 @@ mod tests {
                     host:          "127.0.0.1:5001".parse().unwrap(),
                     user_approved: false, // should be excluded from sync
                     token:         generate_uuid(),
-                });
+                
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             }
         }
 
@@ -4269,8 +4617,8 @@ mod tests {
         let (_, apps) = &data.devices[0];
         // Only the approved app should be present.
         assert_eq!(apps.len(), 1);
-        assert_eq!(apps[0].0, app_uuid(7));
-        assert_eq!(apps[0].1, "test-app");
+        assert_eq!(apps[0].id, app_uuid(7));
+        assert_eq!(apps[0].alias, "test-app");
     }
 
     // ── Headless first-run setup ──────────────────────────────────────────────
@@ -4286,12 +4634,22 @@ mod tests {
         let node = t.ctx.node.read().unwrap();
         assert!(node.is_initialized(), "key_pair should be populated");
         assert_eq!(node.owner.user.alias, "alice");
+        assert_ne!(node.owner.key_pair.private_key, crate::data_models::Ed25519SecretKey::ZERO);
+        assert!(crate::certs::verify_user_cert(
+            &node.owner.user.alias,
+            &node.owner.key_pair.public_key,
+            node.owner.user_cert_issued_at,
+            &node.owner.user_cert_sig,
+        ));
+        assert_ne!(node.device_signing.private_key, crate::data_models::Ed25519SecretKey::ZERO);
 
         let device_uuid = node.device_uuid;
+        let user_pk = node.owner.key_pair.public_key;
         let dev = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid).unwrap();
         assert_eq!(dev.alias, "alice-laptop");
         assert!(matches!(dev.grade, DeviceGrade::SG));
         assert_eq!(dev.sg_rank, Some(2));
+        assert!(crate::certs::device_on_record_verifies(dev, &user_pk));
     }
 
     #[test]
@@ -4525,7 +4883,13 @@ mod tests {
             sg_rank:      None,
             hosts:        Vec::new(),
             applications: Vec::new(),
-        });
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         state.push(0u8); // zero apps
 
         let new_v = SyncVersion {
@@ -4615,7 +4979,12 @@ mod tests {
             host:          "127.0.0.1:9000".parse().unwrap(),
             user_approved: false,
             token:         generate_uuid(),
-        });
+        
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         id
     }
 
@@ -4777,7 +5146,16 @@ mod tests {
                     host:          "127.0.0.1:9001".parse().unwrap(),
                     user_approved: true,
                     token:         generate_uuid(),
+                    identity: crate::data_models::Ed25519KeyPair::ZERO,
+                    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                    cert_issued_at: 0,
+                    cert_alias: String::new(),
                 }],
+                signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+                dh_pk: crate::data_models::X25519PublicKey::ZERO,
+                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
             });
         }
 
@@ -4813,7 +5191,13 @@ mod tests {
                 sg_rank:      Some(2),
                 hosts:        vec!["peer-host:7777".to_string()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         }
         assert!(partition_banner(&t.ctx).is_empty(),
             "an unpolled peer should not falsely trigger the banner");
@@ -4832,7 +5216,13 @@ mod tests {
                 sg_rank:      Some(2),
                 hosts:        vec!["peer-host:7777".to_string()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.sg_statuses.insert((peer, "peer-host:7777".to_string()), SgStatus {
                 last_rtt: None, up: false, last_polled: Instant::now(),
             });
@@ -4856,7 +5246,13 @@ mod tests {
                 sg_rank:      Some(2),
                 hosts:        vec!["host-a:7777".to_string(), "host-b:7777".to_string()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.sg_statuses.insert((peer, "host-a:7777".to_string()), SgStatus {
                 last_rtt: None, up: false, last_polled: Instant::now(),
             });
@@ -4881,7 +5277,13 @@ mod tests {
                 sg_rank:      Some(2),
                 hosts:        vec!["peer-host:7777".to_string()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             let mut wm = HashMap::new();
             wm.insert(peer, SyncVersion { writer_sg_uuid: peer, epoch: 3, seq: 17 });
             node.owner.last_watermarks.insert(peer, wm);
@@ -4937,7 +5339,12 @@ mod tests {
             device_uuid: local,
             app_id:      app_uuid(42),
             app_alias:   "logged".into(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         request_change(change.clone(), &t.ctx).expect("request_change ok");
 
         let node = t.ctx.node.read().unwrap();
@@ -4960,7 +5367,12 @@ mod tests {
             device_uuid: dg_uuid,
             app_id:      app_uuid(77),
             app_alias:   "from-dg".into(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let payload = serialize_change(&change);
         let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
 
@@ -4984,7 +5396,12 @@ mod tests {
             device_uuid: dg_uuid,
             app_id:      app_uuid(7),
             app_alias:   "once".into(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let payload = serialize_change(&change);
         let pkt = build_encrypted_packet(SYNC_WRITE_REQUEST_OP, &dg_conn, &payload);
 
@@ -5022,7 +5439,12 @@ mod tests {
             device_uuid: local,
             app_id:      app_uuid(1),
             app_alias:   "fresh".into(),
-        };
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         request_change(change, &t.ctx).expect("request_change ok");
 
         let node = t.ctx.node.read().unwrap();
@@ -5147,7 +5569,13 @@ mod tests {
                 sg_rank:      Some(1),
                 hosts:        vec!["127.0.0.1:7777".into()],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.owner.active_connections.insert(conn_id, ActiveConnection {
                 id: conn_id,
                 timeout: SystemTime::now() + Duration::from_secs(3600),
@@ -5425,12 +5853,23 @@ mod tests {
             change_entry(peer_writer, 1, 1, &Change::AddDevice {
                 uuid: added_device, alias: "peer-dev".into(),
                 grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(peer_writer, 1, 2, &Change::AddApplication {
                 device_uuid: added_device,
                 app_id:      added_app,
                 app_alias:   "remote-app".into(),
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
         ];
 
         let pre_pub = t.ctx.node.read().unwrap().owner.public_version;
@@ -5490,8 +5929,21 @@ mod tests {
             grade:   DeviceGrade::DG,
             sg_rank: None,
             hosts:   vec![],
-            apps:    vec![(contact_app, "chess".into())],
-        };
+            apps:    vec![ContactAppCard {
+                id: contact_app,
+                alias: "chess".into(),
+                signing_pk: Ed25519PublicKey::ZERO,
+                cert_sig: Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
+            }],
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+};
         let entries = vec![change_entry(writer, 1, 1, &Change::UpsertContact {
             uuid:       contact_uuid,
             alias:      "chad".into(),
@@ -5542,7 +5994,13 @@ mod tests {
         let entry = change_entry(peer_writer, 1, 1, &Change::AddDevice {
             uuid: [0xAB; 16], alias: "already-known".into(),
             grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-        });
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         {
             let mut node = t.ctx.node.write().unwrap();
             node.owner.write_log.push(entry.clone());
@@ -5550,7 +6008,13 @@ mod tests {
                 uuid: [0xAB; 16], alias: "already-known".into(),
                 grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         }
         let pre_pub = t.ctx.node.read().unwrap().owner.public_version;
 
@@ -5606,7 +6070,13 @@ mod tests {
         let entries = vec![change_entry(golden_uuid, 1, 1, &Change::AddDevice {
             uuid: added_device, alias: "golden-dev".into(),
             grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-        })];
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+})];
         let body = build_merge_proposal_body(
             Scope::Public,
             SyncVersion { writer_sg_uuid: golden_uuid, epoch: 1, seq: 1 },
@@ -5666,7 +6136,12 @@ mod tests {
                 id: app_id, alias: "before".into(), protocol: "udp".into(),
                 host: "127.0.0.1:7001".parse().unwrap(),
                 user_approved: true, token: [0u8; 16],
-            });
+            
+    identity: crate::data_models::Ed25519KeyPair::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             // Pre-partition, the network told us golden was the writer.
             node.owner.public_version =
                 SyncVersion { writer_sg_uuid: golden, epoch: 1, seq: 5 };
@@ -5783,7 +6258,13 @@ mod tests {
             grade:   DeviceGrade::DG,
             sg_rank: None,
             hosts:   Vec::new(),
-        });
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         let local = vec![entry.clone()];
         let peer  = vec![entry];
         let ranks = HashMap::new();
@@ -5800,11 +6281,23 @@ mod tests {
         let local = vec![change_entry(wa, 1, 1, &Change::AddDevice {
             uuid: merge_dev_a(), alias: "a".into(),
             grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-        })];
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+})];
         let peer = vec![change_entry(wb, 1, 1, &Change::AddDevice {
             uuid: merge_dev_b(), alias: "b".into(),
             grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-        })];
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+})];
         let ranks = HashMap::new();
         let out = merge_logs(&local, &peer, &ranks);
         assert_eq!(out.new_entries.len(), 1);
@@ -5822,12 +6315,23 @@ mod tests {
             change_entry(wa, 1, 1, &Change::AddDevice {
                 uuid: merge_dev_a(), alias: "phone".into(),
                 grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wa, 1, 2, &Change::AddApplication {
                 device_uuid: merge_dev_a(),
                 app_id:      app,
                 app_alias:   "chess".into(),
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
         ];
         let peer = vec![change_entry(wb, 5, 1, &Change::RemoveApplication {
             device_uuid: merge_dev_a(),
@@ -5855,11 +6359,22 @@ mod tests {
             change_entry(wa, 1, 1, &Change::AddDevice {
                 uuid: merge_dev_a(), alias: "phone".into(),
                 grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wa, 1, 2, &Change::AddApplication {
                 device_uuid: merge_dev_a(), app_id: app,
                 app_alias: "chess".into(),
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wa, 1, 3, &Change::RemoveApplication {
                 device_uuid: merge_dev_a(), app_id: app,
             }),
@@ -5867,7 +6382,12 @@ mod tests {
         let peer = vec![change_entry(wb, 9, 9, &Change::AddApplication {
             device_uuid: merge_dev_a(), app_id: app,
             app_alias: "resurrected".into(),
-        })];
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+})];
         let ranks = HashMap::new();
         let out = merge_logs(&local, &peer, &ranks);
         assert_eq!(out.new_entries.len(), 1, "peer entry recorded in log");
@@ -5886,11 +6406,22 @@ mod tests {
             change_entry(wa, 1, 1, &Change::AddDevice {
                 uuid: merge_dev_a(), alias: "phone".into(),
                 grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wa, 1, 2, &Change::AddApplication {
                 device_uuid: merge_dev_a(), app_id: app,
                 app_alias: "initial".into(),
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wa, 1, 3, &Change::UpdateApplicationAlias {
                 device_uuid: merge_dev_a(), app_id: app,
                 new_alias: "ours".into(),
@@ -5924,11 +6455,22 @@ mod tests {
             change_entry(wa, 1, 1, &Change::AddDevice {
                 uuid: merge_dev_a(), alias: "phone".into(),
                 grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wa, 1, 2, &Change::AddApplication {
                 device_uuid: merge_dev_a(), app_id: app,
                 app_alias: "initial".into(),
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
         ];
         let peer = vec![change_entry(wb, 2, 1, &Change::UpdateApplicationAlias {
             device_uuid: merge_dev_a(), app_id: app,
@@ -5953,11 +6495,22 @@ mod tests {
             change_entry(wa, 5, 5, &Change::AddDevice {
                 uuid: merge_dev_a(), alias: "phone".into(),
                 grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wa, 5, 6, &Change::AddApplication {
                 device_uuid: merge_dev_a(), app_id: app,
                 app_alias: "ours".into(),
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
         ];
         let peer = vec![change_entry(wb, 1, 1, &Change::UpdateApplicationAlias {
             device_uuid: merge_dev_a(), app_id: app,
@@ -5983,11 +6536,22 @@ mod tests {
             change_entry(wa, 1, 1, &Change::AddDevice {
                 uuid: merge_dev_a(), alias: "phone".into(),
                 grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wa, 1, 2, &Change::AddApplication {
                 device_uuid: merge_dev_a(), app_id: app,
                 app_alias: "v1".into(),
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wa, 1, 3, &Change::UpdateApplicationAlias {
                 device_uuid: merge_dev_a(), app_id: app,
                 new_alias: "v2-local".into(),
@@ -6020,11 +6584,22 @@ mod tests {
             change_entry(wb, 1, 1, &Change::AddDevice {
                 uuid: merge_dev_b(), alias: "tablet".into(),
                 grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wb, 1, 2, &Change::AddApplication {
                 device_uuid: merge_dev_b(), app_id: app,
                 app_alias: "original".into(),
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wb, 1, 3, &Change::UpdateApplicationAlias {
                 device_uuid: merge_dev_b(), app_id: app,
                 new_alias: "final".into(),
@@ -6056,11 +6631,22 @@ mod tests {
                 device_uuid: merge_dev_b(),
                 app_id: app_uuid(707),
                 app_alias: "x".into(),
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             change_entry(wb, 1, 1, &Change::AddDevice {
                 uuid: merge_dev_b(), alias: "x-dev".into(),
                 grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
         ];
         let ranks = HashMap::new();
         let out = merge_logs(&local, &peer, &ranks);
@@ -6082,7 +6668,13 @@ mod tests {
                 grade: DeviceGrade::DG,
                 sg_rank: None,
                 hosts: vec![],
-            },
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+},
         )];
         let peer = vec![change_entry(
             wb,
@@ -6115,7 +6707,13 @@ mod tests {
                 sg_rank: None,
                 hosts: vec![],
                 applications: Vec::new(),
-            });
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
             node.owner.active_connections.insert(
                 3,
                 ActiveConnection {
@@ -6230,12 +6828,24 @@ mod tests {
         let e1 = change_entry(wb, 1, 1, &Change::AddDevice {
             uuid: merge_dev_b(), alias: "shared".into(),
             grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-        });
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         let local = vec![
             change_entry(wa, 1, 1, &Change::AddDevice {
                 uuid: merge_dev_a(), alias: "local-only".into(),
                 grade: DeviceGrade::DG, sg_rank: None, hosts: vec![],
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             e1.clone(),
         ];
         let peer = vec![
@@ -6244,7 +6854,12 @@ mod tests {
                 device_uuid: merge_dev_b(),
                 app_id: app_uuid(808),
                 app_alias: "new-app".into(),
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
         ];
         let ranks = HashMap::new();
         let out = merge_logs(&local, &peer, &ranks);
@@ -6281,56 +6896,97 @@ mod tests {
         let a_pnet = a.ctx.udp_socket.local_addr().unwrap();
         let b_pnet = b.ctx.udp_socket.local_addr().unwrap();
 
-        let a_kp = generate_ed25519_keypair();
-        let b_kp = generate_ed25519_keypair();
+        let a_user_kp = generate_ed25519_keypair();
+        let b_user_kp = generate_ed25519_keypair();
+        let a_dev = generate_ed25519_keypair();
+        let b_dev = generate_ed25519_keypair();
+        let a_dh = generate_x25519_keypair();
+        let b_dh = generate_x25519_keypair();
         let (a_uuid, a_user) = {
             let mut n = a.ctx.node.write().unwrap();
-            n.owner.key_pair = a_kp.clone();
+            n.owner.key_pair = a_user_kp.clone();
+            n.device_signing = a_dev.clone();
+            n.device_dh = a_dh.clone();
             n.owner.user.alias = "alice".into();
+            let uuid = n.device_uuid;
+            if let Some(dev) = n.owner.user.devices.iter_mut().find(|d| d.uuid == uuid) {
+                dev.alias = "alice-dev".into();
+                crate::certs::issue_device_cert(
+                    dev, &a_user_kp.private_key, &a_user_kp.public_key, &a_dev, &a_dh.public_key,
+                );
+            }
             (n.device_uuid, n.owner.user.uuid)
         };
         let (b_uuid, b_user) = {
             let mut n = b.ctx.node.write().unwrap();
-            n.owner.key_pair = b_kp.clone();
+            n.owner.key_pair = b_user_kp.clone();
+            n.device_signing = b_dev.clone();
+            n.device_dh = b_dh.clone();
             n.owner.user.alias = "bob".into();
+            let uuid = n.device_uuid;
+            if let Some(dev) = n.owner.user.devices.iter_mut().find(|d| d.uuid == uuid) {
+                dev.alias = "bob-dev".into();
+                crate::certs::issue_device_cert(
+                    dev, &b_user_kp.private_key, &b_user_kp.public_key, &b_dev, &b_dh.public_key,
+                );
+            }
             (n.device_uuid, n.owner.user.uuid)
         };
 
-        // Mutual contact entries so ConnectRequest signature/device checks pass.
+        // Mutual contact entries. The user public key anchors the device cert;
+        // ConnectRequest is signed by the device key inside that cert.
         {
             let mut n = a.ctx.node.write().unwrap();
+            let mut bob = Device {
+                alias: "bob-dev".into(),
+                uuid: b_uuid,
+                grade: DeviceGrade::DG,
+                sg_rank: None,
+                hosts: vec![b_pnet.to_string()],
+                applications: Vec::new(),
+                signing_pk: Ed25519PublicKey::ZERO,
+                dh_pk: X25519PublicKey::ZERO,
+                cert_sig: Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
+            };
+            crate::certs::issue_device_cert(
+                &mut bob, &b_user_kp.private_key, &b_user_kp.public_key, &b_dev, &b_dh.public_key,
+            );
             n.owner.contact_users.push(Contact {
-                public_key: b_kp.public_key,
+                public_key: b_user_kp.public_key,
                 user: User {
                     alias: "bob".into(),
                     uuid: b_user,
-                    devices: vec![Device {
-                        alias: "bob-dev".into(),
-                        uuid: b_uuid,
-                        grade: DeviceGrade::DG,
-                        sg_rank: None,
-                        hosts: vec![b_pnet.to_string()],
-                        applications: Vec::new(),
-                    }],
+                    devices: vec![bob],
                 },
                 last_seen_public_version: SyncVersion::default(),
             });
         }
         {
             let mut n = b.ctx.node.write().unwrap();
+            let mut alice = Device {
+                alias: "alice-dev".into(),
+                uuid: a_uuid,
+                grade: DeviceGrade::DG,
+                sg_rank: None,
+                hosts: vec![a_pnet.to_string()],
+                applications: Vec::new(),
+                signing_pk: Ed25519PublicKey::ZERO,
+                dh_pk: X25519PublicKey::ZERO,
+                cert_sig: Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
+            };
+            crate::certs::issue_device_cert(
+                &mut alice, &a_user_kp.private_key, &a_user_kp.public_key, &a_dev, &a_dh.public_key,
+            );
             n.owner.contact_users.push(Contact {
-                public_key: a_kp.public_key,
+                public_key: a_user_kp.public_key,
                 user: User {
                     alias: "alice".into(),
                     uuid: a_user,
-                    devices: vec![Device {
-                        alias: "alice-dev".into(),
-                        uuid: a_uuid,
-                        grade: DeviceGrade::DG,
-                        sg_rank: None,
-                        hosts: vec![a_pnet.to_string()],
-                        applications: Vec::new(),
-                    }],
+                    devices: vec![alice],
                 },
                 last_seen_public_version: SyncVersion::default(),
             });
@@ -6347,7 +7003,7 @@ mod tests {
                     our_conn_id,
                     our_key_pair: eph.clone(),
                     peer_device_uuid: b_uuid,
-                    peer_longterm_pk: b_kp.public_key,
+                    peer_longterm_pk: b_dev.public_key,
                     created_at: SystemTime::now(),
                 },
             );
@@ -6356,8 +7012,8 @@ mod tests {
             our_conn_id,
             &a_uuid,
             &eph.public_key,
-            &a_kp.public_key,
-            &a_kp.private_key,
+            &a_dev.public_key,
+            &a_dev.private_key,
             false,
         );
         // B stores peer_addr = a_pnet; ack is UDP'd to a_pnet.
@@ -6474,7 +7130,16 @@ mod tests {
                     host: "127.0.0.1:9001".parse().unwrap(),
                     user_approved: true,
                     token: fixed_token,
+                    identity: crate::data_models::Ed25519KeyPair::ZERO,
+                    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                    cert_issued_at: 0,
+                    cert_alias: String::new(),
                 }],
+                signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+                dh_pk: crate::data_models::X25519PublicKey::ZERO,
+                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
             }];
             node.owner.contact_users = vec![Contact {
                 public_key: Ed25519PublicKey([0x55; 32]),
@@ -6495,6 +7160,10 @@ mod tests {
                                 host: "10.0.0.2:9000".parse().unwrap(),
                                 user_approved: true,
                                 token: [0xFF; 16], // must NOT appear in reply
+                                identity: crate::data_models::Ed25519KeyPair::ZERO,
+                                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                                cert_issued_at: 0,
+                                cert_alias: String::new(),
                             },
                             Application {
                                 id: [0x03; 16],
@@ -6503,8 +7172,17 @@ mod tests {
                                 host: "10.0.0.2:9001".parse().unwrap(),
                                 user_approved: false, // filtered out
                                 token: [0x00; 16],
+                                identity: crate::data_models::Ed25519KeyPair::ZERO,
+                                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                                cert_issued_at: 0,
+                                cert_alias: String::new(),
                             },
                         ],
+                        signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+                        dh_pk: crate::data_models::X25519PublicKey::ZERO,
+                        cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                        cert_issued_at: 0,
+                        cert_alias: String::new(),
                     }],
                 },
                 last_seen_public_version: SyncVersion::default(),
@@ -6534,7 +7212,13 @@ mod tests {
             sg_rank: None,
             hosts: vec![],
             applications: Vec::new(),
-        });
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         exp.push(1); // one app on own device
         exp.extend_from_slice(&fixed_app_id);
         push_str(&mut exp, "probe");
@@ -6552,7 +7236,13 @@ mod tests {
             sg_rank: None,
             hosts: vec!["10.0.0.2:7777".into()],
             applications: Vec::new(),
-        });
+        
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+});
         exp.push(1); // only approved contact apps
         exp.extend_from_slice(&fixed_contact_app);
         push_str(&mut exp, "chat");

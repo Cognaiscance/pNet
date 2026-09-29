@@ -25,13 +25,14 @@ use super::super::admin_auth::{
 use super::super::app_web::{
     is_loopback_addr, parse_apps_path, proxy_to_loopback, validate_slug, AppWebMount,
 };
-use super::super::crypto::generate_ed25519_keypair;
+use super::super::crypto::{generate_ed25519_keypair, generate_x25519_keypair};
 use super::super::data_models::{
-    Device, DeviceGrade, Node, Uuid, CONNECTION_LIFETIME, WRITE_LOG_RETENTION, generate_uuid,
+    Device, DeviceGrade, Ed25519SecretKey, Node, Uuid, CONNECTION_LIFETIME, WRITE_LOG_RETENTION,
+    generate_uuid,
 };
 use super::super::wire::*;
 use super::{
-    find_writer_sg, generate_contact_invitation, generate_device_invitation, initiate_bootstrap,
+    find_writer_sg, generate_contact_invitation, generate_device_invitation_with, initiate_bootstrap,
     initiate_contact_exchange, parse_pnet_hosts, request_change, sync_pull, uuid_hex, Change,
     InvitationMint, WriterTarget,
 };
@@ -236,12 +237,27 @@ pub fn ui_request(
         }
         ("POST", "/invitations/device") => {
             // Local mint is fast on the worker; delegated mint waits off-pool (§5.2).
+            // The checkbox asks this node to hand the user private key to the
+            // joiner. A node that does not hold that key cannot do so.
+            let asked = form_field(&body, "releases_user_key").is_some();
+            let releases = if asked {
+                let holds = ctx.node.read().unwrap().owner.key_pair.private_key
+                    != Ed25519SecretKey::ZERO;
+                if !holds {
+                    eprintln!(
+                        "[invitations] ignoring issuer checkbox; this node does not hold the user private key"
+                    );
+                }
+                holds
+            } else {
+                false
+            };
             finish_invitation_mint(
                 stream,
                 session_id,
                 Arc::clone(&ctx.sessions),
                 Arc::clone(&ctx.pending_invites),
-                generate_device_invitation(ctx),
+                generate_device_invitation_with(ctx, releases),
                 true,
             );
         }
@@ -1262,14 +1278,23 @@ pub(crate) const UI_ERR_PUBLISH_FAILED: &str = "publish_failed";
 pub(crate) fn approve_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     let id_str = form_field(body, "id")?;
     let id = uuid_from_hex(id_str)?;
-    let (was_approved, app_alias) = {
+    let (was_approved, app_alias, signing_pk, cert_sig, cert_issued_at, cert_alias) = {
         let mut node    = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
+        let signing = node.device_signing.clone();
         let device = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid)?;
         let app = device.applications.iter_mut().find(|a| a.id == id)?;
         let was_approved = app.user_approved;
         app.user_approved = true;
-        (was_approved, app.alias.clone())
+        crate::certs::issue_app_cert(&mut *app, &signing.private_key, &signing.public_key);
+        (
+            was_approved,
+            app.alias.clone(),
+            app.identity.public_key,
+            app.cert_sig,
+            app.cert_issued_at,
+            app.cert_alias.clone(),
+        )
     };
     ctx.save_node();
 
@@ -1278,6 +1303,10 @@ pub(crate) fn approve_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static s
         device_uuid,
         app_id: id,
         app_alias,
+        signing_pk,
+        cert_sig,
+        cert_issued_at,
+        cert_alias,
     }, ctx) {
         // Roll back the approval — but only if we actually flipped it.
         // Re-approving an already-approved app is a no-op on Err.
@@ -1461,7 +1490,17 @@ fn render_invitations(
         format!("<table><tr><th>Invitation ID (first 8 bytes)</th></tr>{contact_inv_rows}</table>")
     };
 
+    let holds_user_key = node.owner.key_pair.private_key != Ed25519SecretKey::ZERO;
     drop(node);
+
+    let issuer_box = if holds_user_key {
+        "<label style='display:block;margin:.6rem 0;font-size:.9rem'>\
+           <input type='checkbox' name='releases_user_key' value='1'> \
+           This device is a server and may enroll other devices\
+         </label>"
+    } else {
+        ""
+    };
 
     let body = format!(
         "<h1>Invitations</h1>\
@@ -1470,9 +1509,11 @@ fn render_invitations(
          {contact_code_section}\
          <div class='card'>\
            <h2 style='margin-top:0;font-size:1rem'>Add a Device</h2>\
-           <p style='color:#666;font-size:.9rem;margin-top:0'>Generate a one-time code, then enter it on the new device.</p>\
+           <p style='color:#666;font-size:.9rem;margin-top:0'>Generate a one-time code, then enter it on the new device. \
+           An ordinary code does not copy the user private key.</p>\
            {dev_inv_table}\
            <form method='post' action='/invitations/device' style='margin-top:1rem'>\
+             {issuer_box}\
              <button type='submit'>Generate Device Invitation</button>\
            </form>\
          </div>\
@@ -1513,6 +1554,7 @@ pub(crate) fn complete_setup(body: &[u8], ctx: &WorkerContext) -> Result<String,
     let confirm      = form_field(body, "password_confirm").map(url_decode).unwrap_or_default();
 
     validate_new_password(&password, &confirm)?;
+    install_key_passphrase_from_form(body)?;
 
     let grade = if grade_str == "sg" { DeviceGrade::SG } else { DeviceGrade::DG };
     let sg_rank = if matches!(grade, DeviceGrade::SG) {
@@ -1538,6 +1580,7 @@ pub(crate) fn complete_join_setup(body: &[u8], ctx: &WorkerContext) -> Result<St
     let password = form_field(body, "password").map(url_decode).unwrap_or_default();
     let confirm  = form_field(body, "password_confirm").map(url_decode).unwrap_or_default();
     validate_new_password(&password, &confirm)?;
+    install_key_passphrase_from_form(body)?;
 
     // Stash password before bootstrap so a completed join is never passwordless.
     let session = store_password_and_session(ctx, &password);
@@ -1557,13 +1600,27 @@ pub fn apply_new_user_setup(
     if alias.is_empty() || device_alias.is_empty() {
         return Some("fields");
     }
+    if !super::super::keystore::is_installed() {
+        return Some("passphrase");
+    }
 
     let key_pair = generate_ed25519_keypair();
+    let (user_sig, user_issued) = super::super::certs::sign_user_cert(
+        &key_pair.private_key,
+        alias,
+        &key_pair.public_key,
+    );
+    let device_signing = generate_ed25519_keypair();
+    let device_dh = generate_x25519_keypair();
 
     {
         let mut node = ctx.node.write().unwrap();
         node.owner.user.alias = alias.to_string();
-        node.owner.key_pair   = key_pair;
+        node.owner.key_pair = key_pair.clone();
+        node.owner.user_cert_sig = user_sig;
+        node.owner.user_cert_issued_at = user_issued;
+        node.device_signing = device_signing.clone();
+        node.device_dh = device_dh.clone();
 
         let device_uuid = node.device_uuid;
         if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) {
@@ -1578,10 +1635,90 @@ pub fn apply_new_user_setup(
                     dev.hosts = hosts;
                 }
             }
+            super::super::certs::issue_device_cert(
+                dev,
+                &key_pair.private_key,
+                &key_pair.public_key,
+                &device_signing,
+                &device_dh.public_key,
+            );
         }
     }
     ctx.save_node();
     None
+}
+
+/// A node upgraded from the shared-user-key build still has the user seed and
+/// no device certificate. Mint the local device key, sign it, and publish the
+/// certificate when this process holds the user private key.
+pub fn ensure_local_device_cert(ctx: &WorkerContext) {
+    let change = {
+        let mut node = ctx.node.write().unwrap();
+        if !node.is_initialized() || node.owner.key_pair.private_key == Ed25519SecretKey::ZERO {
+            return;
+        }
+        let user_pk = node.owner.key_pair.public_key;
+        let user_sk = node.owner.key_pair.private_key;
+        let device_uuid = node.device_uuid;
+        let already = node
+            .owner
+            .user
+            .devices
+            .iter()
+            .find(|d| d.uuid == device_uuid)
+            .is_some_and(|d| super::super::certs::device_on_record_verifies(d, &user_pk));
+        if already {
+            return;
+        }
+        if node.device_signing.private_key == Ed25519SecretKey::ZERO {
+            node.device_signing = generate_ed25519_keypair();
+            node.device_dh = generate_x25519_keypair();
+        }
+        let signing = node.device_signing.clone();
+        let dh_pk = node.device_dh.public_key;
+        let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device_uuid) else {
+            return;
+        };
+        super::super::certs::issue_device_cert(dev, &user_sk, &user_pk, &signing, &dh_pk);
+        Change::AddDevice {
+            uuid: dev.uuid,
+            alias: dev.alias.clone(),
+            grade: dev.grade,
+            sg_rank: dev.sg_rank,
+            hosts: dev.hosts.clone(),
+            signing_pk: dev.signing_pk,
+            dh_pk: dev.dh_pk,
+            cert_sig: dev.cert_sig,
+            cert_issued_at: dev.cert_issued_at,
+            cert_alias: dev.cert_alias.clone(),
+        }
+    };
+    ctx.save_node();
+    if let Err(e) = request_change(change, ctx) {
+        eprintln!(
+            "[ensure_local_device_cert] device certificate is local but was not published: {e:?}"
+        );
+    }
+}
+
+/// Accept a setup-form passphrase, or keep one already installed from the
+/// environment. The admin password is a different secret.
+fn install_key_passphrase_from_form(body: &[u8]) -> Result<(), &'static str> {
+    if let Some(raw) = form_field(body, "key_passphrase") {
+        let pass = url_decode(raw);
+        if !pass.is_empty() {
+            if pass.len() < super::super::keystore::MIN_PASSPHRASE_LEN {
+                return Err("passphrase_short");
+            }
+            super::super::keystore::install_passphrase(&pass);
+            return Ok(());
+        }
+    }
+    if super::super::keystore::is_installed() {
+        Ok(())
+    } else {
+        Err("passphrase")
+    }
 }
 
 fn render_setup(query: &str) -> String {
@@ -1653,6 +1790,10 @@ fn render_setup_new_user_form(error: &str) -> String {
                      Admin password must be at least 8 characters.</p>",
         "password_mismatch" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
                      Passwords do not match.</p>",
+        "passphrase" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     A key passphrase is required. It seals the user private key on this server.</p>",
+        "passphrase_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     Key passphrase must be at least 8 characters.</p>",
         _ => "",
     };
     format!(
@@ -1677,6 +1818,11 @@ fn render_setup_new_user_form(error: &str) -> String {
            <label class=\"swiz-label\">Confirm admin password</label>\
            <input class=\"swiz-input\" type=\"password\" name=\"password_confirm\" \
                   required minlength=\"8\" autocomplete=\"new-password\">\
+           <label class=\"swiz-label\">Key passphrase</label>\
+           <p class=\"swiz-sub\">Seals the user private key on disk. This is not the admin password. \
+           Headless nodes can set <code>PNET_KEY_PASSPHRASE</code> instead of filling this in.</p>\
+           <input class=\"swiz-input\" type=\"password\" name=\"key_passphrase\" \
+                  minlength=\"8\" autocomplete=\"new-password\">\
            <button class=\"swiz-btn\" type=\"submit\">Create Identity</button>\
          </form>\
          <a class=\"swiz-back\" href=\"/setup?grade=sg\">\u{2190} Back</a>"
@@ -1691,6 +1837,10 @@ fn render_setup_code_entry(grade: &str, error: &str) -> String {
                      Admin password must be at least 8 characters.</p>",
         "password_mismatch" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
                      Passwords do not match.</p>",
+        "passphrase" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     A key passphrase is required. It seals this device\u{2019}s private keys.</p>",
+        "passphrase_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+                     Key passphrase must be at least 8 characters.</p>",
         _ => "",
     };
     format!(
@@ -1713,6 +1863,11 @@ fn render_setup_code_entry(grade: &str, error: &str) -> String {
            <label class=\"swiz-label\">Confirm admin password</label>\
            <input class=\"swiz-input\" type=\"password\" name=\"password_confirm\" \
                   required minlength=\"8\" autocomplete=\"new-password\">\
+           <label class=\"swiz-label\">Key passphrase</label>\
+           <p class=\"swiz-sub\">Seals this device\u{2019}s private keys on disk. \
+           This is not the admin password.</p>\
+           <input class=\"swiz-input\" type=\"password\" name=\"key_passphrase\" \
+                  minlength=\"8\" autocomplete=\"new-password\">\
            <button class=\"swiz-btn\" type=\"submit\">Connect</button>\
          </form>\
          <a class=\"swiz-back\" href=\"{back}\">\u{2190} Back</a>"

@@ -16,6 +16,9 @@ services:
     # PNET_HOSTS is authoritative for advertised SG hosts on every restart.
     # PNET_USER_ALIAS / PNET_DEVICE_ALIAS / PNET_GRADE / PNET_SG_RANK drive
     # headless first-run setup; ignored once the node is initialized.
+    # PNET_KEY_PASSPHRASE (at least 8 characters) seals the user and device
+    # private keys. It is not the admin password. Headless setup refuses to
+    # create an identity until it is set.
     environment:
       - PNET_HOSTS=sg-william,pnet.thehomegarage.com:7777
       - PNET_GRADE=sg

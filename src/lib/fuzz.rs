@@ -13,7 +13,7 @@ use crate::handlers::{
     bootstrap_payload_well_formed, change_payload_well_formed, contact_data_well_formed,
     contact_payload_well_formed, public_state_well_formed, serialize_bootstrap_payload,
     serialize_change, serialize_contact_data, serialize_contact_payload, serialize_public_state,
-    Change, ContactDeviceCard,
+    Change, ContactAppCard, ContactDeviceCard, IssuedDeviceCert,
 };
 use crate::data_models::{
     Device, DeviceGrade, Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Node, User,
@@ -78,6 +78,7 @@ fn fixed_ed25519() -> Ed25519KeyPair {
     Ed25519KeyPair {
         private_key: Ed25519SecretKey(seed),
         public_key: Ed25519PublicKey(*sk.verifying_key().as_bytes()),
+        private_key_sealed: String::new(),
     }
 }
 
@@ -94,7 +95,13 @@ fn seed_node() -> Node {
         sg_rank: Some(1),
         hosts: vec!["127.0.0.1:7777".into()],
         applications: Vec::new(),
-    }];
+    
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}];
     n.owner.contact_users = vec![crate::data_models::Contact {
         public_key: fixed_ed25519().public_key,
         user: User {
@@ -107,7 +114,13 @@ fn seed_node() -> Node {
                 sg_rank: None,
                 hosts: vec!["10.0.0.2:7777".into()],
                 applications: Vec::new(),
-            }],
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}],
         },
         last_seen_public_version: Default::default(),
     }];
@@ -119,7 +132,13 @@ pub fn seed_corpus(target: FuzzTarget) -> Vec<Vec<u8>> {
     let node = seed_node();
     match target {
         FuzzTarget::BootstrapPayload => vec![
-            serialize_bootstrap_payload(&node),
+            serialize_bootstrap_payload(&node, false, &IssuedDeviceCert {
+                signing_pk: Ed25519PublicKey::ZERO,
+                dh_pk: crate::data_models::X25519PublicKey::ZERO,
+                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
+            }),
             // empty-ish: no devices/contacts
             {
                 let mut n = Node::new();
@@ -127,7 +146,13 @@ pub fn seed_corpus(target: FuzzTarget) -> Vec<Vec<u8>> {
                 n.owner.user.uuid = [0; 16];
                 n.owner.key_pair = fixed_ed25519();
                 n.owner.user.devices.clear();
-                serialize_bootstrap_payload(&n)
+                serialize_bootstrap_payload(&n, false, &IssuedDeviceCert {
+                    signing_pk: Ed25519PublicKey::ZERO,
+                    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+                    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                    cert_issued_at: 0,
+                    cert_alias: String::new(),
+                })
             },
         ],
         FuzzTarget::PublicState => vec![serialize_public_state(&node)],
@@ -138,7 +163,12 @@ pub fn seed_corpus(target: FuzzTarget) -> Vec<Vec<u8>> {
                 device_uuid: [0x22; 16],
                 app_id: [0xAB; 16],
                 app_alias: "chat".into(),
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             serialize_change(&Change::RemoveApplication {
                 device_uuid: [0x22; 16],
                 app_id: [0xAB; 16],
@@ -149,7 +179,13 @@ pub fn seed_corpus(target: FuzzTarget) -> Vec<Vec<u8>> {
                 grade: DeviceGrade::DG,
                 sg_rank: None,
                 hosts: vec!["h:1".into()],
-            }),
+            
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}),
             serialize_change(&Change::UpdateApplicationAlias {
                 device_uuid: [0x22; 16],
                 app_id: [0xAB; 16],
@@ -165,8 +201,21 @@ pub fn seed_corpus(target: FuzzTarget) -> Vec<Vec<u8>> {
                     grade: DeviceGrade::DG,
                     sg_rank: None,
                     hosts: vec![],
-                    apps: vec![([0x01; 16], "a".into())],
-                }],
+                    apps: vec![ContactAppCard {
+                        id: [0x01; 16],
+                        alias: "a".into(),
+                        signing_pk: Ed25519PublicKey::ZERO,
+                        cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                        cert_issued_at: 0,
+                        cert_alias: String::new(),
+                    }],
+                
+    signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+    dh_pk: crate::data_models::X25519PublicKey::ZERO,
+    cert_sig: crate::data_models::Ed25519Signature::ZERO,
+    cert_issued_at: 0,
+    cert_alias: String::new(),
+}],
             }),
             serialize_change(&Change::RemoveDevice { uuid: [0x55; 16] }),
             serialize_change(&Change::RemoveContact { uuid: [0x33; 16] }),
