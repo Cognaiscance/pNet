@@ -5188,6 +5188,18 @@ mod tests {
     }
 
     #[test]
+    fn portal_pages_default_dark_and_remember_theme() {
+        let t = TestCtx::new();
+        let html = render_devices(&t.ctx, "");
+        assert!(html.contains("data-theme=\"dark\""), "dark is the default before script");
+        assert!(html.contains("localStorage.getItem(\"pnet-theme\")"));
+        assert!(html.contains("localStorage.setItem(key, next)"));
+        assert!(html.contains("class=\"theme-toggle\""));
+        assert!(html.contains("html[data-theme=\"light\"]"));
+        assert!(html.contains("--gold: #d4b15a"));
+    }
+
+    #[test]
     fn rename_app_success_publishes_and_returns_none() {
         let t = TestCtx::new();
         promote_local_to_sg(&t, 1);
