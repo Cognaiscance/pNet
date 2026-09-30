@@ -32,9 +32,9 @@ use super::super::data_models::{
 };
 use super::super::wire::*;
 use super::{
-    find_writer_sg, generate_contact_invitation, generate_device_invitation_with, initiate_bootstrap,
-    initiate_contact_exchange, parse_pnet_hosts, request_change, sync_pull, uuid_hex, Change,
-    InvitationMint, WriterTarget,
+    cascade_remove_fabric_state, find_writer_sg, generate_contact_invitation,
+    generate_device_invitation_with, initiate_bootstrap, initiate_contact_exchange,
+    parse_pnet_hosts, request_change, sync_pull, uuid_hex, Change, InvitationMint, WriterTarget,
 };
 
 // ── UI / HTTP handlers ────────────────────────────────────────────────────────
@@ -220,13 +220,17 @@ pub fn ui_request(
             respond_redirect(&stream, &target);
         }
         ("GET",  "/contacts")      => respond_html(&stream, 200, &render_contacts(ctx), None),
-        ("GET",  "/devices")       => respond_html(&stream, 200, &render_devices(ctx), None),
+        ("GET",  "/devices")       => respond_html(&stream, 200, &render_devices(ctx, &query), None),
         ("POST", "/devices/sync")  => {
             // Manual refresh: pull the latest public/private state from the
             // writer SG. No-op when this node is the writer or has no
             // reachable own SG.
             sync_pull(ctx);
             respond_redirect(&stream, "/devices");
+        }
+        ("POST", "/devices/remove") => {
+            let target = redirect_with_error("/devices", remove_device(&body, ctx));
+            respond_redirect(&stream, &target);
         }
         ("GET",  "/diagnostics")   => respond_html(&stream, 200, &render_diagnostics(ctx), None),
         ("GET",  "/invitations")   => {
@@ -790,7 +794,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
              <li><a href=\"/pending-apps\">Pending Apps</a> — approve or reject local app registrations</li>\
              <li><a href=\"/applications\">Applications</a> — approved apps on this device</li>\
              <li><a href=\"/contacts\">Contacts</a> — other users you are linked with</li>\
-             <li><a href=\"/devices\">Devices</a> — your devices and advertised hosts</li>\
+             <li><a href=\"/devices\">Devices</a> — your devices; remove a lost one</li>\
              <li><a href=\"/invitations\">Invitations</a> — device and contact invite codes</li>\
              <li><a href=\"/diagnostics\">Diagnostics</a> — fabric health, sessions, partitions</li>\
            </ul>\
@@ -799,14 +803,19 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
     layout(ctx, "Config", &body)
 }
 
-/// Render a red banner for the UI error codes emitted by approve_app /
-/// reject_app. Returns an empty string when there's no error to show.
+/// Render a red banner for UI error codes from approve, reject, rename, and
+/// device removal. Returns an empty string when there's no error to show.
 fn ui_error_banner(query: &str) -> String {
     match query_param(query, "error") {
         Some(code) if code == UI_ERR_PUBLISH_FAILED =>
             "<div class='card' style='background:#fee;color:#900;border:1px solid #c66'>\
                 <strong>Could not publish change:</strong> no reachable writer SG. \
                 The local change has been rolled back; retry when an SG is online.\
+            </div>".to_string(),
+        Some(code) if code == UI_ERR_REMOVE_SELF =>
+            "<div class='card' style='background:#fee;color:#900;border:1px solid #c66'>\
+                <strong>This device cannot remove itself.</strong> \
+                Open Devices on another device that is still in the mesh.\
             </div>".to_string(),
         _ => String::new(),
     }
@@ -965,15 +974,28 @@ fn render_contacts(ctx: &WorkerContext) -> String {
     layout(ctx, "Contacts", &body)
 }
 
-fn render_devices(ctx: &WorkerContext) -> String {
+pub(crate) fn render_devices(ctx: &WorkerContext, query: &str) -> String {
     let node        = ctx.node.read().unwrap();
     let device_uuid = node.device_uuid;
 
     let rows: String = node.owner.user.devices.iter()
         .map(|d| {
             let suffix = if d.uuid == device_uuid { " <em>(this device)</em>" } else { "" };
+            let action = if d.uuid == device_uuid {
+                "<span style='color:#888;font-size:.85rem'>Use another device to remove this one</span>"
+                    .to_string()
+            } else {
+                format!(
+                    "<form method='post' action='/devices/remove' style='margin:0' \
+                       onsubmit='return confirm(\"Remove this device from the mesh? If it is found later, uninstall pNet and set it up again. The old install cannot rejoin.\")'>\
+                       <input type='hidden' name='id' value='{id}'>\
+                       <button class='reject' type='submit' style='margin-left:0'>Remove</button>\
+                     </form>",
+                    id = uuid_hex(&d.uuid),
+                )
+            };
             format!(
-                "<tr><td>{}{suffix}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}{suffix}</td><td>{}</td><td>{}</td><td>{action}</td></tr>",
                 html_escape(&d.alias),
                 html_escape(&d.hosts.join(", ")),
                 d.applications.len(),
@@ -987,15 +1009,20 @@ fn render_devices(ctx: &WorkerContext) -> String {
           <form method='post' action='/devices/sync'>\
             <button type='submit'>Sync</button>\
           </form>\
-        </div>";
+        </div>\
+        <p style='color:#666;font-size:.9rem;margin-top:0'>Remove a lost device here. \
+           It leaves the mesh and its certificate is no longer accepted. \
+           If that device is found later, uninstall pNet and set it up again with a new invitation. \
+           The old install cannot rejoin.</p>";
 
+    let error_banner = ui_error_banner(query);
     let body = if rows.is_empty() {
-        format!("{heading}<p class='empty'>No devices.</p>")
+        format!("{heading}{error_banner}<p class='empty'>No devices.</p>")
     } else {
         format!(
-            "{heading}\
+            "{heading}{error_banner}\
              <table>\
-               <tr><th>Alias</th><th>Host</th><th>Apps</th></tr>\
+               <tr><th>Alias</th><th>Host</th><th>Apps</th><th></th></tr>\
                {rows}\
              </table>"
         )
@@ -1272,6 +1299,9 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
 /// already rolled the local mutation back, so the UI state matches reality.
 pub(crate) const UI_ERR_PUBLISH_FAILED: &str = "publish_failed";
 
+/// The device serving this page cannot remove itself.
+pub(crate) const UI_ERR_REMOVE_SELF: &str = "remove_self";
+
 /// Returns `Some(UI_ERR_*)` if the change could not be published (and the
 /// local mutation was rolled back); `None` on success or for the silent
 /// no-op cases (bad form, unknown id).
@@ -1407,6 +1437,51 @@ pub(crate) fn reject_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static st
         ctx.save_node();
         eprintln!("[reject_app] publish failed for app {}: {e:?}", uuid_hex(&id));
         return Some(UI_ERR_PUBLISH_FAILED);
+    }
+    None
+}
+
+/// Remove a lost device from the mesh.
+///
+/// Publishes `RemoveDevice`. The certificate leaves the directory, so peers
+/// reject that device's connect signature, and a later add of the same uuid
+/// loses to the tombstone. The old install cannot rejoin: uninstall pNet and
+/// set the device up again with a new invitation.
+///
+/// The device serving this page is refused. A node with no reachable writer
+/// rolls the local removal back.
+pub(crate) fn remove_device(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let id_str = form_field(body, "id")?;
+    let id = uuid_from_hex(id_str)?;
+    let local = ctx.node.read().unwrap().device_uuid;
+    if id == local {
+        eprintln!("[remove_device] refusing to remove this device");
+        return Some(UI_ERR_REMOVE_SELF);
+    }
+    let removed = {
+        let mut node = ctx.node.write().unwrap();
+        let pos = node.owner.user.devices.iter().position(|d| d.uuid == id)?;
+        node.owner.user.devices.remove(pos)
+    };
+    ctx.save_node();
+
+    if let Err(e) = request_change(Change::RemoveDevice { uuid: id }, ctx) {
+        {
+            let mut node = ctx.node.write().unwrap();
+            node.owner.user.devices.push(removed);
+        }
+        ctx.save_node();
+        eprintln!("[remove_device] publish failed for {}: {e:?}", uuid_hex(&id));
+        return Some(UI_ERR_PUBLISH_FAILED);
+    }
+    // The local writer already dropped sessions inside `request_change`.
+    // A remote writer applies the change on its side; drop them here too.
+    let writer_local = matches!(
+        find_writer_sg(&ctx.node.read().unwrap()),
+        WriterTarget::Local
+    );
+    if !writer_local {
+        cascade_remove_fabric_state(ctx, &Change::RemoveDevice { uuid: id });
     }
     None
 }

@@ -20,7 +20,15 @@ The device-invitation form has a checkbox: "this device is a server and may enro
 
 A server that already holds the user seed can still mint certificates. That is the enrollment-issuer case, not a stolen phone.
 
-What to do when a phone is lost, a server is destroyed, or the user private key itself is lost is still an open choice. This change does not pick a backup scheme.
+## Lost device
+
+From Config → Devices, the owner removes a device they no longer have. That publishes `RemoveDevice`. The device and its certificate leave the directory, open sessions to it are dropped, and a later add of the same device uuid loses to the tombstone. Peers reject a connect signature from that device.
+
+The device serving the page cannot remove itself. Use another device that is still in the mesh.
+
+The removed install cannot rejoin. Uninstall pNet on it and set it up again with a new invitation, which mints a new device uuid and a new certificate.
+
+What to do when a server is destroyed, or the user private key itself is lost, is still an open choice. Removing a device does not rotate the user key. A device that was given that seed can still sign certificates until the key is replaced.
 
 ## At rest
 
