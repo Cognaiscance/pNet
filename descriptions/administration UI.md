@@ -113,10 +113,11 @@ The owner's address book.
 * Shows their devices and connection availability
 
 ### Devices
-The owner's other devices running pNet.
-* Shows alias, advertised hosts list, and connection health for each device
-* Connection health indicated as online / idle / offline based on last contact
-* Last seen timestamp shown for each device
+The owner's devices running pNet.
+* Shows alias, advertised hosts, and how many apps are on each device
+* Marks the device that is serving this page. That device cannot remove itself
+* **Remove** publishes `RemoveDevice` for another device. Its certificate leaves the directory, peers reject its connect signature, and sessions to it are dropped. A later add of the same device uuid loses to the tombstone
+* A removed install cannot rejoin. Uninstall pNet on that device and set it up again with a new invitation, which mints a new device uuid and a new certificate
 
 ### Activity Log
 A high-level log of notable events on the node.

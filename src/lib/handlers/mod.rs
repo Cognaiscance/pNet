@@ -114,6 +114,7 @@ pub use sync::{
 };
 pub(crate) use sync::{
     apply_change_locally, apply_public_state, build_merge_ack_body,
+    cascade_remove_fabric_state,
     build_merge_proposal_body, build_merge_proposal_for_peer, bumped_scopes,
     change_payload_well_formed, contact_data_well_formed, ContactData,
     cross_user_pull_for_contact, cross_user_pull_on_reconnect, deserialize_change,
@@ -133,8 +134,9 @@ pub use tunnels::{
 mod admin_ui;
 pub use admin_ui::{apply_new_user_setup, ensure_local_device_cert, ui_request};
 pub(crate) use admin_ui::{
-    UI_ERR_PUBLISH_FAILED, approve_app, complete_setup, form_field, own_user_sg_partition,
-    partition_banner, reject_app, rename_app, render_diagnostics, url_decode,
+    UI_ERR_PUBLISH_FAILED, UI_ERR_REMOVE_SELF, approve_app, complete_setup, form_field,
+    own_user_sg_partition, partition_banner, reject_app, remove_device, rename_app,
+    render_devices, render_diagnostics, url_decode,
 };
 
 
@@ -5078,6 +5080,111 @@ mod tests {
             .expect("rollback should restore the app");
         assert_eq!(app.alias, original_alias,
                    "rollback should preserve the original alias");
+    }
+
+    fn blank_device(alias: &str, uuid: Uuid) -> Device {
+        Device {
+            alias: alias.into(),
+            uuid,
+            grade: DeviceGrade::DG,
+            sg_rank: None,
+            hosts: vec![],
+            applications: vec![],
+            signing_pk: Ed25519PublicKey::ZERO,
+            dh_pk: X25519PublicKey::ZERO,
+            cert_sig: Ed25519Signature::ZERO,
+            cert_issued_at: 0,
+            cert_alias: String::new(),
+        }
+    }
+
+    #[test]
+    fn remove_device_publishes_tombstone_and_drops_sessions() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 1);
+        let other = generate_uuid();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.user.devices.push(blank_device("phone", other));
+            node.owner.active_connections.insert(
+                3,
+                ActiveConnection {
+                    id: 3,
+                    timeout: SystemTime::now() + Duration::from_secs(3600),
+                    key_pair: generate_x25519_keypair(),
+                    peer_public_key: X25519PublicKey(generate_key_bytes()),
+                    peer_active_connection_id: 1,
+                    device_uuid: other,
+                    peer_addr: "127.0.0.1:9".parse().unwrap(),
+                },
+            );
+        }
+
+        let body = format!("id={}", uuid_hex(&other));
+        assert_eq!(remove_device(body.as_bytes(), &t.ctx), None);
+
+        let node = t.ctx.node.read().unwrap();
+        assert!(!node.owner.user.devices.iter().any(|d| d.uuid == other));
+        assert!(
+            !node.owner.active_connections.values().any(|c| c.device_uuid == other),
+            "sessions to the removed device must be dropped"
+        );
+        let removes = node.owner.write_log.iter()
+            .filter_map(|e| deserialize_change(&e.change_payload))
+            .filter(|c| matches!(c, Change::RemoveDevice { uuid } if *uuid == other))
+            .count();
+        assert_eq!(removes, 1, "the writer log must record the tombstone");
+    }
+
+    #[test]
+    fn remove_device_refuses_this_device() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 1);
+        let local = t.ctx.node.read().unwrap().device_uuid;
+        let before = t.ctx.node.read().unwrap().owner.user.devices.len();
+
+        let body = format!("id={}", uuid_hex(&local));
+        assert_eq!(remove_device(body.as_bytes(), &t.ctx), Some(UI_ERR_REMOVE_SELF));
+
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(node.owner.user.devices.len(), before);
+        assert!(node.owner.user.devices.iter().any(|d| d.uuid == local));
+        assert!(
+            node.owner.write_log.iter()
+                .filter_map(|e| deserialize_change(&e.change_payload))
+                .all(|c| !matches!(c, Change::RemoveDevice { .. }))
+        );
+    }
+
+    #[test]
+    fn remove_device_unreachable_rolls_back() {
+        let t = TestCtx::new();
+        let other = generate_uuid();
+        t.ctx.node.write().unwrap().owner.user.devices.push(blank_device("phone", other));
+
+        let body = format!("id={}", uuid_hex(&other));
+        assert_eq!(remove_device(body.as_bytes(), &t.ctx), Some(UI_ERR_PUBLISH_FAILED));
+
+        let node = t.ctx.node.read().unwrap();
+        assert!(node.owner.user.devices.iter().any(|d| d.uuid == other && d.alias == "phone"));
+    }
+
+    #[test]
+    fn render_devices_offers_remove_for_other_devices_only() {
+        let t = TestCtx::new();
+        let other = generate_uuid();
+        t.ctx.node.write().unwrap().owner.user.devices.push(blank_device("phone", other));
+        let local = t.ctx.node.read().unwrap().device_uuid;
+
+        let html = render_devices(&t.ctx, "");
+        assert!(html.contains("/devices/remove"));
+        assert!(html.contains(&uuid_hex(&other)));
+        assert!(!html.contains(&uuid_hex(&local)), "this device has no remove control");
+        assert!(html.contains("uninstall pNet"));
+        assert!(html.contains("cannot rejoin"));
+
+        let err = render_devices(&t.ctx, "error=remove_self");
+        assert!(err.contains("cannot remove itself"));
     }
 
     #[test]
