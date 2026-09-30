@@ -573,7 +573,7 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
            <p class=\"empty\" style=\"margin:0\">No app pages registered yet. \
            Local apps can register a mount via \
            <code>POST /api/app-web/register</code> (loopback only).</p>\
-           <p style=\"font-size:.85rem;color:#666;margin:.75rem 0 0\">\
+           <p style=\"font-size:.85rem;color:var(--muted);margin:.75rem 0 0\">\
            App store (discover &amp; install across devices) is a future project.</p>\
          </div>".to_string()
     } else {
@@ -588,7 +588,7 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
             rows.push_str(&format!(
                 "<li style=\"margin:.4rem 0\"><a class=\"portal-btn\" href=\"/apps/{slug}/\">\
                  {title}</a> \
-                 <span style=\"color:#888;font-size:.85rem\">/apps/{slug}/</span></li>"
+                 <span style=\"color:var(--faint);font-size:.85rem\">/apps/{slug}/</span></li>"
             ));
         }
         format!(
@@ -601,12 +601,12 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
 
     let body = format!(
         "<h1>Home</h1>\
-         <p style=\"color:#555;margin-top:-.5rem\">Signed in as <strong>{owner_alias}</strong> \
+         <p style=\"color:var(--muted);margin-top:-.5rem\">Signed in as <strong>{owner_alias}</strong> \
          on <strong>{device_alias}</strong> ({grade_label}).</p>\
          {apps_section}\
          <div class=\"card\">\
            <h2 style=\"margin-top:0;font-size:1.1rem\">Config</h2>\
-           <p style=\"margin:0 0 .75rem;color:#444\">Manage this node: devices, invitations, \
+           <p style=\"margin:0 0 .75rem;color:var(--ink)\">Manage this node: devices, invitations, \
            applications, contacts, and diagnostics. Requires the same owner sign-in \
            (password today; passkeys/2FA later).</p>\
            <p style=\"margin:0\"><a class=\"portal-btn\" href=\"/config\">Open Config</a></p>\
@@ -768,7 +768,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
 
     let hosts_line = match device {
         Some(d) if d.hosts.is_empty() => {
-            "<span style='color:#900'>none — set <code>PNET_HOSTS</code> and restart</span>".to_string()
+            "<span style='color:var(--bad)'>none — set <code>PNET_HOSTS</code> and restart</span>".to_string()
         }
         Some(d) => html_escape(&d.hosts.join(", ")),
         None => "unknown".to_string(),
@@ -776,7 +776,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
 
     let body = format!(
         "<h1>Config</h1>\
-         <p style=\"color:#555;margin-top:-.5rem\">Node and fabric control plane \
+         <p style=\"color:var(--muted);margin-top:-.5rem\">Node and fabric control plane \
          (same capabilities as the classic administration UI).</p>\
          <div class=\"stats\">\
            <div class=\"stat-card\"><div class=\"stat\">{n_contacts}</div><div class=\"label\">Contacts</div></div>\
@@ -808,12 +808,12 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
 fn ui_error_banner(query: &str) -> String {
     match query_param(query, "error") {
         Some(code) if code == UI_ERR_PUBLISH_FAILED =>
-            "<div class='card' style='background:#fee;color:#900;border:1px solid #c66'>\
+            "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
                 <strong>Could not publish change:</strong> no reachable writer SG. \
                 The local change has been rolled back; retry when an SG is online.\
             </div>".to_string(),
         Some(code) if code == UI_ERR_REMOVE_SELF =>
-            "<div class='card' style='background:#fee;color:#900;border:1px solid #c66'>\
+            "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
                 <strong>This device cannot remove itself.</strong> \
                 Open Devices on another device that is still in the mesh.\
             </div>".to_string(),
@@ -932,7 +932,7 @@ fn render_contacts(ctx: &WorkerContext) -> String {
                 )
             }).collect();
             let dev_list = if c.user.devices.is_empty() {
-                "<span style='color:#999;font-size:.85rem'>no devices</span>".to_string()
+                "<span style='color:var(--faint);font-size:.85rem'>no devices</span>".to_string()
             } else {
                 format!("<ul style='margin:0;padding-left:1.2rem'>{dev_cells}</ul>")
             };
@@ -961,11 +961,11 @@ fn render_contacts(ctx: &WorkerContext) -> String {
          {table}\
          <div class='card' style='margin-top:1.5rem'>\
            <h2 style='margin-top:0;font-size:1rem'>Add a Contact</h2>\
-           <p style='color:#666;font-size:.9rem;margin-top:0'>Paste an invitation code from another pNet user.</p>\
+           <p style='color:var(--muted);font-size:.9rem;margin-top:0'>Paste an invitation code from another pNet user.</p>\
            <form method='post' action='/contacts/enter'>\
              <textarea name='code' rows='3' \
                style='width:100%;font-family:monospace;font-size:.85rem;\
-                      box-sizing:border-box;padding:.4rem;border:1px solid #ccc;border-radius:4px' \
+                      box-sizing:border-box;padding:.4rem;border:1px solid var(--line);border-radius:4px' \
                placeholder='Paste contact invitation code here...'></textarea><br>\
              <button type='submit' style='margin-top:.5rem'>Add Contact</button>\
            </form>\
@@ -982,7 +982,7 @@ pub(crate) fn render_devices(ctx: &WorkerContext, query: &str) -> String {
         .map(|d| {
             let suffix = if d.uuid == device_uuid { " <em>(this device)</em>" } else { "" };
             let action = if d.uuid == device_uuid {
-                "<span style='color:#888;font-size:.85rem'>Use another device to remove this one</span>"
+                "<span style='color:var(--faint);font-size:.85rem'>Use another device to remove this one</span>"
                     .to_string()
             } else {
                 format!(
@@ -1010,7 +1010,7 @@ pub(crate) fn render_devices(ctx: &WorkerContext, query: &str) -> String {
             <button type='submit'>Sync</button>\
           </form>\
         </div>\
-        <p style='color:#666;font-size:.9rem;margin-top:0'>Remove a lost device here. \
+        <p style='color:var(--muted);font-size:.9rem;margin-top:0'>Remove a lost device here. \
            It leaves the mesh and its certificate is no longer accepted. \
            If that device is found later, uninstall pNet and set it up again with a new invitation. \
            The old install cannot rejoin.</p>";
@@ -1071,20 +1071,20 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
 
     let partition_now = own_user_sg_partition(&node);
     let partition_html = if partition_now {
-        "<span style='color:#c0392b;font-weight:bold'>yes — own-user SG peer(s) all-down</span>"
+        "<span style='color:var(--bad);font-weight:bold'>yes — own-user SG peer(s) all-down</span>"
             .to_string()
     } else {
-        "<span style='color:#2d7a3b'>no</span>".to_string()
+        "<span style='color:var(--ok)'>no</span>".to_string()
     };
 
     let retention_html = if node.owner.retention_fallback_active {
         format!(
-            "<span style='color:#c0392b;font-weight:bold'>yes — data-loss path</span><br>\
-             <span style='font-size:.85rem;color:#666'>{}</span>",
+            "<span style='color:var(--bad);font-weight:bold'>yes — data-loss path</span><br>\
+             <span style='font-size:.85rem;color:var(--muted)'>{}</span>",
             html_escape(&node.owner.retention_fallback_detail)
         )
     } else {
-        "<span style='color:#2d7a3b'>no</span>".to_string()
+        "<span style='color:var(--ok)'>no</span>".to_string()
     };
 
     let local_section = format!(
@@ -1093,7 +1093,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
            <table>\
              <tr><th>Device UUID</th><td><code>{local}</code></td></tr>\
              <tr><th>Writer SG</th><td><strong>{wlabel}</strong><br>\
-               <span style='font-size:.85rem;color:#666'>{wdetail}</span></td></tr>\
+               <span style='font-size:.85rem;color:var(--muted)'>{wdetail}</span></td></tr>\
              <tr><th>Public version</th><td>writer=<code>{pw}</code> epoch={pe} seq={ps}</td></tr>\
              <tr><th>Private version</th><td>writer=<code>{rw}</code> epoch={re} seq={rs}</td></tr>\
              <tr><th>Partition flag</th><td>{part}</td></tr>\
@@ -1151,7 +1151,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
         let refresh_age_s = refresh_age.as_secs();
         sess_rows.push_str(&format!(
             "<tr>\
-               <td>{alias}<br><code style='font-size:.75rem;color:#888'>{uuid}</code></td>\
+               <td>{alias}<br><code style='font-size:.75rem;color:var(--faint)'>{uuid}</code></td>\
                <td>{cid}</td>\
                <td><code>{addr}</code></td>\
                <td>{rem}s left</td>\
@@ -1168,13 +1168,13 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
     let sessions_section = if sess_rows.is_empty() {
         "<div class='card'><h2 style='margin-top:0'>Active sessions</h2>\
          <p class='empty'>No active connections.</p>\
-         <p style='font-size:.8rem;color:#666'>Refresh age ≈ time since last \
+         <p style='font-size:.8rem;color:var(--muted)'>Refresh age ≈ time since last \
          connect/keepalive timeout refresh (session lifetime − remaining).</p></div>"
             .to_string()
     } else {
         format!(
             "<div class='card'><h2 style='margin-top:0'>Active sessions</h2>\
-             <p style='font-size:.85rem;color:#666;margin-top:0'>Peer list with \
+             <p style='font-size:.85rem;color:var(--muted);margin-top:0'>Peer list with \
              <code>peer_addr</code>, session remaining, and keepalive/refresh age proxy.</p>\
              <table><tr><th>Peer</th><th>Conn id</th><th>peer_addr</th>\
              <th>Session remaining</th><th>Refresh age</th></tr>{sess_rows}</table></div>"
@@ -1194,19 +1194,19 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
                         .checked_duration_since(s.last_polled)
                         .map(|d| format!("{}s ago", d.as_secs()))
                         .unwrap_or_else(|| "—".to_string());
-                    let status = if s.up { "<span style='color:#2d7a3b'>up</span>" }
-                                 else    { "<span style='color:#c0392b'>down</span>" };
+                    let status = if s.up { "<span style='color:var(--ok)'>up</span>" }
+                                 else    { "<span style='color:var(--bad)'>down</span>" };
                     format!(
                         "<li><code>{}</code> — {status} (rtt {rtt}, polled {poll_age})</li>",
                         html_escape(h)
                     )
                 }
-                None => format!("<li><code>{}</code> — <span style='color:#888'>not yet polled</span></li>",
+                None => format!("<li><code>{}</code> — <span style='color:var(--faint)'>not yet polled</span></li>",
                                 html_escape(h)),
             }
         }).collect();
         peer_rows.push_str(&format!(
-            "<tr><td>{alias}<br><code style='font-size:.75rem;color:#888'>{uuid}</code></td>\
+            "<tr><td>{alias}<br><code style='font-size:.75rem;color:var(--faint)'>{uuid}</code></td>\
                  <td><ul style='margin:0;padding-left:1.2rem'>{host_lines}</ul></td></tr>",
             alias = html_escape(&d.alias),
             uuid  = uuid_hex(&d.uuid),
@@ -1230,14 +1230,14 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
         let writers = &node.owner.last_watermarks[peer_uuid];
         let mut sub_rows: Vec<String> = writers.iter().map(|(wu, sv)| {
             format!(
-                "<tr><td><code>{}</code><br><span style='font-size:.75rem;color:#888'>{}</span></td>\
+                "<tr><td><code>{}</code><br><span style='font-size:.75rem;color:var(--faint)'>{}</span></td>\
                      <td>epoch={} seq={}</td></tr>",
                 alias_of(wu), uuid_hex(wu), sv.epoch, sv.seq,
             )
         }).collect();
         sub_rows.sort();
         wm_rows.push_str(&format!(
-            "<tr><td>{alias}<br><code style='font-size:.75rem;color:#888'>{uuid}</code></td>\
+            "<tr><td>{alias}<br><code style='font-size:.75rem;color:var(--faint)'>{uuid}</code></td>\
                  <td><table style='margin:0;box-shadow:none;background:transparent'>\
                        <tr><th>Writer</th><th>Version</th></tr>{}</table></td></tr>",
             sub_rows.concat(),
@@ -1251,7 +1251,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
     } else {
         format!(
             "<div class='card'><h2 style='margin-top:0'>Last watermarks</h2>\
-             <p style='font-size:.85rem;color:#666;margin-top:0'>Per-peer, per-writer agreed reconciliation point. \
+             <p style='font-size:.85rem;color:var(--muted);margin-top:0'>Per-peer, per-writer agreed reconciliation point. \
                 Rebuilt on every watermark-probe round-trip.</p>\
              <table><tr><th>Peer</th><th>Per-writer min</th></tr>{wm_rows}</table></div>"
         )
@@ -1264,7 +1264,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
     for peer_uuid in peers_with_pp {
         let entries = &node.owner.received_merge_proposals[peer_uuid];
         pp_rows.push_str(&format!(
-            "<tr><td>{alias}<br><code style='font-size:.75rem;color:#888'>{uuid}</code></td>\
+            "<tr><td>{alias}<br><code style='font-size:.75rem;color:var(--faint)'>{uuid}</code></td>\
                  <td>{n} entr{plural}</td></tr>",
             alias  = html_escape(&alias_of(peer_uuid)),
             uuid   = uuid_hex(peer_uuid),
@@ -1278,7 +1278,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
     } else {
         format!(
             "<div class='card'><h2 style='margin-top:0'>Buffered merge proposals</h2>\
-             <p style='font-size:.85rem;color:#666;margin-top:0'>Entries received from peers and waiting to be \
+             <p style='font-size:.85rem;color:var(--muted);margin-top:0'>Entries received from peers and waiting to be \
                 merged into the local log.</p>\
              <table><tr><th>Peer</th><th>Buffered</th></tr>{pp_rows}</table></div>"
         )
@@ -1503,7 +1503,7 @@ fn render_invitations(
         .unwrap_or("");
 
     let error_section = match error_param {
-        "no_host" => "<div class='card' style='background:#fee;color:#900;border:1px solid #c66'>\
+        "no_host" => "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
             <strong>Could not generate invitation:</strong> no reachable host is configured \
             for this device. Set the <code>PNET_HOSTS</code> environment variable before \
             starting the node, then restart. See the server log for details.\
@@ -1517,7 +1517,7 @@ fn render_invitations(
                 "<div class='card'>\
                    <div class='label'>Share this code with the new device (expires in 24 h). \
                    It is shown once — copy it now.</div>\
-                   <pre style='word-break:break-all;background:#f0f0f0;padding:.75rem;\
+                   <pre style='word-break:break-all;background:var(--code-bg);padding:.75rem;\
                                border-radius:4px;font-size:.85rem;margin:.5rem 0 0'>{}</pre>\
                  </div>",
                 html_escape(&code)
@@ -1530,7 +1530,7 @@ fn render_invitations(
                 "<div class='card'>\
                    <div class='label'>Share this code with your new contact (expires in 24 h). \
                    It is shown once — copy it now.</div>\
-                   <pre style='word-break:break-all;background:#f0f0f0;padding:.75rem;\
+                   <pre style='word-break:break-all;background:var(--code-bg);padding:.75rem;\
                                border-radius:4px;font-size:.85rem;margin:.5rem 0 0'>{}</pre>\
                  </div>",
                 html_escape(&code)
@@ -1584,7 +1584,7 @@ fn render_invitations(
          {contact_code_section}\
          <div class='card'>\
            <h2 style='margin-top:0;font-size:1rem'>Add a Device</h2>\
-           <p style='color:#666;font-size:.9rem;margin-top:0'>Generate a one-time code, then enter it on the new device. \
+           <p style='color:var(--muted);font-size:.9rem;margin-top:0'>Generate a one-time code, then enter it on the new device. \
            An ordinary code does not copy the user private key.</p>\
            {dev_inv_table}\
            <form method='post' action='/invitations/device' style='margin-top:1rem'>\
@@ -1594,7 +1594,7 @@ fn render_invitations(
          </div>\
          <div class='card'>\
            <h2 style='margin-top:0;font-size:1rem'>Add a Contact</h2>\
-           <p style='color:#666;font-size:.9rem;margin-top:0'>Generate a one-time code and share it with the person you want to add.</p>\
+           <p style='color:var(--muted);font-size:.9rem;margin-top:0'>Generate a one-time code and share it with the person you want to add.</p>\
            {contact_inv_table}\
            <form method='post' action='/invitations/contact' style='margin-top:1rem'>\
              <button type='submit'>Generate Contact Invitation</button>\
@@ -1602,11 +1602,11 @@ fn render_invitations(
          </div>\
          <div class='card'>\
            <h2 style='margin-top:0;font-size:1rem'>Enter Invitation Code</h2>\
-           <p style='color:#666;font-size:.9rem;margin-top:0'>On this new device, paste a code generated on another device.</p>\
+           <p style='color:var(--muted);font-size:.9rem;margin-top:0'>On this new device, paste a code generated on another device.</p>\
            <form method='post' action='/invitations/enter'>\
              <textarea name='code' rows='3' \
                style='width:100%;font-family:monospace;font-size:.85rem;\
-                      box-sizing:border-box;padding:.4rem;border:1px solid #ccc;border-radius:4px' \
+                      box-sizing:border-box;padding:.4rem;border:1px solid var(--line);border-radius:4px' \
                placeholder='Paste invitation code here...'></textarea><br>\
              <button type='submit' style='margin-top:.5rem'>Connect to Network</button>\
            </form>\
@@ -1808,7 +1808,7 @@ fn render_setup(query: &str) -> String {
          <h1>Connecting\u{2026}</h1>\
          <p class=\"swiz-sub\">Waiting for a response from the server.<br>\
          This page will refresh automatically.</p>\
-         <p style=\"color:#888;font-size:.8rem\">Make sure the invitation code was valid \
+         <p style=\"color:var(--faint);font-size:.8rem\">Make sure the invitation code was valid \
          and that the server is reachable.</p>"
             .to_string()
     } else {
@@ -1859,15 +1859,15 @@ fn render_setup_role_step() -> String {
 
 fn render_setup_new_user_form(error: &str) -> String {
     let error_msg = match error {
-        "fields" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "fields" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      Name and device name are required.</p>",
-        "password_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "password_short" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      Admin password must be at least 8 characters.</p>",
-        "password_mismatch" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "password_mismatch" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      Passwords do not match.</p>",
-        "passphrase" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "passphrase" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      A key passphrase is required. It seals the user private key on this server.</p>",
-        "passphrase_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "passphrase_short" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      Key passphrase must be at least 8 characters.</p>",
         _ => "",
     };
@@ -1908,13 +1908,13 @@ fn render_setup_code_entry(grade: &str, error: &str) -> String {
     let back = if grade == "sg" { "/setup?grade=sg" } else { "/setup" };
     let form_grade = if grade == "sg" { "sg" } else { "dg" };
     let error_msg = match error {
-        "password_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "password_short" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      Admin password must be at least 8 characters.</p>",
-        "password_mismatch" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "password_mismatch" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      Passwords do not match.</p>",
-        "passphrase" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "passphrase" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      A key passphrase is required. It seals this device\u{2019}s private keys.</p>",
-        "passphrase_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "passphrase_short" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      Key passphrase must be at least 8 characters.</p>",
         _ => "",
     };
@@ -1951,7 +1951,7 @@ fn render_setup_code_entry(grade: &str, error: &str) -> String {
 
 fn render_login(error: &str) -> String {
     let error_msg = if error == "bad" {
-        "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
          Incorrect password.</p>"
     } else {
         ""
@@ -1972,11 +1972,11 @@ fn render_login(error: &str) -> String {
 
 fn render_set_password(error: &str) -> String {
     let error_msg = match error {
-        "password_short" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "password_short" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      Password must be at least 8 characters.</p>",
-        "password_mismatch" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "password_mismatch" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      Passwords do not match.</p>",
-        "exists" => "<p style=\"color:#c0392b;font-size:.85rem;margin-bottom:1rem\">\
+        "exists" => "<p style=\"color:var(--bad);font-size:.85rem;margin-bottom:1rem\">\
                      A password is already set. Log in instead.</p>",
         _ => "",
     };
@@ -1999,37 +1999,282 @@ fn render_set_password(error: &str) -> String {
 
 // ── HTML layout ───────────────────────────────────────────────────────────────
 
-const CSS: &str = "
-body { font-family: sans-serif; margin: 0; background: #f5f5f5; color: #222; }
-nav { background: #1a1a2e; padding: .75rem 1.5rem; display: flex; align-items: center; gap: 1.5rem; }
-nav a { color: #aac; text-decoration: none; font-size: .9rem; }
-nav a:hover { color: #fff; }
-.brand { color: #fff; font-weight: bold; font-size: 1.1rem; margin-right: 1rem; }
-main { padding: 1.5rem 2rem; max-width: 900px; }
-h1 { margin-top: 0; font-size: 1.4rem; }
-table { border-collapse: collapse; width: 100%; background: white; border-radius: 6px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
-th { background: #eee; text-align: left; padding: .6rem 1rem; font-size: .85rem; color: #555; }
-td { padding: .6rem 1rem; border-top: 1px solid #eee; font-size: .9rem; }
-.card { background: white; border-radius: 6px; padding: 1.2rem 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,.1); margin-bottom: 1rem; }
-.stats { display: flex; gap: 1rem; margin-bottom: 1.5rem; }
-.stat-card { background: white; border-radius: 6px; padding: 1rem 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,.1); flex: 1; }
-.stat { font-size: 2rem; font-weight: bold; color: #1a1a2e; }
-.label { font-size: .8rem; color: #888; }
-button { padding: .3rem .8rem; border: none; border-radius: 4px; cursor: pointer; font-size: .85rem; }
-.approve { background: #2d7a3b; color: white; }
-.reject { background: #c0392b; color: white; margin-left: .4rem; }
+/// Sets `data-theme` from localStorage before first paint. Missing or unknown
+/// values stay on the dark default so the page does not flash light.
+const THEME_HEAD: &str = r##"<meta name="theme-color" content="#070605">
+<script>
+(function () {
+  var theme = "dark";
+  try {
+    var saved = localStorage.getItem("pnet-theme");
+    if (saved === "light" || saved === "dark") theme = saved;
+  } catch (e) {}
+  document.documentElement.setAttribute("data-theme", theme);
+  var meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", theme === "light" ? "#f3eee4" : "#070605");
+})();
+</script>
+"##;
+
+/// Remembers the choice as `pnet-theme` (`light` or `dark`) and updates the toggle.
+const THEME_BOOT: &str = r##"<script>
+(function () {
+  var key = "pnet-theme";
+  function current() {
+    return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+  }
+  function paint(theme) {
+    document.documentElement.setAttribute("data-theme", theme);
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", theme === "light" ? "#f3eee4" : "#070605");
+    var next = theme === "dark" ? "light" : "dark";
+    document.querySelectorAll(".theme-toggle").forEach(function (btn) {
+      btn.textContent = theme === "dark" ? "Light" : "Dark";
+      btn.setAttribute("aria-label", "Switch to " + next + " mode");
+    });
+  }
+  paint(current());
+  document.addEventListener("click", function (ev) {
+    var btn = ev.target.closest && ev.target.closest(".theme-toggle");
+    if (!btn) return;
+    var next = current() === "dark" ? "light" : "dark";
+    try { localStorage.setItem(key, next); } catch (e) {}
+    paint(next);
+  });
+})();
+</script>
+"##;
+
+const CSS: &str = r##"
+:root, html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #070605;
+  --bg-glow: #2a2218;
+  --bg-elev: #14110d;
+  --ink: #f4efe6;
+  --muted: #b7aa96;
+  --faint: #8d8070;
+  --gold: #d4b15a;
+  --gold-hover: #e4c56e;
+  --gold-ink: #1a1408;
+  --gold-soft: rgba(212, 177, 90, 0.16);
+  --line: rgba(244, 239, 230, 0.12);
+  --card-line: rgba(212, 177, 90, 0.32);
+  --line-strong: rgba(212, 177, 90, 0.45);
+  --shadow: 0 16px 36px rgba(0, 0, 0, 0.45);
+  --ok: #8fbf73;
+  --ok-ink: #10180e;
+  --bad: #e07a6a;
+  --bad-ink: #1a0d0b;
+  --bad-bg: rgba(224, 122, 106, 0.14);
+  --bad-border: rgba(224, 122, 106, 0.45);
+  --warn-bg: rgba(212, 177, 90, 0.14);
+  --warn-ink: #f4e2a8;
+  --warn-border: rgba(212, 177, 90, 0.5);
+  --code-bg: #0c0b09;
+  --input-bg: #0e0c0a;
+  --nav: #050403;
+  --nav-link: #e7dccb;
+  --nav-border: rgba(212, 177, 90, 0.4);
+  --stat: #d4b15a;
+  --link: #e4c97a;
+}
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f3eee4;
+  --bg-glow: #f0e0be;
+  --bg-elev: #fffdf8;
+  --ink: #241c14;
+  --muted: #6b5844;
+  --faint: #8a7560;
+  --gold: #8d6818;
+  --gold-hover: #6f5010;
+  --gold-ink: #fffdf8;
+  --gold-soft: rgba(141, 104, 24, 0.1);
+  --line: rgba(36, 28, 20, 0.1);
+  --card-line: rgba(141, 104, 24, 0.28);
+  --line-strong: rgba(141, 104, 24, 0.38);
+  --shadow: 0 12px 32px rgba(70, 48, 16, 0.08);
+  --ok: #1b6b34;
+  --ok-ink: #f4fff6;
+  --bad: #a3261c;
+  --bad-ink: #fff8f6;
+  --bad-bg: #fdecea;
+  --bad-border: #e4b0a8;
+  --warn-bg: #fff6df;
+  --warn-ink: #6a4e0c;
+  --warn-border: #e2c56a;
+  --code-bg: #f7f1e6;
+  --input-bg: #fffdf9;
+  --nav: #2a2118;
+  --nav-link: #f6ead6;
+  --nav-border: rgba(246, 234, 214, 0.35);
+  --stat: #8d6818;
+  --link: #8a6412;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  background:
+    radial-gradient(1100px 520px at 50% -12%, var(--bg-glow) 0%, transparent 58%),
+    var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  line-height: 1.5;
+}
+::selection { background: var(--gold); color: var(--gold-ink); }
+h1, h2, .brand, .swiz-brand, .choice-title, .stat {
+  font-family: Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, serif;
+  font-weight: 600;
+}
+h1 { margin: 0 0 1rem; font-size: 1.9rem; letter-spacing: 0.01em; }
+h2 { font-size: 1.15rem; }
+a { color: var(--link); }
+a:hover { color: var(--gold-hover); }
+nav {
+  background: var(--nav);
+  border-bottom: 1px solid var(--line-strong);
+  padding: .85rem 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  flex-wrap: wrap;
+}
+nav a { color: var(--nav-link); text-decoration: none; font-size: .92rem; }
+nav a:hover { color: var(--gold); }
+.brand {
+  color: var(--gold);
+  font-size: 1.35rem;
+  margin-right: .35rem;
+  letter-spacing: 0.04em;
+}
+.nav-actions { margin-left: auto; display: flex; align-items: center; gap: .6rem; }
+main { padding: 1.75rem 2rem 3rem; max-width: 960px; overflow-x: auto; }
+table {
+  border-collapse: separate;
+  border-spacing: 0;
+  width: 100%;
+  background: var(--bg-elev);
+  border: 1px solid var(--card-line);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: var(--shadow);
+}
+th {
+  background: var(--gold-soft);
+  text-align: left;
+  padding: .7rem 1rem;
+  font-size: .78rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-weight: 600;
+}
+td { padding: .7rem 1rem; border-top: 1px solid var(--line); font-size: .92rem; vertical-align: top; }
+.card table, table table {
+  background: transparent;
+  box-shadow: none;
+  border: none;
+  border-radius: 0;
+}
+.card {
+  background: var(--bg-elev);
+  border: 1px solid var(--card-line);
+  border-radius: 14px;
+  padding: 1.2rem 1.4rem;
+  box-shadow: var(--shadow);
+  margin-bottom: 1rem;
+}
+.stats { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem; }
+.stat-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--card-line);
+  border-radius: 14px;
+  padding: 1rem 1.3rem;
+  box-shadow: var(--shadow);
+  flex: 1;
+  min-width: 140px;
+}
+.stat { font-size: 2.1rem; color: var(--stat); line-height: 1.1; }
+.label { font-size: .78rem; letter-spacing: 0.04em; color: var(--muted); margin-top: .2rem; }
+button, .portal-btn {
+  font: inherit;
+  font-size: .88rem;
+  font-weight: 600;
+  padding: .45rem .95rem;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  background: var(--gold);
+  color: var(--gold-ink);
+  text-decoration: none;
+}
+button:hover, .portal-btn:hover { background: var(--gold-hover); color: var(--gold-ink); }
+button.approve { background: var(--ok); color: var(--ok-ink); }
+button.approve:hover { background: var(--ok); filter: brightness(1.08); }
+button.reject { background: var(--bad); color: var(--bad-ink); margin-left: .4rem; }
+button.reject:hover { background: var(--bad); filter: brightness(1.08); }
+button.theme-toggle, button.nav-logout {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  font-weight: 600;
+  padding: .28rem .7rem;
+}
+nav button.theme-toggle, button.nav-logout {
+  color: var(--nav-link);
+  border-color: var(--nav-border);
+}
+button.theme-toggle:hover, button.nav-logout:hover {
+  background: transparent;
+  color: var(--gold);
+  border-color: var(--gold);
+  filter: none;
+}
+.theme-toggle-corner { position: fixed; top: 1rem; right: 1rem; z-index: 2; }
 form { display: inline; }
-.empty { color: #888; font-style: italic; }
-.portal-btn { display: inline-block; background: #1a1a2e; color: #fff; text-decoration: none;
-              padding: .45rem 1rem; border-radius: 5px; font-size: .9rem; }
-.portal-btn:hover { background: #2a2a4e; color: #fff; }
-.config-links { margin: 0; padding-left: 1.2rem; line-height: 1.7; }
-.config-links a { color: #1a1a2e; font-weight: 600; }
-.subnav { display: flex; flex-wrap: wrap; gap: .75rem 1.25rem; margin: 0 0 1.25rem;
-          padding: .6rem 0; border-bottom: 1px solid #e0e0e0; font-size: .9rem; }
-.subnav a { color: #456; text-decoration: none; }
-.subnav a:hover { color: #1a1a2e; }
-";
+input[type="text"], input[type="password"], input[type="number"], textarea {
+  background: var(--input-bg);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: .5rem .7rem;
+  font: inherit;
+}
+textarea { width: 100%; box-sizing: border-box; min-height: 4.5rem; resize: vertical; }
+input:focus, textarea:focus, button:focus-visible, a:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 2px;
+}
+input[type="checkbox"] { accent-color: var(--gold); }
+code, pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--code-bg);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+code { font-size: .84em; padding: .05rem .32rem; }
+pre { padding: .75rem; font-size: .85rem; margin: .5rem 0 0; white-space: pre-wrap; word-break: break-all; }
+pre code { background: transparent; border: none; padding: 0; }
+.empty { color: var(--faint); font-style: italic; }
+.portal-btn { display: inline-block; }
+.config-links { margin: 0; padding-left: 1.2rem; line-height: 1.8; }
+.config-links a { color: var(--link); font-weight: 600; text-decoration: none; }
+.config-links a:hover { text-decoration: underline; }
+.subnav {
+  display: flex; flex-wrap: wrap; gap: .65rem 1.15rem; margin: 0 0 1.35rem;
+  padding: .15rem 0 .7rem; border-bottom: 1px solid var(--line); font-size: .92rem;
+}
+.subnav a { color: var(--muted); text-decoration: none; }
+.subnav a:hover { color: var(--gold); }
+@media (max-width: 640px) {
+  main { padding: 1.15rem 1rem 2.5rem; }
+  nav { padding: .75rem 1rem; }
+  h1 { font-size: 1.55rem; }
+}
+"##;
 
 /// Top-level portal nav: Home + Config entry + logout. Config section pages
 /// also show a secondary subnav of control-plane links.
@@ -2046,7 +2291,10 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
             | "Diagnostics"
     );
     let mut html = String::with_capacity(4096);
-    html.push_str("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>pNet \u{2014} ");
+    html.push_str("<!DOCTYPE html>\n<html lang=\"en\" data-theme=\"dark\">\n<head>\n<meta charset=\"utf-8\">\n");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    html.push_str(THEME_HEAD);
+    html.push_str("<title>pNet \u{2014} ");
     html.push_str(title);
     html.push_str("</title>\n<style>");
     html.push_str(CSS);
@@ -2055,9 +2303,14 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
     html.push_str("  <span class=\"brand\">pNet</span>\n");
     html.push_str("  <a href=\"/\">Home</a>\n");
     html.push_str("  <a href=\"/config\">Config</a>\n");
-    html.push_str("  <form method=\"post\" action=\"/logout\" style=\"margin-left:auto;display:inline\">\
-                   <button type=\"submit\" style=\"background:transparent;color:#aac;border:1px solid #556;\
-                   padding:.25rem .6rem;cursor:pointer;font-size:.85rem\">Log out</button></form>\n");
+    html.push_str(
+        "  <div class=\"nav-actions\">\
+                   <button type=\"button\" class=\"theme-toggle\" \
+                   aria-label=\"Switch to light mode\">Light</button>\
+                   <form method=\"post\" action=\"/logout\">\
+                   <button class=\"nav-logout\" type=\"submit\">Log out</button></form>\
+                   </div>\n",
+    );
     html.push_str("</nav>\n<main>\n");
     if show_config_subnav {
         html.push_str(
@@ -2074,7 +2327,9 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
     }
     html.push_str(&banner);
     html.push_str(body);
-    html.push_str("\n</main>\n</body>\n</html>");
+    html.push_str("\n</main>\n");
+    html.push_str(THEME_BOOT);
+    html.push_str("</body>\n</html>");
     html
 }
 
@@ -2118,7 +2373,7 @@ pub(crate) fn partition_banner(ctx: &WorkerContext) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!(
-            "<div class='card' style='background:#fff4d6;color:#7a5a00;border:1px solid #e0c060'>\
+            "<div class='card' style='background:var(--warn-bg);color:var(--warn-ink);border:1px solid var(--warn-border)'>\
                 <strong>Partition detected:</strong> own-user SG peer(s) currently unreachable: {aliases}. \
                 Sync v2 will reconcile automatically when the peer comes back. \
                 See <a href='/diagnostics'>Diagnostics</a> for watermarks and pending proposals.\
@@ -2129,7 +2384,7 @@ pub(crate) fn partition_banner(ctx: &WorkerContext) -> String {
     if node.owner.retention_fallback_active {
         let detail = html_escape(&node.owner.retention_fallback_detail);
         out.push_str(&format!(
-            "<div class='card' style='background:#fde8e8;color:#7a1f1f;border:1px solid #e08080'>\
+            "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
                 <strong>Retention fallback (possible data loss):</strong> write-log history was pruned \
                 past a peer watermark; concurrent local-only writes may have been discarded in favor of \
                 full-state adopt. {detail} \
@@ -2141,39 +2396,72 @@ pub(crate) fn partition_banner(ctx: &WorkerContext) -> String {
     out
 }
 
-const SETUP_CSS: &str = "
-.swiz-wrap { max-width: 460px; margin: 5rem auto; padding: 0 1.5rem; }
-.swiz-brand { color: #1a1a2e; font-weight: bold; font-size: 1.3rem; margin-bottom: 2.5rem; }
-.swiz-wrap h1 { font-size: 1.5rem; margin: 0 0 .4rem; }
-.swiz-sub { color: #666; font-size: .9rem; margin: 0 0 1.5rem; line-height: 1.5; }
-.choice-btn { display: block; background: white; border: 1px solid #ddd; border-radius: 8px;
-              padding: 1rem 1.2rem; margin-bottom: .75rem; text-decoration: none; color: #222;
-              box-shadow: 0 1px 3px rgba(0,0,0,.07); transition: border-color .15s; }
-.choice-btn:hover { border-color: #1a1a2e; }
-.choice-title { display: block; font-weight: bold; font-size: .95rem; }
-.choice-desc { display: block; font-size: .8rem; color: #666; margin-top: .25rem; line-height: 1.4; }
-.swiz-label { display: block; font-size: .85rem; color: #555; margin-bottom: .3rem; }
-.swiz-input { display: block; width: 100%; box-sizing: border-box; padding: .55rem .7rem;
-              border: 1px solid #ccc; border-radius: 5px; font-size: .95rem; margin-bottom: 1rem; }
-.swiz-btn { background: #1a1a2e; color: white; border: none; border-radius: 5px;
-            padding: .55rem 1.4rem; font-size: .95rem; cursor: pointer; }
-.swiz-btn:hover { background: #2a2a4e; }
-.swiz-back { display: inline-block; margin-top: 1.25rem; font-size: .8rem; color: #888;
-             text-decoration: none; }
-.swiz-back:hover { color: #444; }
-";
+const SETUP_CSS: &str = r##"
+.swiz-wrap { max-width: 480px; margin: 4.5rem auto; padding: 0 1.5rem 3rem; }
+.swiz-brand { color: var(--gold); font-size: 1.7rem; margin-bottom: 2rem; letter-spacing: 0.04em; }
+.swiz-wrap h1 { font-size: 1.85rem; margin: 0 0 .45rem; }
+.swiz-sub { color: var(--muted); font-size: .95rem; margin: 0 0 1.4rem; line-height: 1.5; }
+.choice-btn {
+  display: block; background: var(--bg-elev); border: 1px solid var(--card-line); border-radius: 14px;
+  padding: 1rem 1.2rem; margin-bottom: .75rem; text-decoration: none; color: var(--ink);
+  box-shadow: var(--shadow); transition: border-color .15s, box-shadow .15s;
+}
+.choice-btn:hover { border-color: var(--gold); box-shadow: var(--shadow), 0 0 0 4px var(--gold-soft); color: var(--ink); }
+.choice-title { display: block; font-size: 1.08rem; }
+.choice-desc { display: block; font-size: .84rem; color: var(--muted); margin-top: .3rem; line-height: 1.45; font-family: "Segoe UI", system-ui, sans-serif; font-weight: 400; }
+.swiz-label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: .3rem; }
+.swiz-input { display: block; width: 100%; margin-bottom: 1rem; }
+.swiz-back { display: inline-block; margin-top: 1.25rem; font-size: .85rem; color: var(--faint); text-decoration: none; }
+.swiz-back:hover { color: var(--gold); }
+"##;
 
 fn setup_layout(body: &str) -> String {
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n\
+        "<!DOCTYPE html>\n<html lang=\"en\" data-theme=\"dark\">\n<head>\n\
          <meta charset=\"utf-8\">\n\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+         {head}\
          <title>pNet \u{2014} Setup</title>\n\
-         <style>{SETUP_CSS}</style>\n\
+         <style>{css}{setup}</style>\n\
          </head>\n<body>\n\
+         <button type=\"button\" class=\"theme-toggle theme-toggle-corner\" \
+           aria-label=\"Switch to light mode\">Light</button>\n\
          <div class=\"swiz-wrap\">\
            <div class=\"swiz-brand\">pNet</div>\
            {body}\
-         </div>\n</body>\n</html>"
+         </div>\n{boot}</body>\n</html>",
+        head = THEME_HEAD,
+        css = CSS,
+        setup = SETUP_CSS,
+        body = body,
+        boot = THEME_BOOT,
     )
 }
 
+#[cfg(test)]
+mod theme_tests {
+    use super::setup_layout;
+
+    #[test]
+    fn setup_pages_default_dark_and_remember_theme() {
+        let html = setup_layout(
+            "<h1>Welcome to pNet</h1>\
+             <p class=\"swiz-sub\">Let’s get your node configured. \
+             First, what type of device is this?</p>\
+             <a class=\"choice-btn\" href=\"/setup?grade=sg\">\
+               <span class=\"choice-title\">Server Grade (SG)</span>\
+               <span class=\"choice-desc\">A server with a static IP or domain. \
+               Acts as a relay for your other devices.</span>\
+             </a>\
+             <a class=\"choice-btn\" href=\"/setup?grade=dg\">\
+               <span class=\"choice-title\">Device Grade (DG)</span>\
+               <span class=\"choice-desc\">A laptop, phone, or any device behind a home router.</span>\
+             </a>",
+        );
+        assert!(html.contains("data-theme=\"dark\""));
+        assert!(html.contains("theme-toggle-corner"));
+        assert!(html.contains("localStorage.getItem(\"pnet-theme\")"));
+        assert!(html.contains("localStorage.setItem(key, next)"));
+        assert!(html.contains(".choice-btn"));
+    }
+}
