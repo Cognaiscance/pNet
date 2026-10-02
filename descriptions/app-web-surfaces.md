@@ -192,19 +192,16 @@ fabric to the open web.
 Optional later: third-party hosted SG packaging so users get
 `https://me.pnet.host/` without running hardware at home.
 
-## Future: App store (do not implement now)
+## How an app gets onto a device
 
-**Status: future project — note only; out of scope for portal MVP.**
+There is no installer app and no catalog that places apps onto devices. A
+person starts each app on the machine where it should run. The app registers
+with the local node. The owner approves it on that device in Config. If the
+app serves a page, it mounts under `/apps/<slug>/` on a server-grade portal.
 
-Full design: **`descriptions/app-store-installer.md`** (installer agent as a
-pNet app, bootstrap installer, desire sync, signed packages, phased delivery).
-
-Short version: portal Home links to an **Installer** app web UI (catalog +
-placement). Installer agents reconcile signed packages locally; target apps
-**self-register** with pNet. Core does not download or exec packages.
-
-Do not fold catalog/install orchestration into early portal PRs beyond this
-pointer.
+`pnet_installer` only bootstraps the node. See
+**`descriptions/app-store-installer.md`**. Core does not download or exec
+packages.
 
 ## Comparison: pure models vs hybrid
 
