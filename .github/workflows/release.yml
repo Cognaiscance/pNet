@@ -1,0 +1,79 @@
+# Publishes a GitHub Release when a tag vX.Y.Z is pushed and that name
+# matches the version in Cargo.toml. See descriptions/release-assets.md.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  pull_request:
+    paths:
+      - "scripts/release-assets.sh"
+      - ".github/workflows/release.yml"
+      - "descriptions/release-assets.md"
+
+permissions:
+  contents: write
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the archive and index layout
+        run: scripts/release-assets.sh self-test
+
+  build:
+    needs: self-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build the archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: scripts/release-assets.sh build ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write index.json
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: scripts/release-assets.sh index
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "pNet ${version}. Each archive contains the \`pnet\` binary. \`index.json\` lists the sha256 of each archive." \
+            dist/*
