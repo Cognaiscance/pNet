@@ -200,6 +200,15 @@ fn abort_if_keys_unreadable(node: &pnet::data_models::Node) {
 }
 
 fn main() {
+    // Before any data-dir, passphrase, or socket work. The installer compares
+    // this line and must be able to run it without creating ~/.pnet.
+    if let Some(arg) = std::env::args().nth(1) {
+        if arg == "--version" || arg == "-V" {
+            println!("pnet {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+    }
+
     install_startup_passphrase();
 
     // ── 1. Load data from disk ───────────────────────────────────────────────
