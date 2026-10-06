@@ -216,7 +216,13 @@ fn main() {
     // before reading keys (see descriptions/data persistence.md).
     let dir = data_dir();
     persistence::ensure_data_dir(&dir).expect("could not create or secure data directory");
-    let loaded = persistence::load(&dir);
+    let loaded = match persistence::load(&dir) {
+        Ok(node) => node,
+        Err(e) => {
+            eprintln!("[main] {e}");
+            std::process::exit(1);
+        }
+    };
     abort_if_keys_unreadable(&loaded);
     let node = Arc::new(RwLock::new(loaded));
 

@@ -800,8 +800,22 @@ pub struct SgStatus {
     pub last_polled: Instant,
 }
 
+/// On-disk shape this build writes. A later break increments it and teaches
+/// `load` how to migrate every smaller number up to this one.
+pub const FORMAT_VERSION: u32 = 1;
+
+/// Files written before `format_version` existed. `serde` fills that in on load.
+pub const LEGACY_FORMAT_VERSION: u32 = 1;
+
+fn legacy_format_version() -> u32 {
+    LEGACY_FORMAT_VERSION
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Node {
+    /// On-disk shape. Missing on files from before this field; those load as version 1.
+    #[serde(default = "legacy_format_version")]
+    pub format_version: u32,
     pub owner:       Owner,
     #[serde(with = "serde_bytes_16")]
     pub device_uuid: Uuid,
@@ -885,6 +899,7 @@ impl Node {
 };
 
         Node {
+            format_version: FORMAT_VERSION,
             device_uuid,
             admin_password_hash: None,
             device_secrets_sealed: String::new(),
