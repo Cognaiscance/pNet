@@ -51,6 +51,14 @@ op, AEAD domain/KDF break, etc.):
 Non-breaking extensions (new optional ops, new app payload conventions)
 require no version bump — only documentation and unused op codes.
 
+## Release record
+
+Each tag notes the on-disk `format_version` it writes (`data persistence.md`) and which older tags this binary still speaks to on UDP 7777. There is no runtime negotiation yet. A breaking wire change still means both ends move together.
+
+| Tag | format_version | Speaks to |
+|-----|----------------|-----------|
+| `0.1.0` (current tree, untagged) | 1 | this shape |
+
 ## Rollout expectation
 
 - Dual-run period: both op/layout families accepted.

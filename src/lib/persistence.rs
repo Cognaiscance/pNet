@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::data_models::{Node, WriteLogEntry};
+use super::data_models::{Node, WriteLogEntry, FORMAT_VERSION};
 
 /// Ensure the data directory exists with private permissions and tighten
 /// known data files if they already exist.
@@ -61,28 +61,27 @@ struct WriteLogFile {
 /// * Write log: `write_log.toml` when present; otherwise any `write_log` still
 ///   embedded in a legacy `node.toml` is kept (one-time migration on next save).
 ///
-/// Falls back to a fresh `Node::new()` if the directory snapshot is missing.
-pub fn load(data_dir: &Path) -> Node {
+/// Falls back to a fresh `Node::new()` only when `node.toml` is absent.
+/// A file that exists and cannot be read, cannot be parsed, or names a
+/// `format_version` this build does not understand is an error. Callers must
+/// exit without writing `node.toml`, `write_log.toml`, or `apps.toml`.
+pub fn load(data_dir: &Path) -> Result<Node, String> {
     let path = data_dir.join("node.toml");
     let mut node = if path.exists() {
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match toml::from_str::<Node>(&content) {
-                Ok(node) => {
-                    println!("[persistence] loaded node from {}", path.display());
-                    node
-                }
-                Err(e) => {
-                    eprintln!("[persistence] failed to parse node.toml: {e}");
-                    println!("[persistence] no saved state — creating new node");
-                    Node::new()
-                }
-            },
-            Err(e) => {
-                eprintln!("[persistence] failed to read node.toml: {e}");
-                println!("[persistence] no saved state — creating new node");
-                Node::new()
-            }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("node.toml exists but could not be read: {e}"))?;
+        let node: Node = toml::from_str(&content)
+            .map_err(|e| format!("node.toml exists but could not be parsed: {e}"))?;
+        if node.format_version == 0 || node.format_version > FORMAT_VERSION {
+            return Err(format!(
+                "node.toml format_version {} is not supported; this pnet understands {} through {}",
+                node.format_version,
+                super::data_models::LEGACY_FORMAT_VERSION,
+                FORMAT_VERSION
+            ));
         }
+        println!("[persistence] loaded node from {}", path.display());
+        node
     } else {
         println!("[persistence] no saved state — creating new node");
         Node::new()
@@ -114,7 +113,7 @@ pub fn load(data_dir: &Path) -> Node {
     }
 
     super::keystore::restore_secrets(&mut node);
-    node
+    Ok(node)
 }
 
 /// Serialize directory snapshot (`node.toml`) — **without** the write log.
@@ -142,6 +141,13 @@ mod tests {
     fn roundtrip(node: &Node) -> Node {
         let toml_str = save(node);
         toml::from_str::<Node>(&toml_str).expect("roundtrip deserialize failed")
+    }
+
+    fn expect_load_err(dir: &Path) -> String {
+        match load(dir) {
+            Err(e) => e,
+            Ok(_) => panic!("expected load to fail"),
+        }
     }
 
     fn unique_dir(name: &str) -> std::path::PathBuf {
@@ -233,8 +239,9 @@ mod tests {
     fn load_returns_new_node_when_file_missing() {
         let dir = unique_dir("missing");
         fs::create_dir_all(&dir).unwrap();
-        let node = load(&dir);
+        let node = load(&dir).unwrap();
         assert_eq!(node.owner.user.alias, "Owner");
+        assert_eq!(node.format_version, FORMAT_VERSION);
     }
 
     #[test]
@@ -284,7 +291,7 @@ mod tests {
         fs::write(dir.join("node.toml"), save(&original)).unwrap();
         fs::write(dir.join("write_log.toml"), save_write_log(&original)).unwrap();
 
-        let restored = load(&dir);
+        let restored = load(&dir).unwrap();
         assert_eq!(restored.owner.user.alias, "SplitUser");
         assert_eq!(restored.owner.write_log.len(), 1);
         assert_eq!(restored.owner.write_log[0].change_payload, vec![0xCA, 0xFE]);
@@ -302,7 +309,7 @@ mod tests {
         let toml_str = save(&original);
         fs::write(dir.join("node.toml"), &toml_str).unwrap();
 
-        let restored = load(&dir);
+        let restored = load(&dir).unwrap();
         assert_eq!(restored.owner.user.alias, "TestUser");
         assert_eq!(restored.device_uuid, original.device_uuid);
     }
@@ -343,5 +350,57 @@ mod tests {
         ensure_data_dir(&data).unwrap();
         let mode = fs::metadata(&data).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn save_writes_format_version_and_a_legacy_file_still_loads() {
+        let dir = unique_dir("legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let mut original = Node::new();
+        original.owner.user.alias = "Legacy".into();
+        let current = save(&original);
+        assert!(current.contains("format_version = 1"));
+        let legacy = current.replace("format_version = 1\n", "");
+        assert!(!legacy.contains("format_version"));
+        let path = dir.join("node.toml");
+        fs::write(&path, &legacy).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let restored = load(&dir).unwrap();
+        assert_eq!(restored.format_version, FORMAT_VERSION);
+        assert_eq!(restored.owner.user.alias, "Legacy");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn load_refuses_a_newer_format_without_rewriting_the_file() {
+        let dir = unique_dir("future");
+        fs::create_dir_all(&dir).unwrap();
+        let future = save(&Node::new()).replace("format_version = 1", "format_version = 99");
+        let path = dir.join("node.toml");
+        fs::write(&path, &future).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let err = expect_load_err(&dir);
+        assert!(err.contains("format_version 99"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn load_refuses_an_unreadable_shape_without_creating_a_new_node() {
+        let dir = unique_dir("corrupt");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.toml");
+        fs::write(&path, "this is not a node {\n").unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let err = expect_load_err(&dir);
+        assert!(err.contains("could not be parsed"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let zero = save(&Node::new()).replace("format_version = 1", "format_version = 0");
+        fs::write(&path, &zero).unwrap();
+        let err = expect_load_err(&dir);
+        assert!(err.contains("format_version 0"), "{err}");
     }
 }
