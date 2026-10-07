@@ -57,7 +57,7 @@ Each tag notes the on-disk `format_version` it writes (`data persistence.md`) an
 
 | Tag | format_version | Speaks to |
 |-----|----------------|-----------|
-| `0.1.0` (current tree, untagged) | 1 | this shape |
+| `v0.1.0` | 1 | no older tag; this is the first release |
 
 ## Rollout expectation
 
