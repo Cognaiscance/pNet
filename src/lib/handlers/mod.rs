@@ -9,8 +9,8 @@ use super::crypto::{
     xchacha20_encrypt,
 };
 use super::data_models::{
-    ActiveConnection, ActiveTunnel, Application, Contact, Device, DeviceGrade,
-    Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Invitation, Owner, PendingBootstrap,
+    ActiveConnection, ActiveTunnel, AppGrant, Application, Contact, Device, DeviceGrade,
+    Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Invitation, Node, Owner, PendingBootstrap,
     PendingConnection, PendingContactExchange, PendingDeviceAcceptance, PendingTunnel,
     PendingTunnelConnection, Scope, SgStatus, SyncVersion, TunnelCounter, User, Uuid,
     WriteLogEntry, X25519KeyPair, X25519PublicKey, WRITE_LOG_RETENTION,
@@ -203,6 +203,56 @@ fn push_device(buf: &mut Vec<u8>, d: &Device) {
     push_str(buf, &d.cert_alias);
 }
 
+/// Whether `sender` may deliver to `dest_app_id` on one of our devices.
+///
+/// Packets aimed at a contact's device are not our decision. Packets aimed at
+/// our device are allowed from our own devices, and from a contact only when
+/// that contact has a grant for the destination app's alias. A missing sender
+/// device is resolved by `sender_app_id` in the directory.
+pub(crate) fn sender_may_deliver(
+    node: &Node,
+    sender_device: Option<Uuid>,
+    sender_app_id: Uuid,
+    dest_device: Uuid,
+    dest_app_id: Uuid,
+) -> bool {
+    let ours = node.owner.user.devices.iter().any(|d| d.uuid == dest_device);
+    if !ours {
+        return true;
+    }
+    let Some(alias) = node.owner.user.devices.iter()
+        .find(|d| d.uuid == dest_device)
+        .and_then(|d| d.applications.iter().find(|a| a.id == dest_app_id))
+        .map(|a| a.alias.clone())
+    else {
+        return false;
+    };
+    if let Some(dev) = sender_device {
+        if node.owner.user.devices.iter().any(|d| d.uuid == dev) {
+            return true;
+        }
+        if let Some(contact) = node.owner.contact_users.iter()
+            .find(|c| c.user.devices.iter().any(|d| d.uuid == dev))
+        {
+            return grant_has(node, contact.user.uuid, &alias);
+        }
+        return false;
+    }
+    if node.owner.user.devices.iter().any(|d| d.applications.iter().any(|a| a.id == sender_app_id)) {
+        return true;
+    }
+    if let Some(contact) = node.owner.contact_users.iter().find(|c| {
+        c.user.devices.iter().any(|d| d.applications.iter().any(|a| a.id == sender_app_id))
+    }) {
+        return grant_has(node, contact.user.uuid, &alias);
+    }
+    false
+}
+
+fn grant_has(node: &Node, contact: Uuid, alias: &str) -> bool {
+    node.owner.app_grants.iter().any(|g| g.contact_uuid == contact && g.app_alias == alias)
+}
+
 /// Local UDP host for a **user-approved** app on this device, if any.
 ///
 /// Every inbound push path (`relay_packet` local delivery, `app_packet`,
@@ -318,6 +368,19 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
         (node.device_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload)
     };
+
+    let allowed = {
+        let node = ctx.node.read().unwrap();
+        sender_may_deliver(&node, sender_uuid, sender_app_id, dest_device_uuid, dest_app_id)
+    };
+    if !allowed {
+        eprintln!(
+            "[relay_packet] dropping app {} for device {}; sender is not allowed",
+            uuid_hex(&dest_app_id),
+            uuid_hex(&dest_device_uuid),
+        );
+        return;
+    }
 
     // If the destination is this device (i.e. the SG is both relay and recipient),
     // deliver directly to the local app without going through active_connections.
@@ -1029,6 +1092,7 @@ mod tests {
                 uuid:    generate_uuid(),
                 devices: vec![device],
             },
+            they_accept: Vec::new(),
             last_seen_public_version: SyncVersion::default(),
         });
         (device_uuid, device_key)
@@ -1162,6 +1226,7 @@ mod tests {
         n.owner.contact_users.push(Contact {
             public_key: peer_lt_pub,
             user: User { alias: "peer".into(), uuid: generate_uuid(), devices: vec![make_sg_device(peer_dev)] },
+            they_accept: Vec::new(),
             last_seen_public_version: SyncVersion::default(),
         });
     }
@@ -1515,6 +1580,7 @@ mod tests {
 },
                     ],
                 },
+                they_accept: Vec::new(),
                 last_seen_public_version: SyncVersion::default(),
             });
         }
@@ -3619,6 +3685,7 @@ mod tests {
     cert_alias: String::new(),
 }],
                 },
+                they_accept: Vec::new(),
                 last_seen_public_version: SyncVersion::default(),
             });
         }
@@ -3745,6 +3812,7 @@ mod tests {
     cert_alias: String::new(),
 }],
                 },
+                they_accept: Vec::new(),
                 last_seen_public_version: SyncVersion::default(),
             });
         }
@@ -3816,6 +3884,47 @@ mod tests {
                 peer_active_connection_id: 99,
                 device_uuid:               generate_uuid(),
             peer_addr:   "127.0.0.1:0".parse().unwrap(),
+            });
+
+            // The sender is a contact app, and that contact is granted "myapp".
+            // An unknown sender app id is dropped before the local push.
+            let contact_uuid = generate_uuid();
+            node.owner.contact_users.push(Contact {
+                public_key: Ed25519PublicKey(generate_key_bytes()),
+                user: User {
+                    alias: "sender".into(),
+                    uuid: contact_uuid,
+                    devices: vec![Device {
+                        alias: "sender-dev".into(),
+                        uuid: generate_uuid(),
+                        grade: DeviceGrade::DG,
+                        sg_rank: None,
+                        hosts: vec![],
+                        applications: vec![Application {
+                            id: sender_app_id,
+                            alias: "theirs".into(),
+                            protocol: "udp".into(),
+                            host: "127.0.0.1:1".parse().unwrap(),
+                            user_approved: true,
+                            token: generate_uuid(),
+                            identity: Ed25519KeyPair::ZERO,
+                            cert_sig: Ed25519Signature::ZERO,
+                            cert_issued_at: 0,
+                            cert_alias: String::new(),
+                        }],
+                        signing_pk: Ed25519PublicKey::ZERO,
+                        dh_pk: X25519PublicKey::ZERO,
+                        cert_sig: Ed25519Signature::ZERO,
+                        cert_issued_at: 0,
+                        cert_alias: String::new(),
+                    }],
+                },
+                they_accept: Vec::new(),
+                last_seen_public_version: SyncVersion::default(),
+            });
+            node.owner.app_grants.push(AppGrant {
+                contact_uuid,
+                app_alias: "myapp".into(),
             });
         }
 
@@ -4159,6 +4268,7 @@ mod tests {
                         cert_alias: String::new(),
                     }],
                 },
+                they_accept: Vec::new(),
                 last_seen_public_version: SyncVersion::default(),
             });
             node.owner.key_pair.private_key
@@ -4539,6 +4649,7 @@ mod tests {
     cert_alias: String::new(),
 }],
                 },
+                they_accept: Vec::new(),
                 last_seen_public_version: SyncVersion::default(),
             });
 
@@ -7079,6 +7190,7 @@ mod tests {
                     uuid: b_user,
                     devices: vec![bob],
                 },
+                they_accept: Vec::new(),
                 last_seen_public_version: SyncVersion::default(),
             });
         }
@@ -7107,6 +7219,7 @@ mod tests {
                     uuid: a_user,
                     devices: vec![alice],
                 },
+                they_accept: Vec::new(),
                 last_seen_public_version: SyncVersion::default(),
             });
         }
@@ -7198,6 +7311,35 @@ mod tests {
                 .id;
             (a_app, b_app)
         };
+
+        // B delivers only if Alice's app is in the directory and Alice is
+        // granted the destination alias. The live contact card is still empty
+        // because this test never ran a cross-user pull.
+        {
+            let mut n = b.ctx.node.write().unwrap();
+            {
+                let dev = n.owner.contact_users.iter_mut()
+                    .find(|c| c.user.uuid == a_user)
+                    .and_then(|c| c.user.devices.first_mut())
+                    .expect("alice device on bob");
+                dev.applications.push(Application {
+                    id: a_app_id,
+                    alias: "a-app".into(),
+                    protocol: "udp".into(),
+                    host: "127.0.0.1:1".parse().unwrap(),
+                    user_approved: true,
+                    token: generate_uuid(),
+                    identity: Ed25519KeyPair::ZERO,
+                    cert_sig: Ed25519Signature::ZERO,
+                    cert_issued_at: 0,
+                    cert_alias: String::new(),
+                });
+            }
+            n.owner.app_grants.push(AppGrant {
+                contact_uuid: a_user,
+                app_alias: "b-app".into(),
+            });
+        }
 
         // Direct path: session to dest → AppPacket on fabric → app_packet → APP_PUSH.
         app_send_packet(
@@ -7304,6 +7446,7 @@ mod tests {
                         cert_alias: String::new(),
                     }],
                 },
+                they_accept: Vec::new(),
                 last_seen_public_version: SyncVersion::default(),
             }];
         }

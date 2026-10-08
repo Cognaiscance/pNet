@@ -59,6 +59,8 @@ Each tag notes the on-disk `format_version` it writes (`data persistence.md`) an
 |-----|----------------|-----------|
 | `v0.1.0` | 1 | no older tag; this is the first release |
 
+The unreleased per-app contact allow list writes `format_version` 2. A version 1 file loads and keeps existing contact access to apps that were already approved. New change kinds `0x08`–`0x0D` carry grants and app invitations. Own-user servers have to move together before those changes are in the write log. The next tag's row records that shape. It is not tagged yet. `develop` is still not an installable version.
+
 ## Rollout expectation
 
 - Dual-run period: both op/layout families accepted.

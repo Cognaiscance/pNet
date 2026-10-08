@@ -122,6 +122,7 @@ fn seed_node() -> Node {
     cert_alias: String::new(),
 }],
         },
+        they_accept: Vec::new(),
         last_seen_public_version: Default::default(),
     }];
     n

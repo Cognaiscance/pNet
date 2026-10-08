@@ -10,9 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
 use super::super::data_models::{
-    Application, Contact, Device, DeviceGrade, Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey,
-    Ed25519Signature, Node, Owner, Scope, SyncVersion, User, Uuid, WriteLogEntry,
-    X25519PublicKey, WRITE_LOG_RETENTION,
+    AppGrant, AppInvitation, Application, Contact, Device, DeviceGrade, Ed25519KeyPair,
+    Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Node, Owner, Scope, SyncVersion, User,
+    Uuid, WriteLogEntry, X25519PublicKey, WRITE_LOG_RETENTION,
 };
 use super::super::wire::*;
 use super::{
@@ -120,19 +120,68 @@ fn merge_app_public(local: &mut Application, incoming: &ContactAppCard, fill_ali
     }
 }
 
+/// Marker before the per-contact allow list and invitations. Older peers stop
+/// at the device list and ignore these trailing bytes.
+const POLICY_MARKER: u8 = 0xA1;
+
 pub(crate) fn serialize_contact_data(node: &Node) -> Vec<u8> {
+    serialize_contact_directory(node, None)
+}
+
+/// Directory we publish to one contact. Approved apps are included only when
+/// that contact has a grant for the app alias. The trailer lists every granted
+/// alias, including aliases with no installed app, and any open invitation.
+pub(crate) fn serialize_contact_data_for(node: &Node, contact_uuid: Uuid) -> Vec<u8> {
+    serialize_contact_directory(node, Some(contact_uuid))
+}
+
+fn serialize_contact_directory(node: &Node, contact_uuid: Option<Uuid>) -> Vec<u8> {
     let mut buf = Vec::new();
     let user = &node.owner.user;
     buf.extend_from_slice(&user.uuid);
     buf.push(user.devices.len() as u8);
+    let granted: Vec<&str> = match contact_uuid {
+        Some(id) => node
+            .owner
+            .app_grants
+            .iter()
+            .filter(|g| g.contact_uuid == id)
+            .map(|g| g.app_alias.as_str())
+            .collect(),
+        None => Vec::new(),
+    };
     for d in &user.devices {
         push_device(&mut buf, d);
-        let approved: Vec<&Application> = d.applications.iter()
+        let approved: Vec<&Application> = d
+            .applications
+            .iter()
             .filter(|a| a.user_approved)
+            .filter(|a| contact_uuid.is_none() || granted.iter().any(|g| *g == a.alias))
             .collect();
         buf.push(approved.len() as u8);
         for a in approved {
             push_public_app_from(&mut buf, a);
+        }
+    }
+    if let Some(id) = contact_uuid {
+        buf.push(POLICY_MARKER);
+        let mut aliases: Vec<&str> = granted;
+        aliases.sort();
+        aliases.dedup();
+        buf.push(aliases.len().min(u8::MAX as usize) as u8);
+        for alias in aliases.iter().take(u8::MAX as usize) {
+            push_str(&mut buf, alias);
+        }
+        let invites: Vec<&AppInvitation> = node
+            .owner
+            .outbound_app_invitations
+            .iter()
+            .filter(|i| i.contact_uuid == id)
+            .collect();
+        buf.push(invites.len().min(u8::MAX as usize) as u8);
+        for invite in invites.iter().take(u8::MAX as usize) {
+            buf.extend_from_slice(&invite.id);
+            push_str(&mut buf, &invite.app_alias);
         }
     }
     buf
@@ -141,6 +190,9 @@ pub(crate) fn serialize_contact_data(node: &Node) -> Vec<u8> {
 pub(crate) struct ContactData {
     pub(crate) user_uuid: Uuid,
     pub(crate) devices:   Vec<(Device, Vec<ContactAppCard>)>,
+    /// `None` when the peer is an older node that published every approved app.
+    pub(crate) accepted_aliases: Option<Vec<String>>,
+    pub(crate) invitations: Vec<(Uuid, String)>,
 }
 
 pub(crate) fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
@@ -157,7 +209,35 @@ pub(crate) fn deserialize_contact_data(data: &[u8]) -> Option<ContactData> {
         }
         devices.push((device, apps));
     }
-    Some(ContactData { user_uuid, devices })
+    if pos >= data.len() || data[pos] != POLICY_MARKER {
+        return Some(ContactData {
+            user_uuid,
+            devices,
+            accepted_aliases: None,
+            invitations: Vec::new(),
+        });
+    }
+    pos += 1;
+    let alias_count = *data.get(pos)? as usize;
+    pos += 1;
+    let mut accepted_aliases = Vec::with_capacity(alias_count);
+    for _ in 0..alias_count {
+        accepted_aliases.push(read_str(data, &mut pos)?);
+    }
+    let invite_count = *data.get(pos)? as usize;
+    pos += 1;
+    let mut invitations = Vec::with_capacity(invite_count);
+    for _ in 0..invite_count {
+        let id: Uuid = read_arr(data, &mut pos)?;
+        let alias = read_str(data, &mut pos)?;
+        invitations.push((id, alias));
+    }
+    Some(ContactData {
+        user_uuid,
+        devices,
+        accepted_aliases: Some(accepted_aliases),
+        invitations,
+    })
 }
 
 /// True if `data` is a well-formed cross-user contact directory blob. §8.2 fuzz.
@@ -203,6 +283,9 @@ pub(crate) fn public_state_well_formed(state: &[u8]) -> bool {
                     let _ = read_public_app(state, &mut pos)?;
                 }
             }
+        }
+        if pos < state.len() && state[pos] == POLICY_MARKER {
+            read_policy_snapshot(state, &mut pos)?;
         }
         let _ = pos;
         Some(())
@@ -328,6 +411,33 @@ pub enum Change {
     /// Public-scope: remove a contact user by uuid (and all their devices).
     /// Tombstone for merge: concurrent UpsertContact of the same uuid loses.
     RemoveContact { uuid: Uuid },
+    /// Public-scope: allow or revoke one app alias for one contact.
+    SetAppGrant {
+        contact_uuid: Uuid,
+        app_alias: String,
+        allowed: bool,
+    },
+    /// Public-scope: record an inbound app invitation we have not answered.
+    PutAppInvitation {
+        id: Uuid,
+        contact_uuid: Uuid,
+        app_alias: String,
+    },
+    /// Public-scope: drop an inbound invitation and remember its id.
+    ForgetAppInvitation { id: Uuid },
+    /// Public-scope: publish an invitation asking that contact to accept us.
+    PutOutboundAppInvitation {
+        id: Uuid,
+        contact_uuid: Uuid,
+        app_alias: String,
+    },
+    /// Public-scope: stop publishing an outbound invitation.
+    ForgetOutboundAppInvitation { id: Uuid },
+    /// Public-scope: replace the alias list this contact has accepted from us.
+    SetContactTheyAccept {
+        contact_uuid: Uuid,
+        aliases: Vec<String>,
+    },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
@@ -344,6 +454,12 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
         Change::UpsertContact { .. }           => &[Scope::Public],
         Change::RemoveDevice { .. }            => &[Scope::Public],
         Change::RemoveContact { .. }           => &[Scope::Public],
+        Change::SetAppGrant { .. }             => &[Scope::Public],
+        Change::PutAppInvitation { .. }        => &[Scope::Public],
+        Change::ForgetAppInvitation { .. }     => &[Scope::Public],
+        Change::PutOutboundAppInvitation { .. } => &[Scope::Public],
+        Change::ForgetOutboundAppInvitation { .. } => &[Scope::Public],
+        Change::SetContactTheyAccept { .. }    => &[Scope::Public],
     }
 }
 
@@ -426,6 +542,40 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
             buf.push(CHANGE_KIND_REMOVE_CONTACT);
             buf.extend_from_slice(uuid);
         }
+        Change::SetAppGrant { contact_uuid, app_alias, allowed } => {
+            buf.push(CHANGE_KIND_SET_APP_GRANT);
+            buf.extend_from_slice(contact_uuid);
+            buf.push(u8::from(*allowed));
+            push_str(&mut buf, app_alias);
+        }
+        Change::PutAppInvitation { id, contact_uuid, app_alias } => {
+            buf.push(CHANGE_KIND_PUT_APP_INVITATION);
+            buf.extend_from_slice(id);
+            buf.extend_from_slice(contact_uuid);
+            push_str(&mut buf, app_alias);
+        }
+        Change::ForgetAppInvitation { id } => {
+            buf.push(CHANGE_KIND_FORGET_APP_INVITATION);
+            buf.extend_from_slice(id);
+        }
+        Change::PutOutboundAppInvitation { id, contact_uuid, app_alias } => {
+            buf.push(CHANGE_KIND_PUT_OUTBOUND_APP_INVITATION);
+            buf.extend_from_slice(id);
+            buf.extend_from_slice(contact_uuid);
+            push_str(&mut buf, app_alias);
+        }
+        Change::ForgetOutboundAppInvitation { id } => {
+            buf.push(CHANGE_KIND_FORGET_OUTBOUND_APP_INVITATION);
+            buf.extend_from_slice(id);
+        }
+        Change::SetContactTheyAccept { contact_uuid, aliases } => {
+            buf.push(CHANGE_KIND_SET_CONTACT_THEY_ACCEPT);
+            buf.extend_from_slice(contact_uuid);
+            buf.push(aliases.len().min(u8::MAX as usize) as u8);
+            for alias in aliases.iter().take(u8::MAX as usize) {
+                push_str(&mut buf, alias);
+            }
+        }
     }
     buf
 }
@@ -506,6 +656,43 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
         CHANGE_KIND_REMOVE_CONTACT => {
             let uuid: Uuid = read_arr(data, &mut pos)?;
             Some(Change::RemoveContact { uuid })
+        }
+        CHANGE_KIND_SET_APP_GRANT => {
+            let contact_uuid: Uuid = read_arr(data, &mut pos)?;
+            let allowed = *data.get(pos)? != 0;
+            pos += 1;
+            let app_alias = read_str(data, &mut pos)?;
+            Some(Change::SetAppGrant { contact_uuid, app_alias, allowed })
+        }
+        CHANGE_KIND_PUT_APP_INVITATION => {
+            let id: Uuid = read_arr(data, &mut pos)?;
+            let contact_uuid: Uuid = read_arr(data, &mut pos)?;
+            let app_alias = read_str(data, &mut pos)?;
+            Some(Change::PutAppInvitation { id, contact_uuid, app_alias })
+        }
+        CHANGE_KIND_FORGET_APP_INVITATION => {
+            let id: Uuid = read_arr(data, &mut pos)?;
+            Some(Change::ForgetAppInvitation { id })
+        }
+        CHANGE_KIND_PUT_OUTBOUND_APP_INVITATION => {
+            let id: Uuid = read_arr(data, &mut pos)?;
+            let contact_uuid: Uuid = read_arr(data, &mut pos)?;
+            let app_alias = read_str(data, &mut pos)?;
+            Some(Change::PutOutboundAppInvitation { id, contact_uuid, app_alias })
+        }
+        CHANGE_KIND_FORGET_OUTBOUND_APP_INVITATION => {
+            let id: Uuid = read_arr(data, &mut pos)?;
+            Some(Change::ForgetOutboundAppInvitation { id })
+        }
+        CHANGE_KIND_SET_CONTACT_THEY_ACCEPT => {
+            let contact_uuid: Uuid = read_arr(data, &mut pos)?;
+            let count = *data.get(pos)? as usize;
+            pos += 1;
+            let mut aliases = Vec::with_capacity(count);
+            for _ in 0..count {
+                aliases.push(read_str(data, &mut pos)?);
+            }
+            Some(Change::SetContactTheyAccept { contact_uuid, aliases })
         }
         _ => None,
     }
@@ -642,6 +829,7 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
                             devices: cards_to_devices(devices),
                         },
                         public_key: *public_key,
+                        they_accept: Vec::new(),
                         last_seen_public_version: SyncVersion::default(),
                     });
                     true
@@ -654,12 +842,113 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
             before != owner.user.devices.len()
         }
         Change::RemoveContact { uuid } => {
-            let before = owner.contact_users.len();
+            let before = owner.contact_users.len()
+                + owner.app_grants.len()
+                + owner.app_invitations.len()
+                + owner.outbound_app_invitations.len();
             owner.contact_users.retain(|c| c.user.uuid != *uuid);
-            before != owner.contact_users.len()
+            clear_contact_policy(owner, *uuid);
+            let after = owner.contact_users.len()
+                + owner.app_grants.len()
+                + owner.app_invitations.len()
+                + owner.outbound_app_invitations.len();
+            before != after
+        }
+        Change::SetAppGrant { contact_uuid, app_alias, allowed } => {
+            set_app_grant(owner, *contact_uuid, app_alias, *allowed)
+        }
+        Change::PutAppInvitation { id, contact_uuid, app_alias } => {
+            put_invitation(&mut owner.app_invitations, &owner.seen_app_invitation_ids, *id, *contact_uuid, app_alias)
+        }
+        Change::ForgetAppInvitation { id } => forget_invitation(owner, *id),
+        Change::PutOutboundAppInvitation { id, contact_uuid, app_alias } => {
+            put_invitation(&mut owner.outbound_app_invitations, &[], *id, *contact_uuid, app_alias)
+        }
+        Change::ForgetOutboundAppInvitation { id } => {
+            let before = owner.outbound_app_invitations.len();
+            owner.outbound_app_invitations.retain(|i| i.id != *id);
+            before != owner.outbound_app_invitations.len()
+        }
+        Change::SetContactTheyAccept { contact_uuid, aliases } => {
+            let Some(contact) = owner.contact_users.iter_mut().find(|c| c.user.uuid == *contact_uuid) else {
+                return Ok(false);
+            };
+            let mut next = aliases.clone();
+            next.sort();
+            next.dedup();
+            if contact.they_accept == next {
+                false
+            } else {
+                contact.they_accept = next;
+                true
+            }
         }
     };
     Ok(applied)
+}
+
+fn clear_contact_policy(owner: &mut Owner, contact_uuid: Uuid) {
+    owner.app_grants.retain(|g| g.contact_uuid != contact_uuid);
+    owner.app_invitations.retain(|i| i.contact_uuid != contact_uuid);
+    owner.outbound_app_invitations.retain(|i| i.contact_uuid != contact_uuid);
+}
+
+fn set_app_grant(owner: &mut Owner, contact_uuid: Uuid, app_alias: &str, allowed: bool) -> bool {
+    let exists = owner.app_grants.iter().any(|g| {
+        g.contact_uuid == contact_uuid && g.app_alias == app_alias
+    });
+    if allowed {
+        if exists {
+            false
+        } else {
+            owner.app_grants.push(AppGrant {
+                contact_uuid,
+                app_alias: app_alias.to_string(),
+            });
+            true
+        }
+    } else if exists {
+        owner.app_grants.retain(|g| {
+            !(g.contact_uuid == contact_uuid && g.app_alias == app_alias)
+        });
+        true
+    } else {
+        false
+    }
+}
+
+fn invitation_seen(seen: &[String], id: Uuid) -> bool {
+    let hex = uuid_hex(&id);
+    seen.iter().any(|s| s == &hex)
+}
+
+fn put_invitation(
+    list: &mut Vec<AppInvitation>,
+    seen: &[String],
+    id: Uuid,
+    contact_uuid: Uuid,
+    app_alias: &str,
+) -> bool {
+    if invitation_seen(seen, id) || list.iter().any(|i| i.id == id) {
+        return false;
+    }
+    list.push(AppInvitation {
+        id,
+        contact_uuid,
+        app_alias: app_alias.to_string(),
+    });
+    true
+}
+
+fn forget_invitation(owner: &mut Owner, id: Uuid) -> bool {
+    let before = owner.app_invitations.len();
+    owner.app_invitations.retain(|i| i.id != id);
+    let hex = uuid_hex(&id);
+    let newly = !owner.seen_app_invitation_ids.iter().any(|s| s == &hex);
+    if newly {
+        owner.seen_app_invitation_ids.push(hex);
+    }
+    before != owner.app_invitations.len() || newly
 }
 
 /// After a successful RemoveDevice / RemoveContact, drop fabric state that
@@ -1384,7 +1673,116 @@ pub(crate) fn serialize_public_state(node: &Node) -> Vec<u8> {
             }
         }
     }
+    push_policy_snapshot(&mut buf, node);
     buf
+}
+
+fn push_u16(buf: &mut Vec<u8>, n: u16) {
+    buf.extend_from_slice(&n.to_be_bytes());
+}
+
+fn read_u16(data: &[u8], pos: &mut usize) -> Option<u16> {
+    let bytes: [u8; 2] = read_arr(data, pos)?;
+    Some(u16::from_be_bytes(bytes))
+}
+
+struct PolicySnapshot {
+    grants: Vec<AppGrant>,
+    they_accept: Vec<(Uuid, Vec<String>)>,
+    inbound: Vec<AppInvitation>,
+    seen: Vec<String>,
+    outbound: Vec<AppInvitation>,
+}
+
+fn push_policy_snapshot(buf: &mut Vec<u8>, node: &Node) {
+    buf.push(POLICY_MARKER);
+    push_u16(buf, node.owner.app_grants.len().min(u16::MAX as usize) as u16);
+    for grant in node.owner.app_grants.iter().take(u16::MAX as usize) {
+        buf.extend_from_slice(&grant.contact_uuid);
+        push_str(buf, &grant.app_alias);
+    }
+    let with_accept: Vec<&Contact> = node
+        .owner
+        .contact_users
+        .iter()
+        .filter(|c| !c.they_accept.is_empty())
+        .collect();
+    push_u16(buf, with_accept.len().min(u16::MAX as usize) as u16);
+    for contact in with_accept.iter().take(u16::MAX as usize) {
+        buf.extend_from_slice(&contact.user.uuid);
+        buf.push(contact.they_accept.len().min(u8::MAX as usize) as u8);
+        for alias in contact.they_accept.iter().take(u8::MAX as usize) {
+            push_str(buf, alias);
+        }
+    }
+    push_invite_list(buf, &node.owner.app_invitations);
+    push_u16(buf, node.owner.seen_app_invitation_ids.len().min(u16::MAX as usize) as u16);
+    for hex_id in node.owner.seen_app_invitation_ids.iter().take(u16::MAX as usize) {
+        if let Some(id) = uuid_from_hex(hex_id) {
+            buf.extend_from_slice(&id);
+        } else {
+            buf.extend_from_slice(&[0u8; 16]);
+        }
+    }
+    push_invite_list(buf, &node.owner.outbound_app_invitations);
+}
+
+fn push_invite_list(buf: &mut Vec<u8>, invites: &[AppInvitation]) {
+    push_u16(buf, invites.len().min(u16::MAX as usize) as u16);
+    for invite in invites.iter().take(u16::MAX as usize) {
+        buf.extend_from_slice(&invite.id);
+        buf.extend_from_slice(&invite.contact_uuid);
+        push_str(buf, &invite.app_alias);
+    }
+}
+
+fn read_policy_snapshot(data: &[u8], pos: &mut usize) -> Option<PolicySnapshot> {
+    if *pos >= data.len() || data[*pos] != POLICY_MARKER {
+        return None;
+    }
+    *pos += 1;
+    let grant_count = read_u16(data, pos)? as usize;
+    let mut grants = Vec::with_capacity(grant_count);
+    for _ in 0..grant_count {
+        let contact_uuid: Uuid = read_arr(data, pos)?;
+        grants.push(AppGrant { contact_uuid, app_alias: read_str(data, pos)? });
+    }
+    let they_count = read_u16(data, pos)? as usize;
+    let mut they_accept = Vec::with_capacity(they_count);
+    for _ in 0..they_count {
+        let contact_uuid: Uuid = read_arr(data, pos)?;
+        let n = *data.get(*pos)? as usize;
+        *pos += 1;
+        let mut aliases = Vec::with_capacity(n);
+        for _ in 0..n {
+            aliases.push(read_str(data, pos)?);
+        }
+        they_accept.push((contact_uuid, aliases));
+    }
+    let inbound = read_invite_list(data, pos)?;
+    let seen_count = read_u16(data, pos)? as usize;
+    let mut seen = Vec::with_capacity(seen_count);
+    for _ in 0..seen_count {
+        let id: Uuid = read_arr(data, pos)?;
+        seen.push(uuid_hex(&id));
+    }
+    let outbound = read_invite_list(data, pos)?;
+    Some(PolicySnapshot { grants, they_accept, inbound, seen, outbound })
+}
+
+fn read_invite_list(data: &[u8], pos: &mut usize) -> Option<Vec<AppInvitation>> {
+    let count = read_u16(data, pos)? as usize;
+    let mut invites = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id: Uuid = read_arr(data, pos)?;
+        let contact_uuid: Uuid = read_arr(data, pos)?;
+        invites.push(AppInvitation {
+            id,
+            contact_uuid,
+            app_alias: read_str(data, pos)?,
+        });
+    }
+    Some(invites)
 }
 
 /// Parse a Public-state blob and apply it to the node:
@@ -1469,6 +1867,13 @@ pub(crate) fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
         contacts.push(ParsedContact { alias, uuid, public_key, devices: devs });
     }
 
+    let policy = if pos < state.len() && state[pos] == POLICY_MARKER {
+        let Some(parsed) = read_policy_snapshot(state, &mut pos) else { return false; };
+        Some(parsed)
+    } else {
+        None
+    };
+
     // Apply.
     let mut node = ctx.node.write().unwrap();
     let local_uuid = node.device_uuid;
@@ -1547,8 +1952,24 @@ pub(crate) fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
             node.owner.contact_users.push(Contact {
                 public_key: c.public_key,
                 user: User { alias: c.alias, uuid: c.uuid, devices: devs_from(c.devices) },
+                they_accept: Vec::new(),
                 last_seen_public_version: SyncVersion::default(),
             });
+        }
+    }
+
+    if let Some(policy) = policy {
+        node.owner.app_grants = policy.grants;
+        node.owner.app_invitations = policy.inbound;
+        node.owner.seen_app_invitation_ids = policy.seen;
+        node.owner.outbound_app_invitations = policy.outbound;
+        for contact in &mut node.owner.contact_users {
+            contact.they_accept.clear();
+        }
+        for (uuid, aliases) in policy.they_accept {
+            if let Some(contact) = node.owner.contact_users.iter_mut().find(|c| c.user.uuid == uuid) {
+                contact.they_accept = aliases;
+            }
         }
     }
 
@@ -2068,7 +2489,15 @@ pub fn cross_user_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
 
     let (current_v, state_blob) = {
         let node = ctx.node.read().unwrap();
-        (node.owner.public_version, serialize_contact_data(&node))
+        let contact_uuid = node.owner.active_connections.get(&conn_id).and_then(|conn| {
+            let peer = conn.device_uuid;
+            node.owner.contact_users.iter()
+                .find(|c| c.user.devices.iter().any(|d| d.uuid == peer))
+                .map(|c| c.user.uuid)
+        });
+        // An unknown peer gets an empty allow list, so no apps and no invitations.
+        let blob = serialize_contact_data_for(&node, contact_uuid.unwrap_or([0u8; 16]));
+        (node.owner.public_version, blob)
     };
 
     use std::cmp::Ordering;
@@ -2204,6 +2633,34 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
                 }, ctx) {
                     eprintln!("[cross_user_pull_response] no reachable writer SG; refreshed \
                                snapshot for {:?} not logged this round", data.user_uuid);
+                }
+                let accepted = match &data.accepted_aliases {
+                    Some(list) => list.clone(),
+                    None => data.devices.iter()
+                        .flat_map(|(_, apps)| apps.iter().map(|a| a.alias.clone()))
+                        .collect(),
+                };
+                let _ = request_change_idempotent(Change::SetContactTheyAccept {
+                    contact_uuid: data.user_uuid,
+                    aliases: accepted,
+                }, ctx);
+                let seen = {
+                    let node = ctx.node.read().unwrap();
+                    node.owner.seen_app_invitation_ids.clone()
+                };
+                let pending = {
+                    let node = ctx.node.read().unwrap();
+                    node.owner.app_invitations.iter().map(|i| i.id).collect::<Vec<_>>()
+                };
+                for (id, app_alias) in &data.invitations {
+                    if invitation_seen(&seen, *id) || pending.contains(id) {
+                        continue;
+                    }
+                    let _ = request_change_idempotent(Change::PutAppInvitation {
+                        id: *id,
+                        contact_uuid: data.user_uuid,
+                        app_alias: app_alias.clone(),
+                    }, ctx);
                 }
             } else {
                 eprintln!("[cross_user_pull_response] data for unknown contact {:?}",
@@ -3070,6 +3527,13 @@ struct MergedState {
     /// (each `UpsertContact` carries the full snapshot, so the highest-priority
     /// entry's snapshot wins outright).
     contacts: HashMap<Uuid, MergedContact>,
+    /// (contact, alias) → (allowed, priority of the winning write).
+    grants: HashMap<(Uuid, String), (bool, EntryPriority)>,
+    inbound: HashMap<Uuid, (Uuid, String)>,
+    inbound_tomb: HashSet<Uuid>,
+    outbound: HashMap<Uuid, (Uuid, String)>,
+    outbound_tomb: HashSet<Uuid>,
+    they_accept: HashMap<Uuid, (Vec<String>, EntryPriority)>,
 }
 
 /// Per-contact accumulator: the winning snapshot plus the priority of the
@@ -3142,6 +3606,12 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
         devices: HashMap::new(),
         tombstones: HashSet::new(),
         contacts: HashMap::new(),
+        grants: HashMap::new(),
+        inbound: HashMap::new(),
+        inbound_tomb: HashSet::new(),
+        outbound: HashMap::new(),
+        outbound_tomb: HashSet::new(),
+        they_accept: HashMap::new(),
     };
 
     // First pass: collect tombstones. Tombstone wins globally for its target,
@@ -3158,6 +3628,12 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
             }
             Some(Change::RemoveContact { uuid }) => {
                 contact_tombstones.insert(uuid);
+            }
+            Some(Change::ForgetAppInvitation { id }) => {
+                state.inbound_tomb.insert(id);
+            }
+            Some(Change::ForgetOutboundAppInvitation { id }) => {
+                state.outbound_tomb.insert(id);
             }
             _ => {}
         }
@@ -3233,6 +3709,44 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
                 }
             }
             Change::RemoveDevice { .. } | Change::RemoveContact { .. } => {}
+            Change::SetAppGrant { contact_uuid, app_alias, allowed } => {
+                if contact_tombstones.contains(&contact_uuid) {
+                    continue;
+                }
+                let key = (contact_uuid, app_alias);
+                match state.grants.get(&key) {
+                    Some((_, prev)) if *prev >= prio => {}
+                    _ => { state.grants.insert(key, (allowed, prio)); }
+                }
+            }
+            Change::PutAppInvitation { id, contact_uuid, app_alias } => {
+                if state.inbound_tomb.contains(&id) || contact_tombstones.contains(&contact_uuid) {
+                    continue;
+                }
+                state.inbound.entry(id).or_insert((contact_uuid, app_alias));
+            }
+            Change::PutOutboundAppInvitation { id, contact_uuid, app_alias } => {
+                if state.outbound_tomb.contains(&id) || contact_tombstones.contains(&contact_uuid) {
+                    continue;
+                }
+                state.outbound.entry(id).or_insert((contact_uuid, app_alias));
+            }
+            Change::ForgetAppInvitation { .. } | Change::ForgetOutboundAppInvitation { .. } => {}
+            Change::SetContactTheyAccept { contact_uuid, aliases } => {
+                if contact_tombstones.contains(&contact_uuid) {
+                    continue;
+                }
+                let win = match state.they_accept.get(&contact_uuid) {
+                    Some((_, prev)) => prio > *prev,
+                    None => true,
+                };
+                if win {
+                    let mut next = aliases;
+                    next.sort();
+                    next.dedup();
+                    state.they_accept.insert(contact_uuid, (next, prio));
+                }
+            }
         }
     }
 
@@ -3243,7 +3757,13 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
     }
     for u in &contact_tombstones {
         state.contacts.remove(u);
+        state.grants.retain(|(contact, _), _| contact != u);
+        state.inbound.retain(|_, (contact, _)| contact != u);
+        state.outbound.retain(|_, (contact, _)| contact != u);
+        state.they_accept.remove(u);
     }
+    state.inbound.retain(|id, _| !state.inbound_tomb.contains(id));
+    state.outbound.retain(|id, _| !state.outbound_tomb.contains(id));
 
     // Drop apps that only ever appeared via an Update (no Add to establish
     // their existence). This shouldn't happen with correct watermark
@@ -3409,5 +3929,211 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
         out.push(Change::RemoveContact { uuid });
     }
 
+    let grant_allowed = |map: &HashMap<(Uuid, String), (bool, EntryPriority)>, key: &(Uuid, String)| {
+        map.get(key).is_some_and(|(allowed, _)| *allowed)
+    };
+    let mut grant_keys: Vec<(Uuid, String)> = current.grants.keys()
+        .chain(target.grants.keys())
+        .cloned()
+        .collect();
+    grant_keys.sort();
+    grant_keys.dedup();
+    for key in grant_keys {
+        let now = grant_allowed(&current.grants, &key);
+        let want = grant_allowed(&target.grants, &key);
+        if now != want {
+            out.push(Change::SetAppGrant {
+                contact_uuid: key.0,
+                app_alias: key.1,
+                allowed: want,
+            });
+        }
+    }
+
+    let mut inbound_ids: Vec<Uuid> = current.inbound.keys()
+        .chain(target.inbound.keys())
+        .copied()
+        .collect();
+    inbound_ids.sort();
+    inbound_ids.dedup();
+    for id in inbound_ids {
+        match (current.inbound.get(&id), target.inbound.get(&id)) {
+            (_, Some((contact, alias))) if current.inbound.get(&id).is_none() => {
+                out.push(Change::PutAppInvitation {
+                    id,
+                    contact_uuid: *contact,
+                    app_alias: alias.clone(),
+                });
+            }
+            (Some(_), None) => out.push(Change::ForgetAppInvitation { id }),
+            _ => {}
+        }
+    }
+
+    let mut outbound_ids: Vec<Uuid> = current.outbound.keys()
+        .chain(target.outbound.keys())
+        .copied()
+        .collect();
+    outbound_ids.sort();
+    outbound_ids.dedup();
+    for id in outbound_ids {
+        match (current.outbound.get(&id), target.outbound.get(&id)) {
+            (_, Some((contact, alias))) if current.outbound.get(&id).is_none() => {
+                out.push(Change::PutOutboundAppInvitation {
+                    id,
+                    contact_uuid: *contact,
+                    app_alias: alias.clone(),
+                });
+            }
+            (Some(_), None) => out.push(Change::ForgetOutboundAppInvitation { id }),
+            _ => {}
+        }
+    }
+
+    let mut accept_ids: Vec<Uuid> = current.they_accept.keys()
+        .chain(target.they_accept.keys())
+        .copied()
+        .filter(|id| target.contacts.contains_key(id) || current.contacts.contains_key(id))
+        .collect();
+    accept_ids.sort();
+    accept_ids.dedup();
+    for id in accept_ids {
+        if !target.contacts.contains_key(&id) {
+            continue;
+        }
+        let want = target.they_accept.get(&id).map(|(a, _)| a.clone()).unwrap_or_default();
+        let now = current.they_accept.get(&id).map(|(a, _)| a.clone()).unwrap_or_default();
+        if want != now {
+            out.push(Change::SetContactTheyAccept { contact_uuid: id, aliases: want });
+        }
+    }
+
     out
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::{
+        deserialize_change, deserialize_contact_data, forget_invitation, put_invitation,
+        serialize_change, serialize_contact_data_for, Change,
+    };
+    use super::super::sender_may_deliver;
+    use crate::data_models::{
+        AppGrant, AppInvitation, Application, Contact, Device, DeviceGrade, Ed25519KeyPair,
+        Ed25519PublicKey, Ed25519Signature, Node, SyncVersion, User, X25519PublicKey,
+    };
+
+    fn app(id: u8, alias: &str, approved: bool) -> Application {
+        Application {
+            id: [id; 16],
+            alias: alias.into(),
+            protocol: String::new(),
+            host: "127.0.0.1:9".parse().unwrap(),
+            user_approved: approved,
+            token: [id; 16],
+            identity: Ed25519KeyPair::ZERO,
+            cert_sig: Ed25519Signature::ZERO,
+            cert_issued_at: 0,
+            cert_alias: String::new(),
+        }
+    }
+
+    #[test]
+    fn contact_directory_lists_only_granted_apps() {
+        let mut node = Node::new();
+        node.owner.user.devices[0].applications.push(app(7, "chat", true));
+        node.owner.user.devices[0].applications.push(app(8, "files", true));
+        let contact = [0x11u8; 16];
+        node.owner.app_grants.push(AppGrant {
+            contact_uuid: contact,
+            app_alias: "chat".into(),
+        });
+        node.owner.app_grants.push(AppGrant {
+            contact_uuid: contact,
+            app_alias: "missing".into(),
+        });
+        node.owner.outbound_app_invitations.push(AppInvitation {
+            id: [0x55; 16],
+            contact_uuid: contact,
+            app_alias: "files".into(),
+        });
+
+        let data = deserialize_contact_data(&serialize_contact_data_for(&node, contact)).unwrap();
+        assert_eq!(data.devices[0].1.len(), 1);
+        assert_eq!(data.devices[0].1[0].alias, "chat");
+        let accepted = data.accepted_aliases.expect("new peers send the allow list");
+        assert!(accepted.iter().any(|a| a == "chat"));
+        assert!(accepted.iter().any(|a| a == "missing"));
+        assert!(!accepted.iter().any(|a| a == "files"));
+        assert_eq!(data.invitations, vec![([0x55; 16], "files".into())]);
+    }
+
+    #[test]
+    fn relay_policy_allows_a_granted_contact_and_our_own_device() {
+        let mut node = Node::new();
+        let dest = node.device_uuid;
+        node.owner.user.devices[0].applications.push(app(7, "chat", true));
+        let sender_dev = [0x42u8; 16];
+        node.owner.contact_users.push(Contact {
+            user: User {
+                alias: "ada".into(),
+                uuid: [0x11; 16],
+                devices: vec![Device {
+                    alias: "phone".into(),
+                    uuid: sender_dev,
+                    grade: DeviceGrade::DG,
+                    sg_rank: None,
+                    hosts: Vec::new(),
+                    applications: Vec::new(),
+                    signing_pk: Ed25519PublicKey::ZERO,
+                    dh_pk: X25519PublicKey::ZERO,
+                    cert_sig: Ed25519Signature::ZERO,
+                    cert_issued_at: 0,
+                    cert_alias: String::new(),
+                }],
+            },
+            public_key: Ed25519PublicKey::ZERO,
+            they_accept: Vec::new(),
+            last_seen_public_version: SyncVersion::default(),
+        });
+
+        assert!(!sender_may_deliver(&node, Some(sender_dev), [9; 16], dest, [7; 16]));
+        node.owner.app_grants.push(AppGrant {
+            contact_uuid: [0x11; 16],
+            app_alias: "chat".into(),
+        });
+        assert!(sender_may_deliver(&node, Some(sender_dev), [9; 16], dest, [7; 16]));
+        assert!(sender_may_deliver(&node, Some(dest), [9; 16], dest, [7; 16]));
+    }
+
+    #[test]
+    fn a_rejected_invitation_does_not_return() {
+        let mut owner = Node::new().owner;
+        assert!(put_invitation(
+            &mut owner.app_invitations,
+            &owner.seen_app_invitation_ids,
+            [1; 16],
+            [2; 16],
+            "chat",
+        ));
+        assert!(forget_invitation(&mut owner, [1; 16]));
+        assert!(!put_invitation(
+            &mut owner.app_invitations,
+            &owner.seen_app_invitation_ids,
+            [1; 16],
+            [2; 16],
+            "chat",
+        ));
+        assert!(owner.app_invitations.is_empty());
+    }
+
+    #[test]
+    fn app_grant_change_roundtrips() {
+        let change = Change::SetAppGrant {
+            contact_uuid: [3; 16],
+            app_alias: "chat".into(),
+            allowed: true,
+        };
+        assert_eq!(deserialize_change(&serialize_change(&change)).unwrap(), change);
+    }
 }

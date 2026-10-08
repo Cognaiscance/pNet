@@ -16,7 +16,7 @@ use super::super::data_models::{
 };
 use super::super::wire::*;
 use super::super::wire::uuid_hex;
-use super::{allocate_conn_id, fabric_event, local_approved_app_host, send};
+use super::{allocate_conn_id, fabric_event, local_approved_app_host, send, sender_may_deliver};
 
 // ── Tunnel handlers ───────────────────────────────────────────────────────────
 
@@ -442,6 +442,13 @@ pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         }
 
+        if !sender_may_deliver(&node, Some(conn.device_uuid), sender_app_id, node.device_uuid, dest_app_id) {
+            eprintln!(
+                "[tunnel_delivery] dropping app {} for tunnel {tunnel_id}; sender is not allowed",
+                uuid_hex(&dest_app_id),
+            );
+            return;
+        }
         let Some(app_host) = local_approved_app_host(&node, dest_app_id) else {
             eprintln!(
                 "[tunnel_delivery] no approved app {} for tunnel {tunnel_id}",

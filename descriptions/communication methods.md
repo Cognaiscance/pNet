@@ -70,13 +70,18 @@ ceiling for the **opaque app bytes** on every path that carries them:
 | Path | Enforcement |
 |------|-------------|
 | Local op 3 `app_send_packet` | Reject with `ERR_PAYLOAD_TOO_LARGE` |
-| Peer `RelayPacket` (0x40) | Drop (no forward / no local push) |
+| Peer `RelayPacket` (0x40) | Drop (no forward / no local push). Also drop when the destination device is ours and the sender contact has no grant for that app alias |
 | Peer `AppPacket` (0x41) | Drop (no local push) |
 | Tunnel delivery (0x54) | Drop (no local push) |
 | Tunnel forward (0x51) | Cap on opaque `nonce‖ciphertext` (`MAX_TUNNEL_FORWARD_BLOB`) |
 
 This is not a path-MTU guarantee: stay ≈1 KiB or less if you want to avoid IP
 fragmentation on typical WANs. Larger app messages must be chunked by the app.
+
+A relay SG decrypts op 0x40, so it can drop a packet to one of its own devices
+when the sender's contact has not been accepted for that app alias. Tunnel
+forward (0x51) does not show the app id, so the destination device drops the
+packet when it decrypts the delivery.
 
 ### 0 — application registration
 
