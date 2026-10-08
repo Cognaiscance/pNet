@@ -667,6 +667,18 @@ pub struct Owner {
     pub user_cert_issued_at: u64,
     pub contact_invitations: Vec<Invitation>,
     pub device_invitations:  Vec<Invitation>,
+    /// Inbound allows: this contact may send to our apps of this alias.
+    #[serde(default)]
+    pub app_grants: Vec<AppGrant>,
+    /// Invitations we have not answered. Accepting adds a grant.
+    #[serde(default)]
+    pub app_invitations: Vec<AppInvitation>,
+    /// Invitation ids we already accepted or rejected, as 32-char hex.
+    #[serde(default)]
+    pub seen_app_invitation_ids: Vec<String>,
+    /// Invitations we have sent and still publish to that contact.
+    #[serde(default)]
+    pub outbound_app_invitations: Vec<AppInvitation>,
 
     /// Latest version of the user's **private** state held by this node.
     /// On the writer SG this is authoritative; on other nodes it's the
@@ -750,11 +762,39 @@ pub struct Contact {
     pub user:       User,
     /// Contact's long-term Ed25519 public key (identity verification).
     pub public_key: Ed25519PublicKey,
+    /// App aliases this contact has accepted from us. Learned from the
+    /// per-contact directory they publish. Empty until a pull says so.
+    /// An alias can be listed here before we have that app installed.
+    #[serde(default)]
+    pub they_accept: Vec<String>,
     /// Highest public-scope version we have applied for this contact via
     /// cross-user sync v1. Used as the `last_seen` baseline on outbound
     /// CrossUserPullRequest so the reply is `NoUpdates` when caught up.
     #[serde(default)]
     pub last_seen_public_version: SyncVersion,
+}
+
+/// We allow `contact_uuid` to send to our apps whose alias is `app_alias`.
+/// The app does not have to be installed yet. One grant covers every device
+/// of ours that runs that alias.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct AppGrant {
+    #[serde(with = "serde_bytes_16")]
+    pub contact_uuid: Uuid,
+    pub app_alias: String,
+}
+
+/// An invitation to accept one app alias from one contact.
+/// `id` is minted by the sender. Rejecting or accepting remembers `id` so a
+/// later copy of the same invitation does not reappear. A new request uses a
+/// new id.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct AppInvitation {
+    #[serde(with = "serde_bytes_16")]
+    pub id: Uuid,
+    #[serde(with = "serde_bytes_16")]
+    pub contact_uuid: Uuid,
+    pub app_alias: String,
 }
 
 /// SG side: maps a tunnel_id to the two active connection IDs on this relay SG.
@@ -802,7 +842,11 @@ pub struct SgStatus {
 
 /// On-disk shape this build writes. A later break increments it and teaches
 /// `load` how to migrate every smaller number up to this one.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// Version 2 adds per-contact app grants and app invitations. Loading a
+/// version 1 file keeps every existing contact allowed to reach every app
+/// that was already user-approved. New apps and new contacts start closed.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Files written before `format_version` existed. `serde` fills that in on load.
 pub const LEGACY_FORMAT_VERSION: u32 = 1;
@@ -920,6 +964,10 @@ impl Node {
                 user_cert_issued_at:        0,
                 contact_invitations:        Vec::new(),
                 device_invitations:         Vec::new(),
+                app_grants:                 Vec::new(),
+                app_invitations:            Vec::new(),
+                seen_app_invitation_ids:    Vec::new(),
+                outbound_app_invitations:   Vec::new(),
                 private_version:            SyncVersion::zero(),
                 public_version:             SyncVersion::zero(),
                 write_log:                  Vec::new(),

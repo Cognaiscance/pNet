@@ -113,7 +113,42 @@ pub fn load(data_dir: &Path) -> Result<Node, String> {
     }
 
     super::keystore::restore_secrets(&mut node);
+    migrate_app_policy(&mut node);
     Ok(node)
+}
+
+/// Format 1 had no per-contact allow list: every contact could reach every
+/// approved app. Keep that access. The in-memory node becomes format 2.
+/// The file is left untouched until the next save.
+fn migrate_app_policy(node: &mut Node) {
+    if node.format_version >= super::data_models::FORMAT_VERSION {
+        return;
+    }
+    let mut aliases: Vec<String> = node
+        .owner
+        .user
+        .devices
+        .iter()
+        .flat_map(|d| d.applications.iter())
+        .filter(|a| a.user_approved)
+        .map(|a| a.alias.clone())
+        .collect();
+    aliases.sort();
+    aliases.dedup();
+    for contact in &node.owner.contact_users {
+        for alias in &aliases {
+            let already = node.owner.app_grants.iter().any(|g| {
+                g.contact_uuid == contact.user.uuid && g.app_alias == *alias
+            });
+            if !already {
+                node.owner.app_grants.push(super::data_models::AppGrant {
+                    contact_uuid: contact.user.uuid,
+                    app_alias: alias.clone(),
+                });
+            }
+        }
+    }
+    node.format_version = super::data_models::FORMAT_VERSION;
 }
 
 /// Serialize directory snapshot (`node.toml`) — **without** the write log.
@@ -359,8 +394,8 @@ mod tests {
         let mut original = Node::new();
         original.owner.user.alias = "Legacy".into();
         let current = save(&original);
-        assert!(current.contains("format_version = 1"));
-        let legacy = current.replace("format_version = 1\n", "");
+        assert!(current.contains("format_version = 2"));
+        let legacy = current.replace("format_version = 2\n", "");
         assert!(!legacy.contains("format_version"));
         let path = dir.join("node.toml");
         fs::write(&path, &legacy).unwrap();
@@ -373,10 +408,63 @@ mod tests {
     }
 
     #[test]
+    fn load_format_1_grants_existing_contacts_their_approved_apps() {
+        let dir = unique_dir("grant-migrate");
+        fs::create_dir_all(&dir).unwrap();
+        let mut node = Node::new();
+        node.format_version = 1;
+        let contact_id = [0x11u8; 16];
+        node.owner.contact_users.push(crate::data_models::Contact {
+            user: crate::data_models::User {
+                alias: "ada".into(),
+                uuid: contact_id,
+                devices: Vec::new(),
+            },
+            public_key: Ed25519PublicKey([0x22; 32]),
+            they_accept: Vec::new(),
+            last_seen_public_version: Default::default(),
+        });
+        node.owner.user.devices[0].applications.push(crate::data_models::Application {
+            id: [0x33; 16],
+            alias: "chat".into(),
+            protocol: String::new(),
+            host: "127.0.0.1:9".parse().unwrap(),
+            user_approved: true,
+            token: [0x44; 16],
+            identity: Ed25519KeyPair::ZERO,
+            cert_sig: crate::data_models::Ed25519Signature::ZERO,
+            cert_issued_at: 0,
+            cert_alias: String::new(),
+        });
+        node.owner.user.devices[0].applications.push(crate::data_models::Application {
+            id: [0x34; 16],
+            alias: "draft".into(),
+            protocol: String::new(),
+            host: "127.0.0.1:10".parse().unwrap(),
+            user_approved: false,
+            token: [0x45; 16],
+            identity: Ed25519KeyPair::ZERO,
+            cert_sig: crate::data_models::Ed25519Signature::ZERO,
+            cert_issued_at: 0,
+            cert_alias: String::new(),
+        });
+        let path = dir.join("node.toml");
+        fs::write(&path, save(&node)).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let loaded = load(&dir).unwrap();
+        assert_eq!(loaded.format_version, FORMAT_VERSION);
+        assert_eq!(loaded.owner.app_grants.len(), 1);
+        assert_eq!(loaded.owner.app_grants[0].contact_uuid, contact_id);
+        assert_eq!(loaded.owner.app_grants[0].app_alias, "chat");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn load_refuses_a_newer_format_without_rewriting_the_file() {
         let dir = unique_dir("future");
         fs::create_dir_all(&dir).unwrap();
-        let future = save(&Node::new()).replace("format_version = 1", "format_version = 99");
+        let future = save(&Node::new()).replace("format_version = 2", "format_version = 99");
         let path = dir.join("node.toml");
         fs::write(&path, &future).unwrap();
         let before = fs::read(&path).unwrap();
@@ -398,7 +486,7 @@ mod tests {
         assert!(err.contains("could not be parsed"), "{err}");
         assert_eq!(fs::read(&path).unwrap(), before);
 
-        let zero = save(&Node::new()).replace("format_version = 1", "format_version = 0");
+        let zero = save(&Node::new()).replace("format_version = 2", "format_version = 0");
         fs::write(&path, &zero).unwrap();
         let err = expect_load_err(&dir);
         assert!(err.contains("format_version 0"), "{err}");

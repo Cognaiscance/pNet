@@ -158,6 +158,7 @@ fn deserialize_bootstrap_payload(data: &[u8]) -> Option<BootstrapPayload> {
         contacts.push(Contact {
             user:       User { alias: c_alias, uuid: c_uuid, devices: c_devices },
             public_key: c_pk,
+            they_accept: Vec::new(),
             last_seen_public_version: SyncVersion::default(),
         });
     }
@@ -1303,6 +1304,7 @@ mod golden_tests {
     cert_alias: String::new(),
 }],
             },
+            they_accept: Vec::new(),
             last_seen_public_version: SyncVersion::default(),
         }];
         n

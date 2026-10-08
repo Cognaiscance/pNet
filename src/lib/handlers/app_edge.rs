@@ -15,7 +15,7 @@ use super::super::data_models::{Application, Ed25519PublicKey, Uuid, generate_uu
 use super::super::wire::*;
 use super::{
     best_sg_connection, ipv4_from, local_approved_app_host, push_device, request_change, send,
-    send_error, sg_candidates_for_dest, top_ranked_sg_for_device, Change,
+    send_error, sender_may_deliver, sg_candidates_for_dest, top_ranked_sg_for_device, Change,
 };
 
 
@@ -637,6 +637,14 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
 
         // Unapproved apps must never receive pushes.
+        if !sender_may_deliver(&node, None, sender_app_id, node.device_uuid, dest_app_id) {
+            eprintln!(
+                "[app_packet] dropping app {}; sender {} is not allowed",
+                uuid_hex(&dest_app_id),
+                uuid_hex(&sender_app_id),
+            );
+            return;
+        }
         let Some(app_host) = local_approved_app_host(&node, dest_app_id) else {
             eprintln!("[app_packet] no approved app with id {}", uuid_hex(&dest_app_id));
             return;

@@ -27,14 +27,15 @@ use super::super::app_web::{
 };
 use super::super::crypto::{generate_ed25519_keypair, generate_x25519_keypair};
 use super::super::data_models::{
-    Device, DeviceGrade, Ed25519SecretKey, Node, Uuid, CONNECTION_LIFETIME, WRITE_LOG_RETENTION,
-    generate_uuid,
+    AppInvitation, Device, DeviceGrade, Ed25519SecretKey, Node, Uuid, CONNECTION_LIFETIME,
+    WRITE_LOG_RETENTION, generate_uuid,
 };
 use super::super::wire::*;
 use super::{
     cascade_remove_fabric_state, find_writer_sg, generate_contact_invitation,
     generate_device_invitation_with, initiate_bootstrap, initiate_contact_exchange,
-    parse_pnet_hosts, request_change, sync_pull, uuid_hex, Change, InvitationMint, WriterTarget,
+    parse_pnet_hosts, request_change, request_change_idempotent, sync_pull, uuid_hex, Change,
+    InvitationMint, WriterTarget,
 };
 
 // ── UI / HTTP handlers ────────────────────────────────────────────────────────
@@ -132,6 +133,14 @@ pub fn ui_request(
         return handle_app_web_proxy(stream, &method, &path, &query, &body, ctx);
     }
 
+    if method == "GET" {
+        if let Some(id) = path.strip_prefix("/contacts/") {
+            if !id.is_empty() && !id.contains('/') {
+                return respond_html(&stream, 200, &render_contact_apps(ctx, id, &query), None);
+            }
+        }
+    }
+
     match (method.as_str(), path.as_str()) {
         ("GET",  "/setup") => respond_html(&stream, 200, &render_setup(&query), None),
         ("POST", "/setup/create") => {
@@ -220,6 +229,9 @@ pub fn ui_request(
             respond_redirect(&stream, &target);
         }
         ("GET",  "/contacts")      => respond_html(&stream, 200, &render_contacts(ctx), None),
+        ("GET",  "/app-invitations") => {
+            respond_html(&stream, 200, &render_app_invitations(ctx, &query), None)
+        }
         ("GET",  "/devices")       => respond_html(&stream, 200, &render_devices(ctx, &query), None),
         ("POST", "/devices/sync")  => {
             // Manual refresh: pull the latest public/private state from the
@@ -284,6 +296,24 @@ pub fn ui_request(
         ("POST", "/contacts/enter") => {
             initiate_contact_exchange(&body, ctx);
             respond_redirect(&stream, "/contacts");
+        }
+        ("POST", "/contacts/grant") => {
+            let back = contact_redirect_target(&body);
+            let target = redirect_with_error(&back, grant_contact_app(&body, ctx));
+            respond_redirect(&stream, &target);
+        }
+        ("POST", "/contacts/invite") => {
+            let back = contact_redirect_target(&body);
+            let target = redirect_with_error(&back, invite_contact_app(&body, ctx));
+            respond_redirect(&stream, &target);
+        }
+        ("POST", "/app-invitations/accept") => {
+            let target = redirect_with_error("/app-invitations", accept_app_invitation(&body, ctx));
+            respond_redirect(&stream, &target);
+        }
+        ("POST", "/app-invitations/reject") => {
+            let target = redirect_with_error("/app-invitations", reject_app_invitation(&body, ctx));
+            respond_redirect(&stream, &target);
         }
         _ => respond_html(&stream, 404, &layout(ctx, "Not Found", "<h1>404 — Not Found</h1>"), None),
     }
@@ -794,6 +824,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
              <li><a href=\"/pending-apps\">Pending Apps</a> — approve or reject local app registrations</li>\
              <li><a href=\"/applications\">Applications</a> — approved apps on this device</li>\
              <li><a href=\"/contacts\">Contacts</a> — other users you are linked with</li>\
+             <li><a href=\"/app-invitations\">App Invitations</a> — requests to accept an app from a contact</li>\
              <li><a href=\"/devices\">Devices</a> — your devices; remove a lost one</li>\
              <li><a href=\"/invitations\">Invitations</a> — device and contact invite codes</li>\
              <li><a href=\"/diagnostics\">Diagnostics</a> — fabric health, sessions, partitions</li>\
@@ -937,8 +968,9 @@ fn render_contacts(ctx: &WorkerContext) -> String {
                 format!("<ul style='margin:0;padding-left:1.2rem'>{dev_cells}</ul>")
             };
             format!(
-                "<tr><td>{}</td><td>{dev_list}</td></tr>",
+                "<tr><td><a href=\"/contacts/{id}\">{}</a></td><td>{dev_list}</td></tr>",
                 html_escape(&c.user.alias),
+                id = uuid_hex(&c.user.uuid),
             )
         })
         .collect();
@@ -972,6 +1004,219 @@ fn render_contacts(ctx: &WorkerContext) -> String {
          </div>"
     );
     layout(ctx, "Contacts", &body)
+}
+
+fn contact_redirect_target(body: &[u8]) -> String {
+    form_field(body, "contact")
+        .filter(|id| uuid_from_hex(id).is_some())
+        .map(|id| format!("/contacts/{id}"))
+        .unwrap_or_else(|| "/contacts".to_string())
+}
+
+fn clean_app_alias(raw: &str) -> Option<String> {
+    let alias = url_decode(raw).trim().to_string();
+    if alias.is_empty() || alias.len() > 255 || alias.chars().any(|c| c.is_control()) {
+        None
+    } else {
+        Some(alias)
+    }
+}
+
+fn publish_policy(change: Change, ctx: &WorkerContext) -> Option<&'static str> {
+    match request_change_idempotent(change, ctx) {
+        Ok(()) => None,
+        Err(e) => {
+            eprintln!("[app-policy] publish failed: {e:?}");
+            Some(UI_ERR_PUBLISH_FAILED)
+        }
+    }
+}
+
+fn grant_contact_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let contact = uuid_from_hex(form_field(body, "contact")?)?;
+    let alias = clean_app_alias(form_field(body, "alias")?)?;
+    let allowed = form_field(body, "allowed")? == "1";
+    {
+        let node = ctx.node.read().unwrap();
+        if !node.owner.contact_users.iter().any(|c| c.user.uuid == contact) {
+            return None;
+        }
+    }
+    publish_policy(Change::SetAppGrant {
+        contact_uuid: contact,
+        app_alias: alias,
+        allowed,
+    }, ctx)
+}
+
+fn invite_contact_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let contact = uuid_from_hex(form_field(body, "contact")?)?;
+    let alias = clean_app_alias(form_field(body, "alias")?)?;
+    let old_ids: Vec<Uuid> = {
+        let node = ctx.node.read().unwrap();
+        if !node.owner.contact_users.iter().any(|c| c.user.uuid == contact) {
+            return None;
+        }
+        node.owner.outbound_app_invitations.iter()
+            .filter(|i| i.contact_uuid == contact && i.app_alias == alias)
+            .map(|i| i.id)
+            .collect()
+    };
+    for id in old_ids {
+        if let Some(err) = publish_policy(Change::ForgetOutboundAppInvitation { id }, ctx) {
+            return Some(err);
+        }
+    }
+    publish_policy(Change::PutOutboundAppInvitation {
+        id: generate_uuid(),
+        contact_uuid: contact,
+        app_alias: alias,
+    }, ctx)
+}
+
+fn invitation_by_id(body: &[u8], ctx: &WorkerContext) -> Option<AppInvitation> {
+    let id = uuid_from_hex(form_field(body, "id")?)?;
+    ctx.node.read().unwrap().owner.app_invitations.iter().find(|i| i.id == id).cloned()
+}
+
+fn accept_app_invitation(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let invite = invitation_by_id(body, ctx)?;
+    if let Some(err) = publish_policy(Change::SetAppGrant {
+        contact_uuid: invite.contact_uuid,
+        app_alias: invite.app_alias.clone(),
+        allowed: true,
+    }, ctx) {
+        return Some(err);
+    }
+    publish_policy(Change::ForgetAppInvitation { id: invite.id }, ctx)
+}
+
+fn reject_app_invitation(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let invite = invitation_by_id(body, ctx)?;
+    publish_policy(Change::ForgetAppInvitation { id: invite.id }, ctx)
+}
+
+fn render_contact_apps(ctx: &WorkerContext, id_hex: &str, query: &str) -> String {
+    let Some(contact_uuid) = uuid_from_hex(id_hex) else {
+        return layout(ctx, "Contact", "<h1>Contact</h1><p class='empty'>Unknown contact.</p>");
+    };
+    let node = ctx.node.read().unwrap();
+    let Some(contact) = node.owner.contact_users.iter().find(|c| c.user.uuid == contact_uuid) else {
+        drop(node);
+        return layout(ctx, "Contact", "<h1>Contact</h1><p class='empty'>That contact is not on this node.</p>");
+    };
+    let name = html_escape(&contact.user.alias);
+    let mut aliases: Vec<String> = node.owner.user.devices.iter()
+        .flat_map(|d| d.applications.iter())
+        .filter(|a| a.user_approved)
+        .map(|a| a.alias.clone())
+        .chain(node.owner.app_grants.iter().filter(|g| g.contact_uuid == contact_uuid).map(|g| g.app_alias.clone()))
+        .chain(contact.they_accept.iter().cloned())
+        .chain(node.owner.outbound_app_invitations.iter().filter(|i| i.contact_uuid == contact_uuid).map(|i| i.app_alias.clone()))
+        .collect();
+    aliases.sort();
+    aliases.dedup();
+
+    let rows: String = aliases.iter().map(|alias| {
+        let we = node.owner.app_grants.iter().any(|g| g.contact_uuid == contact_uuid && g.app_alias == *alias);
+        let they = contact.they_accept.iter().any(|a| a == alias);
+        let invited = node.owner.outbound_app_invitations.iter().any(|i| {
+            i.contact_uuid == contact_uuid && i.app_alias == *alias
+        });
+        let we_cell = if we { "Yes" } else { "No" };
+        let they_cell = if they { "Yes" } else { "No" };
+        let grant_label = if we { "Revoke" } else { "Accept" };
+        let grant_class = if we { " class='reject'" } else { "" };
+        let grant_value = if we { "0" } else { "1" };
+        let invite = if they {
+            String::new()
+        } else if invited {
+            format!(
+                "<form method='post' action='/contacts/invite' style='margin:0'>\
+                   <input type='hidden' name='contact' value='{id_hex}'>\
+                   <input type='hidden' name='alias' value='{}'>\
+                   <button type='submit'>Invite again</button>\
+                 </form>",
+                html_escape(alias),
+            )
+        } else {
+            format!(
+                "<form method='post' action='/contacts/invite' style='margin:0'>\
+                   <input type='hidden' name='contact' value='{id_hex}'>\
+                   <input type='hidden' name='alias' value='{}'>\
+                   <button type='submit'>Invite</button>\
+                 </form>",
+                html_escape(alias),
+            )
+        };
+        format!(
+            "<tr><td>{}</td><td>{we_cell}</td><td>{they_cell}</td>\
+               <td><form method='post' action='/contacts/grant' style='margin:0'>\
+                 <input type='hidden' name='contact' value='{id_hex}'>\
+                 <input type='hidden' name='alias' value='{}'>\
+                 <input type='hidden' name='allowed' value='{grant_value}'>\
+                 <button{grant_class} type='submit'>{grant_label}</button>\
+               </form></td><td>{invite}</td></tr>",
+            html_escape(alias),
+            html_escape(alias),
+        )
+    }).collect();
+
+    let table = if rows.is_empty() {
+        "<p class='empty'>No apps for this contact yet. Approve an app, or accept an invitation for an app you do not have installed.</p>".to_string()
+    } else {
+        format!(
+            "<table><tr><th>App</th><th>We accept them</th><th>They accept us</th><th></th><th></th></tr>{rows}</table>"
+        )
+    };
+    let error_banner = ui_error_banner(query);
+    let body = format!(
+        "<h1>{name}</h1>\
+         <p style='color:var(--muted)'>Apps this contact may send to, and whether they accept you. \
+            Accepting does not require the app to be installed.</p>\
+         {error_banner}{table}\
+         <p><a href='/contacts'>All contacts</a></p>"
+    );
+    drop(node);
+    layout(ctx, "Contact", &body)
+}
+
+fn render_app_invitations(ctx: &WorkerContext, query: &str) -> String {
+    let node = ctx.node.read().unwrap();
+    let rows: String = node.owner.app_invitations.iter().map(|invite| {
+        let who = node.owner.contact_users.iter()
+            .find(|c| c.user.uuid == invite.contact_uuid)
+            .map(|c| c.user.alias.clone())
+            .unwrap_or_else(|| uuid_hex(&invite.contact_uuid));
+        let id = uuid_hex(&invite.id);
+        let contact_hex = uuid_hex(&invite.contact_uuid);
+        format!(
+            "<tr><td>{}</td><td>{}</td>\
+               <td><form method='post' action='/app-invitations/accept' style='margin:0'>\
+                 <input type='hidden' name='id' value='{id}'>\
+                 <button type='submit'>Accept</button></form></td>\
+               <td><form method='post' action='/app-invitations/reject' style='margin:0'>\
+                 <input type='hidden' name='id' value='{id}'>\
+                 <button class='reject' type='submit'>Reject</button></form></td>\
+               <td><a href='/contacts/{contact_hex}'>View apps</a></td></tr>",
+            html_escape(&who),
+            html_escape(&invite.app_alias),
+        )
+    }).collect();
+    let table = if rows.is_empty() {
+        "<p class='empty'>No app invitations.</p>".to_string()
+    } else {
+        format!("<table><tr><th>From</th><th>App</th><th></th><th></th><th></th></tr>{rows}</table>")
+    };
+    let error_banner = ui_error_banner(query);
+    let body = format!(
+        "<h1>App Invitations</h1>\
+         <p style='color:var(--muted)'>Accept lets that contact send to the app, even if it is not installed here. \
+            Reject removes the invitation.</p>\
+         {error_banner}{table}"
+    );
+    drop(node);
+    layout(ctx, "App Invitations", &body)
 }
 
 pub(crate) fn render_devices(ctx: &WorkerContext, query: &str) -> String {
@@ -2286,6 +2531,8 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
             | "Pending Apps"
             | "Applications"
             | "Contacts"
+            | "Contact"
+            | "App Invitations"
             | "Devices"
             | "Invitations"
             | "Diagnostics"
@@ -2319,6 +2566,7 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
                <a href=\"/pending-apps\">Pending Apps</a>\
                <a href=\"/applications\">Applications</a>\
                <a href=\"/contacts\">Contacts</a>\
+               <a href=\"/app-invitations\">App Invitations</a>\
                <a href=\"/devices\">Devices</a>\
                <a href=\"/invitations\">Invitations</a>\
                <a href=\"/diagnostics\">Diagnostics</a>\
@@ -2436,6 +2684,177 @@ fn setup_layout(body: &str) -> String {
         body = body,
         boot = THEME_BOOT,
     )
+}
+
+#[cfg(test)]
+mod policy_ui_tests {
+    use std::net::UdpSocket;
+    use std::sync::{Arc, RwLock, mpsc};
+
+    use crate::action_queue::WorkerContext;
+    use crate::data_models::{
+        AppInvitation, Application, Contact, Device, DeviceGrade, Ed25519KeyPair,
+        Ed25519PublicKey, Ed25519Signature, Node, SyncVersion, User, X25519PublicKey,
+        generate_uuid,
+    };
+    use crate::wire::uuid_hex;
+
+    use super::{
+        accept_app_invitation, grant_contact_app, invite_contact_app, reject_app_invitation,
+        render_app_invitations, render_contact_apps, render_contacts,
+    };
+
+    fn portal() -> (WorkerContext, [u8; 16]) {
+        crate::keystore::install_passphrase("test-passphrase");
+        let node = Arc::new(RwLock::new(Node::new()));
+        let contact = generate_uuid();
+        {
+            let mut n = node.write().unwrap();
+            let local = n.device_uuid;
+            let dev = n.owner.user.devices.iter_mut().find(|d| d.uuid == local).unwrap();
+            dev.grade = DeviceGrade::SG;
+            dev.sg_rank = Some(1);
+            dev.hosts = vec!["127.0.0.1:9".into()];
+            dev.applications.push(Application {
+                id: generate_uuid(),
+                alias: "chat".into(),
+                protocol: "udp".into(),
+                host: "127.0.0.1:9001".parse().unwrap(),
+                user_approved: true,
+                token: generate_uuid(),
+                identity: Ed25519KeyPair::ZERO,
+                cert_sig: Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
+            });
+            n.owner.contact_users.push(Contact {
+                public_key: Ed25519PublicKey([0x11; 32]),
+                user: User {
+                    alias: "sanosuke".into(),
+                    uuid: contact,
+                    devices: vec![Device {
+                        alias: "sanosuke-dg".into(),
+                        uuid: generate_uuid(),
+                        grade: DeviceGrade::DG,
+                        sg_rank: None,
+                        hosts: vec![],
+                        applications: vec![],
+                        signing_pk: Ed25519PublicKey::ZERO,
+                        dh_pk: X25519PublicKey::ZERO,
+                        cert_sig: Ed25519Signature::ZERO,
+                        cert_issued_at: 0,
+                        cert_alias: String::new(),
+                    }],
+                },
+                they_accept: Vec::new(),
+                last_seen_public_version: SyncVersion::default(),
+            });
+        }
+        let (writer_tx, _writer_rx) = mpsc::sync_channel(8);
+        let (scheduler_tx, _sched_rx) = mpsc::channel();
+        let ctx = WorkerContext {
+            node,
+            udp_socket: Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            writer_tx,
+            scheduler_tx,
+            pending_invites: Default::default(),
+            sessions: Arc::new(crate::admin_auth::SessionStore::new()),
+            app_rate_limits: Arc::new(std::sync::Mutex::new(crate::app_api::AppRateLimiter::new())),
+            dns_cache: Arc::new(std::sync::Mutex::new(crate::dns_cache::DnsCache::new())),
+            app_web: Arc::new(crate::app_web::AppWebRegistry::new()),
+        };
+        (ctx, contact)
+    }
+
+    fn form(pairs: &[(&str, &str)]) -> Vec<u8> {
+        pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&").into_bytes()
+    }
+
+    #[test]
+    fn contact_page_grant_invite_and_invitation_accept_reject() {
+        let (ctx, contact) = portal();
+        let hex = uuid_hex(&contact);
+
+        let list = render_contacts(&ctx);
+        assert!(list.contains(&format!("/contacts/{hex}")));
+        assert!(list.contains("sanosuke"));
+
+        let page = render_contact_apps(&ctx, &hex, "");
+        assert!(page.contains("<td>chat</td><td>No</td><td>No</td>"));
+        assert!(page.contains(">Accept</button>"));
+        assert!(page.contains(">Invite</button>"));
+        assert!(page.contains("App Invitations"));
+
+        assert!(grant_contact_app(&form(&[("contact", &hex), ("alias", "chat"), ("allowed", "1")]), &ctx).is_none());
+        let page = render_contact_apps(&ctx, &hex, "");
+        assert!(page.contains("<td>chat</td><td>Yes</td><td>No</td>"));
+        assert!(page.contains(">Revoke</button>"));
+
+        assert!(invite_contact_app(&form(&[("contact", &hex), ("alias", "chat")]), &ctx).is_none());
+        {
+            let node = ctx.node.read().unwrap();
+            assert!(node.owner.outbound_app_invitations.iter().any(|i| {
+                i.contact_uuid == contact && i.app_alias == "chat"
+            }));
+        }
+        let page = render_contact_apps(&ctx, &hex, "");
+        assert!(page.contains(">Invite again</button>"));
+
+        {
+            let mut node = ctx.node.write().unwrap();
+            node.owner.contact_users[0].they_accept = vec!["chat".into()];
+        }
+        let page = render_contact_apps(&ctx, &hex, "");
+        assert!(page.contains("<td>chat</td><td>Yes</td><td>Yes</td>"));
+        assert!(!page.contains(">Invite</button>"));
+        assert!(!page.contains("Invite again"));
+
+        let future_id = generate_uuid();
+        let nope_id = generate_uuid();
+        {
+            let mut node = ctx.node.write().unwrap();
+            node.owner.app_invitations.push(AppInvitation {
+                id: future_id,
+                contact_uuid: contact,
+                app_alias: "future".into(),
+            });
+            node.owner.app_invitations.push(AppInvitation {
+                id: nope_id,
+                contact_uuid: contact,
+                app_alias: "nope".into(),
+            });
+        }
+        let invites = render_app_invitations(&ctx, "");
+        assert!(invites.contains("future"));
+        assert!(invites.contains("nope"));
+        assert!(invites.contains(">Accept</button>"));
+        assert!(invites.contains(">Reject</button>"));
+        assert!(invites.contains(&format!("/contacts/{hex}")));
+        assert!(invites.contains("View apps"));
+
+        let future_hex = uuid_hex(&future_id);
+        assert!(accept_app_invitation(&form(&[("id", &future_hex)]), &ctx).is_none());
+        {
+            let node = ctx.node.read().unwrap();
+            assert!(node.owner.app_grants.iter().any(|g| g.contact_uuid == contact && g.app_alias == "future"));
+            assert!(node.owner.user.devices.iter().all(|d| d.applications.iter().all(|a| a.alias != "future")));
+            assert!(!node.owner.app_invitations.iter().any(|i| i.id == future_id));
+            assert!(node.owner.seen_app_invitation_ids.iter().any(|s| s == &future_hex));
+        }
+        let page = render_contact_apps(&ctx, &hex, "");
+        assert!(page.contains("<td>future</td><td>Yes</td>"));
+
+        let nope_hex = uuid_hex(&nope_id);
+        assert!(reject_app_invitation(&form(&[("id", &nope_hex)]), &ctx).is_none());
+        {
+            let node = ctx.node.read().unwrap();
+            assert!(!node.owner.app_invitations.iter().any(|i| i.id == nope_id));
+            assert!(!node.owner.app_grants.iter().any(|g| g.app_alias == "nope"));
+            assert!(node.owner.seen_app_invitation_ids.iter().any(|s| s == &nope_hex));
+        }
+        let invites = render_app_invitations(&ctx, "");
+        assert!(invites.contains("No app invitations."));
+    }
 }
 
 #[cfg(test)]

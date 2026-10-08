@@ -145,6 +145,12 @@ pub(crate) const CHANGE_KIND_UPDATE_APPLICATION_ALIAS: u8 = 0x04;
 pub(crate) const CHANGE_KIND_UPSERT_CONTACT: u8 = 0x05;
 pub(crate) const CHANGE_KIND_REMOVE_DEVICE: u8 = 0x06;
 pub(crate) const CHANGE_KIND_REMOVE_CONTACT: u8 = 0x07;
+pub(crate) const CHANGE_KIND_SET_APP_GRANT: u8 = 0x08;
+pub(crate) const CHANGE_KIND_PUT_APP_INVITATION: u8 = 0x09;
+pub(crate) const CHANGE_KIND_FORGET_APP_INVITATION: u8 = 0x0A;
+pub(crate) const CHANGE_KIND_PUT_OUTBOUND_APP_INVITATION: u8 = 0x0B;
+pub(crate) const CHANGE_KIND_FORGET_OUTBOUND_APP_INVITATION: u8 = 0x0C;
+pub(crate) const CHANGE_KIND_SET_CONTACT_THEY_ACCEPT: u8 = 0x0D;
 
 // ── Shared min lengths (unencrypted headers / common envelopes) ───────────────
 

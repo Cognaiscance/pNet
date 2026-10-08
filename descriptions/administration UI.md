@@ -109,8 +109,22 @@ A list of all approved applications registered on this node.
 
 ### Contacts
 The owner's address book.
-* Lists each contact by alias
-* Shows their devices and connection availability
+* Lists each contact by alias. The alias opens that contact's app page
+* Shows their devices and how many approved apps each device has published
+
+### Contact app page (`/contacts/<user uuid>`)
+One contact. Each row is an app alias.
+* **We accept them** — this contact may send to our apps of that alias, on every device. Accept does not require the app to be installed. Revoke removes that allow.
+* **They accept us** — that contact has published this alias as allowed. An alias can show Yes before either side has the app installed.
+* **Invite** — ask them to accept this alias. The request appears on their App Invitations page. Invite again sends a new request after they reject one.
+
+Only accepted aliases are included in the directory sent to that contact. Other contacts do not see those apps.
+
+### App Invitations (`/app-invitations`)
+Requests from contacts to accept an app alias.
+* **Accept** — allow that contact to send to the alias, installed or not
+* **Reject** — remove the invitation. The same invitation id does not come back
+* **View apps** — open that contact's app page
 
 ### Devices
 The owner's devices running pNet.
