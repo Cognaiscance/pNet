@@ -1,6 +1,6 @@
 # pNet
 
-These pages describe the `pnet` 0.1.0 process in this checkout. Each statement comes from the Rust under `src/`. The notes in `descriptions/` are a separate set of documents and are not the source of these pages.
+These pages describe the `pnet` 0.2.0 process in this checkout. Each statement comes from the Rust under `src/`. The notes in `descriptions/` are a separate set of documents and are not the source of these pages.
 
 `pnet` is one long-running process. It keeps a local directory of a user, that user's devices, and the user's contacts, and it moves opaque application payloads between those devices. A co-located app talks to the process over UDP. The person who runs the node uses a small HTTP site. Peer nodes talk to each other over the same UDP socket the apps use, distinguished by the first byte of each datagram.
 
@@ -29,7 +29,7 @@ UUIDs (16 raw bytes) are local indexes: user, device, application, invitation, a
 | Four workers | Share one priority queue (capacity 1024). UDP is high priority, HTTP is normal, scheduled work is low. Under pressure the queue drops the lower priority first. |
 | Writer thread | Writes `node.toml` and `write_log.toml` by temp file, fsync, and rename. Files end up mode `0600` on Unix. |
 
-`pnet --version` and `pnet -V` print `pnet 0.1.0` and exit before creating `~/.pnet`.
+`pnet --version` and `pnet -V` print `pnet 0.2.0` and exit before creating `~/.pnet`.
 
 Data lives in `$HOME/.pnet/data`. The directory is created mode `0700`, and `~/.pnet` is tightened to `0700` when that is the parent. `node.toml` holds the directory. `write_log.toml` holds the writer's append-only change log. Sessions, tunnels, SG poll results, and the admin cookie map are memory only and disappear on restart.
 
