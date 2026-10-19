@@ -60,13 +60,17 @@ Successful mutations answer **302**. The invitation code is not put in the redir
 | `POST /logout` | session | Revoke the session and clear the cookie. |
 | `GET /` | session | Home: owner alias, device alias, grade, links to mounted apps, link to Config. |
 | `GET /dashboard` | session | Redirect to `/`. |
-| `GET /config` | session | Counts and links: devices, invitations, applications, contacts, diagnostics. |
+| `GET /config` | session | Counts and links: devices, invitations, applications, purses, contacts, diagnostics. |
 | `POST /api/app-web/register` | loopback | Register a portal mount. Plain text. |
 | `POST /api/app-web/unregister` | loopback | Remove a portal mount. Plain text. |
 | `GET /apps/<slug>/…` | session | Reverse-proxy to the registered loopback port. |
 | `GET /pending-apps` | session | Apps on this device with `user_approved` false. |
 | `POST /pending-apps/approve` | session | Field `id` (hex). Sign an app certificate and publish it. |
 | `POST /pending-apps/reject` | session | Field `id`. Remove the app and publish the removal. |
+| `GET /purses` | session | Fixed spending purses: name, allotment, available amount, member aliases. |
+| `POST /purses/create` | session | Fields `name`, `amount` (dollars, up to 9 decimal places). Publishes a new purse. |
+| `POST /purses/add-alias` | session | Fields `purse` (hex id), `alias`. Adds that app alias to the purse. |
+| `POST /purses/remove-alias` | session | Fields `purse` (hex id), `alias`. Removes that alias. |
 | `GET /applications` | session | Apps on this device. |
 | `POST /applications/rename` | session | Fields `id`, `alias`. Publishes the alias. Empty alias is a no-op. |
 | `POST /applications/delete` | session | Field `id`. Same removal as reject. |

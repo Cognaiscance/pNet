@@ -27,8 +27,8 @@ use super::super::app_web::{
 };
 use super::super::crypto::{generate_ed25519_keypair, generate_x25519_keypair};
 use super::super::data_models::{
-    AppInvitation, Device, DeviceGrade, Ed25519SecretKey, Node, Uuid, CONNECTION_LIFETIME,
-    WRITE_LOG_RETENTION, generate_uuid,
+    AppInvitation, Device, DeviceGrade, Ed25519SecretKey, Node, Purse, Uuid, CONNECTION_LIFETIME,
+    WRITE_LOG_RETENTION, format_nanodollars, generate_uuid, parse_dollar_to_nanodollars,
 };
 use super::super::wire::*;
 use super::{
@@ -217,6 +217,19 @@ pub fn ui_request(
         }
         ("POST", "/pending-apps/reject")  => {
             let target = redirect_with_error("/pending-apps", reject_app(&body, ctx));
+            respond_redirect(&stream, &target);
+        }
+        ("GET",  "/purses") => respond_html(&stream, 200, &render_purses(ctx, &query), None),
+        ("POST", "/purses/create") => {
+            let target = redirect_with_error("/purses", create_purse(&body, ctx));
+            respond_redirect(&stream, &target);
+        }
+        ("POST", "/purses/add-alias") => {
+            let target = redirect_with_error("/purses", add_purse_alias(&body, ctx));
+            respond_redirect(&stream, &target);
+        }
+        ("POST", "/purses/remove-alias") => {
+            let target = redirect_with_error("/purses", remove_purse_alias(&body, ctx));
             respond_redirect(&stream, &target);
         }
         ("GET",  "/applications")  => respond_html(&stream, 200, &render_applications(ctx, &query), None),
@@ -823,6 +836,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
            <ul class=\"config-links\">\
              <li><a href=\"/pending-apps\">Pending Apps</a> — approve or reject local app registrations</li>\
              <li><a href=\"/applications\">Applications</a> — approved apps on this device</li>\
+             <li><a href=\"/purses\">Purses</a> — spending limits for app aliases</li>\
              <li><a href=\"/contacts\">Contacts</a> — other users you are linked with</li>\
              <li><a href=\"/app-invitations\">App Invitations</a> — requests to accept an app from a contact</li>\
              <li><a href=\"/devices\">Devices</a> — your devices; remove a lost one</li>\
@@ -842,6 +856,11 @@ fn ui_error_banner(query: &str) -> String {
             "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
                 <strong>Could not publish change:</strong> no reachable writer SG. \
                 The local change has been rolled back; retry when an SG is online.\
+            </div>".to_string(),
+        Some(code) if code == UI_ERR_BAD_PURSE =>
+            "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
+                <strong>That purse was not saved.</strong> \
+                Use a name and an app alias, and a dollar amount with at most nine decimal places.\
             </div>".to_string(),
         Some(code) if code == UI_ERR_REMOVE_SELF =>
             "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
@@ -1543,6 +1562,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
 /// reaches the sync v1 layer but cannot be published. The handler has
 /// already rolled the local mutation back, so the UI state matches reality.
 pub(crate) const UI_ERR_PUBLISH_FAILED: &str = "publish_failed";
+pub(crate) const UI_ERR_BAD_PURSE: &str = "bad_purse";
 
 /// The device serving this page cannot remove itself.
 pub(crate) const UI_ERR_REMOVE_SELF: &str = "remove_self";
@@ -2530,6 +2550,7 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
         "Config"
             | "Pending Apps"
             | "Applications"
+            | "Purses"
             | "Contacts"
             | "Contact"
             | "App Invitations"
@@ -2565,6 +2586,7 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
                <a href=\"/config\">Overview</a>\
                <a href=\"/pending-apps\">Pending Apps</a>\
                <a href=\"/applications\">Applications</a>\
+               <a href=\"/purses\">Purses</a>\
                <a href=\"/contacts\">Contacts</a>\
                <a href=\"/app-invitations\">App Invitations</a>\
                <a href=\"/devices\">Devices</a>\
@@ -2686,6 +2708,141 @@ fn setup_layout(body: &str) -> String {
     )
 }
 
+fn clean_purse_name(raw: &str) -> Option<String> {
+    let name = url_decode(raw).trim().to_string();
+    if name.is_empty() || name.len() > 255 || name.chars().any(|c| c.is_control()) {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn purse_by_id(ctx: &WorkerContext, body: &[u8]) -> Result<Purse, &'static str> {
+    let id = form_field(body, "purse")
+        .and_then(|raw| uuid_from_hex(&url_decode(raw)))
+        .ok_or(UI_ERR_BAD_PURSE)?;
+    ctx.node.read().unwrap().owner.purses.iter()
+        .find(|purse| purse.id == id)
+        .cloned()
+        .ok_or(UI_ERR_BAD_PURSE)
+}
+
+fn create_purse(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let name = match form_field(body, "name").and_then(clean_purse_name) {
+        Some(name) => name,
+        None => return Some(UI_ERR_BAD_PURSE),
+    };
+    let amount = match form_field(body, "amount")
+        .and_then(|raw| parse_dollar_to_nanodollars(&url_decode(raw)))
+    {
+        Some(amount) => amount,
+        None => return Some(UI_ERR_BAD_PURSE),
+    };
+    publish_policy(Change::UpsertPurse {
+        purse: Purse {
+            id: generate_uuid(),
+            name,
+            allotment_nanodollars: amount,
+            available_nanodollars: amount,
+            aliases: Vec::new(),
+        },
+    }, ctx)
+}
+
+fn add_purse_alias(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let mut purse = match purse_by_id(ctx, body) {
+        Ok(purse) => purse,
+        Err(err) => return Some(err),
+    };
+    let Some(alias) = form_field(body, "alias").and_then(clean_app_alias) else {
+        return Some(UI_ERR_BAD_PURSE);
+    };
+    if !purse.aliases.iter().any(|existing| existing == &alias) {
+        purse.aliases.push(alias);
+    }
+    publish_policy(Change::UpsertPurse { purse }, ctx)
+}
+
+fn remove_purse_alias(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let mut purse = match purse_by_id(ctx, body) {
+        Ok(purse) => purse,
+        Err(err) => return Some(err),
+    };
+    let Some(alias) = form_field(body, "alias").and_then(clean_app_alias) else {
+        return Some(UI_ERR_BAD_PURSE);
+    };
+    purse.aliases.retain(|existing| existing != &alias);
+    publish_policy(Change::UpsertPurse { purse }, ctx)
+}
+
+fn render_purses(ctx: &WorkerContext, query: &str) -> String {
+    let node = ctx.node.read().unwrap();
+    let mut purses = node.owner.purses.clone();
+    drop(node);
+    purses.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+
+    let banner = ui_error_banner(query);
+    let mut cards = String::new();
+    if purses.is_empty() {
+        cards.push_str("<p class='empty'>No purses yet.</p>");
+    }
+    for purse in &purses {
+        let id = uuid_hex(&purse.id);
+        let mut members = String::new();
+        if purse.aliases.is_empty() {
+            members.push_str("<p class='empty'>No apps on this purse.</p>");
+        } else {
+            members.push_str("<ul>");
+            for alias in &purse.aliases {
+                members.push_str(&format!(
+                    "<li>{alias} \
+                     <form method='post' action='/purses/remove-alias' style='display:inline;margin:0'>\
+                       <input type='hidden' name='purse' value='{id}'>\
+                       <input type='hidden' name='alias' value='{alias_attr}'>\
+                       <button type='submit'>Remove</button>\
+                     </form></li>",
+                    alias = html_escape(alias),
+                    alias_attr = html_escape(alias),
+                ));
+            }
+            members.push_str("</ul>");
+        }
+        cards.push_str(&format!(
+            "<div class='card'>\
+               <h2 style='margin-top:0;font-size:1.1rem'>{name}</h2>\
+               <p>Allotment ${allotment}<br>Available ${available}</p>\
+               {members}\
+               <form method='post' action='/purses/add-alias' style='margin-top:.5rem'>\
+                 <input type='hidden' name='purse' value='{id}'>\
+                 <input name='alias' maxlength='255' placeholder='app alias' required>\
+                 <button type='submit'>Add app</button>\
+               </form>\
+             </div>",
+            name = html_escape(&purse.name),
+            allotment = format_nanodollars(purse.allotment_nanodollars),
+            available = format_nanodollars(purse.available_nanodollars),
+        ));
+    }
+
+    let body = format!(
+        "<h1>Purses</h1>\
+         <p style='color:var(--muted);margin-top:-.5rem'>A purse is a spending limit for the \
+         app aliases you add. It belongs to you, not to one device. Payments are not sent yet, \
+         so the available amount stays equal to the allotment.</p>\
+         {banner}\
+         {cards}\
+         <div class='card'>\
+           <h2 style='margin-top:0;font-size:1rem'>New purse</h2>\
+           <form method='post' action='/purses/create'>\
+             <input name='name' maxlength='255' placeholder='name' required>\
+             <input name='amount' inputmode='decimal' placeholder='0.005' required>\
+             <button type='submit'>Create purse</button>\
+           </form>\
+         </div>"
+    );
+    layout(ctx, "Purses", &body)
+}
+
 #[cfg(test)]
 mod policy_ui_tests {
     use std::net::UdpSocket;
@@ -2700,8 +2857,9 @@ mod policy_ui_tests {
     use crate::wire::uuid_hex;
 
     use super::{
-        accept_app_invitation, grant_contact_app, invite_contact_app, reject_app_invitation,
-        render_app_invitations, render_contact_apps, render_contacts,
+        accept_app_invitation, add_purse_alias, create_purse, grant_contact_app,
+        invite_contact_app, reject_app_invitation, remove_purse_alias, render_app_invitations,
+        render_contact_apps, render_contacts, render_purses,
     };
 
     fn portal() -> (WorkerContext, [u8; 16]) {
@@ -2854,6 +3012,47 @@ mod policy_ui_tests {
         }
         let invites = render_app_invitations(&ctx, "");
         assert!(invites.contains("No app invitations."));
+    }
+
+    #[test]
+    fn purse_page_creates_assigns_and_removes_an_alias() {
+        let (ctx, _) = portal();
+        let page = render_purses(&ctx, "");
+        assert!(page.contains("No purses yet."));
+        assert!(page.contains("href=\"/purses\""));
+
+        assert!(create_purse(&form(&[("name", "media"), ("amount", "0.005")]), &ctx).is_none());
+        let purse_id = {
+            let node = ctx.node.read().unwrap();
+            assert_eq!(node.owner.purses.len(), 1);
+            let purse = &node.owner.purses[0];
+            assert_eq!(purse.name, "media");
+            assert_eq!(purse.allotment_nanodollars, 5_000_000);
+            assert_eq!(purse.available_nanodollars, 5_000_000);
+            assert!(purse.aliases.is_empty());
+            assert!(node.owner.private_version.seq >= 1);
+            uuid_hex(&purse.id)
+        };
+        let page = render_purses(&ctx, "");
+        assert!(page.contains("media"));
+        assert!(page.contains("$0.005"));
+        assert!(page.contains("Allotment"));
+        assert!(page.contains("Available"));
+
+        assert!(create_purse(&form(&[("name", "nope"), ("amount", "0.0000000001")]), &ctx).is_some());
+        assert_eq!(ctx.node.read().unwrap().owner.purses.len(), 1);
+
+        assert!(add_purse_alias(&form(&[("purse", &purse_id), ("alias", "discordium")]), &ctx).is_none());
+        assert_eq!(ctx.node.read().unwrap().owner.purses[0].aliases, vec!["discordium".to_string()]);
+        let page = render_purses(&ctx, "");
+        assert!(page.contains("discordium"));
+        assert!(page.contains("/purses/remove-alias"));
+
+        assert!(remove_purse_alias(&form(&[("purse", &purse_id), ("alias", "discordium")]), &ctx).is_none());
+        assert!(ctx.node.read().unwrap().owner.purses[0].aliases.is_empty());
+
+        let hub = super::render_config_hub(&ctx);
+        assert!(hub.contains("/purses"));
     }
 }
 
