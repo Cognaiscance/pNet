@@ -11,8 +11,8 @@ use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
 use super::super::data_models::{
     AppGrant, AppInvitation, Application, Contact, Device, DeviceGrade, Ed25519KeyPair,
-    Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Node, Owner, Scope, SyncVersion, User,
-    Uuid, WriteLogEntry, X25519PublicKey, WRITE_LOG_RETENTION,
+    Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Node, Owner, Purse, Scope, SyncVersion,
+    User, Uuid, WriteLogEntry, X25519PublicKey, WRITE_LOG_RETENTION,
 };
 use super::super::wire::*;
 use super::{
@@ -438,6 +438,10 @@ pub enum Change {
         contact_uuid: Uuid,
         aliases: Vec<String>,
     },
+    /// Private-scope: insert or replace one purse. The record is the whole
+    /// purse, so a later upsert of the same id replaces the earlier one.
+    /// Own devices learn it from a private pull. Contacts do not.
+    UpsertPurse { purse: Purse },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
@@ -460,6 +464,7 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
         Change::PutOutboundAppInvitation { .. } => &[Scope::Public],
         Change::ForgetOutboundAppInvitation { .. } => &[Scope::Public],
         Change::SetContactTheyAccept { .. }    => &[Scope::Public],
+        Change::UpsertPurse { .. }             => &[Scope::Private],
     }
 }
 
@@ -575,6 +580,10 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
             for alias in aliases.iter().take(u8::MAX as usize) {
                 push_str(&mut buf, alias);
             }
+        }
+        Change::UpsertPurse { purse } => {
+            buf.push(CHANGE_KIND_UPSERT_PURSE);
+            push_purse(&mut buf, purse);
         }
     }
     buf
@@ -693,6 +702,10 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
                 aliases.push(read_str(data, &mut pos)?);
             }
             Some(Change::SetContactTheyAccept { contact_uuid, aliases })
+        }
+        CHANGE_KIND_UPSERT_PURSE => {
+            let purse = read_purse(data, &mut pos)?;
+            Some(Change::UpsertPurse { purse })
         }
         _ => None,
     }
@@ -883,8 +896,30 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
                 true
             }
         }
+        Change::UpsertPurse { purse } => upsert_purse(owner, purse),
     };
     Ok(applied)
+}
+
+fn upsert_purse(owner: &mut Owner, purse: &Purse) -> bool {
+    if purse.allotment_nanodollars < 0 || purse.name.trim().is_empty() || purse.name.len() > 255 {
+        return false;
+    }
+    let purse = purse.normalized();
+    if purse.name.is_empty() {
+        return false;
+    }
+    if let Some(existing) = owner.purses.iter_mut().find(|p| p.id == purse.id) {
+        if existing == &purse {
+            false
+        } else {
+            *existing = purse;
+            true
+        }
+    } else {
+        owner.purses.push(purse);
+        true
+    }
 }
 
 fn clear_contact_policy(owner: &mut Owner, contact_uuid: Uuid) {
@@ -1640,9 +1675,9 @@ fn send_pull_request(scope: Scope, last_seen: SyncVersion, conn_id: u16, ctx: &W
 // (`token`, `host`, `protocol`, app secret) stay local and are merged in
 // by `apply_public_state` rather than overwritten.
 //
-// The Private-scope state blob is intentionally empty in Phase 5 — no
-// Change variant currently bumps Private. Future phases (RemoveApplication,
-// invitation sync) will populate it.
+// The Private-scope state blob is a purse snapshot:
+//   [marker: 0xB7][count: u16][purse…]
+// An empty blob is a legacy writer and does not clear the puller's purses.
 
 pub(crate) fn serialize_public_state(node: &Node) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -1679,6 +1714,93 @@ pub(crate) fn serialize_public_state(node: &Node) -> Vec<u8> {
 
 fn push_u16(buf: &mut Vec<u8>, n: u16) {
     buf.extend_from_slice(&n.to_be_bytes());
+}
+
+fn push_i64(buf: &mut Vec<u8>, n: i64) {
+    buf.extend_from_slice(&n.to_be_bytes());
+}
+
+fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
+    let bytes: [u8; 8] = read_arr(data, pos)?;
+    Some(i64::from_be_bytes(bytes))
+}
+
+/// First byte of a private-scope purse snapshot. An empty blob is a legacy
+/// writer that has no purse record and must not wipe purses on the puller.
+const PURSE_SNAPSHOT_MARKER: u8 = 0xB7;
+
+fn push_purse(buf: &mut Vec<u8>, purse: &Purse) {
+    let purse = purse.normalized();
+    buf.extend_from_slice(&purse.id);
+    push_str(buf, &purse.name);
+    push_i64(buf, purse.allotment_nanodollars);
+    push_i64(buf, purse.available_nanodollars);
+    buf.push(purse.aliases.len().min(u8::MAX as usize) as u8);
+    for alias in purse.aliases.iter().take(u8::MAX as usize) {
+        push_str(buf, alias);
+    }
+}
+
+fn read_purse(data: &[u8], pos: &mut usize) -> Option<Purse> {
+    let id: Uuid = read_arr(data, pos)?;
+    let name = read_str(data, pos)?;
+    let allotment_nanodollars = read_i64(data, pos)?;
+    let available_nanodollars = read_i64(data, pos)?;
+    let count = *data.get(*pos)? as usize;
+    *pos += 1;
+    let mut aliases = Vec::with_capacity(count);
+    for _ in 0..count {
+        aliases.push(read_str(data, pos)?);
+    }
+    Some(Purse { id, name, allotment_nanodollars, available_nanodollars, aliases }.normalized())
+}
+
+#[derive(Debug)]
+enum PrivateSnapshot {
+    /// Writer predates purses. Leave the puller's purse list alone.
+    LegacyEmpty,
+    Purses(Vec<Purse>),
+}
+
+fn serialize_private_state(node: &Node) -> Vec<u8> {
+    let mut purses = node.owner.purses.clone();
+    purses.sort_by_key(|purse| purse.id);
+    let mut buf = Vec::new();
+    buf.push(PURSE_SNAPSHOT_MARKER);
+    push_u16(&mut buf, purses.len().min(u16::MAX as usize) as u16);
+    for purse in purses.iter().take(u16::MAX as usize) {
+        push_purse(&mut buf, purse);
+    }
+    buf
+}
+
+fn read_private_snapshot(data: &[u8]) -> Option<PrivateSnapshot> {
+    if data.is_empty() {
+        return Some(PrivateSnapshot::LegacyEmpty);
+    }
+    if data[0] != PURSE_SNAPSHOT_MARKER {
+        return None;
+    }
+    let mut pos = 1usize;
+    let count = read_u16(data, &mut pos)? as usize;
+    let mut purses = Vec::with_capacity(count);
+    for _ in 0..count {
+        purses.push(read_purse(data, &mut pos)?);
+    }
+    if pos != data.len() {
+        return None;
+    }
+    Some(PrivateSnapshot::Purses(purses))
+}
+
+fn apply_private_state(blob: &[u8], ctx: &WorkerContext) -> bool {
+    let Some(snapshot) = read_private_snapshot(blob) else {
+        return false;
+    };
+    if let PrivateSnapshot::Purses(purses) = snapshot {
+        ctx.node.write().unwrap().owner.purses = purses;
+    }
+    true
 }
 
 fn read_u16(data: &[u8], pos: &mut usize) -> Option<u16> {
@@ -2220,8 +2342,8 @@ pub fn sync_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext)
 /// `FullState` carrying a serialized state blob. Cross-writer comparisons
 /// also send `FullState` so the puller adopts the local writer's state.
 ///
-/// Private-scope pulls return an empty state blob in Phase 5 (no Change
-/// variant currently bumps Private). Future phases will populate it.
+/// Private-scope pulls return the purse snapshot. Contacts are not offered
+/// this scope; cross-user sync stays on the public blob.
 pub fn sync_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
         eprintln!("[sync_pull_request] header too short from {src}");
@@ -2255,7 +2377,7 @@ pub fn sync_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let v = node.owner.version(scope);
         let blob = match scope {
             Scope::Public  => serialize_public_state(&node),
-            Scope::Private => Vec::new(), // empty in phase 5
+            Scope::Private => serialize_private_state(&node),
         };
         (v, blob)
     };
@@ -2341,8 +2463,7 @@ pub fn sync_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             let state_blob = &plaintext[pos..];
             let applied = match scope {
                 Scope::Public  => apply_public_state(state_blob, ctx),
-                // Private state blob is empty in Phase 5 — nothing to apply.
-                Scope::Private => state_blob.is_empty(),
+                Scope::Private => apply_private_state(state_blob, ctx),
             };
             if !applied {
                 eprintln!("[sync_pull_response] failed to apply state for {scope:?} from {src}");
@@ -3534,6 +3655,8 @@ struct MergedState {
     outbound: HashMap<Uuid, (Uuid, String)>,
     outbound_tomb: HashSet<Uuid>,
     they_accept: HashMap<Uuid, (Vec<String>, EntryPriority)>,
+    /// purse id → winning whole-purse snapshot.
+    purses: HashMap<Uuid, (Purse, EntryPriority)>,
 }
 
 /// Per-contact accumulator: the winning snapshot plus the priority of the
@@ -3612,6 +3735,7 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
         outbound: HashMap::new(),
         outbound_tomb: HashSet::new(),
         they_accept: HashMap::new(),
+        purses: HashMap::new(),
     };
 
     // First pass: collect tombstones. Tombstone wins globally for its target,
@@ -3745,6 +3869,19 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
                     next.sort();
                     next.dedup();
                     state.they_accept.insert(contact_uuid, (next, prio));
+                }
+            }
+            Change::UpsertPurse { purse } => {
+                if purse.allotment_nanodollars < 0 || purse.name.trim().is_empty() {
+                    continue;
+                }
+                let purse = purse.normalized();
+                let win = match state.purses.get(&purse.id) {
+                    Some((_, prev)) => prio > *prev,
+                    None => true,
+                };
+                if win {
+                    state.purses.insert(purse.id, (purse, prio));
                 }
             }
         }
@@ -4008,6 +4145,21 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
         }
     }
 
+    let mut purse_ids: Vec<Uuid> = current.purses.keys()
+        .chain(target.purses.keys())
+        .copied()
+        .collect();
+    purse_ids.sort();
+    purse_ids.dedup();
+    for id in purse_ids {
+        match (current.purses.get(&id), target.purses.get(&id)) {
+            (_, Some((want, _))) if current.purses.get(&id).map(|(now, _)| now) != Some(want) => {
+                out.push(Change::UpsertPurse { purse: want.clone() });
+            }
+            _ => {}
+        }
+    }
+
     out
 }
 
@@ -4135,5 +4287,66 @@ mod policy_tests {
             allowed: true,
         };
         assert_eq!(deserialize_change(&serialize_change(&change)).unwrap(), change);
+    }
+}
+
+#[cfg(test)]
+mod purse_sync_tests {
+    use std::time::SystemTime;
+
+    use super::{
+        apply_change_to_owner, deserialize_change, merge_logs, read_private_snapshot,
+        serialize_change, serialize_private_state, Change, PrivateSnapshot,
+    };
+    use crate::data_models::{Node, Purse, Scope, SyncVersion, WriteLogEntry};
+
+    fn media() -> Purse {
+        Purse {
+            id: [0x11; 16],
+            name: "media".into(),
+            allotment_nanodollars: 5_000_000,
+            available_nanodollars: 5_000_000,
+            aliases: vec!["discordium".into()],
+        }
+    }
+
+    #[test]
+    fn purse_change_roundtrips_and_a_repeat_is_a_no_op() {
+        let change = Change::UpsertPurse { purse: media() };
+        assert_eq!(deserialize_change(&serialize_change(&change)).unwrap(), change);
+        let mut node = Node::new();
+        assert!(apply_change_to_owner(&mut node.owner, &change).unwrap());
+        assert!(!apply_change_to_owner(&mut node.owner, &change).unwrap());
+        assert_eq!(node.owner.purses, vec![media()]);
+    }
+
+    #[test]
+    fn private_snapshot_lists_purses_and_an_empty_blob_is_legacy() {
+        let mut node = Node::new();
+        node.owner.purses.push(media());
+        let blob = serialize_private_state(&node);
+        match read_private_snapshot(&blob) {
+            Some(PrivateSnapshot::Purses(purses)) => assert_eq!(purses, vec![media()]),
+            other => panic!("expected purse snapshot, got {other:?}"),
+        }
+        assert!(matches!(read_private_snapshot(&[]), Some(PrivateSnapshot::LegacyEmpty)));
+    }
+
+    #[test]
+    fn merge_copies_a_purse_from_the_other_writer() {
+        let entry = |writer: [u8; 16], purse: Purse| WriteLogEntry {
+            version: SyncVersion { writer_sg_uuid: writer, epoch: 1, seq: 1 },
+            scope: Scope::Private,
+            change_payload: serialize_change(&Change::UpsertPurse { purse }),
+            committed_at: SystemTime::UNIX_EPOCH,
+        };
+        let local = vec![entry([0xA1; 16], Purse { id: [0x01; 16], name: "local".into(), aliases: vec![], ..media() })];
+        let peer = vec![entry([0xB2; 16], media())];
+        let out = merge_logs(&local, &peer, &std::collections::HashMap::new());
+        assert_eq!(out.changes_to_apply.len(), 1);
+        match &out.changes_to_apply[0] {
+            Change::UpsertPurse { purse } => assert_eq!(purse.name, "media"),
+            other => panic!("expected purse upsert, got {other:?}"),
+        }
     }
 }

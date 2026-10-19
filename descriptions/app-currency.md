@@ -1,12 +1,12 @@
 # App currency
 
-**Status:** later project. Do not implement this yet.
+**Status:** later project. Step 1, fixed purses on `/purses`, is in the node. Do not implement the later steps yet.
 
 An approved app will be able to spend a small amount with another pNet node. The node keeps one ledger of those payments. A purse is only a limit on how much an app may add to that ledger. pNet rejects a send that would pass the limit.
 
 Each user issues their own credit. The rank-1 server keeps that user's books, the same way it orders the directory. A payment is an obligation from the paying user to a contact. The two of them may clear the net later. A tab can also stay open.
 
-No opcode, error code, or portal page for this is built yet.
+No payment opcode or error code is reserved yet. `/purses` creates fixed purses and assigns app aliases.
 
 ## Who issues
 
@@ -54,7 +54,7 @@ The available amount is local bookkeeping. A signed obligation still stands if t
 
 The owner creates purses on `/purses`. Creating one sets its name, whether it is fixed or monthly, and its allotment. The owner adds and removes app aliases there. Removing an alias stops that app's new sends from that purse. Incoming lines for the alias stay visible.
 
-The page shows each purse's allotment and available amount. The same purses appear on every device, because the writer holds them.
+The page shows each purse's allotment and available amount. The same purses appear on every device, because the writer holds them and own devices pull that private record. Until a later step records a spend, the available amount equals the allotment.
 
 ## What an app can ask
 
@@ -111,3 +111,17 @@ The dollars, when any are paid, stay outside pNet. Only the owner holds keys for
 - Where the owner reads one contact's ledger lines, sees the net, and records a clearing. `/purses` is the page for the limits.
 - Whether many small receivables can be gathered into one balance with a clearing contact, and which outside payment, if any, pays a cleared net. No chain is chosen.
 - The wire layout, the error an app receives when a send is rejected, and the maximum length of a note. No opcode or error code is reserved here.
+
+## Implementation plan
+
+The steps below are the build order. A step that is not marked done stays unbuilt.
+
+1. **Fixed purses. Done.** The writer stores a named purse, its nanodollar allotment, its available amount, and its member app aliases. `/purses` lets the owner create one, add or remove aliases, and see both amounts. Own devices receive the purses through a private-scope pull. Contacts do not. No payment exists yet, so the available amount stays equal to the allotment.
+2. **App reads.** An approved app can ask the local node for the purses it belongs to and the available amount of each. Another app's purses are absent. Incoming and sent lists exist and are empty.
+3. **Reserve.** A send names the purse, the amount, the contact, the destination alias, the note, and the payment id. The node rejects an app that is not a member or an amount over what is available, and the available amount stays put. A fitting amount is reserved once for that payment id. Expiry releases the reserve. The contact is not involved yet.
+4. **Offer, accept, confirm.** Two nodes complete the signed record. The reserve becomes a ledger line on both sides only after the payer confirms it is stored. This step needs the contact's starting receive ceiling before it is coded.
+5. **Repair.** On connect, the two contacts exchange payment ids and copy any missing signed record. Invalid signatures are dropped. Two different signed bodies for one id are both kept. A debt that returns after the purse was spent again shows as an overrun.
+6. **App payment lists.** The incoming list and the sent list return real lines, including the note.
+7. **Clearing record.** Both owners sign a record that names payment ids, and those lines drop out of the net. No bank, chain, or clearing contact is attached.
+
+Monthly reset, changing an allotment after creation, the receive-ceiling control, the contact ledger page, a clearing contact, and any outside payment stay out of these steps until those choices are settled.

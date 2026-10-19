@@ -679,6 +679,9 @@ pub struct Owner {
     /// Invitations we have sent and still publish to that contact.
     #[serde(default)]
     pub outbound_app_invitations: Vec<AppInvitation>,
+    /// Fixed spending limits for this user. Private scope: own devices only.
+    #[serde(default)]
+    pub purses: Vec<Purse>,
 
     /// Latest version of the user's **private** state held by this node.
     /// On the writer SG this is authoritative; on other nodes it's the
@@ -772,6 +775,91 @@ pub struct Contact {
     /// CrossUserPullRequest so the reply is `NoUpdates` when caught up.
     #[serde(default)]
     pub last_seen_public_version: SyncVersion,
+}
+
+/// One nanodollar is $0.000000001. Purse amounts are counts of these.
+pub const NANODOLLARS_PER_DOLLAR: i64 = 1_000_000_000;
+
+/// Parse a non-negative dollar amount into nanodollars.
+/// At most nine digits are allowed after the decimal point. `0.005` is
+/// `5_000_000`. A leading `+`, a minus sign, or a tenth decimal place is rejected.
+pub fn parse_dollar_to_nanodollars(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    if s.is_empty() || s.starts_with('+') || s.starts_with('-') {
+        return None;
+    }
+    let (whole, frac) = match s.split_once('.') {
+        Some((whole, frac)) => (whole, frac),
+        None => (s, ""),
+    };
+    if frac.len() > 9 || (whole.is_empty() && frac.is_empty()) {
+        return None;
+    }
+    if !whole.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let whole_n: i64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let whole_nanos = whole_n.checked_mul(NANODOLLARS_PER_DOLLAR)?;
+    let mut padded = frac.to_string();
+    while padded.len() < 9 {
+        padded.push('0');
+    }
+    let frac_n: i64 = padded.parse().ok()?;
+    whole_nanos.checked_add(frac_n)
+}
+
+/// Format a nanodollar count as a dollar amount. Trailing zeros after the
+/// decimal point are omitted. `5_000_000` is `0.005`.
+pub fn format_nanodollars(amount: i64) -> String {
+    let negative = amount < 0;
+    let magnitude = amount.unsigned_abs();
+    let whole = magnitude / (NANODOLLARS_PER_DOLLAR as u64);
+    let frac = magnitude % (NANODOLLARS_PER_DOLLAR as u64);
+    let mut frac_s = format!("{frac:09}");
+    while frac_s.ends_with('0') {
+        frac_s.pop();
+    }
+    let body = if frac_s.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{frac_s}")
+    };
+    if negative {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// A user-owned spending limit. Membership is by app alias, so every device
+/// that runs the alias shares it. `available_nanodollars` equals
+/// `allotment_nanodollars` until a later step records a spend.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct Purse {
+    #[serde(with = "serde_bytes_16")]
+    pub id: Uuid,
+    pub name: String,
+    pub allotment_nanodollars: i64,
+    pub available_nanodollars: i64,
+    pub aliases: Vec<String>,
+}
+
+impl Purse {
+    /// Sort and deduplicate aliases. Drop an alias that is empty, longer
+    /// than 255 bytes, or contains a control character.
+    pub fn normalized(&self) -> Self {
+        let mut aliases: Vec<String> = self.aliases.iter()
+            .map(|alias| alias.trim().to_string())
+            .filter(|alias| {
+                !alias.is_empty()
+                    && alias.len() <= 255
+                    && !alias.chars().any(|c| c.is_control())
+            })
+            .collect();
+        aliases.sort();
+        aliases.dedup();
+        Purse { aliases, ..self.clone() }
+    }
 }
 
 /// We allow `contact_uuid` to send to our apps whose alias is `app_alias`.
@@ -968,6 +1056,7 @@ impl Node {
                 app_invitations:            Vec::new(),
                 seen_app_invitation_ids:    Vec::new(),
                 outbound_app_invitations:   Vec::new(),
+                purses:                     Vec::new(),
                 private_version:            SyncVersion::zero(),
                 public_version:             SyncVersion::zero(),
                 write_log:                  Vec::new(),
@@ -996,6 +1085,20 @@ mod tests {
 
     fn writer_a() -> Uuid { [0xAA; 16] }
     fn writer_b() -> Uuid { [0xBB; 16] }
+
+    #[test]
+    fn dollar_amounts_use_nanodollars() {
+        assert_eq!(parse_dollar_to_nanodollars("0.005"), Some(5_000_000));
+        assert_eq!(parse_dollar_to_nanodollars(".005"), Some(5_000_000));
+        assert_eq!(parse_dollar_to_nanodollars("1"), Some(1_000_000_000));
+        assert_eq!(parse_dollar_to_nanodollars("0.000000001"), Some(1));
+        assert_eq!(format_nanodollars(5_000_000), "0.005");
+        assert_eq!(format_nanodollars(1_000_000_000), "1");
+        assert_eq!(format_nanodollars(-1), "-0.000000001");
+        assert_eq!(parse_dollar_to_nanodollars("-1"), None);
+        assert_eq!(parse_dollar_to_nanodollars("0.0000000001"), None);
+        assert_eq!(parse_dollar_to_nanodollars(""), None);
+    }
 
     #[test]
     fn try_fill_random_fills_buffer() {
