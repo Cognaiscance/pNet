@@ -2,75 +2,112 @@
 
 **Status:** later project. Do not implement this yet.
 
-An approved app will be able to spend a small amount with another pNet node. The owner assigns how much that app may spend. pNet rejects a transaction that would go past what the app has left.
+An approved app will be able to spend a small amount with another pNet node. The node keeps one ledger of those payments. A purse is only a limit on how much an app may add to that ledger. pNet rejects a send that would pass the limit.
 
-The spend is a tab, settled later. Each user issues their own credit. The rank-1 server keeps that user's books, the same way it orders the directory. A payment creates an obligation from the paying user to a contact. Real money, or a digital currency that already has a price, moves only when those two users clear the net.
+Each user issues their own credit. The rank-1 server keeps that user's books, the same way it orders the directory. A payment is an obligation from the paying user to a contact. The two of them may clear the net later. A tab can also stay open.
+
+No opcode, error code, or portal page for this is built yet.
 
 ## Who issues
 
 The issuer is the user. The user key signs each obligation, so the claim still means something after a device is replaced. Removing a device drops that device's certificate. It does not erase obligations the user key already signed.
 
-Each device does not issue a currency of its own. Sanosuke and n64 are one user. A contact trusts that user, not each device separately. A coin minted by one device would be a different instrument from a coin minted by another, and the contact would have to accept each device on its own.
+Each device does not issue a currency of its own. Sanosuke and n64 are one user. A contact trusts that user, not each device separately.
 
-A device that cannot reach a server does not create new debt while it is partitioned. The writer server orders spends. Two devices of the same user cannot both spend the same remainder.
+A device that cannot reach a server does not create new debt while it is partitioned. The writer server orders spends. Two devices of the same user cannot both spend the same available amount.
 
-## What is transferred
+## The unit
 
-One unit of account is shared, so the same number is the same quantity on both sides. The amount 0.005 has to be exact. Store it as an integer count of a smallest unit. The name of the unit, and how many places that atom covers, are not chosen yet.
+The unit is the US dollar. Every amount is a signed 64-bit count of nanodollars. One nanodollar is $0.000000001. The amount 0.005 is exactly 5,000,000. One cent is exactly 10,000,000. Nine decimal places is the smallest fraction this word holds, and the largest magnitude is about $9.22 billion. A payment amount is zero or greater.
 
-The claim stays personal. An amount of one user's credit is that user's obligation, measured in the shared unit. It is not the same instrument as the other user's credit.
+The claim stays personal. An amount of one user's credit is that user's obligation in dollars. It is not the same instrument as the other user's credit, and it is not a coin a stranger can spend.
 
-What the payee holds is a signed statement: who owes it, who is paid, which app, the amount, and an id for that attempt. The payee can sum those statements later. The payer does not hand over a coin that a stranger can spend.
+Bitcoin can appear as a price on a clearing entry. It is not the unit a purse is counted in.
 
-Until anyone settles, the purse is still a hard quota on what an app may do to another node. Settlement is what turns the quota into a bill.
+## The ledger
 
-## Two ways to fund an app
+Each user has one ledger, stored by the rank-1 server. That user's devices read the writer's copy. There is no master purse beside the ledger.
 
-The owner funds one app in one of these ways. The amount is a limit on how much obligation that app may create in the owner's name.
+A final line is a confirmed signed record. It names the amount, the payer, the payee, the paying app, the destination app alias, the note, and the payment id. Both contacts store that record. The payee can sum the lines later.
 
-**Monthly budget.** The owner sets how much the app may spend in a month. Each accepted transaction reduces what is left of that month's amount. A transaction larger than the remainder is rejected. A new month starts the app again at the assigned amount. Which clock marks the month is not chosen yet.
+Incoming lines credit the user. They do not raise a purse. The destination app does not hold a balance it can spend.
 
-**Fixed purse.** The owner puts a fixed amount on the app, and spending reduces it until nothing is left. For example, the owner assigns 0.005 to discordium. A transaction larger than the remainder is rejected. When the remainder is gone, further transactions are rejected. The purse does not refill on its own.
+The note is the sending app's own reference, such as a transaction number for a video or another purchase. The node carries the note and does not interpret it. The payment id is the node's key for charging a purse once. The same id is the same payment. The note and the payment id are two fields.
 
-Discordium is only an example. The same assignment works for any approved app. An app spends only the amount assigned to it. One app's amount is not available to another app on the node. An app with no assignment cannot spend.
+Contacts do not learn purse names, allotments, or available amounts. Another app does not see this app's notes.
 
-The owner assigns the amount. The app does not set or raise its own budget. An app that is compromised can use up its own purse. It does not receive the keys that pay a contact in actual money.
+## Purses
 
-## What the node enforces
+A purse belongs to the user. Every device sees the same purses. Membership is by app alias, so `discordium-client` on the phone and on the laptop share it. `discordium-client` and `discordium-server` are different aliases, so each is assigned on its own. Any other alias is its own member.
 
-Today the node carries app bytes without reading them. A spend is a separate action the node does read, including its amount, because the node is what accepts or rejects it. Chat, files, and other app bytes stay unread.
+The owner sets the allotment. Two kinds exist.
 
-The app does not keep the balance. A rejected transaction leaves the remainder unchanged. A transaction equal to the remainder is accepted and leaves zero. A spend is charged once. A retry of the same id does not reduce the remainder again.
+**Monthly budget.** The purse allows a set amount in a month. Each confirmed send reduces what is left of that month's amount. A new month starts the purse again at the allotted amount. Which clock marks the month is not chosen yet.
 
-Contacts do not learn an app's budget or what it has left.
+**Fixed purse.** The owner puts a fixed amount on the purse, and sending reduces it until nothing is left. For example, a purse of 0.005 with discordium as a member. When the available amount is gone, further sends are rejected. The purse does not refill on its own.
+
+One purse can have several member apps. One app alias can belong to several purses. Every member may spend the whole available amount, so two apps on one purse share it. An app that belongs to no purse cannot send. An app does not set or raise an allotment. An app that is compromised can use up the purses it belongs to. It does not receive the keys that pay a contact in actual money.
+
+The available amount is local bookkeeping. A signed obligation still stands if that bookkeeping is wrong. The purse then shows an overrun.
+
+## The /purses page
+
+The owner creates purses on `/purses`. Creating one sets its name, whether it is fixed or monthly, and its allotment. The owner adds and removes app aliases there. Removing an alias stops that app's new sends from that purse. Incoming lines for the alias stay visible.
+
+The page shows each purse's allotment and available amount. The same purses appear on every device, because the writer holds them.
+
+## What an app can ask
+
+An assigned app can ask the local node for three things.
+
+- The purses it belongs to, with the kind, the allotment, and the available amount of each.
+- Ledger lines sent to this user for this app alias. Each line has the payer, the paying app, the amount, the note, and the payment id. Every device running that alias can read them.
+- Ledger lines this app itself sent.
+
+A send names the contact, the amount, the destination app alias, the note, and the payment id. An app that belongs to one purse draws on that purse. An app that belongs to several names which purse covers the send. That name chooses the limit. The payment goes to the user.
 
 ## One payment
 
-1. The app asks its local node to pay a contact a specific amount, with an id for that attempt.
-2. The node checks that this app is approved and that the amount is within what the purse or the month still allows. If it is not, the node rejects it and the remainder stays as it is.
-3. If it fits, the node reserves that amount and sends the contact a statement signed by the paying user's key.
-4. The contact's node accepts only while the new claim is under a ceiling that contact set for the payer. Past the ceiling, it refuses.
-5. On acceptance, the reserve becomes a spent charge and the contact records the receivable. On refusal or timeout, the payer's node releases the reserve.
-6. The same id returns the same outcome.
+1. The app asks its local node to pay a contact.
+2. The node checks that this app is approved, that it belongs to the named purse, and that the amount is within what that purse still allows. If it is not, the node rejects the send and the available amount stays as it is.
+3. If it fits, the writer reserves that amount and signs an offer. The offer includes the amount, the contact, both app aliases, the note, the payment id, and an expiry.
+4. The contact's node accepts only while the new claim is under a ceiling that contact set for the payer. Past the ceiling, it refuses. On accept, the contact signs the offer.
+5. The payer signs again to confirm that the accepted record is stored. That confirmation is the ledger line on both sides. The reserve becomes a charge. The contact counts the payment once it has the confirmation.
+6. A proposal with no confirmation expires. The payer releases the reserve, and neither ledger keeps the proposal as a debt.
+7. On refusal, the payer releases the reserve.
+8. The same payment id returns the same outcome. A retry does not reduce the available amount again.
+
+A send equal to the available amount is accepted and leaves zero.
 
 The receive ceiling is what keeps self-issued credit from arriving unwanted. The sanction for someone who will not settle is local: set that person's ceiling to zero and stop accepting their credit.
 
+Today the node carries app bytes without reading them. A spend is a separate action the node does read, including its amount and its note, because the node is what accepts or rejects it. Chat, files, and other app bytes stay unread.
+
+## When the books differ
+
+A ledger line counts only as a copy of a record both user keys have signed, including the payer's confirmation that it is stored. The two contacts repair a difference by copying those records. They do not edit amounts to force the books to match.
+
+When the contacts connect, each sends the list of payment ids it holds for the pair. A missing id is answered with the signed record. A record whose signatures verify is stored and becomes a line. A record that does not verify is discarded. The same id with the same signed bytes is the same payment. If one id arrives as two different signed bodies, both are kept and shown to the owners. The node does not pick a winner.
+
+A cleared tab is another record signed by both user keys. It names the payment ids it settles. A node applies it after those payments are present. The same compare-and-copy step fills in a missing clearing record.
+
+A contact cannot invent a debt, because that contact cannot sign with the other user key. A lost confirmation is copied across on a later connection. If the payer has already spent the purse again, the debt still stands and the purse shows an overrun.
+
 ## Reconciliation
 
-Reconciliation is a different event from an app payment. The two owners take the net of the signed claims and pay that difference once. Both nodes then record a clearing entry signed by both user keys, and those claims no longer count.
+Clearing is a different event from an app payment. The two owners can pay the net and then both sign a clearing record. The named lines no longer count toward the net. Incoming payments and a clearing do not raise a purse.
 
-Paying the net in dollars keeps the dollars outside pNet. One owner transfers the money, then both record that the tab was cleared. Paying the net in a priced digital currency can be checked by the nodes. Only the owner holds the keys for that currency. The app purse stays an allowance to incur obligations.
+Some pairs can leave the tab open. The lines stay on the ledger, and the purse limit has still done its job.
 
 Clearing between two people is the first version. Passing one person's obligation along a chain of contacts, or netting a triangle of debts, waits until bilateral tabs are actually being settled.
 
-A public chain or a stablecoin is the rail to use when the receiver must walk away holding something a stranger will take. For the amounts this note is about, that rail clears a month's net. It does not price every app message.
+The dollars, when any are paid, stay outside pNet. Only the owner holds keys for a priced digital currency, if one is ever used to pay a net. An app purse does not hold those keys.
 
 ## Still open
 
-- The name of the unit, and which atom makes 0.005 exact.
-- Whether a purse or a monthly budget belongs to this install of the app, or to that app's alias across this user's devices.
-- Which app on the contact is paid, when the payment is for an app rather than for the contact's user.
-- How the owner adds to a purse, lowers a budget, switches an app between the two funding ways, or sets a receive ceiling, and where those controls sit beside the Applications page.
-- The wire layout and the error an app receives when a spend is rejected. No opcode or error code is reserved here.
-- Which clock marks the month.
-- Which priced digital currency, if any, is used when a tab is cleared. A dollar payment outside pNet is enough to start.
+- Which clock marks the month, and what happens to a reserve still in flight when the month changes.
+- How the owner raises an allotment, lowers it, or switches a purse between fixed and monthly, and what that does to the unspent available amount. Signed debts stay either way.
+- The starting receive ceiling, and where the owner sets that ceiling.
+- Where the owner reads one contact's ledger lines, sees the net, and records a clearing. `/purses` is the page for the limits.
+- Whether many small receivables can be gathered into one balance with a clearing contact, and which outside payment, if any, pays a cleared net. No chain is chosen.
+- The wire layout, the error an app receives when a send is rejected, and the maximum length of a note. No opcode or error code is reserved here.
