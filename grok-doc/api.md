@@ -3,7 +3,7 @@
 Two interfaces face programs and people on this machine.
 
 - The **owner HTTP site** is how a person sets up the node, signs in, and edits the directory. Most responses are HTML. Two routes are plain text and exist for a local app to register a web mount.
-- The **UDP app API** is how a co-located application registers and sends payloads. It shares the fabric socket (default `127.0.0.1:7777`). Ops `0x00`–`0x03` are accepted from loopback only, unless `PNET_APP_API_REMOTE` is `1`, `true`, or `yes`.
+- The **UDP app API** is how a co-located application registers, reads its purses, and sends payloads. It shares the fabric socket (default `127.0.0.1:7777`). Request ops `0x00`–`0x03` and `0x05`–`0x07` are accepted from loopback only, unless `PNET_APP_API_REMOTE` is `1`, `true`, or `yes`.
 
 Peer-to-peer datagrams are in [wire.md](wire.md). How the process is put together is in [README.md](README.md).
 
@@ -127,7 +127,7 @@ The table is memory only. It is empty after restart. The home page lists mounts.
 
 Send a datagram to the node's UDP port. The first byte is the operation. The rest is the body below. Replies come back to the source address.
 
-Ops `0x00`–`0x03` from a non-loopback address are dropped with a log line when remote access is off. Op `0x04` is not a request. The node sends it to the app.
+Request ops `0x00`–`0x03` and `0x05`–`0x07` from a non-loopback address are dropped with a log line when remote access is off. Op `0x04` is not a request. The node sends it to the app.
 
 | Byte | Name | Who sends it |
 | --- | --- | --- |
@@ -136,6 +136,9 @@ Ops `0x00`–`0x03` from a non-loopback address are dropped with a log line when
 | `0x02` | get data | app → node |
 | `0x03` | send packet | app → node |
 | `0x04` | push | node → app |
+| `0x05` | list purses | app → node |
+| `0x06` | list incoming | app → node |
+| `0x07` | list sent | app → node |
 
 Success replies start with `0x00`. Errors are `0x01` followed by one code. Send (`0x03`) sends nothing on success.
 
@@ -144,7 +147,7 @@ Success replies start with `0x00`. Errors are `0x01` followed by one code. Send 
 | `0x01` | bad packet | Truncated, bad UTF-8, empty string, port 0, or a source that is not IPv4. |
 | `0x02` | token unknown | Token is not on this device. |
 | `0x03` | no writer | Auto-approve, or an alias change, could not be published. |
-| `0x04` | not approved | Token is valid and `user_approved` is false. Used by send. |
+| `0x04` | not approved | Token is valid and `user_approved` is false. Used by send and by the purse reads. |
 | `0x05` | no route | No session to the destination and no SG to relay through. |
 | `0x06` | payload too large | More than 4096 bytes of app payload. |
 | `0x07` | rate limited | Register or send bucket is empty. |
@@ -232,3 +235,30 @@ The node sends this to `host` of an approved local app:
 ```
 
 Unapproved apps are not pushed to. The sender app id is the fabric app id, not a token. The node does not wait for the app to answer.
+
+### List purses (`0x05`)
+
+Body: `token (16)`, exactly 16 bytes. A shorter or longer body is `bad packet`.
+
+The token must belong to an approved app on this device. The reply lists only purses whose member aliases include that app's alias. Order is name, then id. A purse that belongs to another alias is absent, including its name and amounts. An app with no purse gets a count of zero, which is success.
+
+```text
+0x00
+|| count (u16)
+||   repeated purse
+||     id (16) || name || kind (u8, 0 = fixed) || allotment (i64) || available (i64)
+```
+
+Amounts are nanodollars, big-endian. Kind is 0. Monthly purses are not stored. The count is a `u16` so a later payment list can pass 255 lines without a new header. This read does not change the available amount.
+
+Errors: `bad packet`, `token unknown`, `not approved`.
+
+### List incoming (`0x06`)
+
+Body: `token (16)`, exactly 16 bytes. Same approval check as list purses.
+
+Success is `0x00 || count (u16)`. The count is 0 until a payment is stored. The lines, when they exist, are payments sent to this user for this app alias.
+
+### List sent (`0x07`)
+
+Same request, same approval check, and the same empty success as list incoming. The lines, when they exist, are payments this app sent.

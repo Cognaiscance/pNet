@@ -1,6 +1,6 @@
 //! Local app UDP API exposure policy and rate limits.
 //!
-//! App control ops (register / update / get-data / send) are intended for
+//! App control ops (register / update / get-data / send / purse reads) are intended for
 //! co-located apps on the same host. Default: only accept them from loopback.
 //! Opt in to remote sources with `PNET_APP_API_REMOTE=1` (required when the
 //! app runs in another container). See `descriptions/communication methods.md`.
@@ -40,7 +40,7 @@ pub fn parse_app_api_remote(raw: Option<&str>) -> bool {
     .unwrap_or(false)
 }
 
-/// Whether non-loopback sources may use local app ops (0x00–0x03).
+/// Whether non-loopback sources may use local app requests (0x00–0x03 and 0x05–0x07).
 pub fn app_api_remote_enabled() -> bool {
     parse_app_api_remote(std::env::var("PNET_APP_API_REMOTE").ok().as_deref())
 }

@@ -6,9 +6,9 @@ chooses its own listen port and registers it). Peer-to-peer fabric ops
 
 Byte 0 of every **app → node** request is the operation type below.
 
-## Local app ops (0–4)
+## Local app ops (0–7)
 
-### Reply framing (control ops 0–2)
+### Reply framing (control ops 0–2 and 5–7)
 
 | Status | Layout |
 |--------|--------|
@@ -31,15 +31,15 @@ Defined in `src/lib/wire.rs` (stable for apps):
 
 Handlers live in `src/lib/handlers/app_edge.rs`.
 
-### Exposure policy (who may call ops 0–3)
+### Exposure policy (who may call ops 0–3 and 5–7)
 
 The data plane UDP socket (`0.0.0.0:7777`) also carries **peer fabric**
 ops. Local app control/data is a different trust model: the token is only
 as strong as “anyone who can reach this UDP port.”
 
-**Default:** ops `0x00`–`0x03` are accepted **only from loopback**
-(`127.0.0.1` / `::1`). Non-loopback sources are dropped at the UDP listener
-(no error reply).
+**Default:** ops `0x00`–`0x03` and `0x05`–`0x07` are accepted **only from
+loopback** (`127.0.0.1` / `::1`). Non-loopback sources are dropped at the
+UDP listener (no error reply). Op `0x04` is a push the node sends.
 
 **Opt-in remote apps** (Docker sidecar on another container IP, multi-user
 host, etc.):
@@ -49,9 +49,9 @@ PNET_APP_API_REMOTE=1
 ```
 
 **Risk when remote is enabled:** any host that can send UDP to the node can
-attempt `register` / `get_data` / `send` for any token it learns. Prefer
-loopback when the app shares the host. Stage/live compose sets remote for
-sidecar probes.
+attempt `register` / `get_data` / `send` / the purse reads for any token
+it learns. Prefer loopback when the app shares the host. Stage/live
+compose sets remote for sidecar probes.
 
 **Rate limits** (in-process token buckets, see `src/lib/app_api.rs`):
 
@@ -119,6 +119,28 @@ packet when it decrypts the delivery.
   `local_approved_app_host` gates **all** inbound paths: local relay delivery,
   `AppPacket` (0x41), and tunnel delivery (0x54). Unapproved apps are silent
   drops.
+
+### 5 — list purses
+
+- Request: `[token:16]` exactly. Extra bytes are `ERR_BAD_PACKET`.
+- The token must belong to an approved app on this device.
+- Success: `[0x00][count:u16 be]` then, ordered by name then id, each purse
+  the caller's alias belongs to:
+  `[id:16][name][kind:u8][allotment:i64 be][available:i64 be]`
+- `kind` is 0 (fixed). Amounts are nanodollars. Another alias's purses are
+  absent. Count 0 is success. The read does not change a purse.
+- Errors: `ERR_BAD_PACKET`, `ERR_TOKEN_UNKNOWN`, `ERR_NOT_APPROVED`
+
+### 6 — list incoming payments
+
+- Request: `[token:16]` exactly. Same approval check as op 5.
+- Success: `[0x00][count:u16 be]` with count 0 until a payment is stored.
+- These lines will be payments sent to this user for this app alias.
+
+### 7 — list sent payments
+
+- Same request, same approval check, and the same empty success as op 6.
+- These lines will be payments this app sent.
 
 ### get-data secrecy (op 2)
 

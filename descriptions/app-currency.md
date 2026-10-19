@@ -1,12 +1,12 @@
 # App currency
 
-**Status:** later project. Step 1, fixed purses on `/purses`, is in the node. Do not implement the later steps yet.
+**Status:** step 2, app reads, is in the node. Steps 3 through 7 stay unbuilt.
 
 An approved app will be able to spend a small amount with another pNet node. The node keeps one ledger of those payments. A purse is only a limit on how much an app may add to that ledger. pNet rejects a send that would pass the limit.
 
 Each user issues their own credit. The rank-1 server keeps that user's books, the same way it orders the directory. A payment is an obligation from the paying user to a contact. The two of them may clear the net later. A tab can also stay open.
 
-No payment opcode or error code is reserved yet. `/purses` creates fixed purses and assigns app aliases.
+Read opcodes `0x05`, `0x06`, and `0x07` are assigned. No payment opcode or new error code is reserved. `/purses` creates fixed purses and assigns app aliases.
 
 ## Who issues
 
@@ -60,9 +60,11 @@ The page shows each purse's allotment and available amount. The same purses appe
 
 An assigned app can ask the local node for three things.
 
-- The purses it belongs to, with the kind, the allotment, and the available amount of each.
+- The purses it belongs to, with the kind, the allotment, and the available amount of each. The reply also names each purse so the app can tell them apart.
 - Ledger lines sent to this user for this app alias. Each line has the payer, the paying app, the amount, the note, and the payment id. Every device running that alias can read them.
 - Ledger lines this app itself sent.
+
+Those questions are local ops `0x05`, `0x06`, and `0x07`. The kind byte is fixed until a monthly purse exists. The two payment lists stay empty until a later step stores a payment.
 
 A send names the contact, the amount, the destination app alias, the note, and the payment id. An app that belongs to one purse draws on that purse. An app that belongs to several names which purse covers the send. That name chooses the limit. The payment goes to the user.
 
@@ -110,14 +112,14 @@ The dollars, when any are paid, stay outside pNet. Only the owner holds keys for
 - The starting receive ceiling, and where the owner sets that ceiling.
 - Where the owner reads one contact's ledger lines, sees the net, and records a clearing. `/purses` is the page for the limits.
 - Whether many small receivables can be gathered into one balance with a clearing contact, and which outside payment, if any, pays a cleared net. No chain is chosen.
-- The wire layout, the error an app receives when a send is rejected, and the maximum length of a note. No opcode or error code is reserved here.
+- The error an app receives when a send is rejected, and the maximum length of a note. The read opcodes are assigned. No send opcode is reserved.
 
 ## Implementation plan
 
 The steps below are the build order. A step that is not marked done stays unbuilt.
 
 1. **Fixed purses. Done.** The writer stores a named purse, its nanodollar allotment, its available amount, and its member app aliases. `/purses` lets the owner create one, add or remove aliases, and see both amounts. Own devices receive the purses through a private-scope pull. Contacts do not. No payment exists yet, so the available amount stays equal to the allotment.
-2. **App reads.** An approved app can ask the local node for the purses it belongs to and the available amount of each. Another app's purses are absent. Incoming and sent lists exist and are empty.
+2. **App reads. Done.** An approved app asks the local node with three loopback ops. `0x05` returns the purses whose member aliases include the caller's alias, ordered by name then id. Each entry has the id, the name, the kind (fixed), the allotment, and the available amount. Another app's purses are absent. `0x06` (incoming) and `0x07` (sent) succeed with an empty list. An unknown token and an unapproved app are rejected. No payment is stored.
 3. **Reserve.** A send names the purse, the amount, the contact, the destination alias, the note, and the payment id. The node rejects an app that is not a member or an amount over what is available, and the available amount stays put. A fitting amount is reserved once for that payment id. Expiry releases the reserve. The contact is not involved yet.
 4. **Offer, accept, confirm.** Two nodes complete the signed record. The reserve becomes a ledger line on both sides only after the payer confirms it is stored. This step needs the contact's starting receive ceiling before it is coded.
 5. **Repair.** On connect, the two contacts exchange payment ids and copy any missing signed record. Invalid signatures are dropped. Two different signed bodies for one id are both kept. A debt that returns after the purse was spent again shows as an overrun.

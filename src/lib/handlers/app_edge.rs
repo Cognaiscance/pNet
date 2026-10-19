@@ -1,4 +1,4 @@
-//! Local app edge: register / update / get-data / send, and inbound app packet push.
+//! Local app edge: register / update / get-data / purse reads / send, and inbound app packet push.
 //!
 //! These are the UDP control/data APIs apps use against a running node. Peer
 //! fabric routing helpers and sync publish stay in the parent `handlers` module.
@@ -439,6 +439,110 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     drop(node);
     send(ctx, src, &reply);
+}
+
+/// Body of a purse read: exactly the 16-byte token.
+///
+/// On success, the approved local app's alias. On failure the error reply
+/// has already been sent. Membership is that alias, not the device.
+fn require_approved_alias(src: SocketAddr, buf: &[u8], ctx: &WorkerContext) -> Option<String> {
+    if buf.len() != 16 {
+        send_error(ctx, src, ERR_BAD_PACKET);
+        return None;
+    }
+    let Some(token) = slice_arr::<16>(buf, 0) else {
+        send_error(ctx, src, ERR_BAD_PACKET);
+        return None;
+    };
+
+    let found = {
+        let node = ctx.node.read().unwrap();
+        let device_uuid = node.device_uuid;
+        node.owner
+            .user
+            .devices
+            .iter()
+            .find(|d| d.uuid == device_uuid)
+            .and_then(|d| d.applications.iter().find(|a| a.token == token))
+            .map(|a| (a.user_approved, a.alias.clone()))
+    };
+    match found {
+        None => {
+            send_error(ctx, src, ERR_TOKEN_UNKNOWN);
+            None
+        }
+        Some((false, _)) => {
+            send_error(ctx, src, ERR_NOT_APPROVED);
+            None
+        }
+        Some((true, alias)) => Some(alias),
+    }
+}
+
+/// Op 5 — purses this approved app's alias belongs to.
+///
+/// Request body (after op byte): `[token: 16]` exactly.
+///
+/// Success:
+///   `[OK]`
+///   `[count: u16 BE]`
+///   each purse, ordered by name then id:
+///     `[id: 16][name: u8+bytes][kind: u8][allotment: i64 BE][available: i64 BE]`
+///
+/// `kind` is [`PURSE_KIND_FIXED`] (0). Amounts are nanodollars. A purse whose
+/// aliases do not include the caller is absent. Count 0 is success. This read
+/// does not change a purse and does not publish.
+///
+/// Errors: `ERR_BAD_PACKET`, `ERR_TOKEN_UNKNOWN`, `ERR_NOT_APPROVED`.
+pub fn app_list_purses(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let Some(alias) = require_approved_alias(src, &buf, ctx) else {
+        return;
+    };
+
+    let mut purses: Vec<_> = {
+        let node = ctx.node.read().unwrap();
+        node.owner
+            .purses
+            .iter()
+            .filter(|purse| purse.aliases.iter().any(|member| member == &alias))
+            .cloned()
+            .collect()
+    };
+    purses.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+
+    let mut reply = vec![OK];
+    let count = u16::try_from(purses.len()).unwrap_or(u16::MAX);
+    reply.extend_from_slice(&count.to_be_bytes());
+    for purse in purses.into_iter().take(count as usize) {
+        reply.extend_from_slice(&purse.id);
+        push_str(&mut reply, &purse.name);
+        reply.push(PURSE_KIND_FIXED);
+        reply.extend_from_slice(&purse.allotment_nanodollars.to_be_bytes());
+        reply.extend_from_slice(&purse.available_nanodollars.to_be_bytes());
+    }
+    send(ctx, src, &reply);
+}
+
+/// Op 6 — ledger lines sent to this user for this app alias.
+///
+/// Request body (after op byte): `[token: 16]` exactly. Same checks as
+/// list-purses. No payment is stored yet, so success is `[OK][count: u16 BE]`
+/// with count 0.
+pub fn app_list_incoming(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if require_approved_alias(src, &buf, ctx).is_none() {
+        return;
+    }
+    send(ctx, src, &[OK, 0, 0]);
+}
+
+/// Op 7 — ledger lines this app sent.
+///
+/// Same request and same empty success as [`app_list_incoming`].
+pub fn app_list_sent(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if require_approved_alias(src, &buf, ctx).is_none() {
+        return;
+    }
+    send(ctx, src, &[OK, 0, 0]);
 }
 
 /// Op 3 — Application send packet.
