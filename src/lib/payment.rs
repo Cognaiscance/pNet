@@ -304,6 +304,67 @@ pub(crate) fn decode_confirm(
     Some(parsed)
 }
 
+/// The first packet of an index sets this bit and replaces any list in progress.
+pub(crate) const INDEX_START: u8 = 0x01;
+/// The last packet of an index sets this bit. The receiver then copies what it lacks.
+pub(crate) const INDEX_END: u8 = 0x02;
+const INDEX_ENTRY_LEN: usize = 16 + 64;
+/// Entries per packet. Forty fit under a 4096-byte datagram with the session seal.
+pub(crate) const INDEX_MAX_ENTRIES: usize = 40;
+
+pub(crate) fn encode_index(flags: u8, entries: &[(Uuid, Ed25519Signature)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(3 + entries.len() * INDEX_ENTRY_LEN);
+    buf.push(flags);
+    buf.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    for (id, sig) in entries {
+        buf.extend_from_slice(id);
+        buf.extend_from_slice(&sig.0);
+    }
+    buf
+}
+
+pub(crate) fn decode_index(data: &[u8]) -> Option<(u8, Vec<(Uuid, Ed25519Signature)>)> {
+    if data.len() < 3 {
+        return None;
+    }
+    let flags = data[0];
+    let count = u16::from_be_bytes([data[1], data[2]]) as usize;
+    if data.len() != 3 + count * INDEX_ENTRY_LEN {
+        return None;
+    }
+    let mut pos = 3usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id: Uuid = read_arr(data, &mut pos)?;
+        let sig = read_sig(data, &mut pos)?;
+        entries.push((id, sig));
+    }
+    Some((flags, entries))
+}
+
+/// One plaintext per packet. An empty list is one packet with both flags set.
+pub(crate) fn index_plaintexts(entries: &[(Uuid, Ed25519Signature)]) -> Vec<Vec<u8>> {
+    if entries.is_empty() {
+        return vec![encode_index(INDEX_START | INDEX_END, &[])];
+    }
+    let chunks: Vec<&[(Uuid, Ed25519Signature)]> = entries.chunks(INDEX_MAX_ENTRIES).collect();
+    let last = chunks.len() - 1;
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let mut flags = 0u8;
+            if index == 0 {
+                flags |= INDEX_START;
+            }
+            if index == last {
+                flags |= INDEX_END;
+            }
+            encode_index(flags, chunk)
+        })
+        .collect()
+}
+
 pub(crate) fn pending_from(
     body: &OfferBody,
     payer_sig: Ed25519Signature,

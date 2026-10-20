@@ -69,6 +69,8 @@ pub enum Action {
     PaymentAccept { src: SocketAddr, buf: Vec<u8> },
     PaymentRefuse { src: SocketAddr, buf: Vec<u8> },
     PaymentConfirm { src: SocketAddr, buf: Vec<u8> },
+    PaymentIndex { src: SocketAddr, buf: Vec<u8> },
+    PaymentRecord { src: SocketAddr, buf: Vec<u8> },
 
     // From HTTP UI
     UiRequest {
@@ -209,6 +211,8 @@ impl Action {
             Action::PaymentAccept { .. } => "PaymentAccept",
             Action::PaymentRefuse { .. } => "PaymentRefuse",
             Action::PaymentConfirm { .. } => "PaymentConfirm",
+            Action::PaymentIndex { .. } => "PaymentIndex",
+            Action::PaymentRecord { .. } => "PaymentRecord",
             Action::UiRequest { .. } => "UiRequest",
             Action::SgPing { .. } => "SgPing",
             Action::DgKeepalive { .. } => "DgKeepalive",
@@ -267,6 +271,8 @@ impl Action {
             Action::PaymentAccept { src, buf } => handlers::payment_accept(src, buf, ctx),
             Action::PaymentRefuse { src, buf } => handlers::payment_refuse(src, buf, ctx),
             Action::PaymentConfirm { src, buf } => handlers::payment_confirm(src, buf, ctx),
+            Action::PaymentIndex { src, buf } => handlers::payment_index(src, buf, ctx),
+            Action::PaymentRecord { src, buf } => handlers::payment_record(src, buf, ctx),
             Action::UiRequest {
                 stream, method, path, query, cookie, host, origin, referer, body,
             } => {

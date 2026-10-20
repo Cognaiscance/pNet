@@ -125,8 +125,14 @@ The steps below are the build order. A step that is not marked done stays unbuil
 
    The contact accepts on `0x61` only while the new claim stays at or under the ceiling stored for that payer. A missing ceiling is zero, so nothing is accepted until one is stored. An amount equal to the ceiling is accepted. Past the ceiling, the contact signs a refusal (`0x62`) and the payer releases the reserve. A bad offer signature is dropped, and the reserve stays. A node that is not the writer drops the offer.
 
-   The payer signs again on `0x63` to confirm the accepted record is stored. That confirmation is the ledger line on both sides. The reserve becomes a charge: the available amount stays reduced, and the hold is removed so expiry does not add it back. The payee's copy of the line has an empty purse id. The same payment id returns the same outcome, and a retry does not reduce the available amount again. No confirmation before expiry releases the reserve, and an accepted offer that expires is dropped without becoming a line. Ops `0x06` and `0x07` stay empty.
-5. **Repair.** On connect, the two contacts exchange payment ids and copy any missing signed record. Invalid signatures are dropped. Two different signed bodies for one id are both kept. A debt that returns after the purse was spent again shows as an overrun.
+   The payer signs again on `0x63` to confirm the accepted record is stored. That confirmation is the ledger line on both sides. The reserve becomes a charge: the available amount stays reduced, and the hold is removed so expiry does not add it back. The payee's copy of the line has an empty purse id. The same payment id returns the same outcome, and a retry does not reduce the available amount again. No confirmation before expiry releases the reserve. An accepted offer that expires is dropped, and expiry itself does not create a line. Ops `0x06` and `0x07` stay empty.
+5. **Repair. Done.** On connect, each writer sends the payment ids it holds for that pair, together with the payer's confirmation signature, so two bodies of one id stay distinct. Ops are `0x64` (the list) and `0x65` (one signed record). A node that is not the writer drops both. An own device is not a contact, so the exchange does not run for it.
+
+   A record whose signatures fail is dropped. The same signed bytes are the same payment. A different signed body for an id that is already stored is kept beside the first. The purse is not charged again, and the node does not pick a winner.
+
+   The payee stores a copied record with an empty purse id and does not change a purse. The payer keeps the purse from the matching hold and does not subtract again. If that hold is already gone and exactly one purse lists the paying alias, the available amount is reduced and may go negative. That negative amount is the overrun. If no purse or several purses list the alias, the line is stored and no purse is chosen.
+
+   A confirmation that arrives after the staged accept expired is stored. Expiry itself still drops the staged accept and does not create a line. Ops `0x06` and `0x07` stay empty.
 6. **App payment lists.** The incoming list and the sent list return real lines, including the note.
 7. **Clearing record.** Both owners sign a record that names payment ids, and those lines drop out of the net. No bank, chain, or clearing contact is attached.
 

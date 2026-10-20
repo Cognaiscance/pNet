@@ -1,23 +1,28 @@
-//! Offer, accept, refuse, and confirm between the two writers.
+//! Offer, accept, refuse, confirm, and repair between the two writers.
 //!
 //! A node that is not the writer drops the packet. The purse id never leaves
 //! the payer. A missing receive ceiling is zero, so an offer is refused until
-//! one is stored for that payer.
+//! one is stored for that payer. On connect, the writers exchange the payment
+//! ids they hold for the pair and copy any missing signed record.
 
 use std::net::SocketAddr;
 
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
-use super::super::data_models::{Ed25519SecretKey, Ed25519Signature, Uuid, unix_time_ms};
+use super::super::data_models::{
+    Ed25519SecretKey, Ed25519Signature, LedgerLine, Node, Owner, Uuid, unix_time_ms,
+};
 use super::super::payment::{
-    body_from_line, claim_exceeds_ceiling, decode_accept, decode_confirm, decode_offer,
-    decode_refuse, encode_accept, encode_confirm, encode_offer, encode_refuse, line_covers,
-    line_from, offer_body_ok, pending_covers, pending_from, sign_accept, sign_confirm, sign_offer,
-    sign_refuse, verify_accept, verify_confirm, verify_offer, verify_refuse, OfferBody,
-    REFUSE_EXPIRED, REFUSE_MISMATCH, REFUSE_OVER_CEILING,
+    body_from_line, claim_exceeds_ceiling, decode_accept, decode_confirm, decode_index, decode_offer,
+    decode_refuse, encode_accept, encode_confirm, encode_offer, encode_refuse, index_plaintexts,
+    line_covers, line_from, line_same_payment, offer_body_ok, pending_covers, pending_from,
+    sign_accept, sign_confirm, sign_offer, sign_refuse, verify_accept, verify_confirm, verify_offer,
+    verify_refuse, OfferBody, INDEX_END, INDEX_START, REFUSE_EXPIRED, REFUSE_MISMATCH,
+    REFUSE_OVER_CEILING,
 };
 use super::super::wire::{
-    PAYMENT_ACCEPT_OP, PAYMENT_CONFIRM_OP, PAYMENT_OFFER_OP, PAYMENT_REFUSE_OP,
+    PAYMENT_ACCEPT_OP, PAYMENT_CONFIRM_OP, PAYMENT_INDEX_OP, PAYMENT_OFFER_OP, PAYMENT_RECORD_OP,
+    PAYMENT_REFUSE_OP,
 };
 use super::{find_writer_sg, request_change_idempotent, send, Change, PaymentReject, WriteError, WriterTarget};
 
@@ -47,7 +52,7 @@ pub(crate) fn deliver_payment(ctx: &WorkerContext, payment_id: Uuid) {
 }
 
 pub fn payment_offer(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device)) = open_session(ctx, &buf) else {
+    let Some((plain, device, _)) = open_session(ctx, &buf) else {
         return;
     };
     let Some((body, payer_sig)) = decode_offer(&plain) else {
@@ -128,7 +133,7 @@ pub fn payment_offer(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 }
 
 pub fn payment_accept(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device)) = open_session(ctx, &buf) else {
+    let Some((plain, device, _)) = open_session(ctx, &buf) else {
         return;
     };
     let Some((body, payer_sig, payee_sig)) = decode_accept(&plain) else {
@@ -191,7 +196,7 @@ pub fn payment_accept(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 }
 
 pub fn payment_refuse(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device)) = open_session(ctx, &buf) else {
+    let Some((plain, device, _)) = open_session(ctx, &buf) else {
         return;
     };
     let Some((body, payer_sig, reason, payee_sig)) = decode_refuse(&plain) else {
@@ -232,7 +237,7 @@ pub fn payment_refuse(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 }
 
 pub fn payment_confirm(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device)) = open_session(ctx, &buf) else {
+    let Some((plain, device, _)) = open_session(ctx, &buf) else {
         return;
     };
     let Some((body, payer_sig, payee_sig, confirm_sig)) = decode_confirm(&plain) else {
@@ -294,18 +299,209 @@ fn send_refuse(ctx: &WorkerContext, body: &OfferBody, payer_sig: &Ed25519Signatu
     send_to_user(ctx, body.payer, PAYMENT_REFUSE_OP, &plain);
 }
 
-fn open_session(ctx: &WorkerContext, buf: &[u8]) -> Option<(Vec<u8>, Uuid)> {
+fn open_session(ctx: &WorkerContext, buf: &[u8]) -> Option<(Vec<u8>, Uuid, u16)> {
     if buf.len() < 2 {
         return None;
     }
+    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
     let node = ctx.node.read().unwrap();
     if !matches!(find_writer_sg(&node), WriterTarget::Local) {
         return None;
     }
     let plain = decrypt_packet_body(&node, buf)?;
-    let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
     let device = node.owner.active_connections.get(&conn_id)?.device_uuid;
-    Some((plain, device))
+    Some((plain, device, conn_id))
+}
+
+/// When a session to a contact comes up, send the payment ids held for that pair.
+pub(crate) fn exchange_payment_records(conn_id: u16, ctx: &WorkerContext) {
+    let outbound = {
+        let node = ctx.node.read().unwrap();
+        if !matches!(find_writer_sg(&node), WriterTarget::Local) {
+            return;
+        }
+        let Some(conn) = node.owner.active_connections.get(&conn_id) else {
+            return;
+        };
+        let Some(contact) = contact_user_for_device(&node, conn.device_uuid) else {
+            return;
+        };
+        let our = node.owner.user.uuid;
+        let mut entries: Vec<(Uuid, Ed25519Signature)> = node
+            .owner
+            .ledger
+            .iter()
+            .filter(|line| users_are_pair(line.payer, line.payee, our, contact))
+            .map(|line| (line.payment_id, line.confirm_sig))
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.0.cmp(&right.1.0)));
+        let dest = conn.peer_addr;
+        let packets: Vec<Vec<u8>> = index_plaintexts(&entries)
+            .into_iter()
+            .map(|plain| build_encrypted_packet(PAYMENT_INDEX_OP, conn, &plain))
+            .collect();
+        (dest, packets)
+    };
+    for packet in outbound.1 {
+        send(ctx, outbound.0, &packet);
+    }
+}
+
+pub fn payment_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let Some((plain, device, conn_id)) = open_session(ctx, &buf) else {
+        return;
+    };
+    let Some((flags, entries)) = decode_index(&plain) else {
+        eprintln!("[payment_index] bad index from {src}");
+        return;
+    };
+    let replies = {
+        let mut node = ctx.node.write().unwrap();
+        let Some(contact) = contact_user_for_device(&node, device) else {
+            return;
+        };
+        let finished = {
+            let slot = node.owner.payment_index.entry(contact).or_default();
+            if (flags & INDEX_START) != 0 {
+                slot.open = true;
+                slot.seen.clear();
+            }
+            if !slot.open {
+                None
+            } else {
+                slot.seen.extend(entries);
+                if (flags & INDEX_END) == 0 {
+                    None
+                } else {
+                    let seen = std::mem::take(&mut slot.seen);
+                    slot.open = false;
+                    Some(seen)
+                }
+            }
+        };
+        let Some(seen) = finished else {
+            return;
+        };
+        let our = node.owner.user.uuid;
+        let mut replies = Vec::new();
+        for line in &node.owner.ledger {
+            if !users_are_pair(line.payer, line.payee, our, contact) {
+                continue;
+            }
+            if seen.iter().any(|(id, sig)| *id == line.payment_id && *sig == line.confirm_sig) {
+                continue;
+            }
+            let body = body_from_line(line);
+            replies.push(encode_confirm(&body, &line.payer_sig, &line.payee_sig, &line.confirm_sig));
+        }
+        replies
+    };
+    for plain in replies {
+        send_on_conn(ctx, conn_id, PAYMENT_RECORD_OP, &plain);
+    }
+}
+
+pub fn payment_record(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let Some((plain, device, _)) = open_session(ctx, &buf) else {
+        return;
+    };
+    let Some((body, payer_sig, payee_sig, confirm_sig)) = decode_confirm(&plain) else {
+        eprintln!("[payment_record] bad record from {src}");
+        return;
+    };
+    if !offer_body_ok(&body) {
+        return;
+    }
+    let line = {
+        let node = ctx.node.read().unwrap();
+        let Some(contact_uuid) = contact_user_for_device(&node, device) else {
+            return;
+        };
+        let Some(contact) = node.owner.contact_users.iter().find(|contact| contact.user.uuid == contact_uuid) else {
+            return;
+        };
+        if !users_are_pair(body.payer, body.payee, node.owner.user.uuid, contact_uuid) {
+            return;
+        }
+        let our_key = node.owner.key_pair.public_key;
+        let contact_key = contact.public_key;
+        let (payer_key, payee_key) = if body.payer == node.owner.user.uuid {
+            (our_key, contact_key)
+        } else {
+            (contact_key, our_key)
+        };
+        if !verify_offer(&payer_key, &body, &payer_sig)
+            || !verify_accept(&payee_key, &body, &payer_sig, &payee_sig)
+            || !verify_confirm(&payer_key, &body, &payer_sig, &payee_sig, &confirm_sig)
+        {
+            eprintln!("[payment_record] bad signature from {src}");
+            return;
+        }
+        let mut line = line_from(&body, [0u8; 16], payer_sig, payee_sig, confirm_sig);
+        assign_copied_purse(&node.owner, &mut line);
+        line
+    };
+    if let Err(err) = request_change_idempotent(Change::RecordLedger { line }, ctx) {
+        eprintln!("[payment_record] record failed from {src}: {err:?}");
+    }
+}
+
+fn users_are_pair(payer: Uuid, payee: Uuid, our: Uuid, contact: Uuid) -> bool {
+    (payer == our && payee == contact) || (payer == contact && payee == our)
+}
+
+fn contact_user_for_device(node: &Node, device: Uuid) -> Option<Uuid> {
+    if node.owner.user.devices.iter().any(|candidate| candidate.uuid == device) {
+        return None;
+    }
+    node.owner.contact_users.iter().find_map(|contact| {
+        contact
+            .user
+            .devices
+            .iter()
+            .any(|candidate| candidate.uuid == device)
+            .then_some(contact.user.uuid)
+    })
+}
+
+fn same_signed(left: &LedgerLine, right: &LedgerLine) -> bool {
+    body_from_line(left) == body_from_line(right)
+        && left.payer_sig == right.payer_sig
+        && left.payee_sig == right.payee_sig
+        && left.confirm_sig == right.confirm_sig
+}
+
+/// Choose the purse id written into the log. Apply and replay use that id.
+fn assign_copied_purse(owner: &Owner, line: &mut LedgerLine) {
+    if owner.ledger.iter().any(|stored| same_signed(stored, line)) {
+        return;
+    }
+    if owner.ledger.iter().any(|stored| stored.payment_id == line.payment_id) || line.payer != owner.user.uuid {
+        line.purse_id = [0u8; 16];
+        return;
+    }
+    if let Some(reserve) = owner.reserves.iter().find(|reserve| line_same_payment(line, reserve, owner.user.uuid)) {
+        line.purse_id = reserve.purse_id;
+        return;
+    }
+    let mut matches = owner.purses.iter().filter(|purse| {
+        purse.aliases.iter().any(|alias| alias == &line.paying_alias)
+    });
+    match (matches.next(), matches.next()) {
+        (Some(purse), None) => line.purse_id = purse.id,
+        _ => line.purse_id = [0u8; 16],
+    }
+}
+
+fn send_on_conn(ctx: &WorkerContext, conn_id: u16, op: u8, plaintext: &[u8]) {
+    let packet = {
+        let node = ctx.node.read().unwrap();
+        let Some(conn) = node.owner.active_connections.get(&conn_id) else {
+            return;
+        };
+        (build_encrypted_packet(op, conn, plaintext), conn.peer_addr)
+    };
+    send(ctx, packet.1, &packet.0);
 }
 
 fn send_to_user(ctx: &WorkerContext, user: Uuid, op: u8, plaintext: &[u8]) {

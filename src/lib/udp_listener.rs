@@ -15,8 +15,9 @@ use super::wire::{
     CONTACT_REQUEST_OP, CONTACT_RESPONSE_OP, CONN_RESET_OP, CROSS_USER_PULL_REQUEST_OP,
     CROSS_USER_PULL_RESPONSE_OP, CROSS_USER_UPDATE_AVAILABLE_OP, DEVICE_REGISTER_OP,
     DG_KEEPALIVE_OP, GENERATE_INVITATION_REQUEST_OP, GENERATE_INVITATION_RESPONSE_OP,
-    MERGE_ACK_OP, MERGE_PROPOSAL_OP, PAYMENT_ACCEPT_OP, PAYMENT_CONFIRM_OP, PAYMENT_OFFER_OP,
-    PAYMENT_REFUSE_OP, RELAY_PACKET_OP, SG_PING_OP, SYNC_PULL_REQUEST_OP,
+    MERGE_ACK_OP, MERGE_PROPOSAL_OP, PAYMENT_ACCEPT_OP, PAYMENT_CONFIRM_OP, PAYMENT_INDEX_OP,
+    PAYMENT_OFFER_OP, PAYMENT_RECORD_OP, PAYMENT_REFUSE_OP, RELAY_PACKET_OP, SG_PING_OP,
+    SYNC_PULL_REQUEST_OP,
     SYNC_PULL_RESPONSE_OP, SYNC_UPDATE_AVAILABLE_OP, SYNC_WRITE_ACK_OP, SYNC_WRITE_REQUEST_OP,
     TUNNEL_CONNECT_ACK_OP, TUNNEL_CONNECT_REQUEST_OP, TUNNEL_DELIVERY_OP, TUNNEL_FORWARD_OP,
     TUNNEL_INIT_OP, WATERMARK_PROBE_REQUEST_OP, WATERMARK_PROBE_RESPONSE_OP,
@@ -110,6 +111,8 @@ impl UdpListener {
                     PAYMENT_ACCEPT_OP => Action::PaymentAccept { src, buf: payload },
                     PAYMENT_REFUSE_OP => Action::PaymentRefuse { src, buf: payload },
                     PAYMENT_CONFIRM_OP => Action::PaymentConfirm { src, buf: payload },
+                    PAYMENT_INDEX_OP => Action::PaymentIndex { src, buf: payload },
+                    PAYMENT_RECORD_OP => Action::PaymentRecord { src, buf: payload },
                     SG_PING_OP => {
                         let Some(nonce) = slice_arr::<16>(&payload, 0) else {
                             eprintln!("[udp] sg_ping too short from {src}");
@@ -224,6 +227,8 @@ mod tests {
             (0x61, |a| matches!(a, Action::PaymentAccept    { .. })),
             (0x62, |a| matches!(a, Action::PaymentRefuse    { .. })),
             (0x63, |a| matches!(a, Action::PaymentConfirm   { .. })),
+            (0x64, |a| matches!(a, Action::PaymentIndex     { .. })),
+            (0x65, |a| matches!(a, Action::PaymentRecord    { .. })),
             (0x10, |a| matches!(a, Action::SgPing           { .. })),
             (0x20, |a| matches!(a, Action::ConnectRequest   { .. })),
             (0x21, |a| matches!(a, Action::ConnectAck       { .. })),

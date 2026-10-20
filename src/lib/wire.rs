@@ -180,6 +180,10 @@ pub(crate) const PAYMENT_OFFER_OP: u8 = 0x60;
 pub(crate) const PAYMENT_ACCEPT_OP: u8 = 0x61;
 pub(crate) const PAYMENT_REFUSE_OP: u8 = 0x62;
 pub(crate) const PAYMENT_CONFIRM_OP: u8 = 0x63;
+/// Payment ids this writer holds for the pair, sent when a contact session comes up.
+pub(crate) const PAYMENT_INDEX_OP: u8 = 0x64;
+/// One signed confirmation, sent because the contact's index did not list it.
+pub(crate) const PAYMENT_RECORD_OP: u8 = 0x65;
 
 // ── Shared min lengths (unencrypted headers / common envelopes) ───────────────
 
