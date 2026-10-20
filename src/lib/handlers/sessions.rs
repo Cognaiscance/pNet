@@ -660,7 +660,7 @@ pub fn keepalive_dg(ctx: &WorkerContext) {
 pub fn dg_keepalive_receive(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let ok = {
         let node = ctx.node.read().unwrap();
-        decrypt_packet_body(&node, &buf).is_some()
+        decrypt_packet_body(&node, DG_KEEPALIVE_OP, &buf).is_some()
     };
     if !ok {
         send(ctx, src, &[CONN_RESET_OP]);

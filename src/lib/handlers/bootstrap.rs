@@ -12,7 +12,7 @@ use super::super::certs::{self, sign_device_cert};
 use super::super::crypto::{
     aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body,
     ed25519_sign, ed25519_verify, generate_ed25519_keypair, generate_x25519_keypair,
-    xchacha20_decrypt, xchacha20_encrypt,
+    open_with_opcode, seal_with_opcode,
 };
 use super::super::data_models::{
     Contact, Device, DeviceGrade, Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey,
@@ -301,7 +301,7 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     ctx.save_node(); // consumed the device invitation
 
     // Encrypt and send outside the lock.
-    let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
+    let (ciphertext, nonce) = seal_with_opcode(BOOTSTRAP_RESPONSE_OP, &shared_secret, &payload);
     let mut pkt = Vec::with_capacity(1 + 24 + ciphertext.len());
     pkt.push(BOOTSTRAP_RESPONSE_OP);
     pkt.extend_from_slice(&nonce);
@@ -344,7 +344,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         (ss, pb.invitation_id, pb.sg_addr, pb.device_alias.clone(), pb.desired_grade, pb.desired_sg_rank)
     };
 
-    let Some(plaintext) = xchacha20_decrypt(&shared_secret, &nonce, ciphertext) else {
+    let Some(plaintext) = open_with_opcode(BOOTSTRAP_RESPONSE_OP, &shared_secret, &nonce, ciphertext, None) else {
         eprintln!("[bootstrap_response] decryption failed from {src}");
         return;
     };
@@ -442,7 +442,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     println!("[bootstrap_response] bootstrap complete, sending device registration to {sg_addr}");
     // Send DeviceRegistration: [op=0x32][invitation_id:16][nonce:24][encrypted device info]
-    let (ciphertext, reg_nonce) = xchacha20_encrypt(&shared_secret, &device_reg_payload);
+    let (ciphertext, reg_nonce) = seal_with_opcode(DEVICE_REGISTER_OP, &shared_secret, &device_reg_payload);
     let mut pkt = Vec::with_capacity(1 + 16 + 24 + ciphertext.len());
     pkt.push(DEVICE_REGISTER_OP);
     pkt.extend_from_slice(&invitation_id);
@@ -493,7 +493,7 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         // write lock released here
     };
 
-    let Some(plaintext) = xchacha20_decrypt(&shared_secret, &nonce, ciphertext) else {
+    let Some(plaintext) = open_with_opcode(DEVICE_REGISTER_OP, &shared_secret, &nonce, ciphertext, None) else {
         eprintln!("[device_registration] decryption failed from {src}");
         return;
     };
@@ -653,7 +653,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             aead_domain::BOOTSTRAP,
         );
 
-        let Some(plaintext) = xchacha20_decrypt(&shared_secret, &nonce, ciphertext) else {
+        let Some(plaintext) = open_with_opcode(CONTACT_REQUEST_OP, &shared_secret, &nonce, ciphertext, None) else {
             eprintln!("[contact_request] decryption failed from {src}");
             return;
         };
@@ -703,7 +703,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     cross_user_pull_for_contact(contact_uuid, ctx);
 
     // Encrypt and send ContactResponse.
-    let (ciphertext, resp_nonce) = xchacha20_encrypt(&shared_secret, &response_payload);
+    let (ciphertext, resp_nonce) = seal_with_opcode(CONTACT_RESPONSE_OP, &shared_secret, &response_payload);
     let mut pkt = Vec::with_capacity(1 + 24 + ciphertext.len());
     pkt.push(CONTACT_RESPONSE_OP);
     pkt.extend_from_slice(&resp_nonce);
@@ -750,7 +750,7 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         )
     };
 
-    let Some(plaintext) = xchacha20_decrypt(&shared_secret, &nonce, ciphertext) else {
+    let Some(plaintext) = open_with_opcode(CONTACT_RESPONSE_OP, &shared_secret, &nonce, ciphertext, None) else {
         eprintln!("[contact_response] decryption failed from {src}");
         return;
     };
@@ -1101,7 +1101,7 @@ pub fn generate_invitation_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
 
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, GENERATE_INVITATION_REQUEST_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[generate_invitation_request] decryption failed from {src}");
@@ -1161,7 +1161,7 @@ pub fn generate_invitation_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
 pub fn generate_invitation_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, GENERATE_INVITATION_RESPONSE_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[generate_invitation_response] decryption failed from {src}");
@@ -1225,7 +1225,7 @@ pub(crate) fn initiate_contact_exchange(body: &[u8], ctx: &WorkerContext) {
         let node = ctx.node.read().unwrap();
         serialize_contact_payload(&node)
     };
-    let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &payload);
+    let (ciphertext, nonce) = seal_with_opcode(CONTACT_REQUEST_OP, &aead_key, &payload);
 
     {
         let mut node = ctx.node.write().unwrap();

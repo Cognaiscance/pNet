@@ -49,10 +49,15 @@ pub(crate) const ERR_RATE_LIMITED: u8 = 0x07;
 /// this (≈1 KiB is a practical no-fragmentation budget).
 pub(crate) const MAX_APP_PAYLOAD: usize = 4096;
 
-/// Max `nonce ‖ ciphertext` size for tunnel forward (0x51) blobs the SG will
-/// relay without decrypting. Covers AEAD tag + 32-byte app-id header + payload.
+/// Max `nonce ‖ ciphertext` size for the tunnel blob an SG forwards inside
+/// `0x54` after it has opened the session wrapper on `0x51`. Covers the AEAD
+/// tag, the inner opcode, the 32-byte app-id header, and the app payload.
 pub(crate) const MAX_TUNNEL_FORWARD_BLOB: usize =
-    24 /* nonce */ + 16 /* Poly1305 tag */ + 32 /* dest+sender app id */ + MAX_APP_PAYLOAD;
+    24 /* nonce */
+    + 16 /* Poly1305 tag */
+    + 1 /* inner opcode */
+    + 32 /* dest+sender app id */
+    + MAX_APP_PAYLOAD;
 
 // ── Local app op bytes ────────────────────────────────────────────────────────
 

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime};
 use super::action_queue::WorkerContext;
 use super::crypto::{
     aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body, ed25519_sign,
-    ed25519_verify, generate_ed25519_keypair, generate_x25519_keypair, xchacha20_decrypt,
-    xchacha20_encrypt,
+    ed25519_verify, generate_ed25519_keypair, generate_x25519_keypair, seal_with_opcode,
+    xchacha20_decrypt,
 };
 use super::data_models::{
     ActiveConnection, ActiveTunnel, AppGrant, Application, Contact, Device, DeviceGrade,
@@ -341,7 +341,7 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let (local_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload) = {
         let node = ctx.node.read().unwrap();
 
-        let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
+        let Some(plaintext) = decrypt_packet_body(&node, RELAY_PACKET_OP, &buf) else {
             eprintln!("[relay_packet] decryption failed from {src}");
             return;
         };
@@ -2429,7 +2429,7 @@ mod tests {
             device_uuid: conn.device_uuid,
             peer_addr: conn.peer_addr,
         });
-        let plaintext = decrypt_packet_body(&node, buf).expect("decrypt ack");
+        let plaintext = decrypt_packet_body(&node, SYNC_WRITE_ACK_OP, buf).expect("decrypt ack");
         let mut pos = 0usize;
         let result = plaintext[pos]; pos += 1;
         let private_v = read_sync_version(&plaintext, &mut pos).unwrap();
@@ -2575,7 +2575,7 @@ mod tests {
                 device_uuid: dg_conn.device_uuid,
                 peer_addr: dg_conn.peer_addr,
             });
-            decrypt_packet_body(&node, &buf[1..len]).expect("decrypt reply")
+            decrypt_packet_body(&node, buf[0], &buf[1..len]).expect("decrypt reply")
         };
 
         // Body: [token:16][result:1][code...].
@@ -3079,6 +3079,7 @@ mod tests {
                             });
                             node
                         },
+                        buf[0],
                         &buf[1..len],
                     ).unwrap();
                     let mut pos = 0;
@@ -3257,7 +3258,7 @@ mod tests {
                 device_uuid: dg_conn.device_uuid,
                 peer_addr: dg_conn.peer_addr,
             });
-            decrypt_packet_body(&node, &buf[1..len]).unwrap()
+            decrypt_packet_body(&node, buf[0], &buf[1..len]).unwrap()
         };
         let mut pos = 0;
         let scope = read_scope(&plaintext, &mut pos).unwrap();
@@ -3302,7 +3303,7 @@ mod tests {
                 device_uuid: dg_conn.device_uuid,
                 peer_addr: dg_conn.peer_addr,
             });
-            decrypt_packet_body(&node, &buf[1..len]).unwrap()
+            decrypt_packet_body(&node, buf[0], &buf[1..len]).unwrap()
         };
         let mut pos = 0;
         let _scope  = read_scope(&plaintext, &mut pos).unwrap();
@@ -3431,7 +3432,7 @@ mod tests {
                     device_uuid: sg_conn.device_uuid,
                     peer_addr: sg_conn.peer_addr,
                 });
-                decrypt_packet_body(&node, &buf[1..len]).unwrap()
+                decrypt_packet_body(&node, buf[0], &buf[1..len]).unwrap()
             };
             let mut pos = 0;
             let scope = read_scope(&plaintext, &mut pos).unwrap();
@@ -3743,7 +3744,7 @@ mod tests {
             });
         }
         let node     = t2.ctx.node.read().unwrap();
-        let decrypted = decrypt_packet_body(&node, &buf[1..len]).unwrap();
+        let decrypted = decrypt_packet_body(&node, buf[0], &buf[1..len]).unwrap();
 
         // Decrypted body: [dest_app_id: 16][sender_app_id: 16][payload]
         let dest_id_bytes:   [u8; 16] = decrypted[0..16].try_into().unwrap();
@@ -4114,8 +4115,8 @@ mod tests {
                 key_pair: local_kp.clone(),
                 peer_public_key: peer_kp.public_key,
                 peer_active_connection_id: 1,
-                device_uuid: generate_uuid(),
-                peer_addr: "127.0.0.1:0".parse().unwrap(),
+                device_uuid,
+                peer_addr: app_addr,
             });
             node.owner.dg_tunnel_map.insert(tunnel_id, conn_id);
         }
@@ -4129,7 +4130,7 @@ mod tests {
         plaintext.extend_from_slice(&app_id);
         plaintext.extend_from_slice(&sender_app_id);
         plaintext.extend_from_slice(b"tunnel payload");
-        let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &plaintext);
+        let (ciphertext, nonce) = seal_with_opcode(TUNNEL_FORWARD_OP, &aead_key, &plaintext);
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&tunnel_id.to_be_bytes());
@@ -4142,6 +4143,206 @@ mod tests {
         assert!(
             t.app_socket.recv_from(&mut rx).is_err(),
             "unapproved apps must never receive tunnel_delivery pushes"
+        );
+    }
+
+    #[test]
+    fn tunnel_forward_opens_the_session_and_relays_the_blob() {
+        let t = TestCtx::new();
+        let capture = UdpSocket::bind("127.0.0.1:0").unwrap();
+        capture.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let dest_addr = capture.local_addr().unwrap();
+
+        let dg_kp = generate_x25519_keypair();
+        let sg_kp = generate_x25519_keypair();
+        let tunnel_id: u16 = 9;
+        let sender_conn_id: u16 = 10;
+        let dest_conn_id: u16 = 20;
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.active_connections.insert(sender_conn_id, ActiveConnection {
+                id: sender_conn_id,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: sg_kp.clone(),
+                peer_public_key: dg_kp.public_key,
+                peer_active_connection_id: 1,
+                device_uuid: generate_uuid(),
+                peer_addr: "127.0.0.1:1".parse().unwrap(),
+            });
+            node.owner.active_connections.insert(dest_conn_id, ActiveConnection {
+                id: dest_conn_id,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: generate_x25519_keypair(),
+                peer_public_key: generate_x25519_keypair().public_key,
+                peer_active_connection_id: 2,
+                device_uuid: generate_uuid(),
+                peer_addr: dest_addr,
+            });
+            node.owner.active_tunnels.insert(tunnel_id, ActiveTunnel {
+                id: tunnel_id,
+                connection_a_id: sender_conn_id,
+                connection_b_id: dest_conn_id,
+                last_used_at: Instant::now(),
+            });
+        }
+
+        let sender_side = ActiveConnection {
+            id: 1,
+            timeout: SystemTime::now() + Duration::from_secs(3600),
+            key_pair: dg_kp,
+            peer_public_key: sg_kp.public_key,
+            peer_active_connection_id: sender_conn_id,
+            device_uuid: generate_uuid(),
+            peer_addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&tunnel_id.to_be_bytes());
+        body.extend_from_slice(&[0xABu8; 40]);
+        let pkt = build_encrypted_packet(TUNNEL_FORWARD_OP, &sender_side, &body);
+        tunnel_forward("127.0.0.1:9".parse().unwrap(), pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 256];
+        let (n, _) = capture.recv_from(&mut buf).expect("SG should forward a sealed 0x51");
+        assert_eq!(buf[0], TUNNEL_DELIVERY_OP);
+        assert_eq!(u16::from_be_bytes([buf[1], buf[2]]), tunnel_id);
+        assert_eq!(&buf[3..n], &[0xABu8; 40]);
+
+        let wrong = build_encrypted_packet(RELAY_PACKET_OP, &sender_side, &body);
+        tunnel_forward("127.0.0.1:9".parse().unwrap(), wrong[1..].to_vec(), &t.ctx);
+        assert!(
+            capture.recv_from(&mut buf).is_err(),
+            "an inner opcode other than 0x51 must not forward"
+        );
+
+        tunnel_forward("127.0.0.1:9".parse().unwrap(), vec![0u8; 80], &t.ctx);
+        assert!(
+            capture.recv_from(&mut buf).is_err(),
+            "a packet that fails the session tag must not forward"
+        );
+    }
+
+    #[test]
+    fn tunnel_delivery_accepts_inner_forward_opcode_from_the_server() {
+        let t = TestCtx::new();
+        let app_id: Uuid = app_uuid(12);
+        let sender_app_id = app_uuid(6);
+        let peer_kp = generate_x25519_keypair();
+        let local_kp = generate_x25519_keypair();
+        let app_addr = t.app_addr();
+        let tunnel_id: u16 = 8;
+        let conn_id: u16 = 43;
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let device_uuid = node.device_uuid;
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == device_uuid).unwrap();
+            dev.applications.push(Application {
+                id: app_id,
+                alias: "chat".to_string(),
+                protocol: "udp".to_string(),
+                host: app_addr.to_string().parse().unwrap(),
+                user_approved: true,
+                token: generate_uuid(),
+                identity: crate::data_models::Ed25519KeyPair::ZERO,
+                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
+            });
+            node.owner.active_connections.insert(conn_id, ActiveConnection {
+                id: conn_id,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: local_kp.clone(),
+                peer_public_key: peer_kp.public_key,
+                peer_active_connection_id: 1,
+                device_uuid,
+                peer_addr: app_addr,
+            });
+            node.owner.dg_tunnel_map.insert(tunnel_id, conn_id);
+        }
+
+        let aead_key = aead_key_from_dh(
+            &local_kp.private_key,
+            &peer_kp.public_key,
+            aead_domain::TUNNEL,
+        );
+        let mut plaintext = Vec::new();
+        plaintext.extend_from_slice(&app_id);
+        plaintext.extend_from_slice(&sender_app_id);
+        plaintext.extend_from_slice(b"from-server");
+        let (ciphertext, nonce) = seal_with_opcode(TUNNEL_FORWARD_OP, &aead_key, &plaintext);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&tunnel_id.to_be_bytes());
+        buf.extend_from_slice(&nonce);
+        buf.extend_from_slice(&ciphertext);
+
+        tunnel_delivery(app_addr, buf, &t.ctx);
+
+        let mut rx = [0u8; 64];
+        let (n, _) = t.app_socket.recv_from(&mut rx).expect("approved app should receive the push");
+        assert_eq!(rx[0], APP_PUSH_OP);
+        assert_eq!(&rx[17..n], b"from-server");
+    }
+
+    #[test]
+    fn tunnel_delivery_drops_inner_forward_opcode_from_another_source() {
+        let t = TestCtx::new();
+        let app_id: Uuid = app_uuid(13);
+        let sender_app_id = app_uuid(7);
+        let peer_kp = generate_x25519_keypair();
+        let local_kp = generate_x25519_keypair();
+        let app_addr = t.app_addr();
+        let tunnel_id: u16 = 11;
+        let conn_id: u16 = 44;
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let device_uuid = node.device_uuid;
+            let dev = node.owner.user.devices.iter_mut()
+                .find(|d| d.uuid == device_uuid).unwrap();
+            dev.applications.push(Application {
+                id: app_id,
+                alias: "chat".to_string(),
+                protocol: "udp".to_string(),
+                host: app_addr.to_string().parse().unwrap(),
+                user_approved: true,
+                token: generate_uuid(),
+                identity: crate::data_models::Ed25519KeyPair::ZERO,
+                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
+            });
+            node.owner.active_connections.insert(conn_id, ActiveConnection {
+                id: conn_id,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: local_kp.clone(),
+                peer_public_key: peer_kp.public_key,
+                peer_active_connection_id: 1,
+                device_uuid,
+                peer_addr: "127.0.0.1:9".parse().unwrap(),
+            });
+            node.owner.dg_tunnel_map.insert(tunnel_id, conn_id);
+        }
+
+        let aead_key = aead_key_from_dh(
+            &local_kp.private_key,
+            &peer_kp.public_key,
+            aead_domain::TUNNEL,
+        );
+        let mut plaintext = Vec::new();
+        plaintext.extend_from_slice(&app_id);
+        plaintext.extend_from_slice(&sender_app_id);
+        plaintext.extend_from_slice(b"spoofed");
+        let (ciphertext, nonce) = seal_with_opcode(TUNNEL_FORWARD_OP, &aead_key, &plaintext);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&tunnel_id.to_be_bytes());
+        buf.extend_from_slice(&nonce);
+        buf.extend_from_slice(&ciphertext);
+
+        tunnel_delivery(app_addr, buf, &t.ctx);
+
+        let mut rx = [0u8; 64];
+        assert!(
+            t.app_socket.recv_from(&mut rx).is_err(),
+            "inner 0x51 from an address other than the forwarding server must be dropped"
         );
     }
 
@@ -4314,7 +4515,7 @@ mod tests {
             aead_domain::BOOTSTRAP,
         );
         let payload = serialize_contact_payload(requester_node);
-        let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &payload);
+        let (ciphertext, nonce) = seal_with_opcode(CONTACT_REQUEST_OP, &aead_key, &payload);
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&inv.id);
@@ -4524,7 +4725,7 @@ mod tests {
         payload.extend_from_slice(target_pk.as_bytes());
         payload.push(0u8); // 0 devices
 
-        let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &payload);
+        let (ciphertext, nonce) = seal_with_opcode(CONTACT_RESPONSE_OP, &aead_key, &payload);
         let mut buf = Vec::new();
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&ciphertext);
@@ -4566,7 +4767,7 @@ mod tests {
         payload.extend_from_slice(&generate_uuid());
         payload.extend_from_slice(&generate_key_bytes());
         payload.push(0u8);
-        let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &payload);
+        let (ciphertext, nonce) = seal_with_opcode(CONTACT_RESPONSE_OP, &aead_key, &payload);
         let mut buf = Vec::new();
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&ciphertext);
@@ -4592,7 +4793,7 @@ mod tests {
         payload.extend_from_slice(&generate_uuid());
         payload.extend_from_slice(&generate_key_bytes());
         payload.push(0u8);
-        let (ciphertext, nonce) = xchacha20_encrypt(&shared_secret, &payload);
+        let (ciphertext, nonce) = seal_with_opcode(CONTACT_RESPONSE_OP, &shared_secret, &payload);
         let mut buf = Vec::new();
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&ciphertext);
@@ -4969,7 +5170,7 @@ mod tests {
                 device_uuid: sender_conn.device_uuid,
                 peer_addr: sender_conn.peer_addr,
             });
-            decrypt_packet_body(&node, &buf[1..len]).unwrap()
+            decrypt_packet_body(&node, buf[0], &buf[1..len]).unwrap()
         };
         let mut pos = 0usize;
         let scope = read_scope(&plaintext, &mut pos).unwrap();
@@ -5700,7 +5901,7 @@ mod tests {
             device_uuid: peer_conn.device_uuid,
             peer_addr: peer_conn.peer_addr,
         });
-        let plaintext = decrypt_packet_body(&node, &buf[1..]).expect("decrypt");
+        let plaintext = decrypt_packet_body(&node, buf[0], &buf[1..]).expect("decrypt");
         parse_watermark_map(&plaintext).expect("parse")
     }
 
@@ -6063,7 +6264,7 @@ mod tests {
         let mut buf = [0u8; 1024];
         let (len, _) = dg_socket.recv_from(&mut buf).expect("ack received");
         assert_eq!(buf[0], MERGE_ACK_OP);
-        let plaintext = decrypt_packet_body_for(&dg_conn, &buf[1..len]);
+        let plaintext = decrypt_packet_body_for(&dg_conn, buf[0], &buf[1..len]);
         let (_, _, result) = parse_merge_ack_body(&plaintext).expect("parse");
         assert_eq!(result, MERGE_ACK_RESULT_MALFORMED);
     }
@@ -6130,7 +6331,7 @@ mod tests {
         // which sends a SyncUpdateAvailable to this same peer because we
         // promoted it to an own-user SG — drain until we find the ack.)
         let ack_payload = recv_until_op(&peer_socket, MERGE_ACK_OP);
-        let plaintext = decrypt_packet_body_for(&peer_conn, &ack_payload);
+        let plaintext = decrypt_packet_body_for(&peer_conn, MERGE_ACK_OP, &ack_payload);
         let (scope, _wm, result) = parse_merge_ack_body(&plaintext).expect("parse");
         assert_eq!(scope, Scope::Public);
         assert_eq!(result, MERGE_ACK_RESULT_APPLIED);
@@ -6267,7 +6468,7 @@ mod tests {
         let mut buf = [0u8; 1024];
         let (len, _) = peer_socket.recv_from(&mut buf).expect("ack received");
         assert_eq!(buf[0], MERGE_ACK_OP);
-        let plaintext = decrypt_packet_body_for(&peer_conn, &buf[1..len]);
+        let plaintext = decrypt_packet_body_for(&peer_conn, buf[0], &buf[1..len]);
         let (_, _, result) = parse_merge_ack_body(&plaintext).expect("parse");
         assert_eq!(result, MERGE_ACK_RESULT_APPLIED);
         let _ = local_uuid; // silence unused warning if any
@@ -6408,7 +6609,7 @@ mod tests {
 
     /// Decrypt a packet body using a peer-side ActiveConnection. Mirrors
     /// `parse_write_ack`'s pattern.
-    fn decrypt_packet_body_for(conn: &ActiveConnection, buf: &[u8]) -> Vec<u8> {
+    fn decrypt_packet_body_for(conn: &ActiveConnection, expected_op: u8, buf: &[u8]) -> Vec<u8> {
         let mut node = super::super::data_models::Node::new();
         node.owner.active_connections.insert(conn.id, ActiveConnection {
             id: conn.id,
@@ -6419,7 +6620,7 @@ mod tests {
             device_uuid: conn.device_uuid,
             peer_addr: conn.peer_addr,
         });
-        decrypt_packet_body(&node, buf).expect("decrypt")
+        decrypt_packet_body(&node, expected_op, buf).expect("decrypt")
     }
 
     #[test]

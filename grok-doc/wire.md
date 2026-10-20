@@ -14,6 +14,8 @@ op (u8) || receiver's connection id (u16) || nonce (24) || XChaCha20-Poly1305 ci
 
 The key is HKDF-SHA256 of the X25519 shared secret of the two session ephemerals, info string `pnet-aead-v1-session`. The connection id is the id the receiver stored, which the sender learned as `peer_active_connection_id`. A bad id or a bad tag drops the datagram. No error is sent.
 
+Every AEAD plaintext, on the session, bootstrap, and tunnel keys, starts with a copy of the outer opcode. The receiver drops the datagram when that byte differs. Tunnel delivery (`0x54`) is the one exception: an inner `0x51` is accepted when the datagram's source address is the forwarding server stored for that tunnel.
+
 Three HKDF labels exist, and they are not interchangeable:
 
 | Label | Used for |
@@ -22,7 +24,7 @@ Three HKDF labels exist, and they are not interchangeable:
 | `pnet-aead-v1-bootstrap` | Device join and contact-card exchange |
 | `pnet-aead-v1-tunnel` | DG-to-DG payload inside a tunnel |
 
-The opaque app payload maximum is 4096 bytes on relay, direct app packet, and tunnel delivery. A larger inbound fabric payload is dropped with no reply. Tunnel-forward blobs are capped at 24 + 16 + 32 + 4096 bytes (nonce, tag, the two app ids, and the payload).
+The opaque app payload maximum is 4096 bytes on relay, direct app packet, and tunnel delivery. A larger inbound fabric payload is dropped with no reply. The tunnel blob an SG forwards is capped at 24 + 16 + 1 + 32 + 4096 bytes (nonce, tag, inner opcode, the two app ids, and the payload).
 
 ## Op bytes
 
@@ -44,7 +46,7 @@ The opaque app payload maximum is 4096 bytes on relay, direct app packet, and tu
 | `0x40` | relay packet | session |
 | `0x41` | app packet | session |
 | `0x50` | tunnel init | cleartext |
-| `0x51` | tunnel forward | opaque to the SG |
+| `0x51` | tunnel forward | session seal; tunnel blob stays opaque |
 | `0x52` | tunnel connect request | cleartext |
 | `0x53` | tunnel connect ack | cleartext |
 | `0x54` | tunnel delivery | tunnel AEAD inside |
@@ -210,7 +212,7 @@ The destination looks up an approved local app with that id and pushes `0x04 || 
 
 ## Tunnels
 
-Tunnel setup messages are cleartext. The SG never sees the app plaintext.
+Tunnel setup messages are cleartext. The SG opens the session wrapper on a forward and still does not see the app plaintext.
 
 **Tunnel init (`0x50`).** SG to the sending DG: `tunnel id (u16) || destination device uuid (16)`.
 
@@ -223,23 +225,23 @@ The destination creates a session keyed with the tunnel label, maps the tunnel i
 
 **Tunnel connect ack (`0x53`).** `tunnel id (u16) || ephemeral X25519 public key (32)`. The SG records the tunnel against the two device sessions and forwards the ack to the sender. The sender stores its half the same way.
 
-**Tunnel forward (`0x51`).** DG to SG:
+**Tunnel forward (`0x51`).** DG to SG. This is a normal session packet. The session plaintext is:
 
 ```text
-sender's SG connection id (u16) || tunnel id (u16) || nonce (24) || ciphertext
+tunnel id (u16) || tunnel nonce (24) || tunnel ciphertext
 ```
 
-The ciphertext is the tunnel-sealed body. The SG checks the connection id is one leg of that tunnel and forwards the nonce and ciphertext as delivery. It does not decrypt.
+The SG opens that with the device session key. A bad tag or an inner opcode other than `0x51` drops the datagram. The connection id in the session header must be one leg of the named tunnel. The SG then forwards the tunnel nonce and tunnel ciphertext as delivery. It does not open the tunnel ciphertext.
 
-**Tunnel delivery (`0x54`).** SG to DG: `tunnel id (u16) || nonce (24) || ciphertext`.
+**Tunnel delivery (`0x54`).** SG to DG: `tunnel id (u16) || tunnel nonce (24) || tunnel ciphertext`.
 
-Tunnel plaintext, before the AEAD:
+Tunnel plaintext, before the tunnel AEAD:
 
 ```text
-destination app id (16) || sender app id (16) || payload
+opcode (u8) || destination app id (16) || sender app id (16) || payload
 ```
 
-The DG opens it with the tunnel key and pushes to the approved app. Oversized payloads are dropped.
+The sending device writes opcode `0x51`. The DG opens the blob with the tunnel key. It accepts inner `0x51` when the datagram source is the forwarding server, and it accepts an inner opcode that equals `0x54`. Any other pair is dropped. It then pushes the payload to the approved app. Oversized payloads are dropped.
 
 If the sender has a tunnel id but the session or the carrying SG is gone, it does not use the tunnel. It sends a direct app packet or a relay instead.
 

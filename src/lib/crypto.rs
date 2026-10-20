@@ -23,7 +23,8 @@ pub(crate) mod aead_domain {
     pub const SESSION: &[u8] = b"pnet-aead-v1-session";
     /// Device bootstrap and contact-invitation handshakes (ephemeral × invitation PK).
     pub const BOOTSTRAP: &[u8] = b"pnet-aead-v1-bootstrap";
-    /// Lazy tunnel end-to-end payload (DG↔DG ephemerals; SG only forwards ciphertext).
+    /// Lazy tunnel end-to-end payload (DG↔DG ephemerals). The SG opens the
+/// session wrapper on tunnel-forward (`0x51`) and still does not open this.
     pub const TUNNEL: &[u8] = b"pnet-aead-v1-tunnel";
 }
 
@@ -136,11 +137,48 @@ pub(crate) fn xchacha20_decrypt(
     cipher.decrypt(nonce, ciphertext).ok()
 }
 
+/// Seal `body` with a leading copy of `op`, so the tag covers the opcode.
+pub(crate) fn seal_with_opcode(op: u8, key: &[u8; 32], body: &[u8]) -> (Vec<u8>, [u8; 24]) {
+    let mut plain = Vec::with_capacity(1 + body.len());
+    plain.push(op);
+    plain.extend_from_slice(body);
+    xchacha20_encrypt(key, &plain)
+}
+
+/// Open a ciphertext whose plaintext starts with `op`.
+///
+/// `also_accept` is the tunnel-delivery exception: an inner `0x51` under an
+/// outer `0x54` when the caller has already checked that the datagram came
+/// from the forwarding server. Any other mismatch drops the packet.
+pub(crate) fn open_with_opcode(
+    op: u8,
+    key: &[u8; 32],
+    nonce: &[u8; 24],
+    ciphertext: &[u8],
+    also_accept: Option<u8>,
+) -> Option<Vec<u8>> {
+    let plain = xchacha20_decrypt(key, nonce, ciphertext)?;
+    split_opcode(op, &plain, also_accept)
+}
+
+/// Return the plaintext after the leading opcode byte.
+fn split_opcode(outer: u8, plaintext: &[u8], also_accept: Option<u8>) -> Option<Vec<u8>> {
+    let inner = *plaintext.first()?;
+    if inner == outer || also_accept == Some(inner) {
+        Some(plaintext[1..].to_vec())
+    } else {
+        eprintln!(
+            "[aead] dropping packet: outer opcode {outer:#04x} does not match inner {inner:#04x}"
+        );
+        None
+    }
+}
+
 /// Build a complete relay or app packet: unencrypted header + encrypted body.
 ///
 /// Header: `[op: 1][peer_active_conn_id: u16][nonce: 24]`
-/// Body: XChaCha20-Poly1305 encrypted with the session AEAD key
-/// (`aead_domain::SESSION` over the connection's X25519 shared secret).
+/// Body: XChaCha20-Poly1305 of `[op][plaintext]`, keyed with the session AEAD
+/// key (`aead_domain::SESSION` over the connection's X25519 shared secret).
 pub(crate) fn build_encrypted_packet(
     op: u8,
     conn: &ActiveConnection,
@@ -151,7 +189,7 @@ pub(crate) fn build_encrypted_packet(
         &conn.peer_public_key,
         aead_domain::SESSION,
     );
-    let (ct, nonce) = xchacha20_encrypt(&key, plaintext);
+    let (ct, nonce) = seal_with_opcode(op, &key, plaintext);
     let mut pkt = Vec::with_capacity(1 + 2 + 24 + ct.len());
     pkt.push(op);
     pkt.extend_from_slice(&conn.peer_active_connection_id.to_be_bytes());
@@ -160,13 +198,14 @@ pub(crate) fn build_encrypted_packet(
     pkt
 }
 
-/// Decrypt the body of a relay or app packet (`buf` starts after the op byte).
+/// Decrypt the body of a session packet (`buf` starts after the op byte).
 ///
 /// `buf` layout: `[receiver_active_conn_id: u16][nonce: 24][ciphertext]`
 ///
-/// Looks up the named active connection and decrypts with the session AEAD key
-/// for that connection.
-pub(crate) fn decrypt_packet_body(node: &Node, buf: &[u8]) -> Option<Vec<u8>> {
+/// Looks up the named active connection, decrypts with the session AEAD key,
+/// and drops the packet unless the plaintext's first byte equals `expected_op`.
+/// The returned body does not include that byte.
+pub(crate) fn decrypt_packet_body(node: &Node, expected_op: u8, buf: &[u8]) -> Option<Vec<u8>> {
     if buf.len() < ENCRYPTED_BODY_HEADER_LEN {
         return None;
     }
@@ -179,7 +218,7 @@ pub(crate) fn decrypt_packet_body(node: &Node, buf: &[u8]) -> Option<Vec<u8>> {
         &conn.peer_public_key,
         aead_domain::SESSION,
     );
-    xchacha20_decrypt(&key, &nonce, ciphertext)
+    open_with_opcode(expected_op, &key, &nonce, ciphertext, None)
 }
 
 #[cfg(test)]
@@ -309,7 +348,26 @@ mod tests {
             },
         );
 
-        let decrypted = decrypt_packet_body(&node, &pkt[1..]).unwrap();
+        let decrypted = decrypt_packet_body(&node, OP, &pkt[1..]).unwrap();
         assert_eq!(decrypted, plaintext);
+
+        let mut flipped = pkt.clone();
+        flipped[0] = OP ^ 0x01;
+        assert!(
+            decrypt_packet_body(&node, flipped[0], &flipped[1..]).is_none(),
+            "a flipped outer opcode must not open"
+        );
+    }
+
+    #[test]
+    fn open_with_opcode_accepts_forwarded_tunnel_only_when_asked() {
+        let key = generate_key_bytes();
+        let (ct, nonce) = seal_with_opcode(0x51, &key, b"app");
+        assert!(open_with_opcode(0x54, &key, &nonce, &ct, None).is_none());
+        assert_eq!(
+            open_with_opcode(0x54, &key, &nonce, &ct, Some(0x51)).unwrap(),
+            b"app"
+        );
+        assert!(open_with_opcode(0x54, &key, &nonce, &ct, Some(0x40)).is_none());
     }
 }

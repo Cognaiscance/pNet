@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{
-    aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body, xchacha20_encrypt,
+    aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body, seal_with_opcode,
 };
 use super::super::certs::issue_app_cert;
 use super::super::data_models::{Application, Ed25519PublicKey, Uuid, generate_uuid};
@@ -539,22 +539,25 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                         &dg_dg_conn.peer_public_key,
                         aead_domain::TUNNEL,
                     );
-                    let mut plaintext = Vec::with_capacity(32 + payload.len());
-                    plaintext.extend_from_slice(&dest_app_id);
-                    plaintext.extend_from_slice(&sender_app_id);
-                    plaintext.extend_from_slice(payload);
-                    let (ciphertext, nonce) = xchacha20_encrypt(&aead_key, &plaintext);
+                    let mut tunnel_body = Vec::with_capacity(32 + payload.len());
+                    tunnel_body.extend_from_slice(&dest_app_id);
+                    tunnel_body.extend_from_slice(&sender_app_id);
+                    tunnel_body.extend_from_slice(payload);
+                    // Inner opcode is 0x51, the byte on the packet the SG sees.
+                    // The SG rewrites the outer byte to 0x54 and leaves this sealed.
+                    let (ciphertext, nonce) =
+                        seal_with_opcode(TUNNEL_FORWARD_OP, &aead_key, &tunnel_body);
                     let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid).or_else(|| {
                         let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
                         best_sg_connection(&node, &candidates)
                     })?;
-                    let sender_sg_conn_id = sg_conn.peer_active_connection_id;
-                    let mut pkt = Vec::with_capacity(4 + 24 + ciphertext.len());
-                    pkt.push(TUNNEL_FORWARD_OP);
-                    pkt.extend_from_slice(&sender_sg_conn_id.to_be_bytes());
-                    pkt.extend_from_slice(&tunnel_id.to_be_bytes());
-                    pkt.extend_from_slice(&nonce);
-                    pkt.extend_from_slice(&ciphertext);
+                    // Session body: the SG opens this with the device session
+                    // key, then forwards the still-sealed tunnel blob.
+                    let mut session_body = Vec::with_capacity(2 + 24 + ciphertext.len());
+                    session_body.extend_from_slice(&tunnel_id.to_be_bytes());
+                    session_body.extend_from_slice(&nonce);
+                    session_body.extend_from_slice(&ciphertext);
+                    let pkt = build_encrypted_packet(TUNNEL_FORWARD_OP, sg_conn, &session_body);
                     Some((pkt, sg_conn.peer_addr))
                 })()
             } else {
@@ -616,7 +619,7 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let (push_pkt, app_host) = {
         let node = ctx.node.read().unwrap();
 
-        let Some(plaintext) = decrypt_packet_body(&node, &buf) else {
+        let Some(plaintext) = decrypt_packet_body(&node, APP_PACKET_OP, &buf) else {
             eprintln!("[app_packet] decryption failed from {src}");
             return;
         };
