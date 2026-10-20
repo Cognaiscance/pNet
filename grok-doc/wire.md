@@ -48,6 +48,10 @@ The opaque app payload maximum is 4096 bytes on relay, direct app packet, and tu
 | `0x52` | tunnel connect request | cleartext |
 | `0x53` | tunnel connect ack | cleartext |
 | `0x54` | tunnel delivery | tunnel AEAD inside |
+| `0x60` | payment offer | session |
+| `0x61` | payment accept | session |
+| `0x62` | payment refuse | session |
+| `0x63` | payment confirm | session |
 | `0x70` | sync write request | session |
 | `0x71` | sync write ack | session |
 | `0x72` | sync update available | session |
@@ -60,6 +64,10 @@ The opaque app payload maximum is 4096 bytes on relay, direct app packet, and tu
 | `0x79` | merge ack | session |
 | `0x7A` | watermark probe request | session |
 | `0x7B` | watermark probe response | session |
+
+## Payment
+
+Ops `0x60`–`0x63` are the signed handshake between the two writers. Each plaintext is sealed with the session key. The offer names the amount, both user ids, both app aliases, the note, the payment id, and the expiry. It does not name a purse. The payee accepts, refuses, or the payer confirms. A node that is not the writer drops the packet. The local app is not on this path. Its reserve reply stays op `0x08`.
 
 ## Reachability
 

@@ -83,7 +83,7 @@ A join sends `BootstrapRequest` and returns. The asynchronous `BootstrapResponse
 | DG keepalive | 20 s | Each DG sends an empty encrypted datagram on every live SG session. |
 | Sync pull | 30 min | Pull public and private versions from the current writer. |
 | Partition reconcile | 60 s | Each SG sends a public watermark probe to every connected own-user SG. |
-| Release expired reserves | 60 s | The writer adds back purse holds whose 24-hour expiry has passed. |
+| Release expired reserves | 60 s | The writer adds back purse holds whose 24-hour expiry has passed, and drops accepted offers that have expired. |
 | Tunnel cleanup | 5 min | Drops idle tunnels. |
 
 A session lives 24 hours from the last successful handshake or DG keepalive. Maintenance renews a session when less than 2 hours remain. A `ConnectRequest` that gets no ack is forgotten after 5 seconds.

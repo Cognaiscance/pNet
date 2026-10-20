@@ -77,6 +77,8 @@ pub use app_edge::{
     app_reserve,
     app_send_packet, app_update,
 };
+mod payment;
+pub use payment::{payment_accept, payment_confirm, payment_offer, payment_refuse};
 
 mod sessions;
 pub use sessions::{
@@ -110,7 +112,7 @@ pub(crate) use routing::{
 
 mod sync;
 pub use sync::{
-    Change, ContactAppCard, ContactDeviceCard, MergeOutput, ReserveReject, WriteError,
+    Change, ContactAppCard, ContactDeviceCard, MergeOutput, PaymentReject, ReserveReject, WriteError,
     cross_user_pull_request, release_expired_reserves,
     cross_user_pull_response, cross_user_update_available, merge_ack, merge_logs,
     merge_proposal, partition_reconcile_tick, request_change, request_change_idempotent,
@@ -1146,6 +1148,325 @@ mod tests {
         assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_BAD_PACKET]);
         assert!(t.ctx.node.read().unwrap().owner.reserves.is_empty());
         assert_eq!(t.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 5_000_000);
+    }
+
+    // ── Signed payment handshake ──────────────────────────────────────────────
+
+    fn recv_pnet(t: &TestCtx) -> Vec<u8> {
+        let mut buf = [0u8; 4096];
+        let (len, _) = t.ctx.udp_socket.recv_from(&mut buf)
+            .expect("no fabric packet within timeout");
+        buf[..len].to_vec()
+    }
+
+    fn peer_device(uuid: Uuid, rank: Option<u32>) -> Device {
+        Device {
+            alias: "peer".into(),
+            uuid,
+            grade: DeviceGrade::SG,
+            sg_rank: rank,
+            hosts: Vec::new(),
+            applications: Vec::new(),
+            signing_pk: Ed25519PublicKey::ZERO,
+            dh_pk: X25519PublicKey::ZERO,
+            cert_sig: Ed25519Signature::ZERO,
+            cert_issued_at: 0,
+            cert_alias: String::new(),
+        }
+    }
+
+    struct PaymentPair {
+        payer: TestCtx,
+        payee: TestCtx,
+        token: [u8; 16],
+        payee_token: [u8; 16],
+        purse: [u8; 16],
+    }
+
+    fn pair_for_payment() -> PaymentPair {
+        let payer = TestCtx::new();
+        let payee = TestCtx::new();
+        let token = register_and_get_token(&payer, "discordium-client", 9201);
+        approve_local_app(&payer, &token);
+        let payee_token = register_and_get_token(&payee, "player", 9202);
+        approve_local_app(&payee, &payee_token);
+        let purse = [0x41; 16];
+        install_purse(&payer, purse, "media", 5_000_000, 5_000_000, &["discordium-client"]);
+
+        let payer_keys = generate_ed25519_keypair();
+        let payee_keys = generate_ed25519_keypair();
+        payer.ctx.node.write().unwrap().owner.key_pair = payer_keys.clone();
+        payee.ctx.node.write().unwrap().owner.key_pair = payee_keys.clone();
+        promote_local_to_sg(&payer, 1);
+        promote_local_to_sg(&payee, 1);
+
+        let (payer_user, payer_device) = {
+            let node = payer.ctx.node.read().unwrap();
+            (node.owner.user.uuid, node.device_uuid)
+        };
+        let (payee_user, payee_device) = {
+            let node = payee.ctx.node.read().unwrap();
+            (node.owner.user.uuid, node.device_uuid)
+        };
+        {
+            let mut node = payer.ctx.node.write().unwrap();
+            node.owner.contact_users.push(Contact {
+                user: User {
+                    alias: "payee".into(),
+                    uuid: payee_user,
+                    devices: vec![peer_device(payee_device, Some(1))],
+                },
+                public_key: payee_keys.public_key,
+                they_accept: Vec::new(),
+                last_seen_public_version: SyncVersion::zero(),
+            });
+        }
+        {
+            let mut node = payee.ctx.node.write().unwrap();
+            node.owner.contact_users.push(Contact {
+                user: User {
+                    alias: "payer".into(),
+                    uuid: payer_user,
+                    devices: vec![peer_device(payer_device, Some(1))],
+                },
+                public_key: payer_keys.public_key,
+                they_accept: Vec::new(),
+                last_seen_public_version: SyncVersion::zero(),
+            });
+        }
+
+        let payer_dh = generate_x25519_keypair();
+        let payee_dh = generate_x25519_keypair();
+        let payer_addr = payer.ctx.udp_socket.local_addr().unwrap();
+        let payee_addr = payee.ctx.udp_socket.local_addr().unwrap();
+        {
+            let mut node = payer.ctx.node.write().unwrap();
+            node.owner.active_connections.insert(7, ActiveConnection {
+                id: 7,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: payer_dh.clone(),
+                peer_public_key: payee_dh.public_key,
+                peer_active_connection_id: 7,
+                device_uuid: payee_device,
+                peer_addr: payee_addr,
+            });
+        }
+        {
+            let mut node = payee.ctx.node.write().unwrap();
+            node.owner.active_connections.insert(7, ActiveConnection {
+                id: 7,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: payee_dh,
+                peer_public_key: payer_dh.public_key,
+                peer_active_connection_id: 7,
+                device_uuid: payer_device,
+                peer_addr: payer_addr,
+            });
+        }
+        payer.ctx.udp_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        payee.ctx.udp_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        PaymentPair { payer, payee, token, payee_token, purse }
+    }
+
+    fn set_ceiling(t: &TestCtx, payer: Uuid, max_nanodollars: i64) {
+        t.ctx.node.write().unwrap().owner.receive_ceilings.push(
+            super::super::data_models::ReceiveCeiling { payer, max_nanodollars },
+        );
+    }
+
+    fn reserve_to(pair: &PaymentPair, amount: i64, payment: [u8; 16]) {
+        let payee_user = pair.payee.ctx.node.read().unwrap().owner.user.uuid;
+        app_reserve(
+            pair.payer.app_addr(),
+            reserve_packet(&pair.token, &pair.purse, amount, &payee_user, "player", "clip", &payment),
+            &pair.payer.ctx,
+        );
+    }
+
+    fn finish_handshake(pair: &PaymentPair) {
+        let offer = recv_pnet(&pair.payee);
+        assert_eq!(offer[0], PAYMENT_OFFER_OP);
+        payment_offer(
+            pair.payer.ctx.udp_socket.local_addr().unwrap(),
+            offer[1..].to_vec(),
+            &pair.payee.ctx,
+        );
+        let accept = recv_pnet(&pair.payer);
+        assert_eq!(accept[0], PAYMENT_ACCEPT_OP);
+        payment_accept(
+            pair.payee.ctx.udp_socket.local_addr().unwrap(),
+            accept[1..].to_vec(),
+            &pair.payer.ctx,
+        );
+        let confirm = recv_pnet(&pair.payee);
+        assert_eq!(confirm[0], PAYMENT_CONFIRM_OP);
+        payment_confirm(
+            pair.payer.ctx.udp_socket.local_addr().unwrap(),
+            confirm[1..].to_vec(),
+            &pair.payee.ctx,
+        );
+    }
+
+    fn assert_lists_stay_empty(pair: &PaymentPair) {
+        app_list_incoming(pair.payer.app_addr(), pair.token.to_vec(), &pair.payer.ctx);
+        assert_eq!(pair.payer.recv_reply(), vec![OK, 0, 0]);
+        app_list_sent(pair.payer.app_addr(), pair.token.to_vec(), &pair.payer.ctx);
+        assert_eq!(pair.payer.recv_reply(), vec![OK, 0, 0]);
+        app_list_incoming(pair.payee.app_addr(), pair.payee_token.to_vec(), &pair.payee.ctx);
+        assert_eq!(pair.payee.recv_reply(), vec![OK, 0, 0]);
+        app_list_sent(pair.payee.app_addr(), pair.payee_token.to_vec(), &pair.payee.ctx);
+        assert_eq!(pair.payee.recv_reply(), vec![OK, 0, 0]);
+    }
+
+    #[test]
+    fn payment_confirm_stores_one_line_on_each_side() {
+        let pair = pair_for_payment();
+        let amount = 1_000_000i64;
+        let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
+        set_ceiling(&pair.payee, payer_user, amount);
+        let payment = [0x91; 16];
+        reserve_to(&pair, amount, payment);
+        let (available, _) = parse_reserve_ok(&pair.payer.recv_reply());
+        assert_eq!(available, 4_000_000);
+        finish_handshake(&pair);
+
+        let payer_line = {
+            let node = pair.payer.ctx.node.read().unwrap();
+            assert_eq!(node.owner.purses[0].available_nanodollars, 4_000_000);
+            assert!(node.owner.reserves.is_empty());
+            assert!(node.owner.pending_accepts.is_empty());
+            assert_eq!(node.owner.ledger.len(), 1);
+            let line = &node.owner.ledger[0];
+            assert_eq!(line.payment_id, payment);
+            assert_eq!(line.amount_nanodollars, amount);
+            assert_eq!(line.note, "clip");
+            assert_eq!(line.purse_id, pair.purse);
+            line.clone()
+        };
+        let payee_line = {
+            let node = pair.payee.ctx.node.read().unwrap();
+            assert!(node.owner.pending_accepts.is_empty());
+            assert!(node.owner.reserves.is_empty());
+            assert_eq!(node.owner.ledger.len(), 1);
+            assert_eq!(node.owner.ledger[0].purse_id, [0u8; 16]);
+            node.owner.ledger[0].clone()
+        };
+        assert_eq!(payer_line.payer_sig, payee_line.payer_sig);
+        assert_eq!(payer_line.payee_sig, payee_line.payee_sig);
+        assert_eq!(payer_line.confirm_sig, payee_line.confirm_sig);
+        assert_lists_stay_empty(&pair);
+
+        reserve_to(&pair, amount, payment);
+        let (again, _) = parse_reserve_ok(&pair.payer.recv_reply());
+        assert_eq!(again, 4_000_000);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 4_000_000);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), 1);
+        assert_eq!(recv_pnet(&pair.payee)[0], PAYMENT_CONFIRM_OP);
+    }
+
+    fn refuse_over_ceiling(max: Option<i64>) {
+        let pair = pair_for_payment();
+        let amount = 1_000_000i64;
+        if let Some(max) = max {
+            let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
+            set_ceiling(&pair.payee, payer_user, max);
+        }
+        let payment = [0x92; 16];
+        reserve_to(&pair, amount, payment);
+        assert_eq!(parse_reserve_ok(&pair.payer.recv_reply()).0, 4_000_000);
+        let offer = recv_pnet(&pair.payee);
+        assert_eq!(offer[0], PAYMENT_OFFER_OP);
+        payment_offer(
+            pair.payer.ctx.udp_socket.local_addr().unwrap(),
+            offer[1..].to_vec(),
+            &pair.payee.ctx,
+        );
+        let refusal = recv_pnet(&pair.payer);
+        assert_eq!(refusal[0], PAYMENT_REFUSE_OP);
+        let plain = decrypt_packet_body(
+            &pair.payer.ctx.node.read().unwrap(),
+            &refusal[1..],
+        ).expect("refusal decrypts");
+        let (_, _, reason, _) = super::super::payment::decode_refuse(&plain).expect("refusal decodes");
+        assert_eq!(reason, super::super::payment::REFUSE_OVER_CEILING);
+        payment_refuse(
+            pair.payee.ctx.udp_socket.local_addr().unwrap(),
+            refusal[1..].to_vec(),
+            &pair.payer.ctx,
+        );
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 5_000_000);
+        assert!(pair.payer.ctx.node.read().unwrap().owner.reserves.is_empty());
+        assert!(pair.payer.ctx.node.read().unwrap().owner.ledger.is_empty());
+        assert!(pair.payee.ctx.node.read().unwrap().owner.ledger.is_empty());
+        assert!(pair.payee.ctx.node.read().unwrap().owner.pending_accepts.is_empty());
+    }
+
+    #[test]
+    fn payment_with_no_ceiling_is_refused_and_the_reserve_returns() {
+        refuse_over_ceiling(None);
+    }
+
+    #[test]
+    fn payment_past_the_ceiling_is_refused_and_the_reserve_returns() {
+        refuse_over_ceiling(Some(999_999));
+    }
+
+    #[test]
+    fn a_bad_offer_signature_is_dropped() {
+        let pair = pair_for_payment();
+        let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
+        set_ceiling(&pair.payee, payer_user, 1_000_000);
+        reserve_to(&pair, 1_000_000, [0x93; 16]);
+        assert_eq!(parse_reserve_ok(&pair.payer.recv_reply()).0, 4_000_000);
+        let offer = recv_pnet(&pair.payee);
+        assert_eq!(offer[0], PAYMENT_OFFER_OP);
+        let mut plain = decrypt_packet_body(&pair.payee.ctx.node.read().unwrap(), &offer[1..])
+            .expect("offer decrypts");
+        let last = plain.len() - 1;
+        plain[last] ^= 0xff;
+        let pkt = {
+            let node = pair.payer.ctx.node.read().unwrap();
+            let conn = node.owner.active_connections.get(&7).unwrap();
+            build_encrypted_packet(PAYMENT_OFFER_OP, conn, &plain)
+        };
+        payment_offer(
+            pair.payer.ctx.udp_socket.local_addr().unwrap(),
+            pkt[1..].to_vec(),
+            &pair.payee.ctx,
+        );
+        assert!(pair.payee.ctx.node.read().unwrap().owner.pending_accepts.is_empty());
+        assert!(pair.payee.ctx.node.read().unwrap().owner.ledger.is_empty());
+        let mut buf = [0u8; 64];
+        assert!(pair.payer.ctx.udp_socket.recv_from(&mut buf).is_err());
+        let node = pair.payer.ctx.node.read().unwrap();
+        assert_eq!(node.owner.reserves.len(), 1);
+        assert_eq!(node.owner.purses[0].available_nanodollars, 4_000_000);
+    }
+
+    #[test]
+    fn an_expired_pending_accept_is_dropped_without_a_line() {
+        let t = TestCtx::new();
+        promote_local_to_sg(&t, 1);
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let payee = node.owner.user.uuid;
+            node.owner.pending_accepts.push(super::super::data_models::PendingAccept {
+                payment_id: [9; 16],
+                amount_nanodollars: 1,
+                payer: [1; 16],
+                payee,
+                paying_alias: "discordium-client".into(),
+                destination_alias: "player".into(),
+                note: String::new(),
+                expires_at_ms: 0,
+                payer_sig: Ed25519Signature::ZERO,
+                payee_sig: Ed25519Signature::ZERO,
+            });
+        }
+        release_expired_reserves(&t.ctx);
+        let node = t.ctx.node.read().unwrap();
+        assert!(node.owner.pending_accepts.is_empty());
+        assert!(node.owner.ledger.is_empty());
     }
 
     // ── AppSendPacket ─────────────────────────────────────────────────────────

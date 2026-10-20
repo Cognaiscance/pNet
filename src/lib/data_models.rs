@@ -685,6 +685,17 @@ pub struct Owner {
     /// Holds against those purses. Private scope, same as `purses`.
     #[serde(default)]
     pub reserves: Vec<PaymentReserve>,
+    /// How much of one payer's credit this user will still accept.
+    /// A payer with no row is at zero. Private scope.
+    #[serde(default)]
+    pub receive_ceilings: Vec<ReceiveCeiling>,
+    /// Confirmed payments. Private scope. The app lists stay empty until a later step.
+    #[serde(default)]
+    pub ledger: Vec<LedgerLine>,
+    /// Offers this user signed and has not yet been told are stored.
+    /// They count against the payer's ceiling. Private scope.
+    #[serde(default)]
+    pub pending_accepts: Vec<PendingAccept>,
 
     /// Latest version of the user's **private** state held by this node.
     /// On the writer SG this is authoritative; on other nodes it's the
@@ -866,9 +877,8 @@ impl Purse {
 }
 
 /// How long a reserve holds purse funds before the writer gives them back.
-/// The contact is not asked during this step, so every reserve ends this way
-/// unless a later step confirms it first. Twenty-four hours is long enough
-/// for that later accept to arrive the same day.
+/// A confirmed payment consumes the hold first. Twenty-four hours is long
+/// enough for the contact to answer the same day.
 pub const RESERVE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Milliseconds since the Unix epoch. A clock that is not set returns 0.
@@ -908,6 +918,54 @@ impl PaymentReserve {
             && self.note == other.note
             && self.paying_alias == other.paying_alias
     }
+}
+
+/// The most of one payer's credit this user will accept. Missing means zero.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct ReceiveCeiling {
+    #[serde(with = "serde_bytes_16")]
+    pub payer: Uuid,
+    pub max_nanodollars: i64,
+}
+
+/// A confirmed payment. `purse_id` is the payer's local purse and is zero on
+/// the payee, who is not told which purse paid.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct LedgerLine {
+    #[serde(with = "serde_bytes_16")]
+    pub payment_id: Uuid,
+    pub amount_nanodollars: i64,
+    #[serde(with = "serde_bytes_16")]
+    pub payer: Uuid,
+    #[serde(with = "serde_bytes_16")]
+    pub payee: Uuid,
+    pub paying_alias: String,
+    pub destination_alias: String,
+    pub note: String,
+    pub expires_at_ms: u64,
+    #[serde(with = "serde_bytes_16")]
+    pub purse_id: Uuid,
+    pub payer_sig: Ed25519Signature,
+    pub payee_sig: Ed25519Signature,
+    pub confirm_sig: Ed25519Signature,
+}
+
+/// An offer this user has signed and is still waiting to hear was stored.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct PendingAccept {
+    #[serde(with = "serde_bytes_16")]
+    pub payment_id: Uuid,
+    pub amount_nanodollars: i64,
+    #[serde(with = "serde_bytes_16")]
+    pub payer: Uuid,
+    #[serde(with = "serde_bytes_16")]
+    pub payee: Uuid,
+    pub paying_alias: String,
+    pub destination_alias: String,
+    pub note: String,
+    pub expires_at_ms: u64,
+    pub payer_sig: Ed25519Signature,
+    pub payee_sig: Ed25519Signature,
 }
 
 /// We allow `contact_uuid` to send to our apps whose alias is `app_alias`.
@@ -1106,6 +1164,9 @@ impl Node {
                 outbound_app_invitations:   Vec::new(),
                 purses:                     Vec::new(),
                 reserves:                   Vec::new(),
+                receive_ceilings:           Vec::new(),
+                ledger:                     Vec::new(),
+                pending_accepts:            Vec::new(),
                 private_version:            SyncVersion::zero(),
                 public_version:             SyncVersion::zero(),
                 write_log:                  Vec::new(),

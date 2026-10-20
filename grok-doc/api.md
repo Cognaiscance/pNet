@@ -261,11 +261,11 @@ Errors: `bad packet`, `token unknown`, `not approved`.
 
 Body: `token (16)`, exactly 16 bytes. Same approval check as list purses.
 
-Success is `0x00 || count (u16)`. The count is 0 until a payment is stored. The lines, when they exist, are payments sent to this user for this app alias.
+Success is `0x00 || count (u16)`. The count stays 0. A later step returns the stored lines, which are payments sent to this user for this app alias.
 
 ### List sent (`0x07`)
 
-Same request, same approval check, and the same empty success as list incoming. The lines, when they exist, are payments this app sent.
+Same request, same approval check, and the same empty success as list incoming. A later step returns the lines this app sent.
 
 ### Reserve (`0x08`)
 
@@ -276,7 +276,7 @@ token (16) || purse id (16) || amount (i64) || contact uuid (16)
 
 The token must belong to an approved app on this device, and that app's alias must be a member of the purse. The amount is nanodollars and must be greater than zero. The destination alias is trimmed. The note is opaque UTF-8, at most 255 bytes, and may be empty. Nothing follows the payment id.
 
-This node applies the reserve only when it is the writer. Any other node replies `no writer` and leaves the purse as it is. The contact is not told, and no ledger line is stored.
+This node applies the reserve only when it is the writer. Any other node replies `no writer` and leaves the purse as it is. When the writer holds the user key and has a session to that contact, it signs an offer and sends it. The offer does not name the purse. The app reply is the same either way. A missing session leaves the hold until a retry, a refusal, or expiry. The reply does not change when the contact later accepts or refuses. The next purse read shows the restored available amount after a refusal or an expiry.
 
 Success:
 
@@ -284,6 +284,6 @@ Success:
 0x00 || available (i64) || expires at (u64, unix milliseconds)
 ```
 
-`available` is what that purse still has after the hold. The hold lasts 24 hours from the writer's clock. The same payment id with the same body returns this result again and does not reduce the available amount a second time. A different body for an id that is still held is `payment mismatch`. When the hold expires, the writer adds the amount back. The check runs about once a minute, and also at the start of the next reserve.
+`available` is what that purse still has after the hold. The hold lasts 24 hours from the writer's clock. The same payment id with the same body returns this result again and does not reduce the available amount a second time. After the payer has confirmed the line, the same id returns the current available amount and that line's expiry, and does not reserve again. A different body for an id that is still held, or for an id already confirmed with a different body, is `payment mismatch`. When an unconfirmed hold expires, the writer adds the amount back. The check runs about once a minute, and also at the start of the next reserve. A confirmed payment is not added back.
 
 Errors: `bad packet`, `token unknown`, `not approved`, `no writer`, `not in purse`, `over purse`, `payment mismatch`. An amount equal to the available amount succeeds and leaves zero.

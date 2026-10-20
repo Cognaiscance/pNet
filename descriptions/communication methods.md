@@ -137,7 +137,7 @@ packet when it decrypts the delivery.
 ### 6 — list incoming payments
 
 - Request: `[token:16]` exactly. Same approval check as op 5.
-- Success: `[0x00][count:u16 be]` with count 0 until a payment is stored.
+- Success: `[0x00][count:u16 be]` with count 0. Stored lines are not listed yet.
 - These lines will be payments sent to this user for this app alias.
 
 ### 7 — list sent payments
@@ -150,10 +150,34 @@ packet when it decrypts the delivery.
 - Request: `[token:16][purse id:16][amount:i64 be][contact uuid:16][destination alias][note][payment id:16]`
 - Amount is nanodollars and must be greater than zero. The destination alias is trimmed. The note is opaque UTF-8, at most 255 bytes, and may be empty. No bytes follow the payment id.
 - The caller must be an approved app, and a member of that purse. This node applies the reserve only when it is the writer.
-- Success: `[0x00][available:i64 be][expires_at_ms:u64 be]`. `available` is what the purse still has. The hold lasts 24 hours from the writer's clock. The same payment id and the same body return this result again and do not reduce the available amount a second time.
-- A node that is not the writer replies `ERR_NO_WRITER` and does not change the purse. The contact is not told.
+- Success: `[0x00][available:i64 be][expires_at_ms:u64 be]`. `available` is what the purse still has. The hold lasts 24 hours from the writer's clock. The same payment id and the same body return this result again and do not reduce the available amount a second time. After a confirmation, the same id returns the purse's current available amount and the line's expiry, and does not reserve again.
+- A node that is not the writer replies `ERR_NO_WRITER` and does not change the purse. When this node is the writer and holds the user key, it signs an offer and sends op `0x60` to the contact. The offer does not name the purse. A missing session leaves the hold until a retry, a refusal, or expiry.
 - Errors: `ERR_BAD_PACKET`, `ERR_TOKEN_UNKNOWN`, `ERR_NOT_APPROVED`, `ERR_NO_WRITER`, `ERR_NOT_IN_PURSE`, `ERR_OVER_PURSE`, `ERR_PAYMENT_MISMATCH`.
-- When the hold expires, the writer adds the amount back. A later reserve with a new payment id can use it.
+- When the hold expires without a confirmation, the writer adds the amount back. A later reserve with a new payment id can use it. A confirmed payment is not added back.
+
+### 0x60 — payment offer
+
+Session-sealed. The payer's writer sends this to the payee's writer. The plaintext is the offer body and the payer's user-key signature. The body is `[payment id:16][amount:i64 be][payer user uuid:16][payee user uuid:16][paying alias][destination alias][note][expires_at_ms:u64 be]`. The purse id is absent. The signature domain is `pnet-payment-offer-v1`.
+
+The payee's writer drops a packet it cannot open, a bad signature, an offer for another user, or a packet that arrives on a node that is not the writer. An offer past `expires_at_ms` gets a signed refusal with reason `0x02`. An offer whose new claim would pass the ceiling stored for that payer gets reason `0x01`. A missing ceiling is zero. An amount equal to the ceiling is accepted. A different body for a payment id already staged or stored gets reason `0x03`.
+
+### 0x61 — payment accept
+
+Session-sealed. The payee's writer sends this after it has signed the offer. The plaintext is the offer body, the payer signature, and the payee signature. The accept domain is `pnet-payment-accept-v1` over the body and the payer signature.
+
+The payer's writer checks both signatures against the held offer. It then signs the confirmation and stores the ledger line, removing the hold without adding the amount back. It sends op `0x63`. A repeat of an accept that is already a line resends that confirmation.
+
+### 0x62 — payment refuse
+
+Session-sealed. The plaintext is the offer body, the payer signature, one reason byte, and the payee signature. The refuse domain is `pnet-payment-refuse-v1` over the body, the payer signature, and the reason byte. Reasons are `0x01` over the ceiling, `0x02` expired, and `0x03` a different body for that payment id.
+
+A signed refusal that matches the held offer releases it. A refusal after the line exists is ignored. A refusal that does not match the hold is ignored.
+
+### 0x63 — payment confirm
+
+Session-sealed. The plaintext is the accept plus the payer's second signature. The confirm domain is `pnet-payment-confirm-v1` over the body, the payer signature, and the payee signature.
+
+The payee's writer stores the line when the three signatures verify and a matching staged accept is still present. The purse id on that copy is 16 zero bytes. A repeat of the same confirmation is ignored. A staged accept that expired is already gone, and this step does not invent the line.
 
 ### get-data secrecy (op 2)
 
