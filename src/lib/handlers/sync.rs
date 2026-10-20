@@ -11,9 +11,15 @@ use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
 use super::super::data_models::{
     AppGrant, AppInvitation, Application, Contact, Device, DeviceGrade, Ed25519KeyPair,
-    Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Node, Owner, PaymentReserve, Purse,
+    Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, LedgerLine, Node, Owner, PaymentReserve,
+    PendingAccept, Purse, ReceiveCeiling,
     Scope, SyncVersion, User, Uuid, WriteLogEntry, X25519PublicKey, WRITE_LOG_RETENTION,
     unix_time_ms,
+};
+use super::super::payment::{
+    body_from_line, body_from_pending, claim_exceeds_ceiling, decode_accept_at, decode_confirm_at,
+    encode_accept, encode_confirm, line_covers, line_from, line_same_payment, offer_body_ok,
+    pending_covers, pending_from,
 };
 use super::super::wire::*;
 use super::{
@@ -447,7 +453,16 @@ pub enum Change {
     /// A repeat of the same hold does not reduce the available amount again.
     ReservePayment { reserve: PaymentReserve },
     /// Private-scope: return a hold to its purse. A missing id is a no-op.
+    /// A payment that already became a ledger line is not refunded.
     ReleaseReserve { payment_id: Uuid },
+    /// Private-scope: store one confirmed payment. On the payer this consumes
+    /// the matching hold without putting the amount back. On the payee it
+    /// requires the staged accept.
+    RecordLedger { line: LedgerLine },
+    /// Private-scope: remember a signed accept so it counts against the ceiling.
+    StageAccept { pending: PendingAccept },
+    /// Private-scope: forget a staged accept. This does not touch a purse.
+    DropAccept { payment_id: Uuid },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
@@ -473,6 +488,9 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
         Change::UpsertPurse { .. }             => &[Scope::Private],
         Change::ReservePayment { .. }          => &[Scope::Private],
         Change::ReleaseReserve { .. }          => &[Scope::Private],
+        Change::RecordLedger { .. }            => &[Scope::Private],
+        Change::StageAccept { .. }             => &[Scope::Private],
+        Change::DropAccept { .. }              => &[Scope::Private],
     }
 }
 
@@ -599,6 +617,18 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
         }
         Change::ReleaseReserve { payment_id } => {
             buf.push(CHANGE_KIND_RELEASE_RESERVE);
+            buf.extend_from_slice(payment_id);
+        }
+        Change::RecordLedger { line } => {
+            buf.push(CHANGE_KIND_RECORD_LEDGER);
+            push_line(&mut buf, line);
+        }
+        Change::StageAccept { pending } => {
+            buf.push(CHANGE_KIND_STAGE_ACCEPT);
+            push_pending(&mut buf, pending);
+        }
+        Change::DropAccept { payment_id } => {
+            buf.push(CHANGE_KIND_DROP_ACCEPT);
             buf.extend_from_slice(payment_id);
         }
     }
@@ -731,6 +761,18 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
             let payment_id: Uuid = read_arr(data, &mut pos)?;
             Some(Change::ReleaseReserve { payment_id })
         }
+        CHANGE_KIND_RECORD_LEDGER => {
+            let line = read_line(data, &mut pos)?;
+            Some(Change::RecordLedger { line })
+        }
+        CHANGE_KIND_STAGE_ACCEPT => {
+            let pending = read_pending(data, &mut pos)?;
+            Some(Change::StageAccept { pending })
+        }
+        CHANGE_KIND_DROP_ACCEPT => {
+            let payment_id: Uuid = read_arr(data, &mut pos)?;
+            Some(Change::DropAccept { payment_id })
+        }
         _ => None,
     }
 }
@@ -746,6 +788,15 @@ pub enum ReserveReject {
     Mismatch,
 }
 
+/// Why the writer refused a signed payment step without changing the books.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PaymentReject {
+    /// The new claim would pass the ceiling stored for that payer.
+    OverCeiling,
+    /// This payment id is already in use with a different body.
+    Mismatch,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum WriteError {
     /// No reachable own SG. Caller should report the error to the requesting app.
@@ -754,6 +805,8 @@ pub enum WriteError {
     Validation(String),
     /// A reserve was refused. The purse and the other holds are unchanged.
     ReserveRejected(ReserveReject),
+    /// A signed payment step was refused. Existing lines and holds stay as they were.
+    PaymentRejected(PaymentReject),
 }
 
 /// Apply a `Change` to local state, bump the relevant scope version(s), and
@@ -936,6 +989,9 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
         Change::UpsertPurse { purse } => upsert_purse(owner, purse),
         Change::ReservePayment { reserve } => apply_reserve(owner, reserve)?,
         Change::ReleaseReserve { payment_id } => apply_release(owner, *payment_id),
+        Change::RecordLedger { line } => apply_record(owner, line)?,
+        Change::StageAccept { pending } => apply_stage(owner, pending)?,
+        Change::DropAccept { payment_id } => apply_drop(owner, *payment_id),
     };
     Ok(applied)
 }
@@ -947,6 +1003,12 @@ fn apply_reserve(owner: &mut Owner, reserve: &PaymentReserve) -> Result<bool, Wr
         || !alias_ok(&reserve.paying_alias)
     {
         return Err(WriteError::Validation("reserve fields".into()));
+    }
+    if let Some(line) = owner.ledger.iter().find(|line| line.payment_id == reserve.payment_id) {
+        if line_same_payment(line, reserve, owner.user.uuid) {
+            return Ok(false);
+        }
+        return Err(WriteError::ReserveRejected(ReserveReject::Mismatch));
     }
     if let Some(existing) = owner.reserves.iter().find(|r| r.payment_id == reserve.payment_id) {
         if existing.same_hold(reserve) {
@@ -969,6 +1031,11 @@ fn apply_reserve(owner: &mut Owner, reserve: &PaymentReserve) -> Result<bool, Wr
 }
 
 fn apply_release(owner: &mut Owner, payment_id: Uuid) -> bool {
+    if owner.ledger.iter().any(|line| line.payment_id == payment_id) {
+        let before = owner.reserves.len();
+        owner.reserves.retain(|reserve| reserve.payment_id != payment_id);
+        return before != owner.reserves.len();
+    }
     let Some(index) = owner.reserves.iter().position(|r| r.payment_id == payment_id) else {
         return false;
     };
@@ -979,6 +1046,87 @@ fn apply_release(owner: &mut Owner, payment_id: Uuid) -> bool {
             .saturating_add(reserve.amount_nanodollars);
     }
     true
+}
+
+fn apply_record(owner: &mut Owner, line: &LedgerLine) -> Result<bool, WriteError> {
+    if !offer_body_ok(&body_from_line(line)) {
+        return Err(WriteError::Validation("ledger fields".into()));
+    }
+    if let Some(existing) = owner.ledger.iter().find(|stored| stored.payment_id == line.payment_id) {
+        if same_record(existing, line) {
+            let removed_reserve = take_reserve_no_refund(owner, line.payment_id);
+            let removed_pending = take_pending(owner, line.payment_id);
+            return Ok(removed_reserve || removed_pending);
+        }
+        return Err(WriteError::PaymentRejected(PaymentReject::Mismatch));
+    }
+    if line.payer == owner.user.uuid {
+        let Some(reserve) = owner.reserves.iter().find(|reserve| reserve.payment_id == line.payment_id).cloned() else {
+            return Ok(false);
+        };
+        if !line_same_payment(line, &reserve, owner.user.uuid) {
+            return Err(WriteError::PaymentRejected(PaymentReject::Mismatch));
+        }
+        take_reserve_no_refund(owner, line.payment_id);
+    } else {
+        let body = body_from_line(line);
+        let Some(pending) = owner.pending_accepts.iter().find(|pending| pending.payment_id == line.payment_id) else {
+            return Ok(false);
+        };
+        if !pending_covers(pending, &body, &line.payer_sig) || pending.payee_sig != line.payee_sig {
+            return Err(WriteError::PaymentRejected(PaymentReject::Mismatch));
+        }
+    }
+    take_pending(owner, line.payment_id);
+    owner.ledger.push(line.clone());
+    Ok(true)
+}
+
+fn apply_stage(owner: &mut Owner, pending: &PendingAccept) -> Result<bool, WriteError> {
+    if !offer_body_ok(&body_from_pending(pending)) {
+        return Err(WriteError::Validation("accept fields".into()));
+    }
+    let body = body_from_pending(pending);
+    if let Some(line) = owner.ledger.iter().find(|line| line.payment_id == pending.payment_id) {
+        if line_covers(line, &body, &pending.payer_sig) {
+            return Ok(false);
+        }
+        return Err(WriteError::PaymentRejected(PaymentReject::Mismatch));
+    }
+    if let Some(existing) = owner.pending_accepts.iter().find(|stored| stored.payment_id == pending.payment_id) {
+        if pending_covers(existing, &body, &pending.payer_sig) {
+            return Ok(false);
+        }
+        return Err(WriteError::PaymentRejected(PaymentReject::Mismatch));
+    }
+    if claim_exceeds_ceiling(owner, pending.payer, pending.amount_nanodollars, Some(pending.payment_id)) {
+        return Err(WriteError::PaymentRejected(PaymentReject::OverCeiling));
+    }
+    owner.pending_accepts.push(pending.clone());
+    Ok(true)
+}
+
+fn apply_drop(owner: &mut Owner, payment_id: Uuid) -> bool {
+    take_pending(owner, payment_id)
+}
+
+fn same_record(left: &LedgerLine, right: &LedgerLine) -> bool {
+    body_from_line(left) == body_from_line(right)
+        && left.payer_sig == right.payer_sig
+        && left.payee_sig == right.payee_sig
+        && left.confirm_sig == right.confirm_sig
+}
+
+fn take_reserve_no_refund(owner: &mut Owner, payment_id: Uuid) -> bool {
+    let before = owner.reserves.len();
+    owner.reserves.retain(|reserve| reserve.payment_id != payment_id);
+    before != owner.reserves.len()
+}
+
+fn take_pending(owner: &mut Owner, payment_id: Uuid) -> bool {
+    let before = owner.pending_accepts.len();
+    owner.pending_accepts.retain(|pending| pending.payment_id != payment_id);
+    before != owner.pending_accepts.len()
 }
 
 fn alias_ok(alias: &str) -> bool {
@@ -1016,6 +1164,20 @@ pub(crate) fn release_expired_reserves_at(ctx: &WorkerContext, now_ms: u64) {
     for payment_id in ids {
         if let Err(err) = request_change_idempotent(Change::ReleaseReserve { payment_id }, ctx) {
             eprintln!("[release_expired_reserves] {payment_id:?}: {err:?}");
+        }
+    }
+    let pending_ids: Vec<Uuid> = {
+        let node = ctx.node.read().unwrap();
+        node.owner
+            .pending_accepts
+            .iter()
+            .filter(|pending| pending.expires_at_ms <= now_ms)
+            .map(|pending| pending.payment_id)
+            .collect()
+    };
+    for payment_id in pending_ids {
+        if let Err(err) = request_change_idempotent(Change::DropAccept { payment_id }, ctx) {
+            eprintln!("[release_expired_reserves] accept {payment_id:?}: {err:?}");
         }
     }
 }
@@ -1885,6 +2047,39 @@ fn push_reserve(buf: &mut Vec<u8>, reserve: &PaymentReserve) {
     buf.extend_from_slice(&reserve.expires_at_ms.to_be_bytes());
 }
 
+fn push_ceiling(buf: &mut Vec<u8>, ceiling: &ReceiveCeiling) {
+    buf.extend_from_slice(&ceiling.payer);
+    push_i64(buf, ceiling.max_nanodollars);
+}
+
+fn read_ceiling(data: &[u8], pos: &mut usize) -> Option<ReceiveCeiling> {
+    let payer: Uuid = read_arr(data, pos)?;
+    let max_nanodollars = read_i64(data, pos)?;
+    Some(ReceiveCeiling { payer, max_nanodollars })
+}
+
+fn push_line(buf: &mut Vec<u8>, line: &LedgerLine) {
+    let body = body_from_line(line);
+    buf.extend(encode_confirm(&body, &line.payer_sig, &line.payee_sig, &line.confirm_sig));
+    buf.extend_from_slice(&line.purse_id);
+}
+
+fn read_line(data: &[u8], pos: &mut usize) -> Option<LedgerLine> {
+    let (body, payer_sig, payee_sig, confirm_sig) = decode_confirm_at(data, pos)?;
+    let purse_id: Uuid = read_arr(data, pos)?;
+    Some(line_from(&body, purse_id, payer_sig, payee_sig, confirm_sig))
+}
+
+fn push_pending(buf: &mut Vec<u8>, pending: &PendingAccept) {
+    let body = body_from_pending(pending);
+    buf.extend(encode_accept(&body, &pending.payer_sig, &pending.payee_sig));
+}
+
+fn read_pending(data: &[u8], pos: &mut usize) -> Option<PendingAccept> {
+    let (body, payer_sig, payee_sig) = decode_accept_at(data, pos)?;
+    Some(pending_from(&body, payer_sig, payee_sig))
+}
+
 fn read_reserve(data: &[u8], pos: &mut usize) -> Option<PaymentReserve> {
     let payment_id: Uuid = read_arr(data, pos)?;
     let purse_id: Uuid = read_arr(data, pos)?;
@@ -1910,11 +2105,15 @@ fn read_reserve(data: &[u8], pos: &mut usize) -> Option<PaymentReserve> {
 enum PrivateSnapshot {
     /// Writer predates purses. Leave the puller's purse list alone.
     LegacyEmpty,
-    /// Purses, and the holds against them. A blob that ends after the purses
-    /// is a writer from before holds existed; its reserve list is empty.
+    /// Purses, holds, ceilings, confirmed lines, and staged accepts.
+    /// A blob that ends after the purses has no holds. A blob that ends after
+    /// the holds has no ceilings, lines, or staged accepts.
     Purses {
         purses: Vec<Purse>,
         reserves: Vec<PaymentReserve>,
+        ceilings: Vec<ReceiveCeiling>,
+        ledger: Vec<LedgerLine>,
+        pending: Vec<PendingAccept>,
     },
 }
 
@@ -1923,6 +2122,12 @@ fn serialize_private_state(node: &Node) -> Vec<u8> {
     purses.sort_by_key(|purse| purse.id);
     let mut reserves = node.owner.reserves.clone();
     reserves.sort_by_key(|reserve| reserve.payment_id);
+    let mut ceilings = node.owner.receive_ceilings.clone();
+    ceilings.sort_by_key(|ceiling| ceiling.payer);
+    let mut ledger = node.owner.ledger.clone();
+    ledger.sort_by_key(|line| line.payment_id);
+    let mut pending = node.owner.pending_accepts.clone();
+    pending.sort_by_key(|accept| accept.payment_id);
     let mut buf = Vec::new();
     buf.push(PURSE_SNAPSHOT_MARKER);
     push_u16(&mut buf, purses.len().min(u16::MAX as usize) as u16);
@@ -1932,6 +2137,18 @@ fn serialize_private_state(node: &Node) -> Vec<u8> {
     push_u16(&mut buf, reserves.len().min(u16::MAX as usize) as u16);
     for reserve in reserves.iter().take(u16::MAX as usize) {
         push_reserve(&mut buf, reserve);
+    }
+    push_u16(&mut buf, ceilings.len().min(u16::MAX as usize) as u16);
+    for ceiling in ceilings.iter().take(u16::MAX as usize) {
+        push_ceiling(&mut buf, ceiling);
+    }
+    push_u16(&mut buf, ledger.len().min(u16::MAX as usize) as u16);
+    for line in ledger.iter().take(u16::MAX as usize) {
+        push_line(&mut buf, line);
+    }
+    push_u16(&mut buf, pending.len().min(u16::MAX as usize) as u16);
+    for accept in pending.iter().take(u16::MAX as usize) {
+        push_pending(&mut buf, accept);
     }
     buf
 }
@@ -1950,27 +2167,60 @@ fn read_private_snapshot(data: &[u8]) -> Option<PrivateSnapshot> {
         purses.push(read_purse(data, &mut pos)?);
     }
     if pos == data.len() {
-        return Some(PrivateSnapshot::Purses { purses, reserves: Vec::new() });
+        return Some(PrivateSnapshot::Purses {
+            purses,
+            reserves: Vec::new(),
+            ceilings: Vec::new(),
+            ledger: Vec::new(),
+            pending: Vec::new(),
+        });
     }
     let reserve_count = read_u16(data, &mut pos)? as usize;
     let mut reserves = Vec::with_capacity(reserve_count);
     for _ in 0..reserve_count {
         reserves.push(read_reserve(data, &mut pos)?);
     }
+    if pos == data.len() {
+        return Some(PrivateSnapshot::Purses {
+            purses,
+            reserves,
+            ceilings: Vec::new(),
+            ledger: Vec::new(),
+            pending: Vec::new(),
+        });
+    }
+    let ceiling_count = read_u16(data, &mut pos)? as usize;
+    let mut ceilings = Vec::with_capacity(ceiling_count);
+    for _ in 0..ceiling_count {
+        ceilings.push(read_ceiling(data, &mut pos)?);
+    }
+    let line_count = read_u16(data, &mut pos)? as usize;
+    let mut ledger = Vec::with_capacity(line_count);
+    for _ in 0..line_count {
+        ledger.push(read_line(data, &mut pos)?);
+    }
+    let pending_count = read_u16(data, &mut pos)? as usize;
+    let mut pending = Vec::with_capacity(pending_count);
+    for _ in 0..pending_count {
+        pending.push(read_pending(data, &mut pos)?);
+    }
     if pos != data.len() {
         return None;
     }
-    Some(PrivateSnapshot::Purses { purses, reserves })
+    Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending })
 }
 
 fn apply_private_state(blob: &[u8], ctx: &WorkerContext) -> bool {
     let Some(snapshot) = read_private_snapshot(blob) else {
         return false;
     };
-    if let PrivateSnapshot::Purses { purses, reserves } = snapshot {
+    if let PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending } = snapshot {
         let mut node = ctx.node.write().unwrap();
         node.owner.purses = purses;
         node.owner.reserves = reserves;
+        node.owner.receive_ceilings = ceilings;
+        node.owner.ledger = ledger;
+        node.owner.pending_accepts = pending;
     }
     true
 }
@@ -2352,6 +2602,11 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 }
                 Err(WriteError::ReserveRejected(reason)) => {
                     eprintln!("[sync_write_request] reserve rejected from {src}: {reason:?}");
+                    let node = ctx.node.read().unwrap();
+                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new())
+                }
+                Err(WriteError::PaymentRejected(reason)) => {
+                    eprintln!("[sync_write_request] payment rejected from {src}: {reason:?}");
                     let node = ctx.node.read().unwrap();
                     (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new())
                 }
@@ -3836,6 +4091,10 @@ struct MergedState {
     purses: HashMap<Uuid, (Purse, EntryPriority)>,
     /// payment id → hold still outstanding after the log is replayed in order.
     reserves: HashMap<Uuid, PaymentReserve>,
+    /// payment id → confirmed line.
+    ledger: HashMap<Uuid, LedgerLine>,
+    /// payment id → staged accept that is not yet a line.
+    pending: HashMap<Uuid, PendingAccept>,
 }
 
 /// Per-contact accumulator: the winning snapshot plus the priority of the
@@ -3916,6 +4175,8 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
         they_accept: HashMap::new(),
         purses: HashMap::new(),
         reserves: HashMap::new(),
+        ledger: HashMap::new(),
+        pending: HashMap::new(),
     };
 
     // First pass: collect tombstones. Tombstone wins globally for its target,
@@ -4069,6 +4330,15 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
             }
             Change::ReleaseReserve { payment_id } => {
                 replay_release(&mut state, payment_id);
+            }
+            Change::RecordLedger { line } => {
+                replay_record(&mut state, line);
+            }
+            Change::StageAccept { pending } => {
+                replay_stage(&mut state, pending);
+            }
+            Change::DropAccept { payment_id } => {
+                state.pending.remove(&payment_id);
             }
         }
     }
@@ -4375,7 +4645,42 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
             (None, Some(reserve)) => {
                 out.push(Change::ReservePayment { reserve: reserve.clone() });
             }
-            (Some(_), None) => out.push(Change::ReleaseReserve { payment_id: id }),
+            (Some(_), None) if !target.ledger.contains_key(&id) => {
+                out.push(Change::ReleaseReserve { payment_id: id });
+            }
+            _ => {}
+        }
+    }
+
+    let mut line_ids: Vec<Uuid> = current.ledger.keys()
+        .chain(target.ledger.keys())
+        .copied()
+        .collect();
+    line_ids.sort();
+    line_ids.dedup();
+    for id in line_ids {
+        if current.ledger.contains_key(&id) {
+            continue;
+        }
+        if let Some(line) = target.ledger.get(&id) {
+            out.push(Change::RecordLedger { line: line.clone() });
+        }
+    }
+
+    let mut pending_ids: Vec<Uuid> = current.pending.keys()
+        .chain(target.pending.keys())
+        .copied()
+        .collect();
+    pending_ids.sort();
+    pending_ids.dedup();
+    for id in pending_ids {
+        match (current.pending.get(&id), target.pending.get(&id)) {
+            (None, Some(pending)) if !target.ledger.contains_key(&id) => {
+                out.push(Change::StageAccept { pending: pending.clone() });
+            }
+            (Some(_), None) if !target.ledger.contains_key(&id) => {
+                out.push(Change::DropAccept { payment_id: id });
+            }
             _ => {}
         }
     }
@@ -4386,7 +4691,11 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
 /// Sum of holds on `purse_id` that are in `extra` and not in `base`.
 fn reserve_delta(base: &MergedState, extra: &MergedState, purse_id: Uuid) -> i64 {
     extra.reserves.values()
-        .filter(|reserve| reserve.purse_id == purse_id && !base.reserves.contains_key(&reserve.payment_id))
+        .filter(|reserve| {
+            reserve.purse_id == purse_id
+                && !base.reserves.contains_key(&reserve.payment_id)
+                && !base.ledger.contains_key(&reserve.payment_id)
+        })
         .map(|reserve| reserve.amount_nanodollars)
         .fold(0i64, i64::saturating_add)
 }
@@ -4400,7 +4709,7 @@ fn replay_reserve(state: &mut MergedState, reserve: PaymentReserve) {
     if reserve.amount_nanodollars <= 0 {
         return;
     }
-    if state.reserves.contains_key(&reserve.payment_id) {
+    if state.reserves.contains_key(&reserve.payment_id) || state.ledger.contains_key(&reserve.payment_id) {
         return;
     }
     let Some((purse, _)) = state.purses.get_mut(&reserve.purse_id) else {
@@ -4417,10 +4726,43 @@ fn replay_reserve(state: &mut MergedState, reserve: PaymentReserve) {
 }
 
 fn replay_release(state: &mut MergedState, payment_id: Uuid) {
+    if state.ledger.contains_key(&payment_id) {
+        state.reserves.remove(&payment_id);
+        return;
+    }
     let Some(reserve) = state.reserves.remove(&payment_id) else { return };
     if let Some((purse, _)) = state.purses.get_mut(&reserve.purse_id) {
         purse.available_nanodollars = purse.available_nanodollars.saturating_add(reserve.amount_nanodollars);
     }
+}
+
+fn replay_record(state: &mut MergedState, line: LedgerLine) {
+    if !offer_body_ok(&body_from_line(&line)) {
+        return;
+    }
+    if let Some(reserve) = state.reserves.get(&line.payment_id) {
+        if !line_same_payment(&line, reserve, line.payer) {
+            return;
+        }
+    }
+    if state.ledger.contains_key(&line.payment_id) {
+        state.reserves.remove(&line.payment_id);
+        state.pending.remove(&line.payment_id);
+        return;
+    }
+    state.reserves.remove(&line.payment_id);
+    state.pending.remove(&line.payment_id);
+    state.ledger.insert(line.payment_id, line);
+}
+
+fn replay_stage(state: &mut MergedState, pending: PendingAccept) {
+    if state.ledger.contains_key(&pending.payment_id) || state.pending.contains_key(&pending.payment_id) {
+        return;
+    }
+    if !offer_body_ok(&body_from_pending(&pending)) {
+        return;
+    }
+    state.pending.insert(pending.payment_id, pending);
 }
 
 #[cfg(test)]
@@ -4558,7 +4900,10 @@ mod purse_sync_tests {
         apply_change_to_owner, deserialize_change, merge_logs, read_private_snapshot,
         serialize_change, serialize_private_state, Change, PrivateSnapshot, ReserveReject, WriteError,
     };
-    use crate::data_models::{Node, PaymentReserve, Purse, Scope, SyncVersion, WriteLogEntry};
+    use crate::data_models::{
+        Ed25519Signature, LedgerLine, Node, PaymentReserve, PendingAccept, Purse, ReceiveCeiling,
+        Scope, SyncVersion, WriteLogEntry,
+    };
 
     fn media() -> Purse {
         Purse {
@@ -4586,18 +4931,36 @@ mod purse_sync_tests {
         node.owner.purses.push(media());
         let blob = serialize_private_state(&node);
         match read_private_snapshot(&blob) {
-            Some(PrivateSnapshot::Purses { purses, reserves }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending }) => {
                 assert_eq!(purses, vec![media()]);
                 assert!(reserves.is_empty());
+                assert!(ceilings.is_empty());
+                assert!(ledger.is_empty());
+                assert!(pending.is_empty());
             }
             other => panic!("expected purse snapshot, got {other:?}"),
         }
-        // A writer from before holds omits the reserve count. That still loads.
-        let legacy = &blob[..blob.len() - 2];
-        match read_private_snapshot(legacy) {
-            Some(PrivateSnapshot::Purses { purses, reserves }) => {
+        // A writer from step 3 ends after the reserve count.
+        let step3 = &blob[..blob.len() - 6];
+        match read_private_snapshot(step3) {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending }) => {
                 assert_eq!(purses, vec![media()]);
                 assert!(reserves.is_empty());
+                assert!(ceilings.is_empty());
+                assert!(ledger.is_empty());
+                assert!(pending.is_empty());
+            }
+            other => panic!("expected a step-3 snapshot, got {other:?}"),
+        }
+        // A writer from before holds omits the reserve count too.
+        let legacy = &blob[..blob.len() - 8];
+        match read_private_snapshot(legacy) {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending }) => {
+                assert_eq!(purses, vec![media()]);
+                assert!(reserves.is_empty());
+                assert!(ceilings.is_empty());
+                assert!(ledger.is_empty());
+                assert!(pending.is_empty());
             }
             other => panic!("expected a pre-hold snapshot, got {other:?}"),
         }
@@ -4684,9 +5047,12 @@ mod purse_sync_tests {
         node.owner.reserves.push(hold(4, 10, 99));
         let blob = serialize_private_state(&node);
         match read_private_snapshot(&blob) {
-            Some(PrivateSnapshot::Purses { purses, reserves }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending }) => {
                 assert_eq!(purses, vec![media()]);
                 assert_eq!(reserves, vec![hold(4, 10, 99)]);
+                assert!(ceilings.is_empty());
+                assert!(ledger.is_empty());
+                assert!(pending.is_empty());
             }
             other => panic!("expected purse and reserve snapshot, got {other:?}"),
         }
@@ -4717,5 +5083,106 @@ mod purse_sync_tests {
         }
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
         assert_eq!(owner.reserves.len(), 1);
+    }
+
+    fn confirmed_line(payer: [u8; 16], reserve: &PaymentReserve) -> LedgerLine {
+        LedgerLine {
+            payment_id: reserve.payment_id,
+            amount_nanodollars: reserve.amount_nanodollars,
+            payer,
+            payee: reserve.contact_uuid,
+            paying_alias: reserve.paying_alias.clone(),
+            destination_alias: reserve.destination_alias.clone(),
+            note: reserve.note.clone(),
+            expires_at_ms: reserve.expires_at_ms,
+            purse_id: reserve.purse_id,
+            payer_sig: Ed25519Signature::ZERO,
+            payee_sig: Ed25519Signature::ZERO,
+            confirm_sig: Ed25519Signature::ZERO,
+        }
+    }
+
+    #[test]
+    fn record_consumes_a_reserve_once_without_refunding() {
+        let mut owner = Node::new().owner;
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
+        let reserve = hold(7, 1_000_000, 80);
+        apply_change_to_owner(&mut owner, &Change::ReservePayment { reserve: reserve.clone() }).unwrap();
+        let line = confirmed_line(owner.user.uuid, &reserve);
+        let change = Change::RecordLedger { line: line.clone() };
+        assert_eq!(deserialize_change(&serialize_change(&change)).unwrap(), change);
+        assert!(apply_change_to_owner(&mut owner, &change).unwrap());
+        assert!(!apply_change_to_owner(&mut owner, &change).unwrap());
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        assert!(owner.reserves.is_empty());
+        assert_eq!(owner.ledger, vec![line]);
+    }
+
+    #[test]
+    fn private_snapshot_roundtrips_a_ceiling_a_line_and_a_pending_accept() {
+        let mut node = Node::new();
+        node.owner.purses.push(media());
+        let reserve = hold(4, 10, 99);
+        node.owner.reserves.push(reserve.clone());
+        let ceiling = ReceiveCeiling { payer: [3; 16], max_nanodollars: 10 };
+        node.owner.receive_ceilings.push(ceiling.clone());
+        let line = confirmed_line(node.owner.user.uuid, &hold(5, 10, 99));
+        node.owner.ledger.push(line.clone());
+        let pending = PendingAccept {
+            payment_id: [6; 16],
+            amount_nanodollars: 10,
+            payer: [3; 16],
+            payee: node.owner.user.uuid,
+            paying_alias: "discordium".into(),
+            destination_alias: "player".into(),
+            note: "clip-1".into(),
+            expires_at_ms: 99,
+            payer_sig: Ed25519Signature::ZERO,
+            payee_sig: Ed25519Signature::ZERO,
+        };
+        node.owner.pending_accepts.push(pending.clone());
+        match read_private_snapshot(&serialize_private_state(&node)) {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending: staged }) => {
+                assert_eq!(purses, vec![media()]);
+                assert_eq!(reserves, vec![reserve]);
+                assert_eq!(ceilings, vec![ceiling]);
+                assert_eq!(ledger, vec![line]);
+                assert_eq!(staged, vec![pending]);
+            }
+            other => panic!("expected the extra private lists, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_of_a_confirmation_records_the_line_without_refunding() {
+        let reserve = hold(7, 1_000_000, 80);
+        let line = confirmed_line([0x44; 16], &reserve);
+        let entry = |seq: u64, change: Change| WriteLogEntry {
+            version: SyncVersion { writer_sg_uuid: [0xA1; 16], epoch: 1, seq },
+            scope: Scope::Private,
+            change_payload: serialize_change(&change),
+            committed_at: SystemTime::UNIX_EPOCH,
+        };
+        let created = entry(1, Change::UpsertPurse { purse: media() });
+        let reserved = entry(2, Change::ReservePayment { reserve: reserve.clone() });
+        let recorded = entry(3, Change::RecordLedger { line: line.clone() });
+        let out = merge_logs(
+            &[created.clone(), reserved.clone()],
+            &[created, reserved, recorded],
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(out.changes_to_apply.len(), 1, "{:?}", out.changes_to_apply);
+        assert!(matches!(out.changes_to_apply[0], Change::RecordLedger { .. }));
+
+        let mut owner = Node::new().owner;
+        owner.user.uuid = [0x44; 16];
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
+        apply_change_to_owner(&mut owner, &Change::ReservePayment { reserve }).unwrap();
+        for change in &out.changes_to_apply {
+            apply_change_to_owner(&mut owner, change).unwrap();
+        }
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        assert!(owner.reserves.is_empty());
+        assert_eq!(owner.ledger, vec![line]);
     }
 }

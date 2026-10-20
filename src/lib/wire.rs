@@ -171,6 +171,15 @@ pub(crate) const CHANGE_KIND_SET_CONTACT_THEY_ACCEPT: u8 = 0x0D;
 pub(crate) const CHANGE_KIND_UPSERT_PURSE: u8 = 0x0E;
 pub(crate) const CHANGE_KIND_RESERVE_PAYMENT: u8 = 0x0F;
 pub(crate) const CHANGE_KIND_RELEASE_RESERVE: u8 = 0x10;
+pub(crate) const CHANGE_KIND_RECORD_LEDGER: u8 = 0x11;
+pub(crate) const CHANGE_KIND_STAGE_ACCEPT: u8 = 0x12;
+pub(crate) const CHANGE_KIND_DROP_ACCEPT: u8 = 0x13;
+
+/// Offer, accept, refuse, and confirm between two writers. Session-encrypted.
+pub(crate) const PAYMENT_OFFER_OP: u8 = 0x60;
+pub(crate) const PAYMENT_ACCEPT_OP: u8 = 0x61;
+pub(crate) const PAYMENT_REFUSE_OP: u8 = 0x62;
+pub(crate) const PAYMENT_CONFIRM_OP: u8 = 0x63;
 
 // ── Shared min lengths (unencrypted headers / common envelopes) ───────────────
 

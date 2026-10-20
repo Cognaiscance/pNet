@@ -534,8 +534,8 @@ pub fn app_list_purses(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// Op 6 — ledger lines sent to this user for this app alias.
 ///
 /// Request body (after op byte): `[token: 16]` exactly. Same checks as
-/// list-purses. No payment is stored yet, so success is `[OK][count: u16 BE]`
-/// with count 0.
+/// list-purses. Lines may already be stored. This reply stays empty until a
+/// later step returns them. Success is `[OK][count: u16 BE]` with count 0.
 pub fn app_list_incoming(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if require_approved_alias(src, &buf, ctx).is_none() {
         return;
@@ -545,7 +545,8 @@ pub fn app_list_incoming(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
 /// Op 7 — ledger lines this app sent.
 ///
-/// Same request and same empty success as [`app_list_incoming`].
+/// Same request and same empty success as [`app_list_incoming`]. Stored lines
+/// stay out of this reply until a later step.
 pub fn app_list_sent(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if require_approved_alias(src, &buf, ctx).is_none() {
         return;
@@ -564,7 +565,10 @@ pub fn app_list_sent(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// at most 255 bytes, and may be empty. No bytes may follow the payment id.
 ///
 /// This node reserves only when it is the writer. Any other node replies
-/// `ERR_NO_WRITER` and leaves the purse unchanged. The contact is not told.
+/// `ERR_NO_WRITER` and leaves the purse unchanged. After the hold, the writer
+/// signs an offer and sends it when it has the user key and a session to that
+/// contact. The offer does not name the purse. A missing session leaves the hold
+/// in place until a retry, a refusal, or expiry.
 ///
 /// Success: `[OK][available: i64 BE][expires_at_ms: u64 BE]`. The available
 /// amount is what that purse still has after this hold. A repeat of the same
@@ -606,6 +610,7 @@ pub fn app_reserve(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             WriteError::ReserveRejected(ReserveReject::NotMember) => ERR_NOT_IN_PURSE,
             WriteError::ReserveRejected(ReserveReject::OverPurse) => ERR_OVER_PURSE,
             WriteError::ReserveRejected(ReserveReject::Mismatch) => ERR_PAYMENT_MISMATCH,
+            WriteError::PaymentRejected(_) => ERR_PAYMENT_MISMATCH,
             WriteError::Unreachable => ERR_NO_WRITER,
             WriteError::Validation(_) => ERR_BAD_PACKET,
         };
@@ -615,13 +620,28 @@ pub fn app_reserve(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     let stored = {
         let node = ctx.node.read().unwrap();
-        let purse = node.owner.purses.iter().find(|p| p.id == reserve.purse_id);
-        let hold = node.owner.reserves.iter().find(|r| r.payment_id == reserve.payment_id);
-        match (purse, hold) {
-            (Some(purse), Some(hold)) if hold.same_hold(&reserve) => {
-                Some((purse.available_nanodollars, hold.expires_at_ms))
+        let purse = node.owner.purses.iter().find(|p| {
+            p.id == reserve.purse_id && p.aliases.iter().any(|alias| alias == &reserve.paying_alias)
+        });
+        match purse {
+            None => None,
+            Some(purse) => {
+                if let Some(line) = node.owner.ledger.iter().find(|line| line.payment_id == reserve.payment_id) {
+                    if crate::payment::line_same_payment(line, &reserve, node.owner.user.uuid) {
+                        Some((purse.available_nanodollars, line.expires_at_ms))
+                    } else {
+                        None
+                    }
+                } else if let Some(hold) = node.owner.reserves.iter().find(|hold| hold.payment_id == reserve.payment_id) {
+                    if hold.same_hold(&reserve) {
+                        Some((purse.available_nanodollars, hold.expires_at_ms))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }
-            _ => None,
         }
     };
     let Some((available, expires_at_ms)) = stored else {
@@ -633,6 +653,7 @@ pub fn app_reserve(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     reply.extend_from_slice(&available.to_be_bytes());
     reply.extend_from_slice(&expires_at_ms.to_be_bytes());
     send(ctx, src, &reply);
+    super::payment::deliver_payment(ctx, reserve.payment_id);
 }
 
 struct ParsedReserve {

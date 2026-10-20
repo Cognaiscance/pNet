@@ -65,6 +65,10 @@ pub enum Action {
     AppListIncoming { src: SocketAddr, buf: Vec<u8> },
     AppListSent { src: SocketAddr, buf: Vec<u8> },
     AppReserve { src: SocketAddr, buf: Vec<u8> },
+    PaymentOffer { src: SocketAddr, buf: Vec<u8> },
+    PaymentAccept { src: SocketAddr, buf: Vec<u8> },
+    PaymentRefuse { src: SocketAddr, buf: Vec<u8> },
+    PaymentConfirm { src: SocketAddr, buf: Vec<u8> },
 
     // From HTTP UI
     UiRequest {
@@ -201,6 +205,10 @@ impl Action {
             Action::AppListIncoming { .. } => "AppListIncoming",
             Action::AppListSent { .. } => "AppListSent",
             Action::AppReserve { .. } => "AppReserve",
+            Action::PaymentOffer { .. } => "PaymentOffer",
+            Action::PaymentAccept { .. } => "PaymentAccept",
+            Action::PaymentRefuse { .. } => "PaymentRefuse",
+            Action::PaymentConfirm { .. } => "PaymentConfirm",
             Action::UiRequest { .. } => "UiRequest",
             Action::SgPing { .. } => "SgPing",
             Action::DgKeepalive { .. } => "DgKeepalive",
@@ -255,6 +263,10 @@ impl Action {
             Action::AppListIncoming { src, buf } => handlers::app_list_incoming(src, buf, ctx),
             Action::AppListSent { src, buf } => handlers::app_list_sent(src, buf, ctx),
             Action::AppReserve { src, buf } => handlers::app_reserve(src, buf, ctx),
+            Action::PaymentOffer { src, buf } => handlers::payment_offer(src, buf, ctx),
+            Action::PaymentAccept { src, buf } => handlers::payment_accept(src, buf, ctx),
+            Action::PaymentRefuse { src, buf } => handlers::payment_refuse(src, buf, ctx),
+            Action::PaymentConfirm { src, buf } => handlers::payment_confirm(src, buf, ctx),
             Action::UiRequest {
                 stream, method, path, query, cookie, host, origin, referer, body,
             } => {
