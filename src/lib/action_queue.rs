@@ -61,6 +61,9 @@ pub enum Action {
     AppUpdate     { src: SocketAddr, buf: Vec<u8> },
     AppGetData    { src: SocketAddr, buf: Vec<u8> },
     AppSendPacket { src: SocketAddr, buf: Vec<u8> },
+    AppListPurses { src: SocketAddr, buf: Vec<u8> },
+    AppListIncoming { src: SocketAddr, buf: Vec<u8> },
+    AppListSent { src: SocketAddr, buf: Vec<u8> },
 
     // From HTTP UI
     UiRequest {
@@ -191,6 +194,9 @@ impl Action {
             Action::AppUpdate { .. } => "AppUpdate",
             Action::AppGetData { .. } => "AppGetData",
             Action::AppSendPacket { .. } => "AppSendPacket",
+            Action::AppListPurses { .. } => "AppListPurses",
+            Action::AppListIncoming { .. } => "AppListIncoming",
+            Action::AppListSent { .. } => "AppListSent",
             Action::UiRequest { .. } => "UiRequest",
             Action::SgPing { .. } => "SgPing",
             Action::DgKeepalive { .. } => "DgKeepalive",
@@ -240,6 +246,9 @@ impl Action {
             Action::AppUpdate     { src, buf } => handlers::app_update(src, buf, ctx),
             Action::AppGetData    { src, buf } => handlers::app_get_data(src, buf, ctx),
             Action::AppSendPacket { src, buf } => handlers::app_send_packet(src, buf, ctx),
+            Action::AppListPurses { src, buf } => handlers::app_list_purses(src, buf, ctx),
+            Action::AppListIncoming { src, buf } => handlers::app_list_incoming(src, buf, ctx),
+            Action::AppListSent { src, buf } => handlers::app_list_sent(src, buf, ctx),
             Action::UiRequest {
                 stream, method, path, query, cookie, host, origin, referer, body,
             } => {

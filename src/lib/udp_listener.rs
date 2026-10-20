@@ -8,7 +8,8 @@ use super::action_queue::{Action, PRIORITY_HIGH};
 use super::app_api::app_api_source_allowed;
 use super::thread_pool::SharedQueue;
 use super::wire::{
-    slice_arr, APP_GET_DATA_OP, APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_PACKET_OP, APP_UPDATE_OP,
+    slice_arr, APP_GET_DATA_OP, APP_LIST_INCOMING_OP, APP_LIST_PURSES_OP, APP_LIST_SENT_OP,
+    APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_PACKET_OP, APP_UPDATE_OP,
     BOOTSTRAP_REQUEST_OP, BOOTSTRAP_RESPONSE_OP, CONNECT_ACK_OP, CONNECT_REQUEST_OP,
     CONTACT_REQUEST_OP, CONTACT_RESPONSE_OP, CONN_RESET_OP, CROSS_USER_PULL_REQUEST_OP,
     CROSS_USER_PULL_RESPONSE_OP, CROSS_USER_UPDATE_AVAILABLE_OP, DEVICE_REGISTER_OP,
@@ -71,12 +72,19 @@ impl UdpListener {
                 let op = buf[0];
                 let payload = buf[1..len].to_vec();
 
-                // Local app control plane (ops 0x00–0x03): loopback-only by
-                // default. Peer fabric ops stay open on the public UDP socket.
+                // Local app requests (0x00–0x03 and 0x05–0x07): loopback-only
+                // by default. Op 0x04 is a push the node sends, not a request.
+                // Peer fabric ops stay open on the public UDP socket.
                 // Opt in with PNET_APP_API_REMOTE=1 (e.g. Docker sidecar apps).
                 let is_app_api = matches!(
                     op,
-                    APP_REGISTER_OP | APP_UPDATE_OP | APP_GET_DATA_OP | APP_SEND_PACKET_OP
+                    APP_REGISTER_OP
+                        | APP_UPDATE_OP
+                        | APP_GET_DATA_OP
+                        | APP_SEND_PACKET_OP
+                        | APP_LIST_PURSES_OP
+                        | APP_LIST_INCOMING_OP
+                        | APP_LIST_SENT_OP
                 );
                 if is_app_api && !app_api_source_allowed(src) {
                     eprintln!(
@@ -91,6 +99,9 @@ impl UdpListener {
                     APP_UPDATE_OP => Action::AppUpdate { src, buf: payload },
                     APP_GET_DATA_OP => Action::AppGetData { src, buf: payload },
                     APP_SEND_PACKET_OP => Action::AppSendPacket { src, buf: payload },
+                    APP_LIST_PURSES_OP => Action::AppListPurses { src, buf: payload },
+                    APP_LIST_INCOMING_OP => Action::AppListIncoming { src, buf: payload },
+                    APP_LIST_SENT_OP => Action::AppListSent { src, buf: payload },
                     SG_PING_OP => {
                         let Some(nonce) = slice_arr::<16>(&payload, 0) else {
                             eprintln!("[udp] sg_ping too short from {src}");
@@ -197,6 +208,9 @@ mod tests {
             (0x01, |a| matches!(a, Action::AppUpdate        { .. })),
             (0x02, |a| matches!(a, Action::AppGetData       { .. })),
             (0x03, |a| matches!(a, Action::AppSendPacket    { .. })),
+            (0x05, |a| matches!(a, Action::AppListPurses    { .. })),
+            (0x06, |a| matches!(a, Action::AppListIncoming  { .. })),
+            (0x07, |a| matches!(a, Action::AppListSent      { .. })),
             (0x10, |a| matches!(a, Action::SgPing           { .. })),
             (0x20, |a| matches!(a, Action::ConnectRequest   { .. })),
             (0x21, |a| matches!(a, Action::ConnectAck       { .. })),

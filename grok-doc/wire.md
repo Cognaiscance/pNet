@@ -1,6 +1,6 @@
 # Wire protocol
 
-Peers and the local node share one IPv4 UDP socket (default port 7777). The first byte selects the handler. An unknown byte is logged and dropped. App ops `0x00`–`0x03` are the local API in [api.md](api.md) and are filtered by source address. Every other op below is accepted from any source. There is no separate peer port.
+Peers and the local node share one IPv4 UDP socket (default port 7777). The first byte selects the handler. An unknown byte is logged and dropped. App request ops `0x00`–`0x03` and `0x05`–`0x07` are the local API in [api.md](api.md) and are filtered by source address. Op `0x04` is a push the node sends. Every other op below is accepted from any source. There is no separate peer port.
 
 Integers are big-endian unless marked LE. Strings are `u8` length plus UTF-8. UUIDs are 16 bytes. The device layout used inside several payloads is the one in the app API's get-data section.
 

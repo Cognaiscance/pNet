@@ -72,7 +72,10 @@ pub(crate) fn fabric_event(event: &str, fields: &[(&str, &str)]) {
 
 // Local app edge (register/update/get-data/send + inbound app_packet push).
 mod app_edge;
-pub use app_edge::{app_get_data, app_packet, app_register, app_send_packet, app_update};
+pub use app_edge::{
+    app_get_data, app_list_incoming, app_list_purses, app_list_sent, app_packet, app_register,
+    app_send_packet, app_update,
+};
 
 mod sessions;
 pub use sessions::{
@@ -781,6 +784,152 @@ mod tests {
         let reply = t.recv_reply();
         assert_eq!(reply[0], STATUS_ERR);
         assert_eq!(reply[1], ERR_TOKEN_UNKNOWN);
+    }
+
+    // ── App purse reads ───────────────────────────────────────────────────────
+
+    fn install_purse(
+        t: &TestCtx,
+        id: [u8; 16],
+        name: &str,
+        allotment: i64,
+        available: i64,
+        aliases: &[&str],
+    ) {
+        let mut node = t.ctx.node.write().unwrap();
+        node.owner.purses.push(super::super::data_models::Purse {
+            id,
+            name: name.to_string(),
+            allotment_nanodollars: allotment,
+            available_nanodollars: available,
+            aliases: aliases.iter().map(|alias| (*alias).to_string()).collect(),
+        });
+    }
+
+    struct ListedPurse {
+        id: [u8; 16],
+        name: String,
+        kind: u8,
+        allotment: i64,
+        available: i64,
+    }
+
+    fn parse_purse_list(reply: &[u8]) -> Vec<ListedPurse> {
+        assert_eq!(reply[0], OK);
+        assert!(reply.len() >= 3, "purse reply shorter than status and count");
+        let count = u16::from_be_bytes([reply[1], reply[2]]) as usize;
+        let mut pos = 3usize;
+        let mut purses = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id: [u8; 16] = reply[pos..pos + 16].try_into().unwrap();
+            pos += 16;
+            let name = read_str(reply, &mut pos).unwrap();
+            let kind = reply[pos];
+            pos += 1;
+            let allotment = i64::from_be_bytes(reply[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let available = i64::from_be_bytes(reply[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            purses.push(ListedPurse { id, name, kind, allotment, available });
+        }
+        assert_eq!(pos, reply.len(), "trailing bytes after the purse list");
+        purses
+    }
+
+    #[test]
+    fn app_list_purses_returns_only_the_callers_membership() {
+        let t = TestCtx::new();
+        let client = register_and_get_token(&t, "discordium-client", 9001);
+        let server = register_and_get_token(&t, "discordium-server", 9002);
+        approve_local_app(&t, &client);
+        approve_local_app(&t, &server);
+
+        // beta has the lower id. Name order must still put alpha first.
+        install_purse(&t, [0x22; 16], "alpha", 5_000_000, 4_000_000, &["discordium-client"]);
+        install_purse(&t, [0x11; 16], "beta", 10_000_000, 10_000_000, &["discordium-client"]);
+        install_purse(&t, [0x44; 16], "shared", 1, 1, &["discordium-client", "discordium-server"]);
+        install_purse(&t, [0x33; 16], "secret-ledger", 9, 9, &["discordium-server"]);
+        install_purse(&t, [0x55; 16], "lookalike", 7, 7, &["discordium-client-extra"]);
+
+        let before = t.ctx.node.read().unwrap().owner.purses.clone();
+        app_list_purses(t.app_addr(), client.to_vec(), &t.ctx);
+        let reply = t.recv_reply();
+        // First entry: count, id, name length, "alpha", kind, then the two amounts.
+        let amounts_at = 3 + 16 + 1 + "alpha".len() + 1;
+        assert_eq!(&reply[amounts_at..amounts_at + 8], &5_000_000i64.to_be_bytes());
+        assert_eq!(&reply[amounts_at + 8..amounts_at + 16], &4_000_000i64.to_be_bytes());
+        let client_rows = parse_purse_list(&reply);
+        assert_eq!(client_rows.len(), 3);
+        assert_eq!(client_rows[0].name, "alpha");
+        assert_eq!(client_rows[0].id, [0x22; 16]);
+        assert_eq!(client_rows[0].kind, PURSE_KIND_FIXED);
+        assert_eq!(client_rows[0].allotment, 5_000_000);
+        assert_eq!(client_rows[0].available, 4_000_000);
+        assert_eq!(client_rows[1].name, "beta");
+        assert_eq!(client_rows[1].id, [0x11; 16]);
+        assert_eq!(client_rows[2].name, "shared");
+        assert_eq!(client_rows[2].id, [0x44; 16]);
+        assert!(client_rows.iter().all(|row| row.kind == PURSE_KIND_FIXED));
+        let client_reply_names: Vec<&str> = client_rows.iter().map(|row| row.name.as_str()).collect();
+        assert!(!client_reply_names.contains(&"secret-ledger"));
+        assert!(!client_reply_names.contains(&"lookalike"));
+
+        app_list_purses(t.app_addr(), server.to_vec(), &t.ctx);
+        let server_rows = parse_purse_list(&t.recv_reply());
+        assert_eq!(
+            server_rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["secret-ledger", "shared"]
+        );
+        assert!(server_rows.iter().all(|row| row.id != [0x22; 16] && row.id != [0x11; 16]));
+
+        let after = t.ctx.node.read().unwrap().owner.purses.clone();
+        assert_eq!(before, after, "a read must not change the stored purses");
+    }
+
+    #[test]
+    fn app_list_purses_empty_for_an_approved_app_with_no_membership() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "lonely", 9003);
+        approve_local_app(&t, &token);
+        install_purse(&t, [0x66; 16], "alpha", 1, 1, &["discordium-client"]);
+
+        app_list_purses(t.app_addr(), token.to_vec(), &t.ctx);
+        assert_eq!(t.recv_reply(), vec![OK, 0, 0]);
+    }
+
+    #[test]
+    fn app_purse_reads_reject_unknown_unapproved_and_bad_bodies() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "pending", 9004);
+
+        for op in [app_list_purses, app_list_incoming, app_list_sent] {
+            op(t.app_addr(), token.to_vec(), &t.ctx);
+            assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_NOT_APPROVED]);
+
+            op(t.app_addr(), vec![0xFF; 16], &t.ctx);
+            assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_TOKEN_UNKNOWN]);
+
+            op(t.app_addr(), vec![0xAA; 15], &t.ctx);
+            assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_BAD_PACKET]);
+
+            let mut extra = token.to_vec();
+            extra.push(0);
+            op(t.app_addr(), extra, &t.ctx);
+            assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_BAD_PACKET]);
+        }
+    }
+
+    #[test]
+    fn app_payment_lists_are_empty_for_an_approved_app() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "discordium-client", 9005);
+        approve_local_app(&t, &token);
+        install_purse(&t, [0x77; 16], "alpha", 5_000_000, 5_000_000, &["discordium-client"]);
+
+        app_list_incoming(t.app_addr(), token.to_vec(), &t.ctx);
+        assert_eq!(t.recv_reply(), vec![OK, 0, 0]);
+        app_list_sent(t.app_addr(), token.to_vec(), &t.ctx);
+        assert_eq!(t.recv_reply(), vec![OK, 0, 0]);
     }
 
     // ── AppSendPacket ─────────────────────────────────────────────────────────
