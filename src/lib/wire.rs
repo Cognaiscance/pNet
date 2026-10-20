@@ -34,6 +34,12 @@ pub(crate) const ERR_NO_ROUTE: u8 = 0x05;
 pub(crate) const ERR_PAYLOAD_TOO_LARGE: u8 = 0x06;
 /// Register or send rate limit exceeded (token bucket).
 pub(crate) const ERR_RATE_LIMITED: u8 = 0x07;
+/// The purse is missing, or the caller's alias is not a member.
+pub(crate) const ERR_NOT_IN_PURSE: u8 = 0x08;
+/// The amount is greater than the purse's available amount.
+pub(crate) const ERR_OVER_PURSE: u8 = 0x09;
+/// This payment id is already reserved with a different body.
+pub(crate) const ERR_PAYMENT_MISMATCH: u8 = 0x0A;
 
 /// Fabric-wide maximum **opaque app payload** length in bytes.
 ///
@@ -67,6 +73,8 @@ pub(crate) const APP_LIST_PURSES_OP: u8 = 0x05;
 pub(crate) const APP_LIST_INCOMING_OP: u8 = 0x06;
 /// Approved app asks for ledger lines it sent. Empty until payments exist.
 pub(crate) const APP_LIST_SENT_OP: u8 = 0x07;
+/// Approved app reserves purse funds for one payment id. The contact is not told.
+pub(crate) const APP_RESERVE_OP: u8 = 0x08;
 
 /// Kind byte on a list-purses entry. Monthly purses are not stored yet.
 pub(crate) const PURSE_KIND_FIXED: u8 = 0x00;
@@ -161,6 +169,8 @@ pub(crate) const CHANGE_KIND_PUT_OUTBOUND_APP_INVITATION: u8 = 0x0B;
 pub(crate) const CHANGE_KIND_FORGET_OUTBOUND_APP_INVITATION: u8 = 0x0C;
 pub(crate) const CHANGE_KIND_SET_CONTACT_THEY_ACCEPT: u8 = 0x0D;
 pub(crate) const CHANGE_KIND_UPSERT_PURSE: u8 = 0x0E;
+pub(crate) const CHANGE_KIND_RESERVE_PAYMENT: u8 = 0x0F;
+pub(crate) const CHANGE_KIND_RELEASE_RESERVE: u8 = 0x10;
 
 // ── Shared min lengths (unencrypted headers / common envelopes) ───────────────
 

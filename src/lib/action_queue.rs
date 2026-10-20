@@ -64,6 +64,7 @@ pub enum Action {
     AppListPurses { src: SocketAddr, buf: Vec<u8> },
     AppListIncoming { src: SocketAddr, buf: Vec<u8> },
     AppListSent { src: SocketAddr, buf: Vec<u8> },
+    AppReserve { src: SocketAddr, buf: Vec<u8> },
 
     // From HTTP UI
     UiRequest {
@@ -122,6 +123,8 @@ pub enum Action {
 
     // Scheduled
     PollSG,
+    /// Writer gives back purse holds whose expiry has passed.
+    ReleaseExpiredReserves,
     MaintainConnections,
     KeepAliveDG,
     CleanupTunnels,
@@ -197,6 +200,7 @@ impl Action {
             Action::AppListPurses { .. } => "AppListPurses",
             Action::AppListIncoming { .. } => "AppListIncoming",
             Action::AppListSent { .. } => "AppListSent",
+            Action::AppReserve { .. } => "AppReserve",
             Action::UiRequest { .. } => "UiRequest",
             Action::SgPing { .. } => "SgPing",
             Action::DgKeepalive { .. } => "DgKeepalive",
@@ -230,6 +234,7 @@ impl Action {
             Action::TunnelConnectRequest { .. } => "TunnelConnectRequest",
             Action::TunnelConnectAck { .. } => "TunnelConnectAck",
             Action::PollSG => "PollSG",
+            Action::ReleaseExpiredReserves => "ReleaseExpiredReserves",
             Action::MaintainConnections => "MaintainConnections",
             Action::KeepAliveDG => "KeepAliveDG",
             Action::CleanupTunnels => "CleanupTunnels",
@@ -249,6 +254,7 @@ impl Action {
             Action::AppListPurses { src, buf } => handlers::app_list_purses(src, buf, ctx),
             Action::AppListIncoming { src, buf } => handlers::app_list_incoming(src, buf, ctx),
             Action::AppListSent { src, buf } => handlers::app_list_sent(src, buf, ctx),
+            Action::AppReserve { src, buf } => handlers::app_reserve(src, buf, ctx),
             Action::UiRequest {
                 stream, method, path, query, cookie, host, origin, referer, body,
             } => {
@@ -288,6 +294,7 @@ impl Action {
             Action::TunnelConnectRequest { src, buf } => handlers::tunnel_connect_request(src, buf, ctx),
             Action::TunnelConnectAck     { src, buf } => handlers::tunnel_connect_ack(src, buf, ctx),
             Action::PollSG                           => handlers::poll_sg(ctx),
+            Action::ReleaseExpiredReserves           => handlers::release_expired_reserves(ctx),
             Action::MaintainConnections              => handlers::maintain_connections(ctx),
             Action::KeepAliveDG                      => handlers::keepalive_dg(ctx),
             Action::CleanupTunnels                   => handlers::cleanup_tunnels(ctx),

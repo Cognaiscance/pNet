@@ -11,11 +11,15 @@ use super::super::crypto::{
     aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body, xchacha20_encrypt,
 };
 use super::super::certs::issue_app_cert;
-use super::super::data_models::{Application, Ed25519PublicKey, Uuid, generate_uuid};
+use super::super::data_models::{
+    Application, Ed25519PublicKey, PaymentReserve, Uuid, generate_uuid, unix_time_ms, RESERVE_TTL_MS,
+};
 use super::super::wire::*;
+use super::routing::find_writer_sg_probing;
 use super::{
-    best_sg_connection, ipv4_from, local_approved_app_host, push_device, request_change, send,
-    send_error, sender_may_deliver, sg_candidates_for_dest, top_ranked_sg_for_device, Change,
+    best_sg_connection, ipv4_from, local_approved_app_host, push_device, release_expired_reserves,
+    request_change, request_change_idempotent, send, send_error, sender_may_deliver,
+    sg_candidates_for_dest, top_ranked_sg_for_device, Change, ReserveReject, WriteError, WriterTarget,
 };
 
 
@@ -441,20 +445,11 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     send(ctx, src, &reply);
 }
 
-/// Body of a purse read: exactly the 16-byte token.
+/// The approved local app that owns `token`.
 ///
-/// On success, the approved local app's alias. On failure the error reply
-/// has already been sent. Membership is that alias, not the device.
-fn require_approved_alias(src: SocketAddr, buf: &[u8], ctx: &WorkerContext) -> Option<String> {
-    if buf.len() != 16 {
-        send_error(ctx, src, ERR_BAD_PACKET);
-        return None;
-    }
-    let Some(token) = slice_arr::<16>(buf, 0) else {
-        send_error(ctx, src, ERR_BAD_PACKET);
-        return None;
-    };
-
+/// On failure the error reply has already been sent. Membership is the
+/// alias, not the device.
+fn approved_alias(src: SocketAddr, token: &[u8; 16], ctx: &WorkerContext) -> Option<String> {
     let found = {
         let node = ctx.node.read().unwrap();
         let device_uuid = node.device_uuid;
@@ -463,7 +458,7 @@ fn require_approved_alias(src: SocketAddr, buf: &[u8], ctx: &WorkerContext) -> O
             .devices
             .iter()
             .find(|d| d.uuid == device_uuid)
-            .and_then(|d| d.applications.iter().find(|a| a.token == token))
+            .and_then(|d| d.applications.iter().find(|a| a.token == *token))
             .map(|a| (a.user_approved, a.alias.clone()))
     };
     match found {
@@ -477,6 +472,19 @@ fn require_approved_alias(src: SocketAddr, buf: &[u8], ctx: &WorkerContext) -> O
         }
         Some((true, alias)) => Some(alias),
     }
+}
+
+/// Body of a purse read: exactly the 16-byte token.
+fn require_approved_alias(src: SocketAddr, buf: &[u8], ctx: &WorkerContext) -> Option<String> {
+    if buf.len() != 16 {
+        send_error(ctx, src, ERR_BAD_PACKET);
+        return None;
+    }
+    let Some(token) = slice_arr::<16>(buf, 0) else {
+        send_error(ctx, src, ERR_BAD_PACKET);
+        return None;
+    };
+    approved_alias(src, &token, ctx)
 }
 
 /// Op 5 — purses this approved app's alias belongs to.
@@ -543,6 +551,138 @@ pub fn app_list_sent(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
     send(ctx, src, &[OK, 0, 0]);
+}
+
+/// Op 8 — reserve purse funds for one payment id.
+///
+/// Request body (after op byte):
+///   `[token: 16][purse id: 16][amount: i64 BE][contact uuid: 16]`
+///   `[destination alias][note][payment id: 16]`
+///
+/// The amount is nanodollars and must be greater than zero. The destination
+/// alias is trimmed and must be a normal app alias. The note is opaque UTF-8,
+/// at most 255 bytes, and may be empty. No bytes may follow the payment id.
+///
+/// This node reserves only when it is the writer. Any other node replies
+/// `ERR_NO_WRITER` and leaves the purse unchanged. The contact is not told.
+///
+/// Success: `[OK][available: i64 BE][expires_at_ms: u64 BE]`. The available
+/// amount is what that purse still has after this hold. A repeat of the same
+/// payment id and the same body returns that same result and does not reduce
+/// the available amount again. A different body for an id that is still on
+/// hold is `ERR_PAYMENT_MISMATCH`.
+///
+/// The hold lasts [`RESERVE_TTL_MS`] from the writer's clock. When it expires,
+/// the writer adds the amount back. A fitting amount equal to what is
+/// available leaves zero.
+pub fn app_reserve(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let Some(parsed) = parse_reserve(&buf) else {
+        send_error(ctx, src, ERR_BAD_PACKET);
+        return;
+    };
+    let Some(paying_alias) = approved_alias(src, &parsed.token, ctx) else {
+        return;
+    };
+    if !matches!(find_writer_sg_probing(ctx), WriterTarget::Local) {
+        send_error(ctx, src, ERR_NO_WRITER);
+        return;
+    }
+
+    release_expired_reserves(ctx);
+    let now_ms = unix_time_ms();
+    let reserve = PaymentReserve {
+        payment_id: parsed.payment_id,
+        purse_id: parsed.purse_id,
+        amount_nanodollars: parsed.amount,
+        contact_uuid: parsed.contact_uuid,
+        destination_alias: parsed.destination_alias,
+        note: parsed.note,
+        paying_alias,
+        expires_at_ms: now_ms.saturating_add(RESERVE_TTL_MS),
+    };
+
+    if let Err(err) = request_change_idempotent(Change::ReservePayment { reserve: reserve.clone() }, ctx) {
+        let code = match err {
+            WriteError::ReserveRejected(ReserveReject::NotMember) => ERR_NOT_IN_PURSE,
+            WriteError::ReserveRejected(ReserveReject::OverPurse) => ERR_OVER_PURSE,
+            WriteError::ReserveRejected(ReserveReject::Mismatch) => ERR_PAYMENT_MISMATCH,
+            WriteError::Unreachable => ERR_NO_WRITER,
+            WriteError::Validation(_) => ERR_BAD_PACKET,
+        };
+        send_error(ctx, src, code);
+        return;
+    }
+
+    let stored = {
+        let node = ctx.node.read().unwrap();
+        let purse = node.owner.purses.iter().find(|p| p.id == reserve.purse_id);
+        let hold = node.owner.reserves.iter().find(|r| r.payment_id == reserve.payment_id);
+        match (purse, hold) {
+            (Some(purse), Some(hold)) if hold.same_hold(&reserve) => {
+                Some((purse.available_nanodollars, hold.expires_at_ms))
+            }
+            _ => None,
+        }
+    };
+    let Some((available, expires_at_ms)) = stored else {
+        send_error(ctx, src, ERR_PAYMENT_MISMATCH);
+        return;
+    };
+    let mut reply = Vec::with_capacity(1 + 8 + 8);
+    reply.push(OK);
+    reply.extend_from_slice(&available.to_be_bytes());
+    reply.extend_from_slice(&expires_at_ms.to_be_bytes());
+    send(ctx, src, &reply);
+}
+
+struct ParsedReserve {
+    token: [u8; 16],
+    purse_id: [u8; 16],
+    amount: i64,
+    contact_uuid: [u8; 16],
+    destination_alias: String,
+    note: String,
+    payment_id: [u8; 16],
+}
+
+fn parse_reserve(buf: &[u8]) -> Option<ParsedReserve> {
+    if buf.len() < 16 + 16 + 8 + 16 {
+        return None;
+    }
+    let token = slice_arr::<16>(buf, 0)?;
+    let purse_id = slice_arr::<16>(buf, 16)?;
+    let amount = i64::from_be_bytes(slice_arr::<8>(buf, 32)?);
+    if amount <= 0 {
+        return None;
+    }
+    let contact_uuid = slice_arr::<16>(buf, 40)?;
+    let mut pos = 56usize;
+    let destination_raw = read_str(buf, &mut pos)?;
+    let destination_alias = destination_raw.trim().to_string();
+    if destination_alias.is_empty()
+        || destination_alias.len() > 255
+        || destination_alias.chars().any(|c| c.is_control())
+    {
+        return None;
+    }
+    let note = read_str(buf, &mut pos)?;
+    if note.len() > 255 {
+        return None;
+    }
+    let payment_id = slice_arr::<16>(buf, pos)?;
+    pos += 16;
+    if pos != buf.len() {
+        return None;
+    }
+    Some(ParsedReserve {
+        token,
+        purse_id,
+        amount,
+        contact_uuid,
+        destination_alias,
+        note,
+        payment_id,
+    })
 }
 
 /// Op 3 — Application send packet.

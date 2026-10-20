@@ -74,6 +74,7 @@ pub(crate) fn fabric_event(event: &str, fields: &[(&str, &str)]) {
 mod app_edge;
 pub use app_edge::{
     app_get_data, app_list_incoming, app_list_purses, app_list_sent, app_packet, app_register,
+    app_reserve,
     app_send_packet, app_update,
 };
 
@@ -109,7 +110,8 @@ pub(crate) use routing::{
 
 mod sync;
 pub use sync::{
-    Change, ContactAppCard, ContactDeviceCard, MergeOutput, WriteError, cross_user_pull_request,
+    Change, ContactAppCard, ContactDeviceCard, MergeOutput, ReserveReject, WriteError,
+    cross_user_pull_request, release_expired_reserves,
     cross_user_pull_response, cross_user_update_available, merge_ack, merge_logs,
     merge_proposal, partition_reconcile_tick, request_change, request_change_idempotent,
     sync_pull, sync_pull_request, sync_pull_response, sync_update_available,
@@ -491,7 +493,7 @@ mod tests {
     use std::sync::{Arc, RwLock, mpsc};
     use std::time::Duration;
     use super::super::action_queue::WorkerContext;
-    use super::super::data_models::Node;
+    use super::super::data_models::{Node, RESERVE_TTL_MS, unix_time_ms};
     use super::super::writer::WriteRequest;
 
     /// All the state needed to exercise a handler in isolation.
@@ -930,6 +932,220 @@ mod tests {
         assert_eq!(t.recv_reply(), vec![OK, 0, 0]);
         app_list_sent(t.app_addr(), token.to_vec(), &t.ctx);
         assert_eq!(t.recv_reply(), vec![OK, 0, 0]);
+    }
+
+    // ── App reserve ───────────────────────────────────────────────────────────
+
+    fn reserve_packet(
+        token: &[u8; 16],
+        purse: &[u8; 16],
+        amount: i64,
+        contact: &[u8; 16],
+        destination: &str,
+        note: &str,
+        payment: &[u8; 16],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(token);
+        buf.extend_from_slice(purse);
+        buf.extend_from_slice(&amount.to_be_bytes());
+        buf.extend_from_slice(contact);
+        push_str(&mut buf, destination);
+        push_str(&mut buf, note);
+        buf.extend_from_slice(payment);
+        buf
+    }
+
+    fn parse_reserve_ok(reply: &[u8]) -> (i64, u64) {
+        assert_eq!(reply[0], OK);
+        assert_eq!(reply.len(), 17);
+        let available = i64::from_be_bytes(reply[1..9].try_into().unwrap());
+        let expires_at = u64::from_be_bytes(reply[9..17].try_into().unwrap());
+        (available, expires_at)
+    }
+
+    #[test]
+    fn app_reserve_holds_the_amount_once_and_a_retry_does_not() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "discordium-client", 9101);
+        approve_local_app(&t, &token);
+        let purse = [0x31; 16];
+        install_purse(&t, purse, "media", 5_000_000, 5_000_000, &["discordium-client"]);
+        promote_local_to_sg(&t, 1);
+
+        let payment = [0x71; 16];
+        let contact = [0x81; 16];
+        let body = reserve_packet(&token, &purse, 1_000_000, &contact, " player ", "clip-9", &payment);
+        let before = unix_time_ms();
+        app_reserve(t.app_addr(), body.clone(), &t.ctx);
+        let (available, expires_at) = parse_reserve_ok(&t.recv_reply());
+        assert_eq!(available, 4_000_000);
+        assert!(expires_at >= before.saturating_add(RESERVE_TTL_MS));
+        assert!(expires_at <= unix_time_ms().saturating_add(RESERVE_TTL_MS));
+        {
+            let node = t.ctx.node.read().unwrap();
+            assert_eq!(node.owner.purses[0].available_nanodollars, 4_000_000);
+            assert_eq!(node.owner.reserves.len(), 1);
+            assert_eq!(node.owner.reserves[0].destination_alias, "player");
+            assert_eq!(node.owner.reserves[0].note, "clip-9");
+            assert_eq!(node.owner.reserves[0].contact_uuid, contact);
+            assert_eq!(node.owner.reserves[0].paying_alias, "discordium-client");
+        }
+
+        app_reserve(t.app_addr(), body, &t.ctx);
+        let (again, same_expiry) = parse_reserve_ok(&t.recv_reply());
+        assert_eq!(again, 4_000_000);
+        assert_eq!(same_expiry, expires_at);
+        assert_eq!(t.ctx.node.read().unwrap().owner.reserves.len(), 1);
+
+        app_list_purses(t.app_addr(), token.to_vec(), &t.ctx);
+        let rows = parse_purse_list(&t.recv_reply());
+        assert_eq!(rows[0].available, 4_000_000);
+        assert_eq!(rows[0].allotment, 5_000_000);
+    }
+
+    #[test]
+    fn app_reserve_rejects_a_non_member_an_overage_and_a_different_body() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "discordium-client", 9102);
+        approve_local_app(&t, &token);
+        let purse = [0x32; 16];
+        install_purse(&t, purse, "media", 5_000_000, 5_000_000, &["discordium-client"]);
+        promote_local_to_sg(&t, 1);
+        let contact = [0x82; 16];
+        let payment = [0x72; 16];
+
+        app_reserve(
+            t.app_addr(),
+            reserve_packet(&token, &[0x99; 16], 1, &contact, "player", "", &payment),
+            &t.ctx,
+        );
+        assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_NOT_IN_PURSE]);
+
+        app_reserve(
+            t.app_addr(),
+            reserve_packet(&token, &purse, 5_000_001, &contact, "player", "", &payment),
+            &t.ctx,
+        );
+        assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_OVER_PURSE]);
+        assert_eq!(t.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 5_000_000);
+        assert!(t.ctx.node.read().unwrap().owner.reserves.is_empty());
+
+        app_reserve(
+            t.app_addr(),
+            reserve_packet(&token, &purse, 5_000_000, &contact, "player", "full", &payment),
+            &t.ctx,
+        );
+        assert_eq!(parse_reserve_ok(&t.recv_reply()).0, 0);
+
+        app_reserve(
+            t.app_addr(),
+            reserve_packet(&token, &purse, 1, &contact, "player", "other", &payment),
+            &t.ctx,
+        );
+        assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_PAYMENT_MISMATCH]);
+        assert_eq!(t.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 0);
+        assert_eq!(t.ctx.node.read().unwrap().owner.reserves[0].note, "full");
+    }
+
+    #[test]
+    fn app_reserve_expiry_returns_the_amount_for_a_new_payment() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "discordium-client", 9103);
+        approve_local_app(&t, &token);
+        let purse = [0x33; 16];
+        install_purse(&t, purse, "media", 5_000_000, 5_000_000, &["discordium-client"]);
+        promote_local_to_sg(&t, 1);
+        let contact = [0x83; 16];
+
+        app_reserve(
+            t.app_addr(),
+            reserve_packet(&token, &purse, 2_000_000, &contact, "player", "", &[0x01; 16]),
+            &t.ctx,
+        );
+        assert_eq!(parse_reserve_ok(&t.recv_reply()).0, 3_000_000);
+        t.ctx.node.write().unwrap().owner.reserves[0].expires_at_ms = 0;
+
+        app_reserve(
+            t.app_addr(),
+            reserve_packet(&token, &purse, 2_000_000, &contact, "player", "", &[0x02; 16]),
+            &t.ctx,
+        );
+        assert_eq!(parse_reserve_ok(&t.recv_reply()).0, 3_000_000);
+        let node = t.ctx.node.read().unwrap();
+        assert_eq!(node.owner.reserves.len(), 1);
+        assert_eq!(node.owner.reserves[0].payment_id, [0x02; 16]);
+        assert_eq!(node.owner.purses[0].available_nanodollars, 3_000_000);
+    }
+
+    #[test]
+    fn app_reserve_on_a_non_writer_changes_nothing() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "discordium-client", 9104);
+        approve_local_app(&t, &token);
+        let purse = [0x34; 16];
+        install_purse(&t, purse, "media", 5_000_000, 5_000_000, &["discordium-client"]);
+
+        app_reserve(
+            t.app_addr(),
+            reserve_packet(&token, &purse, 1, &[0x84; 16], "player", "n", &[0x74; 16]),
+            &t.ctx,
+        );
+        assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_NO_WRITER]);
+        assert_eq!(t.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 5_000_000);
+        assert!(t.ctx.node.read().unwrap().owner.reserves.is_empty());
+
+        add_peer_sg(&t, 1, true, Some(true));
+        app_reserve(
+            t.app_addr(),
+            reserve_packet(&token, &purse, 1, &[0x84; 16], "player", "n", &[0x74; 16]),
+            &t.ctx,
+        );
+        assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_NO_WRITER]);
+        assert!(t.ctx.node.read().unwrap().owner.reserves.is_empty());
+    }
+
+    #[test]
+    fn app_reserve_rejects_unapproved_unknown_and_bad_bodies() {
+        let t = TestCtx::new();
+        let token = register_and_get_token(&t, "discordium-client", 9105);
+        let purse = [0x35; 16];
+        install_purse(&t, purse, "media", 5_000_000, 5_000_000, &["discordium-client"]);
+        promote_local_to_sg(&t, 1);
+        let contact = [0x85; 16];
+        let payment = [0x75; 16];
+
+        app_reserve(
+            t.app_addr(),
+            reserve_packet(&token, &purse, 1, &contact, "player", "", &payment),
+            &t.ctx,
+        );
+        assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_NOT_APPROVED]);
+
+        approve_local_app(&t, &token);
+        app_reserve(
+            t.app_addr(),
+            reserve_packet(&[0xFF; 16], &purse, 1, &contact, "player", "", &payment),
+            &t.ctx,
+        );
+        assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_TOKEN_UNKNOWN]);
+
+        for body in [
+            vec![0x11; 15],
+            reserve_packet(&token, &purse, 0, &contact, "player", "", &payment),
+            reserve_packet(&token, &purse, -1, &contact, "player", "", &payment),
+            reserve_packet(&token, &purse, 1, &contact, "", "", &payment),
+            reserve_packet(&token, &purse, 1, &contact, "bad\nname", "", &payment),
+        ] {
+            app_reserve(t.app_addr(), body, &t.ctx);
+            assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_BAD_PACKET]);
+        }
+        let mut extra = reserve_packet(&token, &purse, 1, &contact, "player", "", &payment);
+        extra.push(0);
+        app_reserve(t.app_addr(), extra, &t.ctx);
+        assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_BAD_PACKET]);
+        assert!(t.ctx.node.read().unwrap().owner.reserves.is_empty());
+        assert_eq!(t.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 5_000_000);
     }
 
     // ── AppSendPacket ─────────────────────────────────────────────────────────

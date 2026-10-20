@@ -3,7 +3,7 @@
 Two interfaces face programs and people on this machine.
 
 - The **owner HTTP site** is how a person sets up the node, signs in, and edits the directory. Most responses are HTML. Two routes are plain text and exist for a local app to register a web mount.
-- The **UDP app API** is how a co-located application registers, reads its purses, and sends payloads. It shares the fabric socket (default `127.0.0.1:7777`). Request ops `0x00`–`0x03` and `0x05`–`0x07` are accepted from loopback only, unless `PNET_APP_API_REMOTE` is `1`, `true`, or `yes`.
+- The **UDP app API** is how a co-located application registers, reads its purses, reserves funds, and sends payloads. It shares the fabric socket (default `127.0.0.1:7777`). Request ops `0x00`–`0x03` and `0x05`–`0x08` are accepted from loopback only, unless `PNET_APP_API_REMOTE` is `1`, `true`, or `yes`.
 
 Peer-to-peer datagrams are in [wire.md](wire.md). How the process is put together is in [README.md](README.md).
 
@@ -127,7 +127,7 @@ The table is memory only. It is empty after restart. The home page lists mounts.
 
 Send a datagram to the node's UDP port. The first byte is the operation. The rest is the body below. Replies come back to the source address.
 
-Request ops `0x00`–`0x03` and `0x05`–`0x07` from a non-loopback address are dropped with a log line when remote access is off. Op `0x04` is not a request. The node sends it to the app.
+Request ops `0x00`–`0x03` and `0x05`–`0x08` from a non-loopback address are dropped with a log line when remote access is off. Op `0x04` is not a request. The node sends it to the app.
 
 | Byte | Name | Who sends it |
 | --- | --- | --- |
@@ -139,6 +139,7 @@ Request ops `0x00`–`0x03` and `0x05`–`0x07` from a non-loopback address are 
 | `0x05` | list purses | app → node |
 | `0x06` | list incoming | app → node |
 | `0x07` | list sent | app → node |
+| `0x08` | reserve | app → node |
 
 Success replies start with `0x00`. Errors are `0x01` followed by one code. Send (`0x03`) sends nothing on success.
 
@@ -147,10 +148,13 @@ Success replies start with `0x00`. Errors are `0x01` followed by one code. Send 
 | `0x01` | bad packet | Truncated, bad UTF-8, empty string, port 0, or a source that is not IPv4. |
 | `0x02` | token unknown | Token is not on this device. |
 | `0x03` | no writer | Auto-approve, or an alias change, could not be published. |
-| `0x04` | not approved | Token is valid and `user_approved` is false. Used by send and by the purse reads. |
+| `0x04` | not approved | Token is valid and `user_approved` is false. Used by send, the purse reads, and reserve. |
 | `0x05` | no route | No session to the destination and no SG to relay through. |
 | `0x06` | payload too large | More than 4096 bytes of app payload. |
 | `0x07` | rate limited | Register or send bucket is empty. |
+| `0x08` | not in purse | The purse is missing, or this app's alias is not a member. |
+| `0x09` | over purse | The amount is greater than the available amount. |
+| `0x0A` | payment mismatch | This payment id is already reserved with a different body. |
 
 Register is limited per source IP: capacity 10, refill 2 tokens per second. Send is limited per source IP and per token: capacity 200, refill 100 per second. Idle buckets are dropped about once a minute.
 
@@ -262,3 +266,24 @@ Success is `0x00 || count (u16)`. The count is 0 until a payment is stored. The 
 ### List sent (`0x07`)
 
 Same request, same approval check, and the same empty success as list incoming. The lines, when they exist, are payments this app sent.
+
+### Reserve (`0x08`)
+
+```text
+token (16) || purse id (16) || amount (i64) || contact uuid (16)
+|| destination alias || note || payment id (16)
+```
+
+The token must belong to an approved app on this device, and that app's alias must be a member of the purse. The amount is nanodollars and must be greater than zero. The destination alias is trimmed. The note is opaque UTF-8, at most 255 bytes, and may be empty. Nothing follows the payment id.
+
+This node applies the reserve only when it is the writer. Any other node replies `no writer` and leaves the purse as it is. The contact is not told, and no ledger line is stored.
+
+Success:
+
+```text
+0x00 || available (i64) || expires at (u64, unix milliseconds)
+```
+
+`available` is what that purse still has after the hold. The hold lasts 24 hours from the writer's clock. The same payment id with the same body returns this result again and does not reduce the available amount a second time. A different body for an id that is still held is `payment mismatch`. When the hold expires, the writer adds the amount back. The check runs about once a minute, and also at the start of the next reserve.
+
+Errors: `bad packet`, `token unknown`, `not approved`, `no writer`, `not in purse`, `over purse`, `payment mismatch`. An amount equal to the available amount succeeds and leaves zero.
