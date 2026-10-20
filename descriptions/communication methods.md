@@ -6,9 +6,9 @@ chooses its own listen port and registers it). Peer-to-peer fabric ops
 
 Byte 0 of every **app → node** request is the operation type below.
 
-## Local app ops (0–7)
+## Local app ops (0–8)
 
-### Reply framing (control ops 0–2 and 5–7)
+### Reply framing (control ops 0–2 and 5–8)
 
 | Status | Layout |
 |--------|--------|
@@ -28,16 +28,19 @@ Defined in `src/lib/wire.rs` (stable for apps):
 | `0x05` | `ERR_NO_ROUTE` | No path to dest (no session / no reachable SG) |
 | `0x06` | `ERR_PAYLOAD_TOO_LARGE` | Payload longer than `MAX_APP_PAYLOAD` (4096) |
 | `0x07` | `ERR_RATE_LIMITED` | Register/send token-bucket rate limit exceeded |
+| `0x08` | `ERR_NOT_IN_PURSE` | Purse missing, or the caller's alias is not a member |
+| `0x09` | `ERR_OVER_PURSE` | Amount is above the purse's available amount |
+| `0x0A` | `ERR_PAYMENT_MISMATCH` | Payment id is already reserved with a different body |
 
 Handlers live in `src/lib/handlers/app_edge.rs`.
 
-### Exposure policy (who may call ops 0–3 and 5–7)
+### Exposure policy (who may call ops 0–3 and 5–8)
 
 The data plane UDP socket (`0.0.0.0:7777`) also carries **peer fabric**
 ops. Local app control/data is a different trust model: the token is only
 as strong as “anyone who can reach this UDP port.”
 
-**Default:** ops `0x00`–`0x03` and `0x05`–`0x07` are accepted **only from
+**Default:** ops `0x00`–`0x03` and `0x05`–`0x08` are accepted **only from
 loopback** (`127.0.0.1` / `::1`). Non-loopback sources are dropped at the
 UDP listener (no error reply). Op `0x04` is a push the node sends.
 
@@ -141,6 +144,16 @@ packet when it decrypts the delivery.
 
 - Same request, same approval check, and the same empty success as op 6.
 - These lines will be payments this app sent.
+
+### 8 — reserve
+
+- Request: `[token:16][purse id:16][amount:i64 be][contact uuid:16][destination alias][note][payment id:16]`
+- Amount is nanodollars and must be greater than zero. The destination alias is trimmed. The note is opaque UTF-8, at most 255 bytes, and may be empty. No bytes follow the payment id.
+- The caller must be an approved app, and a member of that purse. This node applies the reserve only when it is the writer.
+- Success: `[0x00][available:i64 be][expires_at_ms:u64 be]`. `available` is what the purse still has. The hold lasts 24 hours from the writer's clock. The same payment id and the same body return this result again and do not reduce the available amount a second time.
+- A node that is not the writer replies `ERR_NO_WRITER` and does not change the purse. The contact is not told.
+- Errors: `ERR_BAD_PACKET`, `ERR_TOKEN_UNKNOWN`, `ERR_NOT_APPROVED`, `ERR_NO_WRITER`, `ERR_NOT_IN_PURSE`, `ERR_OVER_PURSE`, `ERR_PAYMENT_MISMATCH`.
+- When the hold expires, the writer adds the amount back. A later reserve with a new payment id can use it.
 
 ### get-data secrecy (op 2)
 

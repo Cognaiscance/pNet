@@ -11,8 +11,9 @@ use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
 use super::super::data_models::{
     AppGrant, AppInvitation, Application, Contact, Device, DeviceGrade, Ed25519KeyPair,
-    Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Node, Owner, Purse, Scope, SyncVersion,
-    User, Uuid, WriteLogEntry, X25519PublicKey, WRITE_LOG_RETENTION,
+    Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Node, Owner, PaymentReserve, Purse,
+    Scope, SyncVersion, User, Uuid, WriteLogEntry, X25519PublicKey, WRITE_LOG_RETENTION,
+    unix_time_ms,
 };
 use super::super::wire::*;
 use super::{
@@ -442,6 +443,11 @@ pub enum Change {
     /// purse, so a later upsert of the same id replaces the earlier one.
     /// Own devices learn it from a private pull. Contacts do not.
     UpsertPurse { purse: Purse },
+    /// Private-scope: hold `amount_nanodollars` of one purse for `payment_id`.
+    /// A repeat of the same hold does not reduce the available amount again.
+    ReservePayment { reserve: PaymentReserve },
+    /// Private-scope: return a hold to its purse. A missing id is a no-op.
+    ReleaseReserve { payment_id: Uuid },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
@@ -465,6 +471,8 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
         Change::ForgetOutboundAppInvitation { .. } => &[Scope::Public],
         Change::SetContactTheyAccept { .. }    => &[Scope::Public],
         Change::UpsertPurse { .. }             => &[Scope::Private],
+        Change::ReservePayment { .. }          => &[Scope::Private],
+        Change::ReleaseReserve { .. }          => &[Scope::Private],
     }
 }
 
@@ -584,6 +592,14 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
         Change::UpsertPurse { purse } => {
             buf.push(CHANGE_KIND_UPSERT_PURSE);
             push_purse(&mut buf, purse);
+        }
+        Change::ReservePayment { reserve } => {
+            buf.push(CHANGE_KIND_RESERVE_PAYMENT);
+            push_reserve(&mut buf, reserve);
+        }
+        Change::ReleaseReserve { payment_id } => {
+            buf.push(CHANGE_KIND_RELEASE_RESERVE);
+            buf.extend_from_slice(payment_id);
         }
     }
     buf
@@ -707,8 +723,27 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
             let purse = read_purse(data, &mut pos)?;
             Some(Change::UpsertPurse { purse })
         }
+        CHANGE_KIND_RESERVE_PAYMENT => {
+            let reserve = read_reserve(data, &mut pos)?;
+            Some(Change::ReservePayment { reserve })
+        }
+        CHANGE_KIND_RELEASE_RESERVE => {
+            let payment_id: Uuid = read_arr(data, &mut pos)?;
+            Some(Change::ReleaseReserve { payment_id })
+        }
         _ => None,
     }
+}
+
+/// Why the writer refused a reserve without changing the purse.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReserveReject {
+    /// The purse is missing, or the paying alias is not a member.
+    NotMember,
+    /// The amount is above what that purse still has available.
+    OverPurse,
+    /// This payment id is already on hold with a different body.
+    Mismatch,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -717,6 +752,8 @@ pub enum WriteError {
     Unreachable,
     /// Change refers to state the writer doesn't have (e.g., unknown device_uuid).
     Validation(String),
+    /// A reserve was refused. The purse and the other holds are unchanged.
+    ReserveRejected(ReserveReject),
 }
 
 /// Apply a `Change` to local state, bump the relevant scope version(s), and
@@ -897,8 +934,90 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
             }
         }
         Change::UpsertPurse { purse } => upsert_purse(owner, purse),
+        Change::ReservePayment { reserve } => apply_reserve(owner, reserve)?,
+        Change::ReleaseReserve { payment_id } => apply_release(owner, *payment_id),
     };
     Ok(applied)
+}
+
+fn apply_reserve(owner: &mut Owner, reserve: &PaymentReserve) -> Result<bool, WriteError> {
+    if reserve.amount_nanodollars <= 0
+        || reserve.note.len() > 255
+        || !alias_ok(&reserve.destination_alias)
+        || !alias_ok(&reserve.paying_alias)
+    {
+        return Err(WriteError::Validation("reserve fields".into()));
+    }
+    if let Some(existing) = owner.reserves.iter().find(|r| r.payment_id == reserve.payment_id) {
+        if existing.same_hold(reserve) {
+            return Ok(false);
+        }
+        return Err(WriteError::ReserveRejected(ReserveReject::Mismatch));
+    }
+    let Some(purse) = owner.purses.iter_mut().find(|p| p.id == reserve.purse_id) else {
+        return Err(WriteError::ReserveRejected(ReserveReject::NotMember));
+    };
+    if !purse.aliases.iter().any(|alias| alias == &reserve.paying_alias) {
+        return Err(WriteError::ReserveRejected(ReserveReject::NotMember));
+    }
+    if reserve.amount_nanodollars > purse.available_nanodollars {
+        return Err(WriteError::ReserveRejected(ReserveReject::OverPurse));
+    }
+    purse.available_nanodollars -= reserve.amount_nanodollars;
+    owner.reserves.push(reserve.clone());
+    Ok(true)
+}
+
+fn apply_release(owner: &mut Owner, payment_id: Uuid) -> bool {
+    let Some(index) = owner.reserves.iter().position(|r| r.payment_id == payment_id) else {
+        return false;
+    };
+    let reserve = owner.reserves.remove(index);
+    if let Some(purse) = owner.purses.iter_mut().find(|p| p.id == reserve.purse_id) {
+        purse.available_nanodollars = purse
+            .available_nanodollars
+            .saturating_add(reserve.amount_nanodollars);
+    }
+    true
+}
+
+fn alias_ok(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 255
+        && alias.trim() == alias
+        && !alias.chars().any(|c| c.is_control())
+}
+
+/// Give back every hold whose expiry is at or before `now_ms`.
+///
+/// Only the writer does this. Another device leaves the holds for the writer
+/// and learns the restored amount from the private pull.
+pub fn release_expired_reserves(ctx: &WorkerContext) {
+    release_expired_reserves_at(ctx, unix_time_ms());
+}
+
+pub(crate) fn release_expired_reserves_at(ctx: &WorkerContext, now_ms: u64) {
+    let local = {
+        let node = ctx.node.read().unwrap();
+        matches!(find_writer_sg(&node), WriterTarget::Local)
+    };
+    if !local {
+        return;
+    }
+    let ids: Vec<Uuid> = {
+        let node = ctx.node.read().unwrap();
+        node.owner
+            .reserves
+            .iter()
+            .filter(|reserve| reserve.expires_at_ms <= now_ms)
+            .map(|reserve| reserve.payment_id)
+            .collect()
+    };
+    for payment_id in ids {
+        if let Err(err) = request_change_idempotent(Change::ReleaseReserve { payment_id }, ctx) {
+            eprintln!("[release_expired_reserves] {payment_id:?}: {err:?}");
+        }
+    }
 }
 
 fn upsert_purse(owner: &mut Owner, purse: &Purse) -> bool {
@@ -1755,21 +1874,64 @@ fn read_purse(data: &[u8], pos: &mut usize) -> Option<Purse> {
     Some(Purse { id, name, allotment_nanodollars, available_nanodollars, aliases }.normalized())
 }
 
+fn push_reserve(buf: &mut Vec<u8>, reserve: &PaymentReserve) {
+    buf.extend_from_slice(&reserve.payment_id);
+    buf.extend_from_slice(&reserve.purse_id);
+    push_i64(buf, reserve.amount_nanodollars);
+    buf.extend_from_slice(&reserve.contact_uuid);
+    push_str(buf, &reserve.destination_alias);
+    push_str(buf, &reserve.note);
+    push_str(buf, &reserve.paying_alias);
+    buf.extend_from_slice(&reserve.expires_at_ms.to_be_bytes());
+}
+
+fn read_reserve(data: &[u8], pos: &mut usize) -> Option<PaymentReserve> {
+    let payment_id: Uuid = read_arr(data, pos)?;
+    let purse_id: Uuid = read_arr(data, pos)?;
+    let amount_nanodollars = read_i64(data, pos)?;
+    let contact_uuid: Uuid = read_arr(data, pos)?;
+    let destination_alias = read_str(data, pos)?;
+    let note = read_str(data, pos)?;
+    let paying_alias = read_str(data, pos)?;
+    let expires_bytes: [u8; 8] = read_arr(data, pos)?;
+    Some(PaymentReserve {
+        payment_id,
+        purse_id,
+        amount_nanodollars,
+        contact_uuid,
+        destination_alias,
+        note,
+        paying_alias,
+        expires_at_ms: u64::from_be_bytes(expires_bytes),
+    })
+}
+
 #[derive(Debug)]
 enum PrivateSnapshot {
     /// Writer predates purses. Leave the puller's purse list alone.
     LegacyEmpty,
-    Purses(Vec<Purse>),
+    /// Purses, and the holds against them. A blob that ends after the purses
+    /// is a writer from before holds existed; its reserve list is empty.
+    Purses {
+        purses: Vec<Purse>,
+        reserves: Vec<PaymentReserve>,
+    },
 }
 
 fn serialize_private_state(node: &Node) -> Vec<u8> {
     let mut purses = node.owner.purses.clone();
     purses.sort_by_key(|purse| purse.id);
+    let mut reserves = node.owner.reserves.clone();
+    reserves.sort_by_key(|reserve| reserve.payment_id);
     let mut buf = Vec::new();
     buf.push(PURSE_SNAPSHOT_MARKER);
     push_u16(&mut buf, purses.len().min(u16::MAX as usize) as u16);
     for purse in purses.iter().take(u16::MAX as usize) {
         push_purse(&mut buf, purse);
+    }
+    push_u16(&mut buf, reserves.len().min(u16::MAX as usize) as u16);
+    for reserve in reserves.iter().take(u16::MAX as usize) {
+        push_reserve(&mut buf, reserve);
     }
     buf
 }
@@ -1787,18 +1949,28 @@ fn read_private_snapshot(data: &[u8]) -> Option<PrivateSnapshot> {
     for _ in 0..count {
         purses.push(read_purse(data, &mut pos)?);
     }
+    if pos == data.len() {
+        return Some(PrivateSnapshot::Purses { purses, reserves: Vec::new() });
+    }
+    let reserve_count = read_u16(data, &mut pos)? as usize;
+    let mut reserves = Vec::with_capacity(reserve_count);
+    for _ in 0..reserve_count {
+        reserves.push(read_reserve(data, &mut pos)?);
+    }
     if pos != data.len() {
         return None;
     }
-    Some(PrivateSnapshot::Purses(purses))
+    Some(PrivateSnapshot::Purses { purses, reserves })
 }
 
 fn apply_private_state(blob: &[u8], ctx: &WorkerContext) -> bool {
     let Some(snapshot) = read_private_snapshot(blob) else {
         return false;
     };
-    if let PrivateSnapshot::Purses(purses) = snapshot {
-        ctx.node.write().unwrap().owner.purses = purses;
+    if let PrivateSnapshot::Purses { purses, reserves } = snapshot {
+        let mut node = ctx.node.write().unwrap();
+        node.owner.purses = purses;
+        node.owner.reserves = reserves;
     }
     true
 }
@@ -2175,6 +2347,11 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 }
                 Err(WriteError::Validation(msg)) => {
                     eprintln!("[sync_write_request] validation error from {src}: {msg}");
+                    let node = ctx.node.read().unwrap();
+                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new())
+                }
+                Err(WriteError::ReserveRejected(reason)) => {
+                    eprintln!("[sync_write_request] reserve rejected from {src}: {reason:?}");
                     let node = ctx.node.read().unwrap();
                     (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new())
                 }
@@ -3657,6 +3834,8 @@ struct MergedState {
     they_accept: HashMap<Uuid, (Vec<String>, EntryPriority)>,
     /// purse id → winning whole-purse snapshot.
     purses: HashMap<Uuid, (Purse, EntryPriority)>,
+    /// payment id → hold still outstanding after the log is replayed in order.
+    reserves: HashMap<Uuid, PaymentReserve>,
 }
 
 /// Per-contact accumulator: the winning snapshot plus the priority of the
@@ -3736,6 +3915,7 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
         outbound_tomb: HashSet::new(),
         they_accept: HashMap::new(),
         purses: HashMap::new(),
+        reserves: HashMap::new(),
     };
 
     // First pass: collect tombstones. Tombstone wins globally for its target,
@@ -3883,6 +4063,12 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
                 if win {
                     state.purses.insert(purse.id, (purse, prio));
                 }
+            }
+            Change::ReservePayment { reserve } => {
+                replay_reserve(&mut state, reserve);
+            }
+            Change::ReleaseReserve { payment_id } => {
+                replay_release(&mut state, payment_id);
             }
         }
     }
@@ -4152,15 +4338,89 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
     purse_ids.sort();
     purse_ids.dedup();
     for id in purse_ids {
-        match (current.purses.get(&id), target.purses.get(&id)) {
-            (_, Some((want, _))) if current.purses.get(&id).map(|(now, _)| now) != Some(want) => {
-                out.push(Change::UpsertPurse { purse: want.clone() });
+        let Some((want, _)) = target.purses.get(&id) else { continue };
+        let added = reserve_delta(current, target, id);
+        let removed = reserve_delta(target, current, id);
+        match current.purses.get(&id) {
+            None => {
+                let mut purse = want.clone();
+                purse.available_nanodollars = net_before_reserve_diff(want.available_nanodollars, added, removed);
+                out.push(Change::UpsertPurse { purse });
             }
+            Some((now, _)) => {
+                let definition_differs = now.name != want.name
+                    || now.allotment_nanodollars != want.allotment_nanodollars
+                    || now.aliases != want.aliases;
+                let predicted = now.available_nanodollars.saturating_sub(added).saturating_add(removed);
+                // A hold explains an available-amount change by itself. An
+                // upsert is only needed when the definition differs, or when
+                // the amount moved for some other reason.
+                if definition_differs || predicted != want.available_nanodollars {
+                    let mut purse = want.clone();
+                    purse.available_nanodollars = net_before_reserve_diff(want.available_nanodollars, added, removed);
+                    out.push(Change::UpsertPurse { purse });
+                }
+            }
+        }
+    }
+
+    let mut reserve_ids: Vec<Uuid> = current.reserves.keys()
+        .chain(target.reserves.keys())
+        .copied()
+        .collect();
+    reserve_ids.sort();
+    reserve_ids.dedup();
+    for id in reserve_ids {
+        match (current.reserves.get(&id), target.reserves.get(&id)) {
+            (None, Some(reserve)) => {
+                out.push(Change::ReservePayment { reserve: reserve.clone() });
+            }
+            (Some(_), None) => out.push(Change::ReleaseReserve { payment_id: id }),
             _ => {}
         }
     }
 
     out
+}
+
+/// Sum of holds on `purse_id` that are in `extra` and not in `base`.
+fn reserve_delta(base: &MergedState, extra: &MergedState, purse_id: Uuid) -> i64 {
+    extra.reserves.values()
+        .filter(|reserve| reserve.purse_id == purse_id && !base.reserves.contains_key(&reserve.payment_id))
+        .map(|reserve| reserve.amount_nanodollars)
+        .fold(0i64, i64::saturating_add)
+}
+
+/// `available` before the reserve diff is applied on top of it.
+fn net_before_reserve_diff(available: i64, added: i64, removed: i64) -> i64 {
+    available.saturating_add(added).saturating_sub(removed)
+}
+
+fn replay_reserve(state: &mut MergedState, reserve: PaymentReserve) {
+    if reserve.amount_nanodollars <= 0 {
+        return;
+    }
+    if state.reserves.contains_key(&reserve.payment_id) {
+        return;
+    }
+    let Some((purse, _)) = state.purses.get_mut(&reserve.purse_id) else {
+        return;
+    };
+    if !purse.aliases.iter().any(|alias| alias == &reserve.paying_alias) {
+        return;
+    }
+    if reserve.amount_nanodollars > purse.available_nanodollars {
+        return;
+    }
+    purse.available_nanodollars -= reserve.amount_nanodollars;
+    state.reserves.insert(reserve.payment_id, reserve);
+}
+
+fn replay_release(state: &mut MergedState, payment_id: Uuid) {
+    let Some(reserve) = state.reserves.remove(&payment_id) else { return };
+    if let Some((purse, _)) = state.purses.get_mut(&reserve.purse_id) {
+        purse.available_nanodollars = purse.available_nanodollars.saturating_add(reserve.amount_nanodollars);
+    }
 }
 
 #[cfg(test)]
@@ -4296,9 +4556,9 @@ mod purse_sync_tests {
 
     use super::{
         apply_change_to_owner, deserialize_change, merge_logs, read_private_snapshot,
-        serialize_change, serialize_private_state, Change, PrivateSnapshot,
+        serialize_change, serialize_private_state, Change, PrivateSnapshot, ReserveReject, WriteError,
     };
-    use crate::data_models::{Node, Purse, Scope, SyncVersion, WriteLogEntry};
+    use crate::data_models::{Node, PaymentReserve, Purse, Scope, SyncVersion, WriteLogEntry};
 
     fn media() -> Purse {
         Purse {
@@ -4326,8 +4586,20 @@ mod purse_sync_tests {
         node.owner.purses.push(media());
         let blob = serialize_private_state(&node);
         match read_private_snapshot(&blob) {
-            Some(PrivateSnapshot::Purses(purses)) => assert_eq!(purses, vec![media()]),
+            Some(PrivateSnapshot::Purses { purses, reserves }) => {
+                assert_eq!(purses, vec![media()]);
+                assert!(reserves.is_empty());
+            }
             other => panic!("expected purse snapshot, got {other:?}"),
+        }
+        // A writer from before holds omits the reserve count. That still loads.
+        let legacy = &blob[..blob.len() - 2];
+        match read_private_snapshot(legacy) {
+            Some(PrivateSnapshot::Purses { purses, reserves }) => {
+                assert_eq!(purses, vec![media()]);
+                assert!(reserves.is_empty());
+            }
+            other => panic!("expected a pre-hold snapshot, got {other:?}"),
         }
         assert!(matches!(read_private_snapshot(&[]), Some(PrivateSnapshot::LegacyEmpty)));
     }
@@ -4348,5 +4620,102 @@ mod purse_sync_tests {
             Change::UpsertPurse { purse } => assert_eq!(purse.name, "media"),
             other => panic!("expected purse upsert, got {other:?}"),
         }
+    }
+
+    fn hold(payment_id: u8, amount: i64, expires_at_ms: u64) -> PaymentReserve {
+        PaymentReserve {
+            payment_id: [payment_id; 16],
+            purse_id: [0x11; 16],
+            amount_nanodollars: amount,
+            contact_uuid: [0x22; 16],
+            destination_alias: "player".into(),
+            note: "clip-1".into(),
+            paying_alias: "discordium".into(),
+            expires_at_ms,
+        }
+    }
+
+    #[test]
+    fn reserve_reduces_once_and_a_different_body_is_refused() {
+        let mut owner = Node::new().owner;
+        assert!(apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap());
+        let reserve = hold(1, 1_000_000, 50);
+        let change = Change::ReservePayment { reserve: reserve.clone() };
+        assert_eq!(deserialize_change(&serialize_change(&change)).unwrap(), change);
+        assert!(apply_change_to_owner(&mut owner, &change).unwrap());
+        assert!(!apply_change_to_owner(&mut owner, &change).unwrap());
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        assert_eq!(owner.reserves, vec![reserve.clone()]);
+
+        let mut other = reserve.clone();
+        other.note = "clip-2".into();
+        let err = apply_change_to_owner(&mut owner, &Change::ReservePayment { reserve: other }).unwrap_err();
+        assert_eq!(err, WriteError::ReserveRejected(ReserveReject::Mismatch));
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        assert_eq!(owner.reserves.len(), 1);
+
+        let over = hold(2, 4_000_001, 50);
+        let err = apply_change_to_owner(&mut owner, &Change::ReservePayment { reserve: over }).unwrap_err();
+        assert_eq!(err, WriteError::ReserveRejected(ReserveReject::OverPurse));
+        assert_eq!(owner.reserves.len(), 1);
+
+        let outsider = PaymentReserve { paying_alias: "other".into(), ..hold(3, 1, 50) };
+        let err = apply_change_to_owner(&mut owner, &Change::ReservePayment { reserve: outsider }).unwrap_err();
+        assert_eq!(err, WriteError::ReserveRejected(ReserveReject::NotMember));
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+    }
+
+    #[test]
+    fn release_restores_the_available_amount() {
+        let mut owner = Node::new().owner;
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
+        apply_change_to_owner(&mut owner, &Change::ReservePayment { reserve: hold(1, 5_000_000, 50) }).unwrap();
+        assert_eq!(owner.purses[0].available_nanodollars, 0);
+        assert!(apply_change_to_owner(&mut owner, &Change::ReleaseReserve { payment_id: [1; 16] }).unwrap());
+        assert!(!apply_change_to_owner(&mut owner, &Change::ReleaseReserve { payment_id: [1; 16] }).unwrap());
+        assert_eq!(owner.purses[0].available_nanodollars, 5_000_000);
+        assert!(owner.reserves.is_empty());
+    }
+
+    #[test]
+    fn private_snapshot_roundtrips_a_reserve() {
+        let mut node = Node::new();
+        node.owner.purses.push(media());
+        node.owner.reserves.push(hold(4, 10, 99));
+        let blob = serialize_private_state(&node);
+        match read_private_snapshot(&blob) {
+            Some(PrivateSnapshot::Purses { purses, reserves }) => {
+                assert_eq!(purses, vec![media()]);
+                assert_eq!(reserves, vec![hold(4, 10, 99)]);
+            }
+            other => panic!("expected purse and reserve snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_applies_a_reserve_without_subtracting_twice() {
+        let created = WriteLogEntry {
+            version: SyncVersion { writer_sg_uuid: [0xA1; 16], epoch: 1, seq: 1 },
+            scope: Scope::Private,
+            change_payload: serialize_change(&Change::UpsertPurse { purse: media() }),
+            committed_at: SystemTime::UNIX_EPOCH,
+        };
+        let reserved = WriteLogEntry {
+            version: SyncVersion { writer_sg_uuid: [0xA1; 16], epoch: 1, seq: 2 },
+            scope: Scope::Private,
+            change_payload: serialize_change(&Change::ReservePayment { reserve: hold(7, 1_000_000, 80) }),
+            committed_at: SystemTime::UNIX_EPOCH,
+        };
+        let out = merge_logs(&[created.clone()], &[reserved], &std::collections::HashMap::new());
+        assert_eq!(out.changes_to_apply.len(), 1, "{:?}", out.changes_to_apply);
+        assert!(matches!(out.changes_to_apply[0], Change::ReservePayment { .. }));
+
+        let mut owner = Node::new().owner;
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
+        for change in &out.changes_to_apply {
+            apply_change_to_owner(&mut owner, change).unwrap();
+        }
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        assert_eq!(owner.reserves.len(), 1);
     }
 }

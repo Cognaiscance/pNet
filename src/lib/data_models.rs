@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddrV4;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const TUNNEL_THRESHOLD:      u32      = 10;
 pub const TUNNEL_COUNTER_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -682,6 +682,9 @@ pub struct Owner {
     /// Fixed spending limits for this user. Private scope: own devices only.
     #[serde(default)]
     pub purses: Vec<Purse>,
+    /// Holds against those purses. Private scope, same as `purses`.
+    #[serde(default)]
+    pub reserves: Vec<PaymentReserve>,
 
     /// Latest version of the user's **private** state held by this node.
     /// On the writer SG this is authoritative; on other nodes it's the
@@ -832,8 +835,8 @@ pub fn format_nanodollars(amount: i64) -> String {
 }
 
 /// A user-owned spending limit. Membership is by app alias, so every device
-/// that runs the alias shares it. `available_nanodollars` equals
-/// `allotment_nanodollars` until a later step records a spend.
+/// that runs the alias shares it. A reserve reduces `available_nanodollars`
+/// until it expires. Incoming payments do not raise it.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub struct Purse {
     #[serde(with = "serde_bytes_16")]
@@ -859,6 +862,51 @@ impl Purse {
         aliases.sort();
         aliases.dedup();
         Purse { aliases, ..self.clone() }
+    }
+}
+
+/// How long a reserve holds purse funds before the writer gives them back.
+/// The contact is not asked during this step, so every reserve ends this way
+/// unless a later step confirms it first. Twenty-four hours is long enough
+/// for that later accept to arrive the same day.
+pub const RESERVE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Milliseconds since the Unix epoch. A clock that is not set returns 0.
+pub fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// One hold against a purse. The same `payment_id` is the same hold.
+/// `expires_at_ms` is the writer's clock. Contacts do not receive this record.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct PaymentReserve {
+    #[serde(with = "serde_bytes_16")]
+    pub payment_id: Uuid,
+    #[serde(with = "serde_bytes_16")]
+    pub purse_id: Uuid,
+    pub amount_nanodollars: i64,
+    #[serde(with = "serde_bytes_16")]
+    pub contact_uuid: Uuid,
+    pub destination_alias: String,
+    pub note: String,
+    pub paying_alias: String,
+    pub expires_at_ms: u64,
+}
+
+impl PaymentReserve {
+    /// The fields that make a retry the same hold. The expiry is the writer's
+    /// stamp and is not part of the identity.
+    pub fn same_hold(&self, other: &Self) -> bool {
+        self.payment_id == other.payment_id
+            && self.purse_id == other.purse_id
+            && self.amount_nanodollars == other.amount_nanodollars
+            && self.contact_uuid == other.contact_uuid
+            && self.destination_alias == other.destination_alias
+            && self.note == other.note
+            && self.paying_alias == other.paying_alias
     }
 }
 
@@ -1057,6 +1105,7 @@ impl Node {
                 seen_app_invitation_ids:    Vec::new(),
                 outbound_app_invitations:   Vec::new(),
                 purses:                     Vec::new(),
+                reserves:                   Vec::new(),
                 private_version:            SyncVersion::zero(),
                 public_version:             SyncVersion::zero(),
                 write_log:                  Vec::new(),

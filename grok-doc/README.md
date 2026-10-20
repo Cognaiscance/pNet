@@ -69,7 +69,7 @@ A join sends `BootstrapRequest` and returns. The asynchronous `BootstrapResponse
 | `PNET_HTTP_PORT` | `8777` | Portal port. |
 | `PNET_HTTP_BIND` | `127.0.0.1` | IPv4 bind address. `localhost` is loopback. An unparseable value falls back to loopback. |
 | `PNET_HTTP_BIND_ALL` | unset | `1` or `true` binds `0.0.0.0` when `PNET_HTTP_BIND` is unset. |
-| `PNET_APP_API_REMOTE` | unset | `1`, `true`, or `yes` lets non-loopback hosts use app request ops `0x00`–`0x03` and `0x05`–`0x07`. |
+| `PNET_APP_API_REMOTE` | unset | `1`, `true`, or `yes` lets non-loopback hosts use app request ops `0x00`–`0x03` and `0x05`–`0x08`. |
 | `PNET_AUTO_APPROVE_APPS` | unset | `1` or `true` marks a new registration approved, signs an app certificate, and publishes it. |
 | `PNET_ADMIN_PASSWORD` | unset | First admin password, if none is stored yet. |
 | `PNET_KEY_PASSPHRASE` | unset | Passphrase that seals private keys. Minimum 8 characters. |
@@ -83,6 +83,7 @@ A join sends `BootstrapRequest` and returns. The asynchronous `BootstrapResponse
 | DG keepalive | 20 s | Each DG sends an empty encrypted datagram on every live SG session. |
 | Sync pull | 30 min | Pull public and private versions from the current writer. |
 | Partition reconcile | 60 s | Each SG sends a public watermark probe to every connected own-user SG. |
+| Release expired reserves | 60 s | The writer adds back purse holds whose 24-hour expiry has passed. |
 | Tunnel cleanup | 5 min | Drops idle tunnels. |
 
 A session lives 24 hours from the last successful handshake or DG keepalive. Maintenance renews a session when less than 2 hours remain. A `ConnectRequest` that gets no ack is forgotten after 5 seconds.

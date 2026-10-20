@@ -22,6 +22,8 @@ const SYNC_PULL_INTERVAL:            Duration = Duration::from_secs(30 * 60);
 /// Empty-merge round-trips when nothing diverged are cheap (one packet
 /// pair). See `descriptions/data sync.md` §"v2: partition reconciliation".
 const PARTITION_RECONCILE_INTERVAL:  Duration = Duration::from_secs(60);
+/// How often the writer returns purse holds that have reached their expiry.
+const RELEASE_EXPIRED_INTERVAL:      Duration = Duration::from_secs(60);
 
 pub struct SchedulerThread {
     handle: thread::JoinHandle<()>,
@@ -49,6 +51,7 @@ impl SchedulerThread {
             let mut last_cleanup_tunnels    = Instant::now();
             let mut last_sync_pull          = Instant::now();
             let mut last_partition_reconcile = Instant::now();
+            let mut last_release_expired = Instant::now();
             let mut pending: Vec<(Instant, Action)> = Vec::new();
 
             while !stop.load(Ordering::Acquire) {
@@ -87,6 +90,10 @@ impl SchedulerThread {
                 if now.duration_since(last_partition_reconcile) >= PARTITION_RECONCILE_INTERVAL {
                     to_enqueue.push(Action::PartitionReconcile);
                     last_partition_reconcile = now;
+                }
+                if now.duration_since(last_release_expired) >= RELEASE_EXPIRED_INTERVAL {
+                    to_enqueue.push(Action::ReleaseExpiredReserves);
+                    last_release_expired = now;
                 }
 
                 // One-shot pending jobs — drain those that are due.
