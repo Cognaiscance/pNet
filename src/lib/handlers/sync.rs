@@ -1052,33 +1052,47 @@ fn apply_record(owner: &mut Owner, line: &LedgerLine) -> Result<bool, WriteError
     if !offer_body_ok(&body_from_line(line)) {
         return Err(WriteError::Validation("ledger fields".into()));
     }
-    if let Some(existing) = owner.ledger.iter().find(|stored| stored.payment_id == line.payment_id) {
-        if same_record(existing, line) {
-            let removed_reserve = take_reserve_no_refund(owner, line.payment_id);
-            let removed_pending = take_pending(owner, line.payment_id);
-            return Ok(removed_reserve || removed_pending);
-        }
-        return Err(WriteError::PaymentRejected(PaymentReject::Mismatch));
+    // The same signed bytes are the same payment. A different body is kept.
+    // The purse is charged only for the first body, and only when this record
+    // names one purse that lists the paying alias and no matching hold remains.
+    if owner.ledger.iter().any(|stored| same_record(stored, line)) {
+        let removed_reserve = take_matching_reserve(owner, line);
+        let removed_pending = take_matching_pending(owner, line);
+        return Ok(removed_reserve || removed_pending);
     }
-    if line.payer == owner.user.uuid {
-        let Some(reserve) = owner.reserves.iter().find(|reserve| reserve.payment_id == line.payment_id).cloned() else {
-            return Ok(false);
-        };
-        if !line_same_payment(line, &reserve, owner.user.uuid) {
-            return Err(WriteError::PaymentRejected(PaymentReject::Mismatch));
-        }
+    if owner.ledger.iter().any(|stored| stored.payment_id == line.payment_id) {
+        take_matching_pending(owner, line);
+        let mut stored = line.clone();
+        stored.purse_id = [0u8; 16];
+        owner.ledger.push(stored);
+        return Ok(true);
+    }
+    let reserve_purse = owner.reserves.iter().find_map(|reserve| {
+        (reserve.payment_id == line.payment_id && line_same_payment(line, reserve, line.payer))
+            .then_some(reserve.purse_id)
+    });
+    take_matching_pending(owner, line);
+    if let Some(purse_id) = reserve_purse {
         take_reserve_no_refund(owner, line.payment_id);
-    } else {
-        let body = body_from_line(line);
-        let Some(pending) = owner.pending_accepts.iter().find(|pending| pending.payment_id == line.payment_id) else {
-            return Ok(false);
-        };
-        if !pending_covers(pending, &body, &line.payer_sig) || pending.payee_sig != line.payee_sig {
-            return Err(WriteError::PaymentRejected(PaymentReject::Mismatch));
+        let mut stored = line.clone();
+        stored.purse_id = purse_id;
+        owner.ledger.push(stored);
+        return Ok(true);
+    }
+    let mut stored = line.clone();
+    if stored.purse_id != [0u8; 16] {
+        if let Some(purse) = owner.purses.iter_mut().find(|purse| purse.id == stored.purse_id) {
+            if purse.aliases.iter().any(|alias| alias == &stored.paying_alias) {
+                purse.available_nanodollars = purse
+                    .available_nanodollars
+                    .saturating_sub(stored.amount_nanodollars);
+                owner.ledger.push(stored);
+                return Ok(true);
+            }
         }
     }
-    take_pending(owner, line.payment_id);
-    owner.ledger.push(line.clone());
+    stored.purse_id = [0u8; 16];
+    owner.ledger.push(stored);
     Ok(true)
 }
 
@@ -1121,6 +1135,29 @@ fn take_reserve_no_refund(owner: &mut Owner, payment_id: Uuid) -> bool {
     let before = owner.reserves.len();
     owner.reserves.retain(|reserve| reserve.payment_id != payment_id);
     before != owner.reserves.len()
+}
+
+fn take_matching_reserve(owner: &mut Owner, line: &LedgerLine) -> bool {
+    let matches = owner.reserves.iter().any(|reserve| {
+        reserve.payment_id == line.payment_id && line_same_payment(line, reserve, line.payer)
+    });
+    if !matches {
+        return false;
+    }
+    take_reserve_no_refund(owner, line.payment_id)
+}
+
+fn take_matching_pending(owner: &mut Owner, line: &LedgerLine) -> bool {
+    let body = body_from_line(line);
+    let matches = owner.pending_accepts.iter().any(|pending| {
+        pending.payment_id == line.payment_id
+            && pending_covers(pending, &body, &line.payer_sig)
+            && pending.payee_sig == line.payee_sig
+    });
+    if !matches {
+        return false;
+    }
+    take_pending(owner, line.payment_id)
 }
 
 fn take_pending(owner: &mut Owner, payment_id: Uuid) -> bool {
@@ -4091,8 +4128,9 @@ struct MergedState {
     purses: HashMap<Uuid, (Purse, EntryPriority)>,
     /// payment id → hold still outstanding after the log is replayed in order.
     reserves: HashMap<Uuid, PaymentReserve>,
-    /// payment id → confirmed line.
-    ledger: HashMap<Uuid, LedgerLine>,
+    /// payment id → confirmed lines, in the order they were recorded.
+    /// Two signed bodies of one id are both kept.
+    ledger: HashMap<Uuid, Vec<LedgerLine>>,
     /// payment id → staged accept that is not yet a line.
     pending: HashMap<Uuid, PendingAccept>,
 }
@@ -4609,8 +4647,8 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
     purse_ids.dedup();
     for id in purse_ids {
         let Some((want, _)) = target.purses.get(&id) else { continue };
-        let added = reserve_delta(current, target, id);
-        let removed = reserve_delta(target, current, id);
+        let added = reserve_delta(current, target, id).saturating_add(charge_delta(current, target, id));
+        let removed = reserve_delta(target, current, id).saturating_add(charge_delta(target, current, id));
         match current.purses.get(&id) {
             None => {
                 let mut purse = want.clone();
@@ -4659,10 +4697,13 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
     line_ids.sort();
     line_ids.dedup();
     for id in line_ids {
-        if current.ledger.contains_key(&id) {
-            continue;
-        }
-        if let Some(line) = target.ledger.get(&id) {
+        let current_lines = current.ledger.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+        let Some(target_lines) = target.ledger.get(&id) else { continue };
+        // Target order is replay order, so the body that charged is applied first.
+        for line in target_lines {
+            if current_lines.iter().any(|stored| same_record(stored, line)) {
+                continue;
+            }
             out.push(Change::RecordLedger { line: line.clone() });
         }
     }
@@ -4705,6 +4746,27 @@ fn net_before_reserve_diff(available: i64, added: i64, removed: i64) -> i64 {
     available.saturating_add(added).saturating_sub(removed)
 }
 
+/// Sum of first-body charges on `purse_id` that are in `extra` and not in `base`.
+///
+/// A copied debt with no hold reduces the purse once. A second body of an id
+/// `base` already stores does not. A hold `base` still has explains the amount,
+/// so that id is left out and the record consumes the hold instead.
+fn charge_delta(base: &MergedState, extra: &MergedState, purse_id: Uuid) -> i64 {
+    let Some((purse, _)) = extra.purses.get(&purse_id) else {
+        return 0;
+    };
+    extra.ledger.iter().filter_map(|(id, lines)| {
+        let first = lines.first()?;
+        if first.purse_id != purse_id || base.ledger.contains_key(id) || base.reserves.contains_key(id) {
+            return None;
+        }
+        if !purse.aliases.iter().any(|alias| alias == &first.paying_alias) {
+            return None;
+        }
+        Some(first.amount_nanodollars)
+    }).fold(0i64, i64::saturating_add)
+}
+
 fn replay_reserve(state: &mut MergedState, reserve: PaymentReserve) {
     if reserve.amount_nanodollars <= 0 {
         return;
@@ -4736,23 +4798,64 @@ fn replay_release(state: &mut MergedState, payment_id: Uuid) {
     }
 }
 
+fn matching_reserve_purse(state: &MergedState, line: &LedgerLine) -> Option<Uuid> {
+    let reserve = state.reserves.get(&line.payment_id)?;
+    line_same_payment(line, reserve, line.payer).then_some(reserve.purse_id)
+}
+
+fn take_matching_pending_state(state: &mut MergedState, line: &LedgerLine) {
+    let body = body_from_line(line);
+    let matches = state.pending.get(&line.payment_id).is_some_and(|pending| {
+        pending_covers(pending, &body, &line.payer_sig) && pending.payee_sig == line.payee_sig
+    });
+    if matches {
+        state.pending.remove(&line.payment_id);
+    }
+}
+
 fn replay_record(state: &mut MergedState, line: LedgerLine) {
     if !offer_body_ok(&body_from_line(&line)) {
         return;
     }
-    if let Some(reserve) = state.reserves.get(&line.payment_id) {
-        if !line_same_payment(&line, reserve, line.payer) {
-            return;
+    let same = state.ledger.get(&line.payment_id).is_some_and(|lines| {
+        lines.iter().any(|stored| same_record(stored, &line))
+    });
+    if same {
+        if matching_reserve_purse(state, &line).is_some() {
+            state.reserves.remove(&line.payment_id);
         }
-    }
-    if state.ledger.contains_key(&line.payment_id) {
-        state.reserves.remove(&line.payment_id);
-        state.pending.remove(&line.payment_id);
+        take_matching_pending_state(state, &line);
         return;
     }
-    state.reserves.remove(&line.payment_id);
-    state.pending.remove(&line.payment_id);
-    state.ledger.insert(line.payment_id, line);
+    if state.ledger.contains_key(&line.payment_id) {
+        take_matching_pending_state(state, &line);
+        let mut stored = line;
+        stored.purse_id = [0u8; 16];
+        state.ledger.get_mut(&stored.payment_id).expect("ledger list").push(stored);
+        return;
+    }
+    take_matching_pending_state(state, &line);
+    if let Some(purse_id) = matching_reserve_purse(state, &line) {
+        state.reserves.remove(&line.payment_id);
+        let mut stored = line;
+        stored.purse_id = purse_id;
+        state.ledger.insert(stored.payment_id, vec![stored]);
+        return;
+    }
+    let mut stored = line;
+    if stored.purse_id != [0u8; 16] {
+        if let Some((purse, _)) = state.purses.get_mut(&stored.purse_id) {
+            if purse.aliases.iter().any(|alias| alias == &stored.paying_alias) {
+                purse.available_nanodollars = purse
+                    .available_nanodollars
+                    .saturating_sub(stored.amount_nanodollars);
+                state.ledger.insert(stored.payment_id, vec![stored]);
+                return;
+            }
+        }
+    }
+    stored.purse_id = [0u8; 16];
+    state.ledger.insert(stored.payment_id, vec![stored]);
 }
 
 fn replay_stage(state: &mut MergedState, pending: PendingAccept) {
@@ -5184,5 +5287,118 @@ mod purse_sync_tests {
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
         assert!(owner.reserves.is_empty());
         assert_eq!(owner.ledger, vec![line]);
+    }
+
+    #[test]
+    fn private_snapshot_roundtrips_two_lines_for_one_payment() {
+        let mut node = Node::new();
+        let first = confirmed_line(node.owner.user.uuid, &hold(5, 10, 99));
+        let mut second = first.clone();
+        second.note = "other".into();
+        second.purse_id = [0u8; 16];
+        second.confirm_sig = Ed25519Signature([2; 64]);
+        node.owner.ledger.push(first.clone());
+        node.owner.ledger.push(second.clone());
+        match read_private_snapshot(&serialize_private_state(&node)) {
+            Some(PrivateSnapshot::Purses { ledger, .. }) => {
+                assert_eq!(ledger.len(), 2);
+                assert!(ledger.iter().any(|line| line.note == first.note && line.confirm_sig == first.confirm_sig));
+                assert!(ledger.iter().any(|line| line.note == "other" && line.purse_id == [0u8; 16]));
+            }
+            other => panic!("expected both lines, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreserved_record_overruns_one_purse_and_keeps_a_second_body() {
+        let mut owner = Node::new().owner;
+        owner.user.uuid = [0x44; 16];
+        let mut purse = media();
+        purse.available_nanodollars = 0;
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse }).unwrap();
+        let line = confirmed_line([0x44; 16], &hold(7, 1_000_000, 80));
+        assert!(apply_change_to_owner(&mut owner, &Change::RecordLedger { line: line.clone() }).unwrap());
+        assert_eq!(owner.purses[0].available_nanodollars, -1_000_000);
+        let mut other = line.clone();
+        other.note = "other".into();
+        other.purse_id = [0x11; 16];
+        other.confirm_sig = Ed25519Signature([4; 64]);
+        assert!(apply_change_to_owner(&mut owner, &Change::RecordLedger { line: other }).unwrap());
+        assert!(!apply_change_to_owner(&mut owner, &Change::RecordLedger { line }).unwrap());
+        assert_eq!(owner.purses[0].available_nanodollars, -1_000_000);
+        assert_eq!(owner.ledger.len(), 2);
+        assert_eq!(owner.ledger[1].purse_id, [0u8; 16]);
+    }
+
+    #[test]
+    fn merge_of_an_unreserved_line_charges_once() {
+        let line = confirmed_line([0x44; 16], &hold(7, 1_000_000, 80));
+        let entry = |seq: u64, change: Change| WriteLogEntry {
+            version: SyncVersion { writer_sg_uuid: [0xA1; 16], epoch: 1, seq },
+            scope: Scope::Private,
+            change_payload: serialize_change(&change),
+            committed_at: SystemTime::UNIX_EPOCH,
+        };
+        let created = entry(1, Change::UpsertPurse { purse: media() });
+        let recorded = entry(2, Change::RecordLedger { line: line.clone() });
+        let out = merge_logs(
+            &[created.clone()],
+            &[created.clone(), recorded.clone()],
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(out.changes_to_apply.len(), 1, "{:?}", out.changes_to_apply);
+        assert!(matches!(out.changes_to_apply[0], Change::RecordLedger { .. }));
+
+        let mut owner = Node::new().owner;
+        owner.user.uuid = [0x44; 16];
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
+        for change in &out.changes_to_apply {
+            apply_change_to_owner(&mut owner, change).unwrap();
+        }
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        assert_eq!(owner.ledger.len(), 1);
+
+        let again = merge_logs(
+            &[created.clone(), recorded.clone()],
+            &[created, recorded],
+            &std::collections::HashMap::new(),
+        );
+        assert!(again.changes_to_apply.is_empty());
+    }
+
+    #[test]
+    fn merge_of_a_second_body_does_not_charge_again() {
+        let first = confirmed_line([0x44; 16], &hold(7, 1_000_000, 80));
+        let mut second = first.clone();
+        second.note = "other".into();
+        second.purse_id = [0u8; 16];
+        second.confirm_sig = Ed25519Signature([9; 64]);
+        let entry = |seq: u64, change: Change| WriteLogEntry {
+            version: SyncVersion { writer_sg_uuid: [0xA1; 16], epoch: 1, seq },
+            scope: Scope::Private,
+            change_payload: serialize_change(&change),
+            committed_at: SystemTime::UNIX_EPOCH,
+        };
+        let created = entry(1, Change::UpsertPurse { purse: media() });
+        let recorded = entry(2, Change::RecordLedger { line: first });
+        let extra = entry(3, Change::RecordLedger { line: second });
+        let out = merge_logs(
+            &[created.clone(), recorded.clone()],
+            &[created, recorded, extra],
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(out.changes_to_apply.len(), 1, "{:?}", out.changes_to_apply);
+        assert!(matches!(out.changes_to_apply[0], Change::RecordLedger { .. }));
+
+        let mut owner = Node::new().owner;
+        owner.user.uuid = [0x44; 16];
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
+        let first = confirmed_line([0x44; 16], &hold(7, 1_000_000, 80));
+        apply_change_to_owner(&mut owner, &Change::RecordLedger { line: first }).unwrap();
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        apply_change_to_owner(&mut owner, &out.changes_to_apply[0]).unwrap();
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        assert_eq!(owner.ledger.len(), 2);
+        assert_eq!(owner.ledger[1].purse_id, [0u8; 16]);
     }
 }

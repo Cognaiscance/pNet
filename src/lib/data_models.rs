@@ -651,6 +651,13 @@ pub struct PendingDeviceAcceptance {
     pub expected_signing_pk: Ed25519PublicKey,
 }
 
+/// Payment ids a contact has listed on the current session. Not written to disk.
+#[derive(Default)]
+pub struct PaymentIndexAccum {
+    pub open: bool,
+    pub seen: Vec<(Uuid, Ed25519Signature)>,
+}
+
 /// The local owner of this node. Extends User with contacts and a long-term key pair.
 #[derive(Serialize, Deserialize)]
 pub struct Owner {
@@ -696,6 +703,9 @@ pub struct Owner {
     /// They count against the payer's ceiling. Private scope.
     #[serde(default)]
     pub pending_accepts: Vec<PendingAccept>,
+    /// In-progress payment index from a contact. Dropped when the list ends.
+    #[serde(skip)]
+    pub payment_index: HashMap<Uuid, PaymentIndexAccum>,
 
     /// Latest version of the user's **private** state held by this node.
     /// On the writer SG this is authoritative; on other nodes it's the
@@ -1167,6 +1177,7 @@ impl Node {
                 receive_ceilings:           Vec::new(),
                 ledger:                     Vec::new(),
                 pending_accepts:            Vec::new(),
+                payment_index:              HashMap::new(),
                 private_version:            SyncVersion::zero(),
                 public_version:             SyncVersion::zero(),
                 write_log:                  Vec::new(),

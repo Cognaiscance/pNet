@@ -177,7 +177,19 @@ A signed refusal that matches the held offer releases it. A refusal after the li
 
 Session-sealed. The plaintext is the accept plus the payer's second signature. The confirm domain is `pnet-payment-confirm-v1` over the body, the payer signature, and the payee signature.
 
-The payee's writer stores the line when the three signatures verify and a matching staged accept is still present. The purse id on that copy is 16 zero bytes. A repeat of the same confirmation is ignored. A staged accept that expired is already gone, and this step does not invent the line.
+The payee's writer stores the line when the three signatures verify. The purse id on that copy is 16 zero bytes. A repeat of the same confirmation is ignored. A second body for an id that already has a line is ignored on this op. Expiry drops a staged accept and does not by itself create a line. A confirmation that arrives after that still stores the line.
+
+### 0x64 — payment index
+
+Session-sealed. A writer sends this when a session to one of a contact's devices comes up. It is not sent to an own device. The plaintext is `[flags:u8][count:u16 be]` and then `count` entries of `[payment id:16][confirm signature:64]`. Flag `0x01` starts a list and replaces one in progress. Flag `0x02` ends the list. One packet can set both. A long list uses more than one packet, and the receiver unions them before comparing.
+
+When the list ends, the receiver sends op `0x65` for each confirmed line of this pair whose payment id and confirmation signature are absent. It does not answer with another index. A node that is not the writer drops the packet.
+
+### 0x65 — payment record
+
+Session-sealed. The plaintext is the confirmation from op `0x63` and does not name a purse. The receiver stores it when the three signatures verify and the two users are this node and the contact that owns the session. A bad signature is dropped, and nothing is released or changed.
+
+The same signed bytes are not stored twice. A different signed body is stored beside the first and does not reduce a purse again. The payee's copy uses an empty purse id. A payer with a matching hold consumes that hold and does not subtract again. A payer with no matching hold reduces the one purse that lists the paying alias, which can leave a negative available amount. If none or several do, the line is stored and no purse is chosen.
 
 ### get-data secrecy (op 2)
 

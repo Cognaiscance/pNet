@@ -253,7 +253,7 @@ The token must belong to an approved app on this device. The reply lists only pu
 ||     id (16) || name || kind (u8, 0 = fixed) || allotment (i64) || available (i64)
 ```
 
-Amounts are nanodollars, big-endian. Kind is 0. Monthly purses are not stored. The count is a `u16` so a later payment list can pass 255 lines without a new header. This read does not change the available amount.
+Amounts are nanodollars, big-endian. Kind is 0. Monthly purses are not stored. The count is a `u16` so a later payment list can pass 255 lines without a new header. This read does not change the available amount. Available is signed: a debt copied back after the purse was spent again can make it negative.
 
 Errors: `bad packet`, `token unknown`, `not approved`.
 

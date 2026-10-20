@@ -155,6 +155,7 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // can initiate the probe; running it from both ends just means both sides
     // populate `last_watermarks` and ship their proposal in parallel.
     partition_reconcile_on_reconnect(our_conn_id, ctx);
+    super::payment::exchange_payment_records(our_conn_id, ctx);
 }
 
 /// Op 0x21 — Acknowledgement from a peer node in response to our ConnectRequest.
@@ -233,6 +234,7 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // Sync v2: if the peer is an own-user SG, kick off partition reconciliation
     // (watermark probe → merge proposal exchange). No-op otherwise.
     partition_reconcile_on_reconnect(our_conn_id, ctx);
+    super::payment::exchange_payment_records(our_conn_id, ctx);
 }
 
 const SG_PING_TIMEOUT: Duration = Duration::from_secs(1);
