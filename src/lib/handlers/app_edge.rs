@@ -498,9 +498,9 @@ fn require_approved_alias(src: SocketAddr, buf: &[u8], ctx: &WorkerContext) -> O
 ///   each purse, ordered by name then id:
 ///     `[id: 16][name: u8+bytes][kind: u8][allotment: i64 BE][available: i64 BE]`
 ///
-/// `kind` is [`PURSE_KIND_FIXED`] (0). Amounts are nanodollars. A purse whose
-/// aliases do not include the caller is absent. Count 0 is success. This read
-/// does not change a purse and does not publish.
+/// `kind` is [`PURSE_KIND_FIXED`] (0) or [`PURSE_KIND_MONTHLY`] (1). Amounts
+/// are nanodollars. A purse whose aliases do not include the caller is absent.
+/// Count 0 is success. This read does not change a purse and does not publish.
 ///
 /// Errors: `ERR_BAD_PACKET`, `ERR_TOKEN_UNKNOWN`, `ERR_NOT_APPROVED`.
 pub fn app_list_purses(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
@@ -525,7 +525,7 @@ pub fn app_list_purses(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     for purse in purses.into_iter().take(count as usize) {
         reply.extend_from_slice(&purse.id);
         push_str(&mut reply, &purse.name);
-        reply.push(PURSE_KIND_FIXED);
+        reply.push(purse.kind);
         reply.extend_from_slice(&purse.allotment_nanodollars.to_be_bytes());
         reply.extend_from_slice(&purse.available_nanodollars.to_be_bytes());
     }
@@ -622,8 +622,10 @@ fn list_payments(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext, incoming: b
 /// hold is `ERR_PAYMENT_MISMATCH`.
 ///
 /// The hold lasts [`RESERVE_TTL_MS`] from the writer's clock. When it expires,
-/// the writer adds the amount back. A fitting amount equal to what is
-/// available leaves zero.
+/// the writer adds the amount back, unless the purse is monthly and the hold
+/// belongs to an earlier UTC month. That release does not raise the new month.
+/// A fitting amount equal to what is available leaves zero. The writer rolls
+/// a monthly purse to its allotment before taking the hold.
 pub fn app_reserve(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let Some(parsed) = parse_reserve(&buf) else {
         send_error(ctx, src, ERR_BAD_PACKET);
@@ -639,6 +641,12 @@ pub fn app_reserve(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     release_expired_reserves(ctx);
     let now_ms = unix_time_ms();
+    let period = {
+        let node = ctx.node.read().unwrap();
+        node.owner.purses.iter().find(|purse| purse.id == parsed.purse_id).map(|purse| {
+            if purse.kind == PURSE_KIND_MONTHLY { purse.period } else { 0 }
+        }).unwrap_or(0)
+    };
     let reserve = PaymentReserve {
         payment_id: parsed.payment_id,
         purse_id: parsed.purse_id,
@@ -648,6 +656,7 @@ pub fn app_reserve(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         note: parsed.note,
         paying_alias,
         expires_at_ms: now_ms.saturating_add(RESERVE_TTL_MS),
+        period,
     };
 
     if let Err(err) = request_change_idempotent(Change::ReservePayment { reserve: reserve.clone() }, ctx) {

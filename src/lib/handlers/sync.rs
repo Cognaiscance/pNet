@@ -14,7 +14,7 @@ use super::super::data_models::{
     Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, LedgerLine, Node, Owner,
     PaymentReserve, PendingAccept, Purse, ReceiveCeiling,
     Scope, SyncVersion, User, Uuid, WriteLogEntry, X25519PublicKey, WRITE_LOG_RETENTION,
-    unix_time_ms,
+    unix_time_ms, utc_month_period,
 };
 use super::super::payment::{
     body_from_line, body_from_pending, claim_exceeds_ceiling, clearing_record_ok, decode_accept_at,
@@ -619,11 +619,18 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
         }
         Change::UpsertPurse { purse } => {
             buf.push(CHANGE_KIND_UPSERT_PURSE);
-            push_purse(&mut buf, purse);
+            let mut purse = purse.normalized();
+            if purse.kind == PURSE_KIND_FIXED {
+                purse.period = 0;
+            }
+            push_purse(&mut buf, &purse);
+            buf.push(purse.kind);
+            buf.extend_from_slice(&purse.period.to_be_bytes());
         }
         Change::ReservePayment { reserve } => {
             buf.push(CHANGE_KIND_RESERVE_PAYMENT);
             push_reserve(&mut buf, reserve);
+            buf.extend_from_slice(&reserve.period.to_be_bytes());
         }
         Change::ReleaseReserve { payment_id } => {
             buf.push(CHANGE_KIND_RELEASE_RESERVE);
@@ -769,11 +776,11 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
             Some(Change::SetContactTheyAccept { contact_uuid, aliases })
         }
         CHANGE_KIND_UPSERT_PURSE => {
-            let purse = read_purse(data, &mut pos)?;
+            let purse = read_purse_change(data, &mut pos)?;
             Some(Change::UpsertPurse { purse })
         }
         CHANGE_KIND_RESERVE_PAYMENT => {
-            let reserve = read_reserve(data, &mut pos)?;
+            let reserve = read_reserve_change(data, &mut pos)?;
             Some(Change::ReservePayment { reserve })
         }
         CHANGE_KIND_RELEASE_RESERVE => {
@@ -1073,11 +1080,20 @@ fn apply_release(owner: &mut Owner, payment_id: Uuid) -> bool {
     };
     let reserve = owner.reserves.remove(index);
     if let Some(purse) = owner.purses.iter_mut().find(|p| p.id == reserve.purse_id) {
-        purse.available_nanodollars = purse
-            .available_nanodollars
-            .saturating_add(reserve.amount_nanodollars);
+        if reserve_refunds(purse, &reserve) {
+            purse.available_nanodollars = purse
+                .available_nanodollars
+                .saturating_add(reserve.amount_nanodollars);
+        }
     }
     true
+}
+
+/// A fixed purse always returns a released hold. A monthly purse returns it
+/// only while the hold still belongs to the purse's current month. A hold
+/// from an earlier month was left behind when the allotment was restored.
+fn reserve_refunds(purse: &Purse, reserve: &PaymentReserve) -> bool {
+    purse.kind != PURSE_KIND_MONTHLY || reserve.period == purse.period
 }
 
 fn apply_record(owner: &mut Owner, line: &LedgerLine) -> Result<bool, WriteError> {
@@ -1232,6 +1248,7 @@ pub(crate) fn release_expired_reserves_at(ctx: &WorkerContext, now_ms: u64) {
     if !local {
         return;
     }
+    roll_monthly_purses_at(ctx, now_ms);
     let ids: Vec<Uuid> = {
         let node = ctx.node.read().unwrap();
         node.owner
@@ -1293,11 +1310,41 @@ fn set_receive_ceiling(owner: &mut Owner, payer: Uuid, max_nanodollars: i64) -> 
     true
 }
 
+/// Start a new UTC month on each monthly purse whose stored period is behind
+/// `now_ms`. The available amount becomes the allotment. Unspent amount does
+/// not carry, and an open hold is not added back. Only the writer calls this.
+fn roll_monthly_purses_at(ctx: &WorkerContext, now_ms: u64) {
+    let period = utc_month_period(now_ms);
+    let due: Vec<Purse> = {
+        let node = ctx.node.read().unwrap();
+        node.owner
+            .purses
+            .iter()
+            .filter(|purse| purse.kind == PURSE_KIND_MONTHLY && purse.period != period)
+            .cloned()
+            .collect()
+    };
+    for mut purse in due {
+        purse.period = period;
+        purse.available_nanodollars = purse.allotment_nanodollars;
+        if let Err(err) = request_change_idempotent(Change::UpsertPurse { purse }, ctx) {
+            eprintln!("[roll_monthly_purses] {err:?}");
+        }
+    }
+}
+
 fn upsert_purse(owner: &mut Owner, purse: &Purse) -> bool {
-    if purse.allotment_nanodollars < 0 || purse.name.trim().is_empty() || purse.name.len() > 255 {
+    if purse.allotment_nanodollars < 0
+        || purse.name.trim().is_empty()
+        || purse.name.len() > 255
+        || (purse.kind != PURSE_KIND_FIXED && purse.kind != PURSE_KIND_MONTHLY)
+    {
         return false;
     }
-    let purse = purse.normalized();
+    let mut purse = purse.normalized();
+    if purse.kind == PURSE_KIND_FIXED {
+        purse.period = 0;
+    }
     if purse.name.is_empty() {
         return false;
     }
@@ -2070,8 +2117,10 @@ fn send_pull_request(scope: Scope, last_seen: SyncVersion, conn_id: u16, ctx: &W
 // The Private-scope state blob is a purse snapshot:
 //   [marker: 0xB7][count: u16][purse…]
 //   then reserves, ceilings, lines, staged accepts, and clearings.
+//   then each purse's kind and UTC month, and each reserve's month.
 // An empty blob is a legacy writer and does not clear the puller's purses.
 // A blob that ends before the clearing count has no clearings.
+// A blob that ends at the clearings has fixed purses and reserve month 0.
 
 pub(crate) fn serialize_public_state(node: &Node) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -2146,7 +2195,32 @@ fn read_purse(data: &[u8], pos: &mut usize) -> Option<Purse> {
     for _ in 0..count {
         aliases.push(read_str(data, pos)?);
     }
-    Some(Purse { id, name, allotment_nanodollars, available_nanodollars, aliases }.normalized())
+    Some(Purse {
+        id,
+        name,
+        allotment_nanodollars,
+        available_nanodollars,
+        aliases,
+        kind: PURSE_KIND_FIXED,
+        period: 0,
+    }.normalized())
+}
+
+/// Kind and period follow the purse bytes. A change from before monthly
+/// purses ends at the alias list and loads as fixed.
+fn read_purse_change(data: &[u8], pos: &mut usize) -> Option<Purse> {
+    let mut purse = read_purse(data, pos)?;
+    if *pos == data.len() {
+        return Some(purse);
+    }
+    if data.len() - *pos != 5 {
+        return None;
+    }
+    purse.kind = *data.get(*pos)?;
+    *pos += 1;
+    let period_bytes: [u8; 4] = read_arr(data, pos)?;
+    purse.period = u32::from_be_bytes(period_bytes);
+    Some(purse)
 }
 
 fn push_reserve(buf: &mut Vec<u8>, reserve: &PaymentReserve) {
@@ -2219,7 +2293,23 @@ fn read_reserve(data: &[u8], pos: &mut usize) -> Option<PaymentReserve> {
         note,
         paying_alias,
         expires_at_ms: u64::from_be_bytes(expires_bytes),
+        period: 0,
     })
+}
+
+/// The month follows the reserve bytes. An older change ends at the expiry
+/// and loads as month 0.
+fn read_reserve_change(data: &[u8], pos: &mut usize) -> Option<PaymentReserve> {
+    let mut reserve = read_reserve(data, pos)?;
+    if *pos == data.len() {
+        return Some(reserve);
+    }
+    if data.len() - *pos != 4 {
+        return None;
+    }
+    let period_bytes: [u8; 4] = read_arr(data, pos)?;
+    reserve.period = u32::from_be_bytes(period_bytes);
+    Some(reserve)
 }
 
 #[derive(Debug)]
@@ -2280,6 +2370,17 @@ fn serialize_private_state(node: &Node) -> Vec<u8> {
     push_u16(&mut buf, clearings.len().min(u16::MAX as usize) as u16);
     for record in clearings.iter().take(u16::MAX as usize) {
         push_clearing(&mut buf, record);
+    }
+    push_u16(&mut buf, purses.len().min(u16::MAX as usize) as u16);
+    for purse in purses.iter().take(u16::MAX as usize) {
+        buf.extend_from_slice(&purse.id);
+        buf.push(purse.kind);
+        buf.extend_from_slice(&purse.period.to_be_bytes());
+    }
+    push_u16(&mut buf, reserves.len().min(u16::MAX as usize) as u16);
+    for reserve in reserves.iter().take(u16::MAX as usize) {
+        buf.extend_from_slice(&reserve.payment_id);
+        buf.extend_from_slice(&reserve.period.to_be_bytes());
     }
     buf
 }
@@ -2352,10 +2453,50 @@ fn read_private_snapshot(data: &[u8]) -> Option<PrivateSnapshot> {
     for _ in 0..clearing_count {
         clearings.push(read_clearing(data, &mut pos)?);
     }
-    if pos != data.len() {
+    read_month_tail(data, &mut pos, &mut purses, &mut reserves)?;
+    Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings })
+}
+
+/// Kind and month for each purse, then the month of each reserve. Missing
+/// tail means fixed purses and reserve month 0. A purse id that is not in
+/// the snapshot is skipped.
+fn read_month_tail(
+    data: &[u8],
+    pos: &mut usize,
+    purses: &mut [Purse],
+    reserves: &mut [PaymentReserve],
+) -> Option<()> {
+    if *pos == data.len() {
+        return Some(());
+    }
+    let purse_count = read_u16(data, pos)? as usize;
+    for _ in 0..purse_count {
+        let id: Uuid = read_arr(data, pos)?;
+        let kind = *data.get(*pos)?;
+        *pos += 1;
+        let period_bytes: [u8; 4] = read_arr(data, pos)?;
+        let period = u32::from_be_bytes(period_bytes);
+        if let Some(purse) = purses.iter_mut().find(|purse| purse.id == id) {
+            purse.kind = kind;
+            purse.period = period;
+        }
+    }
+    if *pos == data.len() {
+        return Some(());
+    }
+    let reserve_count = read_u16(data, pos)? as usize;
+    for _ in 0..reserve_count {
+        let id: Uuid = read_arr(data, pos)?;
+        let period_bytes: [u8; 4] = read_arr(data, pos)?;
+        let period = u32::from_be_bytes(period_bytes);
+        if let Some(reserve) = reserves.iter_mut().find(|reserve| reserve.payment_id == id) {
+            reserve.period = period;
+        }
+    }
+    if *pos != data.len() {
         return None;
     }
-    Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings })
+    Some(())
 }
 
 fn apply_private_state(blob: &[u8], ctx: &WorkerContext) -> bool {
@@ -4469,10 +4610,16 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
                 }
             }
             Change::UpsertPurse { purse } => {
-                if purse.allotment_nanodollars < 0 || purse.name.trim().is_empty() {
+                if purse.allotment_nanodollars < 0
+                    || purse.name.trim().is_empty()
+                    || (purse.kind != PURSE_KIND_FIXED && purse.kind != PURSE_KIND_MONTHLY)
+                {
                     continue;
                 }
-                let purse = purse.normalized();
+                let mut purse = purse.normalized();
+                if purse.kind == PURSE_KIND_FIXED {
+                    purse.period = 0;
+                }
                 let win = match state.purses.get(&purse.id) {
                     Some((_, prev)) => prio > *prev,
                     None => true,
@@ -4781,7 +4928,7 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
     for id in purse_ids {
         let Some((want, _)) = target.purses.get(&id) else { continue };
         let added = reserve_delta(current, target, id).saturating_add(charge_delta(current, target, id));
-        let removed = reserve_delta(target, current, id).saturating_add(charge_delta(target, current, id));
+        let removed = release_delta(current, target, id).saturating_add(charge_delta(target, current, id));
         match current.purses.get(&id) {
             None => {
                 let mut purse = want.clone();
@@ -4791,7 +4938,9 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
             Some((now, _)) => {
                 let definition_differs = now.name != want.name
                     || now.allotment_nanodollars != want.allotment_nanodollars
-                    || now.aliases != want.aliases;
+                    || now.aliases != want.aliases
+                    || now.kind != want.kind
+                    || now.period != want.period;
                 let predicted = now.available_nanodollars.saturating_sub(added).saturating_add(removed);
                 // A hold explains an available-amount change by itself. An
                 // upsert is only needed when the definition differs, or when
@@ -4893,6 +5042,23 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
     out
 }
 
+/// Sum of holds on `purse_id` that `current` still has and `target` does not,
+/// counting only a release that adds the amount back.
+fn release_delta(current: &MergedState, target: &MergedState, purse_id: Uuid) -> i64 {
+    let Some((purse, _)) = target.purses.get(&purse_id) else {
+        return 0;
+    };
+    current.reserves.values()
+        .filter(|reserve| {
+            reserve.purse_id == purse_id
+                && !target.reserves.contains_key(&reserve.payment_id)
+                && !target.ledger.contains_key(&reserve.payment_id)
+                && reserve_refunds(purse, reserve)
+        })
+        .map(|reserve| reserve.amount_nanodollars)
+        .fold(0i64, i64::saturating_add)
+}
+
 /// Sum of holds on `purse_id` that are in `extra` and not in `base`.
 fn reserve_delta(base: &MergedState, extra: &MergedState, purse_id: Uuid) -> i64 {
     extra.reserves.values()
@@ -4958,7 +5124,9 @@ fn replay_release(state: &mut MergedState, payment_id: Uuid) {
     }
     let Some(reserve) = state.reserves.remove(&payment_id) else { return };
     if let Some((purse, _)) = state.purses.get_mut(&reserve.purse_id) {
-        purse.available_nanodollars = purse.available_nanodollars.saturating_add(reserve.amount_nanodollars);
+        if reserve_refunds(purse, &reserve) {
+            purse.available_nanodollars = purse.available_nanodollars.saturating_add(reserve.amount_nanodollars);
+        }
     }
 }
 
@@ -5181,8 +5349,9 @@ mod purse_sync_tests {
     use crate::data_models::{
         ClearingRecord, Ed25519Signature, LedgerLine, Node, PaymentReserve, PendingAccept, Purse,
         ReceiveCeiling,
-        Scope, SyncVersion, WriteLogEntry,
+        Scope, SyncVersion, WriteLogEntry, utc_month_period,
     };
+    use crate::wire::{PURSE_KIND_FIXED, PURSE_KIND_MONTHLY};
 
     fn media() -> Purse {
         Purse {
@@ -5191,6 +5360,8 @@ mod purse_sync_tests {
             allotment_nanodollars: 5_000_000,
             available_nanodollars: 5_000_000,
             aliases: vec!["discordium".into()],
+            kind: PURSE_KIND_FIXED,
+            period: 0,
         }
     }
 
@@ -5220,8 +5391,23 @@ mod purse_sync_tests {
             }
             other => panic!("expected purse snapshot, got {other:?}"),
         }
+        // One purse and no reserves: purse-count, id, kind, period, reserve-count.
+        let month_tail = 2 + 16 + 1 + 4 + 2;
+        // A writer from step 7 ends at the clearings, before the month tail.
+        let step7 = &blob[..blob.len() - month_tail];
+        match read_private_snapshot(step7) {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
+                assert_eq!(purses, vec![media()]);
+                assert!(reserves.is_empty());
+                assert!(ceilings.is_empty());
+                assert!(ledger.is_empty());
+                assert!(pending.is_empty());
+                assert!(clearings.is_empty());
+            }
+            other => panic!("expected a step-7 snapshot, got {other:?}"),
+        }
         // A writer from step 6 ends after the pending count.
-        let step6 = &blob[..blob.len() - 2];
+        let step6 = &blob[..blob.len() - 2 - month_tail];
         match read_private_snapshot(step6) {
             Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
                 assert_eq!(purses, vec![media()]);
@@ -5234,7 +5420,7 @@ mod purse_sync_tests {
             other => panic!("expected a step-6 snapshot, got {other:?}"),
         }
         // A writer from step 3 ends after the reserve count.
-        let step3 = &blob[..blob.len() - 8];
+        let step3 = &blob[..blob.len() - 8 - month_tail];
         match read_private_snapshot(step3) {
             Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
                 assert_eq!(purses, vec![media()]);
@@ -5247,7 +5433,7 @@ mod purse_sync_tests {
             other => panic!("expected a step-3 snapshot, got {other:?}"),
         }
         // A writer from before holds omits the reserve count too.
-        let legacy = &blob[..blob.len() - 10];
+        let legacy = &blob[..blob.len() - 10 - month_tail];
         match read_private_snapshot(legacy) {
             Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
                 assert_eq!(purses, vec![media()]);
@@ -5290,6 +5476,7 @@ mod purse_sync_tests {
             note: "clip-1".into(),
             paying_alias: "discordium".into(),
             expires_at_ms,
+            period: 0,
         }
     }
 
@@ -5333,6 +5520,148 @@ mod purse_sync_tests {
         assert!(!apply_change_to_owner(&mut owner, &Change::ReleaseReserve { payment_id: [1; 16] }).unwrap());
         assert_eq!(owner.purses[0].available_nanodollars, 5_000_000);
         assert!(owner.reserves.is_empty());
+    }
+
+    fn monthly(period: u32, available: i64) -> Purse {
+        Purse {
+            kind: PURSE_KIND_MONTHLY,
+            period,
+            available_nanodollars: available,
+            ..media()
+        }
+    }
+
+    fn log_entry(seq: u64, change: Change) -> WriteLogEntry {
+        WriteLogEntry {
+            version: SyncVersion { writer_sg_uuid: [0xA1; 16], epoch: 1, seq },
+            scope: Scope::Private,
+            change_payload: serialize_change(&change),
+            committed_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn a_reserve_from_the_previous_month_does_not_raise_the_new_one() {
+        let oct = utc_month_period(1_790_812_800_000);
+        let nov = utc_month_period(1_793_491_200_000);
+        assert_ne!(oct, nov);
+        let mut owner = Node::new().owner;
+        let purse = monthly(oct, 5_000_000);
+        let stored = serialize_change(&Change::UpsertPurse { purse: purse.clone() });
+        assert_eq!(deserialize_change(&stored).unwrap(), Change::UpsertPurse { purse: purse.clone() });
+        let older = deserialize_change(&stored[..stored.len() - 5]).unwrap();
+        match older {
+            Change::UpsertPurse { purse } => {
+                assert_eq!(purse.kind, PURSE_KIND_FIXED);
+                assert_eq!(purse.period, 0);
+            }
+            other => panic!("expected an older purse upsert, got {other:?}"),
+        }
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse }).unwrap();
+        let mut reserve = hold(1, 1_000_000, 50);
+        reserve.period = oct;
+        let reserve_bytes = serialize_change(&Change::ReservePayment { reserve: reserve.clone() });
+        assert_eq!(
+            deserialize_change(&reserve_bytes).unwrap(),
+            Change::ReservePayment { reserve: reserve.clone() }
+        );
+        match deserialize_change(&reserve_bytes[..reserve_bytes.len() - 4]).unwrap() {
+            Change::ReservePayment { reserve } => assert_eq!(reserve.period, 0),
+            other => panic!("expected an older reserve, got {other:?}"),
+        }
+        apply_change_to_owner(&mut owner, &Change::ReservePayment { reserve: reserve.clone() }).unwrap();
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: monthly(nov, 5_000_000) }).unwrap();
+        assert_eq!(owner.reserves.len(), 1);
+        assert!(apply_change_to_owner(&mut owner, &Change::ReleaseReserve { payment_id: [1; 16] }).unwrap());
+        assert_eq!(owner.purses[0].available_nanodollars, 5_000_000);
+        assert_eq!(owner.purses[0].period, nov);
+        assert!(owner.reserves.is_empty());
+
+        let mut same_month = hold(2, 1_000_000, 50);
+        same_month.period = nov;
+        apply_change_to_owner(&mut owner, &Change::ReservePayment { reserve: same_month }).unwrap();
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        apply_change_to_owner(&mut owner, &Change::ReleaseReserve { payment_id: [2; 16] }).unwrap();
+        assert_eq!(owner.purses[0].available_nanodollars, 5_000_000);
+
+        let mut bad = monthly(nov, 5_000_000);
+        bad.kind = 9;
+        assert!(!apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: bad }).unwrap());
+        assert_eq!(owner.purses[0].kind, PURSE_KIND_MONTHLY);
+    }
+
+    #[test]
+    fn merge_does_not_refund_a_hold_from_the_previous_month() {
+        let oct = utc_month_period(1_790_812_800_000);
+        let nov = utc_month_period(1_793_491_200_000);
+        let mut reserve = hold(1, 1_000_000, 50);
+        reserve.period = oct;
+        let local = vec![
+            log_entry(1, Change::UpsertPurse { purse: monthly(oct, 5_000_000) }),
+            log_entry(2, Change::ReservePayment { reserve: reserve.clone() }),
+        ];
+        let peer = vec![
+            log_entry(3, Change::UpsertPurse { purse: monthly(nov, 5_000_000) }),
+            log_entry(4, Change::ReleaseReserve { payment_id: [1; 16] }),
+        ];
+        let out = merge_logs(&local, &peer, &std::collections::HashMap::new());
+        let mut owner = Node::new().owner;
+        for entry in &local {
+            apply_change_to_owner(&mut owner, &deserialize_change(&entry.change_payload).unwrap()).unwrap();
+        }
+        for change in &out.changes_to_apply {
+            apply_change_to_owner(&mut owner, change).unwrap();
+        }
+        assert_eq!(owner.purses[0].available_nanodollars, 5_000_000);
+        assert_eq!(owner.purses[0].period, nov);
+        assert!(owner.reserves.is_empty());
+        assert!(out.changes_to_apply.iter().any(|change| matches!(
+            change,
+            Change::UpsertPurse { purse } if purse.available_nanodollars == 5_000_000 && purse.period == nov
+        )));
+
+        let same_month = vec![log_entry(3, Change::ReleaseReserve { payment_id: [1; 16] })];
+        let refunded = merge_logs(&local, &same_month, &std::collections::HashMap::new());
+        let mut owner = Node::new().owner;
+        for entry in &local {
+            apply_change_to_owner(&mut owner, &deserialize_change(&entry.change_payload).unwrap()).unwrap();
+        }
+        for change in &refunded.changes_to_apply {
+            apply_change_to_owner(&mut owner, change).unwrap();
+        }
+        assert_eq!(owner.purses[0].available_nanodollars, 5_000_000);
+        assert!(owner.reserves.is_empty());
+        assert!(refunded.changes_to_apply.iter().all(|change| !matches!(change, Change::UpsertPurse { .. })));
+    }
+
+    #[test]
+    fn monthly_snapshot_roundtrips_and_an_older_tail_stays_fixed() {
+        let mut node = Node::new();
+        let purse = monthly(2026 * 12 + 9, 4_000_000);
+        node.owner.purses.push(purse.clone());
+        let mut reserve = hold(4, 1_000_000, 99);
+        reserve.period = 2026 * 12 + 9;
+        node.owner.reserves.push(reserve.clone());
+        let blob = serialize_private_state(&node);
+        match read_private_snapshot(&blob) {
+            Some(PrivateSnapshot::Purses { purses, reserves, .. }) => {
+                assert_eq!(purses, vec![purse]);
+                assert_eq!(reserves, vec![reserve]);
+            }
+            other => panic!("expected a monthly snapshot, got {other:?}"),
+        }
+        // Drop the reserve-month count and its one row. The purse month remains.
+        let purse_only = &blob[..blob.len() - (2 + 16 + 4)];
+        match read_private_snapshot(purse_only) {
+            Some(PrivateSnapshot::Purses { purses, reserves, .. }) => {
+                assert_eq!(purses[0].kind, PURSE_KIND_MONTHLY);
+                assert_eq!(purses[0].period, 2026 * 12 + 9);
+                assert_eq!(reserves[0].period, 0);
+            }
+            other => panic!("expected a purse-month tail, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5617,7 +5946,9 @@ mod purse_sync_tests {
             Some(PrivateSnapshot::Purses { clearings, .. }) => assert_eq!(clearings, vec![record]),
             other => panic!("expected the clearing, got {other:?}"),
         }
-        let step6 = &blob[..blob.len() - 2 - encode_len_of_one_clearing()];
+        // No purses and no reserves: the month tail is two counts.
+        let month_tail = 2 + 2;
+        let step6 = &blob[..blob.len() - month_tail - 2 - encode_len_of_one_clearing()];
         match read_private_snapshot(step6) {
             Some(PrivateSnapshot::Purses { clearings, ledger, pending, .. }) => {
                 assert!(clearings.is_empty());

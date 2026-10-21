@@ -76,8 +76,10 @@ pub(crate) const APP_LIST_SENT_OP: u8 = 0x07;
 /// Approved app reserves purse funds for one payment id. The contact is not told.
 pub(crate) const APP_RESERVE_OP: u8 = 0x08;
 
-/// Kind byte on a list-purses entry. Monthly purses are not stored yet.
+/// Kind byte on a list-purses entry. A fixed purse does not refill.
 pub(crate) const PURSE_KIND_FIXED: u8 = 0x00;
+/// Kind byte on a list-purses entry. A monthly purse refills at the UTC month.
+pub(crate) const PURSE_KIND_MONTHLY: u8 = 0x01;
 
 // ── Peer fabric op bytes ──────────────────────────────────────────────────────
 
