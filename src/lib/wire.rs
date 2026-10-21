@@ -69,9 +69,9 @@ pub(crate) const APP_SEND_PACKET_OP: u8 = 0x03;
 pub(crate) const APP_PUSH_OP: u8 = 0x04;
 /// Approved app asks for the purses its alias belongs to.
 pub(crate) const APP_LIST_PURSES_OP: u8 = 0x05;
-/// Approved app asks for ledger lines sent to its alias. Empty until payments exist.
+/// Approved app asks for confirmed payments sent to its alias.
 pub(crate) const APP_LIST_INCOMING_OP: u8 = 0x06;
-/// Approved app asks for ledger lines it sent. Empty until payments exist.
+/// Approved app asks for confirmed payments its alias sent.
 pub(crate) const APP_LIST_SENT_OP: u8 = 0x07;
 /// Approved app reserves purse funds for one payment id. The contact is not told.
 pub(crate) const APP_RESERVE_OP: u8 = 0x08;

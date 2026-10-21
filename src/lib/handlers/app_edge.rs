@@ -1,4 +1,4 @@
-//! Local app edge: register / update / get-data / purse reads / send, and inbound app packet push.
+//! Local app edge: register / update / get-data / purse and payment reads / send, and inbound app packet push.
 //!
 //! These are the UDP control/data APIs apps use against a running node. Peer
 //! fabric routing helpers and sync publish stay in the parent `handlers` module.
@@ -12,7 +12,8 @@ use super::super::crypto::{
 };
 use super::super::certs::issue_app_cert;
 use super::super::data_models::{
-    Application, Ed25519PublicKey, PaymentReserve, Uuid, generate_uuid, unix_time_ms, RESERVE_TTL_MS,
+    Application, Ed25519PublicKey, LedgerLine, PaymentReserve, Uuid, generate_uuid, unix_time_ms,
+    RESERVE_TTL_MS,
 };
 use super::super::wire::*;
 use super::routing::find_writer_sg_probing;
@@ -531,27 +532,71 @@ pub fn app_list_purses(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     send(ctx, src, &reply);
 }
 
-/// Op 6 — ledger lines sent to this user for this app alias.
+/// Op 6 — confirmed payments sent to this user for this app alias.
 ///
 /// Request body (after op byte): `[token: 16]` exactly. Same checks as
-/// list-purses. Lines may already be stored. This reply stays empty until a
-/// later step returns them. Success is `[OK][count: u16 BE]` with count 0.
+/// list-purses.
+///
+/// Success:
+///   `[OK][count: u16 BE]`
+///   each line, ordered by payment id, then the payer's confirmation signature:
+///     `[payment id: 16][amount: i64 BE][payer: 16][payee: 16]`
+///     `[paying alias][destination alias][note]`
+///
+/// The amount is nanodollars. Strings use the same length byte as a purse name.
+/// The purse id, the expiry, and the signatures stay off this reply. A hold that
+/// is not a confirmed line is absent. A line for another alias is absent. Two
+/// signed bodies of one id are both listed. Count 0 is success. This read does
+/// not change a purse or the ledger.
 pub fn app_list_incoming(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    if require_approved_alias(src, &buf, ctx).is_none() {
-        return;
-    }
-    send(ctx, src, &[OK, 0, 0]);
+    list_payments(src, buf, ctx, true);
 }
 
-/// Op 7 — ledger lines this app sent.
+/// Op 7 — confirmed payments this app sent.
 ///
-/// Same request and same empty success as [`app_list_incoming`]. Stored lines
-/// stay out of this reply until a later step.
+/// Same request, same checks, and the same line layout as [`app_list_incoming`].
+/// A line is included when this user is the payer and the paying alias is the
+/// caller's alias.
 pub fn app_list_sent(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    if require_approved_alias(src, &buf, ctx).is_none() {
+    list_payments(src, buf, ctx, false);
+}
+
+fn list_payments(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext, incoming: bool) {
+    let Some(alias) = require_approved_alias(src, &buf, ctx) else {
         return;
+    };
+
+    let mut lines: Vec<LedgerLine> = {
+        let node = ctx.node.read().unwrap();
+        let user = node.owner.user.uuid;
+        node.owner
+            .ledger
+            .iter()
+            .filter(|line| {
+                if incoming {
+                    line.payee == user && line.destination_alias == alias
+                } else {
+                    line.payer == user && line.paying_alias == alias
+                }
+            })
+            .cloned()
+            .collect()
+    };
+    lines.sort_by(|a, b| a.payment_id.cmp(&b.payment_id).then(a.confirm_sig.0.cmp(&b.confirm_sig.0)));
+
+    let mut reply = vec![OK];
+    let count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    reply.extend_from_slice(&count.to_be_bytes());
+    for line in lines.into_iter().take(count as usize) {
+        reply.extend_from_slice(&line.payment_id);
+        reply.extend_from_slice(&line.amount_nanodollars.to_be_bytes());
+        reply.extend_from_slice(&line.payer);
+        reply.extend_from_slice(&line.payee);
+        push_str(&mut reply, &line.paying_alias);
+        push_str(&mut reply, &line.destination_alias);
+        push_str(&mut reply, &line.note);
     }
-    send(ctx, src, &[OK, 0, 0]);
+    send(ctx, src, &reply);
 }
 
 /// Op 8 — reserve purse funds for one payment id.
