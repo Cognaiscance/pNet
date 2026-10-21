@@ -951,8 +951,9 @@ pub struct PaymentReserve {
     pub paying_alias: String,
     pub expires_at_ms: u64,
     /// UTC month the hold was taken against. 0 on a fixed purse and on a
-    /// save from before monthly purses. A release refunds only when this
-    /// still matches the purse's period.
+    /// save from before monthly purses. A monthly hold is returned only while
+    /// this matches the purse's period. Period 0 is still returned after the
+    /// purse becomes monthly.
     #[serde(default)]
     pub period: u32,
 }

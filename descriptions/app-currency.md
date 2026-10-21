@@ -1,12 +1,12 @@
 # App currency
 
-**Status:** steps 1 through 10 are in the node. Allotment edits, a clearing contact, and outside payment stay unbuilt.
+**Status:** steps 1 through 11 are in the node. A clearing contact and outside payment stay unbuilt.
 
 An approved app will be able to spend a small amount with another pNet node. The node keeps one ledger of those payments. A purse is only a limit on how much an app may add to that ledger. pNet rejects a send that would pass the limit.
 
 Each user issues their own credit. The rank-1 server keeps that user's books, the same way it orders the directory. A payment is an obligation from the paying user to a contact. The two of them may clear the net later. A tab can also stay open.
 
-Read opcodes `0x05`, `0x06`, and `0x07` are assigned. `0x06` and `0x07` return confirmed lines for the caller's alias. Reserve is opcode `0x08`. After a reserve, the two writers finish the payment on fabric ops `0x60` through `0x63`. A note is at most 255 bytes. `/purses` creates fixed purses and assigns app aliases.
+Read opcodes `0x05`, `0x06`, and `0x07` are assigned. `0x06` and `0x07` return confirmed lines for the caller's alias. Reserve is opcode `0x08`. After a reserve, the two writers finish the payment on fabric ops `0x60` through `0x63`. A note is at most 255 bytes. `/purses` creates purses, sets the kind and the allotment, and assigns app aliases.
 
 ## Who issues
 
@@ -46,13 +46,15 @@ The owner sets the allotment. Two kinds exist.
 
 **Fixed purse.** The owner puts a fixed amount on the purse, and sending reduces it until nothing is left. For example, a purse of 0.005 with discordium as a member. When the available amount is gone, further sends are rejected. The purse does not refill on its own.
 
+The owner can raise the allotment, lower it, or switch the purse between fixed and monthly. The available amount moves by that same difference and may go negative. Signed lines stay as they are. The switch does not refill the purse. A hold from an earlier month is dropped without a refund when a monthly purse becomes fixed. A hold from the current month, and a hold taken while the purse was fixed, is still returned if it is released.
+
 One purse can have several member apps. One app alias can belong to several purses. Every member may spend the whole available amount, so two apps on one purse share it. An app that belongs to no purse cannot send. An app does not set or raise an allotment. An app that is compromised can use up the purses it belongs to. It does not receive the keys that pay a contact in actual money.
 
 The available amount is local bookkeeping. A signed obligation still stands if that bookkeeping is wrong. The purse then shows an overrun.
 
 ## The /purses page
 
-The owner creates purses on `/purses`. Creating one sets its name, whether it is fixed or monthly, and its allotment. The owner adds and removes app aliases there. Removing an alias stops that app's new sends from that purse. Incoming lines for the alias stay visible.
+The owner creates purses on `/purses`. Creating one sets its name, whether it is fixed or monthly, and its allotment. The owner can later change that allotment and that kind on the same page. Saving the same kind and allotment changes nothing. The owner adds and removes app aliases there. Removing an alias stops that app's new sends from that purse. Incoming lines for the alias stay visible.
 
 The page shows each purse's allotment and available amount. The same purses appear on every device, because the writer holds them and own devices pull that private record. A reserve lowers the available amount on the writer. Own devices see that amount on the next private pull.
 
@@ -111,7 +113,6 @@ The dollars, when any are paid, stay outside pNet. Only the owner holds keys for
 
 ## Still open
 
-- How the owner raises an allotment, lowers it, or switches a purse between fixed and monthly, and what that does to the unspent available amount. Signed debts stay either way.
 - The starting receive ceiling is zero until a ceiling for that payer is stored. `/receive-ceilings` is the page that sets it.
 - The owner reads one contact's ledger, sees the net, and records a clearing on `/contacts/<id>/ledger`. The other owner still has to sign. `/purses` stays the page for the limits. Dollars paid stay outside pNet.
 - Whether many small receivables can be gathered into one balance with a clearing contact, and which outside payment, if any, pays a cleared net. No chain is chosen.
@@ -146,6 +147,7 @@ The steps below are the build order. A step that is not marked done stays unbuil
    On connect, `0x68` lists clearing ids and the lower user's signature, in the same packet shape as `0x64`. `0x69` copies one dual-signed record. A node that is not the writer drops these packets. A copied record is stored even when a named line is briefly missing, and that id leaves the net once the line is there. The copy does not change a purse. A private snapshot writes the clearing count after the staged accepts. A blob that ends at the staged accepts still loads, with no clearings. Own devices learn a clearing through the private scope.
 8. **Receive ceiling. Done.** `/receive-ceilings` lists each contact and the ceiling stored for that payer, or zero when no row is stored. The owner posts a dollar amount with at most nine decimal places. Zero is allowed. A bad amount, or a user who is not a contact, is not stored. Private change `0x15` replaces that payer's row. The same payer and amount does not append a second row and does not bump the private version. Own devices apply it from the private log. A purse's available amount, a reserve, and the net do not change. There is no app opcode and no fabric session op. The contact ledger page is step 9.
 9. **Contact ledger. Done.** `/contacts/<id>/ledger` lists confirmed lines between this user and that contact. Each line shows the payment id, the amount, whether it was incoming or sent, both app aliases, and the note. Two bodies of one id are both shown. A line with anyone else is absent. A pending accept is absent. A cleared line stays on the page and is left out of the net. The net is what `net_nanodollars` already computes: a positive amount is what the contact owes this user. The owner checks open lines and records a clearing. The writer signs and sends op `0x66`. The record is not stored here, and a purse does not change, until the other owner signs it back. An empty selection, an id that is not a line for the pair, more than 64 ids, a node that is not the writer, or a missing user key sends nothing. There is no app opcode. `/purses` stays the limits page.
-10. **Monthly purse. Done.** `/purses` can create a monthly purse. Kind 1 is monthly and kind 0 stays fixed. The writer rolls it on the reserve sweep and before a new reserve. The period is the UTC year and month on that writer's clock. The available amount becomes the allotment. Unspent amount does not carry, including a negative overrun. Signed lines stay. An open reserve keeps its old period. Releasing it does not add the amount back. A reserve taken after the roll reduces the new allotment, and releasing that one still adds the amount back. A node that is not the writer leaves the purse alone. An older private snapshot that ends at the clearings still loads as fixed. There is no new opcode. Changing an allotment after creation stays out.
+10. **Monthly purse. Done.** `/purses` can create a monthly purse. Kind 1 is monthly and kind 0 stays fixed. The writer rolls it on the reserve sweep and before a new reserve. The period is the UTC year and month on that writer's clock. The available amount becomes the allotment. Unspent amount does not carry, including a negative overrun. Signed lines stay. An open reserve keeps its old period. Releasing it does not add the amount back. A reserve taken after the roll reduces the new allotment, and releasing that one still adds the amount back. A node that is not the writer leaves the purse alone. An older private snapshot that ends at the clearings still loads as fixed. There is no new opcode. The allotment edit is step 11.
+11. **Allotment edit. Done.** `POST /purses/edit` names the purse, the kind (`fixed` or `monthly`), and the new allotment. The available amount moves by the difference between the new allotment and the old one, and it may go negative. The same kind and allotment does not publish. The writer closes the previous month before that difference is applied, so a raise does not keep last month's remainder. Switching from fixed to monthly sets the current UTC period and does not refill. Switching from monthly to fixed drops holds from earlier months without adding them back, and sets the period to zero. A hold from the current month, and a hold taken while the purse was fixed, is still returned when it is released. Signed lines stay. The name and the aliases stay. There is no app opcode. An app still cannot raise an allotment.
 
-Changing an allotment after creation, a clearing contact, and any outside payment stay out of these steps until those choices are settled.
+A clearing contact and any outside payment stay out of these steps until those choices are settled.
