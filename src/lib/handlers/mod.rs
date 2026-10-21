@@ -44,6 +44,39 @@ fn send_error(ctx: &WorkerContext, dest: SocketAddr, code: u8) {
     send(ctx, dest, &[STATUS_ERR, code]);
 }
 
+/// Reply to one app reserve. Code 0 is success and carries the writer's
+/// available amount and expiry. Any other code is an app error byte.
+pub(crate) fn reply_app_reserve(
+    ctx: &WorkerContext,
+    src: SocketAddr,
+    code: u8,
+    available: i64,
+    expires_at_ms: u64,
+) {
+    if code == 0 {
+        let mut reply = Vec::with_capacity(1 + 8 + 8);
+        reply.push(OK);
+        reply.extend_from_slice(&available.to_be_bytes());
+        reply.extend_from_slice(&expires_at_ms.to_be_bytes());
+        send(ctx, src, &reply);
+    } else {
+        send_error(ctx, src, code);
+    }
+}
+
+/// Answer every app still waiting on this forwarded reserve.
+pub(crate) fn finish_forwarded_reserve(
+    ctx: &WorkerContext,
+    payment_id: Uuid,
+    code: u8,
+    available: i64,
+    expires_at_ms: u64,
+) {
+    for src in ctx.pending_reserves.take(payment_id) {
+        reply_app_reserve(ctx, src, code, available, expires_at_ms);
+    }
+}
+
 /// Structured fabric ops log (§6.2). Greppable: `[fabric] event=<name> k=v …`.
 /// Values with spaces or `=` are double-quoted; quotes inside are escaped.
 pub(crate) fn fabric_event(event: &str, fields: &[(&str, &str)]) {
@@ -529,6 +562,7 @@ mod tests {
                 writer_tx,
                 scheduler_tx,
                 pending_invites: Default::default(),
+                pending_reserves: Default::default(),
                 sessions: Arc::new(super::super::admin_auth::SessionStore::new()),
                 app_rate_limits: Arc::new(std::sync::Mutex::new(
                     super::super::app_api::AppRateLimiter::new(),
@@ -1213,15 +1247,134 @@ mod tests {
         assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_NO_WRITER]);
         assert_eq!(t.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 5_000_000);
         assert!(t.ctx.node.read().unwrap().owner.reserves.is_empty());
+    }
 
-        add_peer_sg(&t, 1, true, Some(true));
-        app_reserve(
-            t.app_addr(),
-            reserve_packet(&token, &purse, 1, &[0x84; 16], "player", "n", &[0x74; 16]),
-            &t.ctx,
+    fn link_writer(dg: &TestCtx, writer: &TestCtx) {
+        let dg_kp = generate_x25519_keypair();
+        let sg_kp = generate_x25519_keypair();
+        let dg_addr = dg.ctx.udp_socket.local_addr().unwrap();
+        let writer_addr = writer.ctx.udp_socket.local_addr().unwrap();
+        let writer_uuid = promote_local_to_sg(writer, 1);
+        let dg_uuid = dg.ctx.node.read().unwrap().device_uuid;
+        {
+            let mut node = dg.ctx.node.write().unwrap();
+            node.owner.user.devices.push(Device {
+                alias: "writer".into(),
+                uuid: writer_uuid,
+                grade: DeviceGrade::SG,
+                sg_rank: Some(1),
+                hosts: vec![writer_addr.to_string()],
+                applications: Vec::new(),
+                signing_pk: Ed25519PublicKey::ZERO,
+                dh_pk: X25519PublicKey::ZERO,
+                cert_sig: Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
+            });
+            node.owner.active_connections.insert(7, ActiveConnection {
+                id: 7,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: dg_kp.clone(),
+                peer_public_key: sg_kp.public_key,
+                peer_active_connection_id: 8,
+                device_uuid: writer_uuid,
+                peer_addr: writer_addr,
+            });
+        }
+        {
+            let mut node = writer.ctx.node.write().unwrap();
+            node.owner.active_connections.insert(8, ActiveConnection {
+                id: 8,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: sg_kp,
+                peer_public_key: dg_kp.public_key,
+                peer_active_connection_id: 7,
+                device_uuid: dg_uuid,
+                peer_addr: dg_addr,
+            });
+        }
+    }
+
+    fn exchange_reserve(dg: &TestCtx, writer: &TestCtx, body: Vec<u8>) {
+        app_reserve(dg.app_addr(), body, &dg.ctx);
+        let mut buf = [0u8; 4096];
+        let (len, src) = writer.ctx.udp_socket.recv_from(&mut buf).expect("writer should receive the reserve");
+        assert_eq!(buf[0], SYNC_WRITE_REQUEST_OP);
+        sync_write_request(src, buf[1..len].to_vec(), &writer.ctx);
+        let (len, src) = dg.ctx.udp_socket.recv_from(&mut buf).expect("device should receive the ack");
+        assert_eq!(buf[0], SYNC_WRITE_ACK_OP);
+        sync_write_ack(src, buf[1..len].to_vec(), &dg.ctx);
+    }
+
+    #[test]
+    fn app_reserve_on_a_non_writer_waits_for_the_writer() {
+        let dg = TestCtx::new();
+        let writer = TestCtx::new();
+        dg.ctx.udp_socket.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        writer.ctx.udp_socket.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let token = register_and_get_token(&dg, "discordium-client", 9106);
+        approve_local_app(&dg, &token);
+        let purse = [0x36; 16];
+        install_purse(&dg, purse, "media", 5_000_000, 5_000_000, &["discordium-client"]);
+        install_purse(&writer, purse, "media", 5_000_000, 5_000_000, &["discordium-client"]);
+        link_writer(&dg, &writer);
+        let contact = [0x86; 16];
+        let payment = [0x76; 16];
+
+        exchange_reserve(
+            &dg,
+            &writer,
+            reserve_packet(&token, &purse, 5_000_001, &contact, "player", "too much", &payment),
         );
-        assert_eq!(t.recv_reply(), vec![STATUS_ERR, ERR_NO_WRITER]);
-        assert!(t.ctx.node.read().unwrap().owner.reserves.is_empty());
+        assert_eq!(dg.recv_reply(), vec![STATUS_ERR, ERR_OVER_PURSE]);
+        assert_eq!(writer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 5_000_000);
+        assert!(writer.ctx.node.read().unwrap().owner.reserves.is_empty());
+
+        let body = reserve_packet(&token, &purse, 1_000_000, &contact, "player", "clip", &payment);
+        let before = unix_time_ms();
+        exchange_reserve(&dg, &writer, body.clone());
+        let (available, expires_at) = parse_reserve_ok(&dg.recv_reply());
+        assert_eq!(available, 4_000_000);
+        assert!(expires_at >= before.saturating_add(RESERVE_TTL_MS));
+        assert!(expires_at <= unix_time_ms().saturating_add(RESERVE_TTL_MS));
+        {
+            let node = writer.ctx.node.read().unwrap();
+            assert_eq!(node.owner.reserves.len(), 1);
+            assert_eq!(node.owner.reserves[0].expires_at_ms, expires_at);
+            assert_eq!(node.owner.reserves[0].note, "clip");
+            assert_eq!(node.owner.reserves[0].period, 0);
+            assert_ne!(node.owner.reserves[0].expires_at_ms, 0);
+        }
+        {
+            let node = dg.ctx.node.read().unwrap();
+            assert_eq!(node.owner.purses[0].available_nanodollars, 5_000_000);
+            assert!(node.owner.reserves.is_empty());
+        }
+
+        exchange_reserve(&dg, &writer, body);
+        let (again, same_expiry) = parse_reserve_ok(&dg.recv_reply());
+        assert_eq!(again, 4_000_000);
+        assert_eq!(same_expiry, expires_at);
+        assert_eq!(writer.ctx.node.read().unwrap().owner.reserves.len(), 1);
+
+        exchange_reserve(
+            &dg,
+            &writer,
+            reserve_packet(&token, &purse, 1, &contact, "player", "other", &payment),
+        );
+        assert_eq!(dg.recv_reply(), vec![STATUS_ERR, ERR_PAYMENT_MISMATCH]);
+        assert_eq!(writer.ctx.node.read().unwrap().owner.reserves[0].note, "clip");
+        assert_eq!(writer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 4_000_000);
+
+        exchange_reserve(
+            &dg,
+            &writer,
+            reserve_packet(&token, &[0x99; 16], 1, &contact, "player", "", &[0x77; 16]),
+        );
+        assert_eq!(dg.recv_reply(), vec![STATUS_ERR, ERR_NOT_IN_PURSE]);
+        let node = dg.ctx.node.read().unwrap();
+        assert_eq!(node.owner.purses[0].available_nanodollars, 5_000_000);
+        assert!(node.owner.reserves.is_empty());
     }
 
     #[test]

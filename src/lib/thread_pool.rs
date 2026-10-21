@@ -102,6 +102,7 @@ mod tests {
             writer_tx,
             scheduler_tx,
             pending_invites: Default::default(),
+            pending_reserves: Default::default(),
             sessions:     Arc::new(super::super::admin_auth::SessionStore::new()),
             app_rate_limits: Arc::new(std::sync::Mutex::new(
                 super::super::app_api::AppRateLimiter::new(),

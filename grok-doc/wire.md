@@ -287,6 +287,14 @@ result (u8) || private version (28) || public version (28)
 | `1` | This node is not the writer. |
 | `2` | The change did not parse as a valid mutation. |
 
+When the change is a reserve, the ack continues:
+
+```text
+payment id (16) || app code (u8) || available (i64) || expires at (u64)
+```
+
+App code `0` is success. Any other byte is the app error. The device that forwarded the reserve replies to the app from this tail and does not change its own purse. An ack that ends at the versions is not a reserve result. The writer stamps the expiry from its own clock before it stores the hold. A repeat of the same hold keeps the stored expiry.
+
 **Update available (`0x72`).** Session plaintext: `scope || version (28)`. If the version is newer from the same writer, or from a different writer, the receiver sends a pull request.
 
 **Pull request (`0x73`).** Session plaintext: `scope || last-seen version (28)`.
