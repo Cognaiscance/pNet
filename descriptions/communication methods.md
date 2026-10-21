@@ -193,6 +193,28 @@ Session-sealed. The plaintext is the confirmation from op `0x63` and does not na
 
 The same signed bytes are not stored twice. A different signed body is stored beside the first and does not reduce a purse again. The payee's copy uses an empty purse id. A payer with a matching hold consumes that hold and does not subtract again. A payer with no matching hold reduces the one purse that lists the paying alias, which can leave a negative available amount. If none or several do, the line is stored and no purse is chosen.
 
+### 0x66 — clearing proposal
+
+Session-sealed. One owner sends this to the other. An app does not. The plaintext is the body and the sender's user-key signature. The body is `[clearing id:16][user lo:16][user hi:16][count:u16 be][payment id:16…]`. The user ids are in byte order. The payment ids are strictly increasing, at least one and at most 64. The signature domain is `pnet-payment-clearing-v1` over the body. Both users sign those same bytes.
+
+The receiver signs only when every named id is already a ledger line between this pair. An id that belongs to some other pair does not count. A missing id gets no reply. A bad signature is dropped. There is no refusal op. A node that is not the writer drops the packet.
+
+### 0x67 — clearing ack
+
+Session-sealed. The plaintext is the body plus the lower user's signature and then the higher user's signature. This is also the stored record. The same body is stored once and does not change a purse. A different body for the same clearing id is kept beside the first. The net excludes every payment id named by any stored clearing for the pair. The lines stay on the ledger and on ops `0x06` and `0x07`.
+
+A repeat of a proposal the receiver has already signed sends this ack again and does not store a second row. If the sender already holds that exact record, a later proposal is this ack instead of a new `0x66`.
+
+### 0x68 — clearing index
+
+Session-sealed. A writer sends this when a session to one of a contact's devices comes up, after the payment index. It is not sent to an own device. The plaintext has the same shape as op `0x64`: `[flags:u8][count:u16 be]` and then `count` entries of `[clearing id:16][lower-user signature:64]`. Flag `0x01` starts a list. Flag `0x02` ends it. The lower user's signature distinguishes two bodies of one clearing id.
+
+When the list ends, the receiver sends op `0x69` for each clearing of this pair whose id and lower-user signature are absent. It does not answer with another index. A node that is not the writer drops the packet.
+
+### 0x69 — clearing record
+
+Session-sealed. The plaintext is the ack from op `0x67`. The receiver stores it when both signatures verify and the two users are this node and the contact that owns the session. A missing payment line does not block the copy. Once that line is stored, the id no longer counts toward the net or toward that payer's receive ceiling. The purse's available amount does not change. A bad signature is dropped.
+
 ### get-data secrecy (op 2)
 
 - Echoes **only the requesting app's own token** (never sibling or contact tokens).

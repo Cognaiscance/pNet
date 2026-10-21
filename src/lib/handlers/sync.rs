@@ -10,16 +10,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
 use super::super::data_models::{
-    AppGrant, AppInvitation, Application, Contact, Device, DeviceGrade, Ed25519KeyPair,
-    Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, LedgerLine, Node, Owner, PaymentReserve,
-    PendingAccept, Purse, ReceiveCeiling,
+    AppGrant, AppInvitation, Application, ClearingRecord, Contact, Device, DeviceGrade,
+    Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, LedgerLine, Node, Owner,
+    PaymentReserve, PendingAccept, Purse, ReceiveCeiling,
     Scope, SyncVersion, User, Uuid, WriteLogEntry, X25519PublicKey, WRITE_LOG_RETENTION,
     unix_time_ms,
 };
 use super::super::payment::{
-    body_from_line, body_from_pending, claim_exceeds_ceiling, decode_accept_at, decode_confirm_at,
-    encode_accept, encode_confirm, line_covers, line_from, line_same_payment, offer_body_ok,
-    pending_covers, pending_from,
+    body_from_line, body_from_pending, claim_exceeds_ceiling, clearing_record_ok, decode_accept_at,
+    decode_clearing_record_at, decode_confirm_at, encode_accept, encode_clearing_record, encode_confirm,
+    line_covers, line_from, line_same_payment, offer_body_ok, pending_covers, pending_from,
 };
 use super::super::wire::*;
 use super::{
@@ -463,6 +463,10 @@ pub enum Change {
     StageAccept { pending: PendingAccept },
     /// Private-scope: forget a staged accept. This does not touch a purse.
     DropAccept { payment_id: Uuid },
+    /// Private-scope: store one dual-signed clearing. The same signed bytes are
+    /// one record. A different body of the same id is kept. This does not
+    /// change a purse, and it does not require the named lines to be present yet.
+    RecordClearing { record: ClearingRecord },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
@@ -491,6 +495,7 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
         Change::RecordLedger { .. }            => &[Scope::Private],
         Change::StageAccept { .. }             => &[Scope::Private],
         Change::DropAccept { .. }              => &[Scope::Private],
+        Change::RecordClearing { .. }          => &[Scope::Private],
     }
 }
 
@@ -630,6 +635,10 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
         Change::DropAccept { payment_id } => {
             buf.push(CHANGE_KIND_DROP_ACCEPT);
             buf.extend_from_slice(payment_id);
+        }
+        Change::RecordClearing { record } => {
+            buf.push(CHANGE_KIND_RECORD_CLEARING);
+            push_clearing(&mut buf, record);
         }
     }
     buf
@@ -772,6 +781,10 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
         CHANGE_KIND_DROP_ACCEPT => {
             let payment_id: Uuid = read_arr(data, &mut pos)?;
             Some(Change::DropAccept { payment_id })
+        }
+        CHANGE_KIND_RECORD_CLEARING => {
+            let record = read_clearing(data, &mut pos)?;
+            Some(Change::RecordClearing { record })
         }
         _ => None,
     }
@@ -992,6 +1005,7 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
         Change::RecordLedger { line } => apply_record(owner, line)?,
         Change::StageAccept { pending } => apply_stage(owner, pending)?,
         Change::DropAccept { payment_id } => apply_drop(owner, *payment_id),
+        Change::RecordClearing { record } => apply_clearing(owner, record)?,
     };
     Ok(applied)
 }
@@ -1122,6 +1136,17 @@ fn apply_stage(owner: &mut Owner, pending: &PendingAccept) -> Result<bool, Write
 
 fn apply_drop(owner: &mut Owner, payment_id: Uuid) -> bool {
     take_pending(owner, payment_id)
+}
+
+fn apply_clearing(owner: &mut Owner, record: &ClearingRecord) -> Result<bool, WriteError> {
+    if !clearing_record_ok(record) {
+        return Err(WriteError::Validation("clearing fields".into()));
+    }
+    if owner.clearings.iter().any(|stored| stored == record) {
+        return Ok(false);
+    }
+    owner.clearings.push(record.clone());
+    Ok(true)
 }
 
 fn same_record(left: &LedgerLine, right: &LedgerLine) -> bool {
@@ -1995,7 +2020,9 @@ fn send_pull_request(scope: Scope, last_seen: SyncVersion, conn_id: u16, ctx: &W
 //
 // The Private-scope state blob is a purse snapshot:
 //   [marker: 0xB7][count: u16][purse…]
+//   then reserves, ceilings, lines, staged accepts, and clearings.
 // An empty blob is a legacy writer and does not clear the puller's purses.
+// A blob that ends before the clearing count has no clearings.
 
 pub(crate) fn serialize_public_state(node: &Node) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -2117,6 +2144,14 @@ fn read_pending(data: &[u8], pos: &mut usize) -> Option<PendingAccept> {
     Some(pending_from(&body, payer_sig, payee_sig))
 }
 
+fn push_clearing(buf: &mut Vec<u8>, record: &ClearingRecord) {
+    buf.extend(encode_clearing_record(record));
+}
+
+fn read_clearing(data: &[u8], pos: &mut usize) -> Option<ClearingRecord> {
+    decode_clearing_record_at(data, pos)
+}
+
 fn read_reserve(data: &[u8], pos: &mut usize) -> Option<PaymentReserve> {
     let payment_id: Uuid = read_arr(data, pos)?;
     let purse_id: Uuid = read_arr(data, pos)?;
@@ -2142,15 +2177,17 @@ fn read_reserve(data: &[u8], pos: &mut usize) -> Option<PaymentReserve> {
 enum PrivateSnapshot {
     /// Writer predates purses. Leave the puller's purse list alone.
     LegacyEmpty,
-    /// Purses, holds, ceilings, confirmed lines, and staged accepts.
+    /// Purses, holds, ceilings, confirmed lines, staged accepts, and clearings.
     /// A blob that ends after the purses has no holds. A blob that ends after
-    /// the holds has no ceilings, lines, or staged accepts.
+    /// the holds has no ceilings, lines, or staged accepts. A blob that ends
+    /// after the staged accepts has no clearings.
     Purses {
         purses: Vec<Purse>,
         reserves: Vec<PaymentReserve>,
         ceilings: Vec<ReceiveCeiling>,
         ledger: Vec<LedgerLine>,
         pending: Vec<PendingAccept>,
+        clearings: Vec<ClearingRecord>,
     },
 }
 
@@ -2165,6 +2202,10 @@ fn serialize_private_state(node: &Node) -> Vec<u8> {
     ledger.sort_by_key(|line| line.payment_id);
     let mut pending = node.owner.pending_accepts.clone();
     pending.sort_by_key(|accept| accept.payment_id);
+    let mut clearings = node.owner.clearings.clone();
+    clearings.sort_by(|left, right| {
+        left.clearing_id.cmp(&right.clearing_id).then(left.sig_lo.0.cmp(&right.sig_lo.0))
+    });
     let mut buf = Vec::new();
     buf.push(PURSE_SNAPSHOT_MARKER);
     push_u16(&mut buf, purses.len().min(u16::MAX as usize) as u16);
@@ -2186,6 +2227,10 @@ fn serialize_private_state(node: &Node) -> Vec<u8> {
     push_u16(&mut buf, pending.len().min(u16::MAX as usize) as u16);
     for accept in pending.iter().take(u16::MAX as usize) {
         push_pending(&mut buf, accept);
+    }
+    push_u16(&mut buf, clearings.len().min(u16::MAX as usize) as u16);
+    for record in clearings.iter().take(u16::MAX as usize) {
+        push_clearing(&mut buf, record);
     }
     buf
 }
@@ -2210,6 +2255,7 @@ fn read_private_snapshot(data: &[u8]) -> Option<PrivateSnapshot> {
             ceilings: Vec::new(),
             ledger: Vec::new(),
             pending: Vec::new(),
+            clearings: Vec::new(),
         });
     }
     let reserve_count = read_u16(data, &mut pos)? as usize;
@@ -2224,6 +2270,7 @@ fn read_private_snapshot(data: &[u8]) -> Option<PrivateSnapshot> {
             ceilings: Vec::new(),
             ledger: Vec::new(),
             pending: Vec::new(),
+            clearings: Vec::new(),
         });
     }
     let ceiling_count = read_u16(data, &mut pos)? as usize;
@@ -2241,23 +2288,39 @@ fn read_private_snapshot(data: &[u8]) -> Option<PrivateSnapshot> {
     for _ in 0..pending_count {
         pending.push(read_pending(data, &mut pos)?);
     }
+    if pos == data.len() {
+        return Some(PrivateSnapshot::Purses {
+            purses,
+            reserves,
+            ceilings,
+            ledger,
+            pending,
+            clearings: Vec::new(),
+        });
+    }
+    let clearing_count = read_u16(data, &mut pos)? as usize;
+    let mut clearings = Vec::with_capacity(clearing_count);
+    for _ in 0..clearing_count {
+        clearings.push(read_clearing(data, &mut pos)?);
+    }
     if pos != data.len() {
         return None;
     }
-    Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending })
+    Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings })
 }
 
 fn apply_private_state(blob: &[u8], ctx: &WorkerContext) -> bool {
     let Some(snapshot) = read_private_snapshot(blob) else {
         return false;
     };
-    if let PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending } = snapshot {
+    if let PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings } = snapshot {
         let mut node = ctx.node.write().unwrap();
         node.owner.purses = purses;
         node.owner.reserves = reserves;
         node.owner.receive_ceilings = ceilings;
         node.owner.ledger = ledger;
         node.owner.pending_accepts = pending;
+        node.owner.clearings = clearings;
     }
     true
 }
@@ -4133,6 +4196,8 @@ struct MergedState {
     ledger: HashMap<Uuid, Vec<LedgerLine>>,
     /// payment id → staged accept that is not yet a line.
     pending: HashMap<Uuid, PendingAccept>,
+    /// clearing id → dual-signed records. Two bodies of one id are both kept.
+    clearings: HashMap<Uuid, Vec<ClearingRecord>>,
 }
 
 /// Per-contact accumulator: the winning snapshot plus the priority of the
@@ -4215,6 +4280,7 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
         reserves: HashMap::new(),
         ledger: HashMap::new(),
         pending: HashMap::new(),
+        clearings: HashMap::new(),
     };
 
     // First pass: collect tombstones. Tombstone wins globally for its target,
@@ -4377,6 +4443,9 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
             }
             Change::DropAccept { payment_id } => {
                 state.pending.remove(&payment_id);
+            }
+            Change::RecordClearing { record } => {
+                replay_clearing(&mut state, record);
             }
         }
     }
@@ -4726,6 +4795,23 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
         }
     }
 
+    let mut clearing_ids: Vec<Uuid> = current.clearings.keys()
+        .chain(target.clearings.keys())
+        .copied()
+        .collect();
+    clearing_ids.sort();
+    clearing_ids.dedup();
+    for id in clearing_ids {
+        let current_rows = current.clearings.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+        let Some(target_rows) = target.clearings.get(&id) else { continue };
+        for record in target_rows {
+            if current_rows.iter().any(|stored| stored == record) {
+                continue;
+            }
+            out.push(Change::RecordClearing { record: record.clone() });
+        }
+    }
+
     out
 }
 
@@ -4811,6 +4897,17 @@ fn take_matching_pending_state(state: &mut MergedState, line: &LedgerLine) {
     if matches {
         state.pending.remove(&line.payment_id);
     }
+}
+
+fn replay_clearing(state: &mut MergedState, record: ClearingRecord) {
+    if !clearing_record_ok(&record) {
+        return;
+    }
+    let rows = state.clearings.entry(record.clearing_id).or_default();
+    if rows.iter().any(|stored| stored == &record) {
+        return;
+    }
+    rows.push(record);
 }
 
 fn replay_record(state: &mut MergedState, line: LedgerLine) {
@@ -5004,7 +5101,8 @@ mod purse_sync_tests {
         serialize_change, serialize_private_state, Change, PrivateSnapshot, ReserveReject, WriteError,
     };
     use crate::data_models::{
-        Ed25519Signature, LedgerLine, Node, PaymentReserve, PendingAccept, Purse, ReceiveCeiling,
+        ClearingRecord, Ed25519Signature, LedgerLine, Node, PaymentReserve, PendingAccept, Purse,
+        ReceiveCeiling,
         Scope, SyncVersion, WriteLogEntry,
     };
 
@@ -5034,36 +5132,52 @@ mod purse_sync_tests {
         node.owner.purses.push(media());
         let blob = serialize_private_state(&node);
         match read_private_snapshot(&blob) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
                 assert_eq!(purses, vec![media()]);
                 assert!(reserves.is_empty());
                 assert!(ceilings.is_empty());
                 assert!(ledger.is_empty());
                 assert!(pending.is_empty());
+                assert!(clearings.is_empty());
             }
             other => panic!("expected purse snapshot, got {other:?}"),
         }
-        // A writer from step 3 ends after the reserve count.
-        let step3 = &blob[..blob.len() - 6];
-        match read_private_snapshot(step3) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending }) => {
+        // A writer from step 6 ends after the pending count.
+        let step6 = &blob[..blob.len() - 2];
+        match read_private_snapshot(step6) {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
                 assert_eq!(purses, vec![media()]);
                 assert!(reserves.is_empty());
                 assert!(ceilings.is_empty());
                 assert!(ledger.is_empty());
                 assert!(pending.is_empty());
+                assert!(clearings.is_empty());
+            }
+            other => panic!("expected a step-6 snapshot, got {other:?}"),
+        }
+        // A writer from step 3 ends after the reserve count.
+        let step3 = &blob[..blob.len() - 8];
+        match read_private_snapshot(step3) {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
+                assert_eq!(purses, vec![media()]);
+                assert!(reserves.is_empty());
+                assert!(ceilings.is_empty());
+                assert!(ledger.is_empty());
+                assert!(pending.is_empty());
+                assert!(clearings.is_empty());
             }
             other => panic!("expected a step-3 snapshot, got {other:?}"),
         }
         // A writer from before holds omits the reserve count too.
-        let legacy = &blob[..blob.len() - 8];
+        let legacy = &blob[..blob.len() - 10];
         match read_private_snapshot(legacy) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
                 assert_eq!(purses, vec![media()]);
                 assert!(reserves.is_empty());
                 assert!(ceilings.is_empty());
                 assert!(ledger.is_empty());
                 assert!(pending.is_empty());
+                assert!(clearings.is_empty());
             }
             other => panic!("expected a pre-hold snapshot, got {other:?}"),
         }
@@ -5150,12 +5264,13 @@ mod purse_sync_tests {
         node.owner.reserves.push(hold(4, 10, 99));
         let blob = serialize_private_state(&node);
         match read_private_snapshot(&blob) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
                 assert_eq!(purses, vec![media()]);
                 assert_eq!(reserves, vec![hold(4, 10, 99)]);
                 assert!(ceilings.is_empty());
                 assert!(ledger.is_empty());
                 assert!(pending.is_empty());
+                assert!(clearings.is_empty());
             }
             other => panic!("expected purse and reserve snapshot, got {other:?}"),
         }
@@ -5245,12 +5360,13 @@ mod purse_sync_tests {
         };
         node.owner.pending_accepts.push(pending.clone());
         match read_private_snapshot(&serialize_private_state(&node)) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending: staged }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending: staged, clearings }) => {
                 assert_eq!(purses, vec![media()]);
                 assert_eq!(reserves, vec![reserve]);
                 assert_eq!(ceilings, vec![ceiling]);
                 assert_eq!(ledger, vec![line]);
                 assert_eq!(staged, vec![pending]);
+                assert!(clearings.is_empty());
             }
             other => panic!("expected the extra private lists, got {other:?}"),
         }
@@ -5400,5 +5516,104 @@ mod purse_sync_tests {
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
         assert_eq!(owner.ledger.len(), 2);
         assert_eq!(owner.ledger[1].purse_id, [0u8; 16]);
+    }
+
+    fn sample_clearing(clearing_id: [u8; 16], payment_id: [u8; 16]) -> ClearingRecord {
+        ClearingRecord {
+            clearing_id,
+            user_lo: [0x01; 16],
+            user_hi: [0x02; 16],
+            payment_ids: vec![payment_id],
+            sig_lo: Ed25519Signature([1; 64]),
+            sig_hi: Ed25519Signature([2; 64]),
+        }
+    }
+
+    #[test]
+    fn private_snapshot_roundtrips_a_clearing_and_an_older_blob_has_none() {
+        let mut node = Node::new();
+        let record = sample_clearing([0xC1; 16], [0x10; 16]);
+        node.owner.clearings.push(record.clone());
+        let blob = serialize_private_state(&node);
+        match read_private_snapshot(&blob) {
+            Some(PrivateSnapshot::Purses { clearings, .. }) => assert_eq!(clearings, vec![record]),
+            other => panic!("expected the clearing, got {other:?}"),
+        }
+        let step6 = &blob[..blob.len() - 2 - encode_len_of_one_clearing()];
+        match read_private_snapshot(step6) {
+            Some(PrivateSnapshot::Purses { clearings, ledger, pending, .. }) => {
+                assert!(clearings.is_empty());
+                assert!(ledger.is_empty());
+                assert!(pending.is_empty());
+            }
+            other => panic!("expected a snapshot with no clearing section, got {other:?}"),
+        }
+    }
+
+    fn encode_len_of_one_clearing() -> usize {
+        let record = sample_clearing([0xC1; 16], [0x10; 16]);
+        serialize_change(&Change::RecordClearing { record }).len() - 1
+    }
+
+    #[test]
+    fn merge_applies_a_clearing_without_moving_the_purse() {
+        let reserve = hold(7, 1_000_000, 80);
+        let line = confirmed_line([0x44; 16], &reserve);
+        let record = sample_clearing([0xC2; 16], reserve.payment_id);
+        let entry = |seq: u64, change: Change| WriteLogEntry {
+            version: SyncVersion { writer_sg_uuid: [0xA1; 16], epoch: 1, seq },
+            scope: Scope::Private,
+            change_payload: serialize_change(&change),
+            committed_at: SystemTime::UNIX_EPOCH,
+        };
+        let change = Change::RecordClearing { record: record.clone() };
+        assert_eq!(deserialize_change(&serialize_change(&change)).unwrap(), change);
+        let created = entry(1, Change::UpsertPurse { purse: media() });
+        let recorded = entry(2, Change::RecordLedger { line: line.clone() });
+        let cleared = entry(3, change);
+        let out = merge_logs(
+            &[created.clone(), recorded.clone()],
+            &[created, recorded, cleared],
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(out.changes_to_apply.len(), 1, "{:?}", out.changes_to_apply);
+        assert!(matches!(out.changes_to_apply[0], Change::RecordClearing { .. }));
+
+        let mut owner = Node::new().owner;
+        owner.user.uuid = [0x44; 16];
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
+        apply_change_to_owner(&mut owner, &Change::RecordLedger { line }).unwrap();
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        assert!(apply_change_to_owner(&mut owner, &out.changes_to_apply[0]).unwrap());
+        assert!(!apply_change_to_owner(&mut owner, &out.changes_to_apply[0]).unwrap());
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        assert_eq!(owner.clearings.len(), 1);
+        assert_eq!(owner.ledger.len(), 1);
+    }
+
+    #[test]
+    fn a_second_clearing_body_is_kept_and_the_net_is_the_union() {
+        let mut owner = Node::new().owner;
+        owner.user.uuid = [0x11; 16];
+        let contact = [0x22; 16];
+        let first_line = confirmed_line(owner.user.uuid, &hold(1, 1_000_000, 80));
+        let mut second_reserve = hold(2, 250_000, 80);
+        second_reserve.payment_id = [2; 16];
+        let second_line = confirmed_line(owner.user.uuid, &second_reserve);
+        owner.ledger.push(first_line);
+        owner.ledger.push(second_line);
+        let mut first = sample_clearing([0xC3; 16], [1; 16]);
+        first.user_lo = owner.user.uuid;
+        first.user_hi = contact;
+        let mut second = sample_clearing([0xC3; 16], [2; 16]);
+        second.user_lo = owner.user.uuid;
+        second.user_hi = contact;
+        second.sig_lo = Ed25519Signature([3; 64]);
+        assert!(apply_change_to_owner(&mut owner, &Change::RecordClearing { record: first }).unwrap());
+        assert_eq!(crate::payment::net_nanodollars(&owner, contact), -250_000);
+        assert!(apply_change_to_owner(&mut owner, &Change::RecordClearing { record: second }).unwrap());
+        assert_eq!(owner.clearings.len(), 2);
+        assert_eq!(crate::payment::net_nanodollars(&owner, contact), 0);
+        assert!(owner.purses.is_empty());
     }
 }

@@ -6,8 +6,8 @@
 
 use super::crypto::{ed25519_sign, ed25519_verify};
 use super::data_models::{
-    Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, LedgerLine, Owner, PaymentReserve,
-    PendingAccept, Uuid,
+    ClearingRecord, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, LedgerLine, Owner,
+    PaymentReserve, PendingAccept, Uuid,
 };
 use super::wire::{push_str, read_arr, read_str};
 
@@ -15,6 +15,10 @@ const OFFER_DOMAIN: &[u8] = b"pnet-payment-offer-v1";
 const ACCEPT_DOMAIN: &[u8] = b"pnet-payment-accept-v1";
 const CONFIRM_DOMAIN: &[u8] = b"pnet-payment-confirm-v1";
 const REFUSE_DOMAIN: &[u8] = b"pnet-payment-refuse-v1";
+const CLEARING_DOMAIN: &[u8] = b"pnet-payment-clearing-v1";
+
+/// One clearing names at most this many payment ids, so the record fits one datagram.
+pub(crate) const CLEARING_MAX_IDS: usize = 64;
 
 pub(crate) const REFUSE_OVER_CEILING: u8 = 0x01;
 pub(crate) const REFUSE_EXPIRED: u8 = 0x02;
@@ -470,7 +474,11 @@ pub(crate) fn claim_exceeds_ceiling(
         .unwrap_or(0);
     let mut used = 0i64;
     for line in &owner.ledger {
-        if line.payer == payer && line.payee == owner.user.uuid && Some(line.payment_id) != except {
+        if line.payer == payer
+            && line.payee == owner.user.uuid
+            && Some(line.payment_id) != except
+            && !payment_is_cleared(owner, payer, line.payment_id)
+        {
             used = used.saturating_add(line.amount_nanodollars);
         }
     }
@@ -482,8 +490,206 @@ pub(crate) fn claim_exceeds_ceiling(
     used.saturating_add(amount) > max
 }
 
+/// The two user ids in byte order. The same user twice is not a pair.
+pub(crate) fn ordered_users(a: Uuid, b: Uuid) -> Option<(Uuid, Uuid)> {
+    if a < b {
+        Some((a, b))
+    } else if b < a {
+        Some((b, a))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn users_are_pair(payer: Uuid, payee: Uuid, our: Uuid, contact: Uuid) -> bool {
+    (payer == our && payee == contact) || (payer == contact && payee == our)
+}
+
+/// Sort and drop duplicates. Empty, or more than [`CLEARING_MAX_IDS`] distinct ids, is refused.
+pub(crate) fn normalize_payment_ids(ids: &[Uuid]) -> Option<Vec<Uuid>> {
+    if ids.is_empty() {
+        return None;
+    }
+    let mut out = ids.to_vec();
+    out.sort();
+    out.dedup();
+    if out.is_empty() || out.len() > CLEARING_MAX_IDS {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// The bytes both user keys sign. No amount, purse, note, or expiry.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct ClearingBody {
+    pub clearing_id: Uuid,
+    pub user_lo: Uuid,
+    pub user_hi: Uuid,
+    pub payment_ids: Vec<Uuid>,
+}
+
+impl ClearingBody {
+    pub(crate) fn from_record(record: &ClearingRecord) -> Self {
+        Self {
+            clearing_id: record.clearing_id,
+            user_lo: record.user_lo,
+            user_hi: record.user_hi,
+            payment_ids: record.payment_ids.clone(),
+        }
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(50 + self.payment_ids.len() * 16);
+        buf.extend_from_slice(&self.clearing_id);
+        buf.extend_from_slice(&self.user_lo);
+        buf.extend_from_slice(&self.user_hi);
+        buf.extend_from_slice(&(self.payment_ids.len() as u16).to_be_bytes());
+        for id in &self.payment_ids {
+            buf.extend_from_slice(id);
+        }
+        buf
+    }
+}
+
+pub(crate) fn clearing_body_ok(body: &ClearingBody) -> bool {
+    body.user_lo < body.user_hi
+        && !body.payment_ids.is_empty()
+        && body.payment_ids.len() <= CLEARING_MAX_IDS
+        && body.payment_ids.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+pub(crate) fn clearing_record_ok(record: &ClearingRecord) -> bool {
+    clearing_body_ok(&ClearingBody::from_record(record))
+}
+
+pub(crate) fn clearing_for_pair(body: &ClearingBody, our: Uuid, contact: Uuid) -> bool {
+    match ordered_users(our, contact) {
+        Some((lo, hi)) => body.user_lo == lo && body.user_hi == hi,
+        None => false,
+    }
+}
+
+fn decode_clearing_body_at(data: &[u8], pos: &mut usize) -> Option<ClearingBody> {
+    let clearing_id: Uuid = read_arr(data, pos)?;
+    let user_lo: Uuid = read_arr(data, pos)?;
+    let user_hi: Uuid = read_arr(data, pos)?;
+    let count = read_u16(data, pos)? as usize;
+    if count == 0 || count > CLEARING_MAX_IDS {
+        return None;
+    }
+    let mut payment_ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        payment_ids.push(read_arr(data, pos)?);
+    }
+    Some(ClearingBody { clearing_id, user_lo, user_hi, payment_ids })
+}
+
+pub(crate) fn sign_clearing(secret: &Ed25519SecretKey, body: &ClearingBody) -> Ed25519Signature {
+    let bytes = body.encode();
+    Ed25519Signature(ed25519_sign(secret, &tagged(CLEARING_DOMAIN, &[&bytes])))
+}
+
+pub(crate) fn verify_clearing(
+    public_key: &Ed25519PublicKey,
+    body: &ClearingBody,
+    sig: &Ed25519Signature,
+) -> bool {
+    let bytes = body.encode();
+    ed25519_verify(public_key, &tagged(CLEARING_DOMAIN, &[&bytes]), &sig.0)
+}
+
+pub(crate) fn encode_clearing_proposal(body: &ClearingBody, sig: &Ed25519Signature) -> Vec<u8> {
+    let mut buf = body.encode();
+    push_sig(&mut buf, sig);
+    buf
+}
+
+pub(crate) fn decode_clearing_proposal(data: &[u8]) -> Option<(ClearingBody, Ed25519Signature)> {
+    let mut pos = 0usize;
+    let body = decode_clearing_body_at(data, &mut pos)?;
+    let sig = read_sig(data, &mut pos)?;
+    if pos != data.len() {
+        return None;
+    }
+    Some((body, sig))
+}
+
+pub(crate) fn encode_clearing_record(record: &ClearingRecord) -> Vec<u8> {
+    let mut buf = ClearingBody::from_record(record).encode();
+    push_sig(&mut buf, &record.sig_lo);
+    push_sig(&mut buf, &record.sig_hi);
+    buf
+}
+
+pub(crate) fn decode_clearing_record_at(data: &[u8], pos: &mut usize) -> Option<ClearingRecord> {
+    let body = decode_clearing_body_at(data, pos)?;
+    let sig_lo = read_sig(data, pos)?;
+    let sig_hi = read_sig(data, pos)?;
+    Some(ClearingRecord {
+        clearing_id: body.clearing_id,
+        user_lo: body.user_lo,
+        user_hi: body.user_hi,
+        payment_ids: body.payment_ids,
+        sig_lo,
+        sig_hi,
+    })
+}
+
+pub(crate) fn decode_clearing_record(data: &[u8]) -> Option<ClearingRecord> {
+    let mut pos = 0usize;
+    let record = decode_clearing_record_at(data, &mut pos)?;
+    if pos != data.len() {
+        return None;
+    }
+    Some(record)
+}
+
+pub(crate) fn clearing_body_matches(record: &ClearingRecord, body: &ClearingBody) -> bool {
+    record.clearing_id == body.clearing_id
+        && record.user_lo == body.user_lo
+        && record.user_hi == body.user_hi
+        && record.payment_ids == body.payment_ids
+}
+
+/// True when any stored clearing for this pair names `payment_id`.
+pub(crate) fn payment_is_cleared(owner: &Owner, contact: Uuid, payment_id: Uuid) -> bool {
+    let Some((lo, hi)) = ordered_users(owner.user.uuid, contact) else {
+        return false;
+    };
+    owner.clearings.iter().any(|record| {
+        record.user_lo == lo
+            && record.user_hi == hi
+            && record.payment_ids.binary_search(&payment_id).is_ok()
+    })
+}
+
+/// Incoming uncleared amounts minus outgoing ones. Positive means `contact` owes this user.
+/// A cleared id drops every body of that payment. Pending accepts are not lines.
+pub(crate) fn net_nanodollars(owner: &Owner, contact: Uuid) -> i64 {
+    let mut net = 0i64;
+    for line in &owner.ledger {
+        if !users_are_pair(line.payer, line.payee, owner.user.uuid, contact) {
+            continue;
+        }
+        if payment_is_cleared(owner, contact, line.payment_id) {
+            continue;
+        }
+        if line.payee == owner.user.uuid {
+            net = net.saturating_add(line.amount_nanodollars);
+        } else {
+            net = net.saturating_sub(line.amount_nanodollars);
+        }
+    }
+    net
+}
+
 fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
     Some(i64::from_be_bytes(read_arr(data, pos)?))
+}
+
+fn read_u16(data: &[u8], pos: &mut usize) -> Option<u16> {
+    Some(u16::from_be_bytes(read_arr(data, pos)?))
 }
 
 fn read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {

@@ -697,15 +697,23 @@ pub struct Owner {
     #[serde(default)]
     pub receive_ceilings: Vec<ReceiveCeiling>,
     /// Confirmed payments. Private scope. Ops `0x06` and `0x07` list the lines for one alias.
+    /// A clearing does not remove a line from this list.
     #[serde(default)]
     pub ledger: Vec<LedgerLine>,
     /// Offers this user signed and has not yet been told are stored.
     /// They count against the payer's ceiling. Private scope.
     #[serde(default)]
     pub pending_accepts: Vec<PendingAccept>,
+    /// Dual-signed clearings. A named payment id no longer counts toward the
+    /// net or the receive ceiling. The line stays on the ledger. Private scope.
+    #[serde(default)]
+    pub clearings: Vec<ClearingRecord>,
     /// In-progress payment index from a contact. Dropped when the list ends.
     #[serde(skip)]
     pub payment_index: HashMap<Uuid, PaymentIndexAccum>,
+    /// In-progress clearing index from a contact. Separate from `payment_index`.
+    #[serde(skip)]
+    pub clearing_index: HashMap<Uuid, PaymentIndexAccum>,
 
     /// Latest version of the user's **private** state held by this node.
     /// On the writer SG this is authoritative; on other nodes it's the
@@ -960,6 +968,22 @@ pub struct LedgerLine {
     pub confirm_sig: Ed25519Signature,
 }
 
+/// A tab both owners signed off. It names payment ids and carries no amount.
+/// `user_lo` sorts before `user_hi`. `payment_ids` is strictly increasing.
+/// `sig_lo` and `sig_hi` are those users' signatures over the same body.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct ClearingRecord {
+    #[serde(with = "serde_bytes_16")]
+    pub clearing_id: Uuid,
+    #[serde(with = "serde_bytes_16")]
+    pub user_lo: Uuid,
+    #[serde(with = "serde_bytes_16")]
+    pub user_hi: Uuid,
+    pub payment_ids: Vec<Uuid>,
+    pub sig_lo: Ed25519Signature,
+    pub sig_hi: Ed25519Signature,
+}
+
 /// An offer this user has signed and is still waiting to hear was stored.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub struct PendingAccept {
@@ -1177,7 +1201,9 @@ impl Node {
                 receive_ceilings:           Vec::new(),
                 ledger:                     Vec::new(),
                 pending_accepts:            Vec::new(),
+                clearings:                  Vec::new(),
                 payment_index:              HashMap::new(),
+                clearing_index:             HashMap::new(),
                 private_version:            SyncVersion::zero(),
                 public_version:             SyncVersion::zero(),
                 write_log:                  Vec::new(),
