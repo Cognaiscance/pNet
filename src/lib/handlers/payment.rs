@@ -365,8 +365,8 @@ pub(crate) fn exchange_payment_records(conn_id: u16, ctx: &WorkerContext) {
     }
 }
 
-/// The writer signs a clearing for `contact` and sends it. Tests and, later, the
-/// contact page call this. There is no app opcode. A missing line is not proposed.
+/// The writer signs a clearing for `contact` and sends it. Tests and the contact
+/// ledger page call this. There is no app opcode. A missing line is not proposed.
 /// A record this node already holds for the same body is sent again as the ack.
 pub(crate) fn propose_clearing(ctx: &WorkerContext, contact: Uuid, clearing_id: Uuid, payment_ids: &[Uuid]) {
     let prepared = {

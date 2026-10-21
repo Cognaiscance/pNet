@@ -76,8 +76,10 @@ Successful mutations answer **302**. The invitation code is not put in the redir
 | `GET /applications` | session | Apps on this device. |
 | `POST /applications/rename` | session | Fields `id`, `alias`. Publishes the alias. Empty alias is a no-op. |
 | `POST /applications/delete` | session | Field `id`. Same removal as reject. |
-| `GET /contacts` | session | Contact list and a form to enter a contact code. |
+| `GET /contacts` | session | Contact list and a form to enter a contact code. Each contact links to its ledger. |
 | `POST /contacts/enter` | session | Field `code`. Starts a contact exchange. |
+| `GET /contacts/<32 hex>/ledger` | session | Confirmed lines with that contact, which are cleared, and the net in dollars. A line with anyone else is absent. A pending accept is absent. |
+| `POST /contacts/<32 hex>/ledger` | session | Repeated field `payment` (hex id). The writer proposes a clearing for those lines. An empty list, an id that is not a line for the pair, or more than 64 ids is not sent. The purse does not change. The record is stored when the other owner signs. |
 | `GET /devices` | session | Own devices, sessions, hosts. |
 | `POST /devices/sync` | session | Pull from the writer, then redirect to `/devices`. |
 | `POST /devices/remove` | session | Field `id` (device UUID hex). Publishes `RemoveDevice`. |
