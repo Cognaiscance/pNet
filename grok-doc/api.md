@@ -67,8 +67,9 @@ Successful mutations answer **302**. The invitation code is not put in the redir
 | `GET /pending-apps` | session | Apps on this device with `user_approved` false. |
 | `POST /pending-apps/approve` | session | Field `id` (hex). Sign an app certificate and publish it. |
 | `POST /pending-apps/reject` | session | Field `id`. Remove the app and publish the removal. |
-| `GET /purses` | session | Fixed spending purses: name, allotment, available amount, member aliases. |
-| `POST /purses/create` | session | Fields `name`, `amount` (dollars, up to 9 decimal places). Publishes a new purse. |
+| `GET /purses` | session | Spending purses: kind, name, allotment, available amount, member aliases. |
+| `POST /purses/create` | session | Fields `name`, `kind` (`fixed` or `monthly`; missing means fixed), `amount` (dollars, up to 9 decimal places). Publishes a new purse. |
+| `POST /purses/edit` | session | Fields `purse` (hex id), `kind` (`fixed` or `monthly`), `amount`. Moves the available amount by the allotment difference. The same kind and amount does not bump the private version. |
 | `POST /purses/add-alias` | session | Fields `purse` (hex id), `alias`. Adds that app alias to the purse. |
 | `POST /purses/remove-alias` | session | Fields `purse` (hex id), `alias`. Removes that alias. |
 | `GET /receive-ceilings` | session | Each contact and the receive ceiling stored for that payer. A missing row is shown as zero. |

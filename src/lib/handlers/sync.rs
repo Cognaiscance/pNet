@@ -1089,11 +1089,13 @@ fn apply_release(owner: &mut Owner, payment_id: Uuid) -> bool {
     true
 }
 
-/// A fixed purse always returns a released hold. A monthly purse returns it
-/// only while the hold still belongs to the purse's current month. A hold
-/// from an earlier month was left behind when the allotment was restored.
+/// A fixed purse returns a released hold. So does a hold taken while the
+/// purse was fixed (`period` 0), even after the purse becomes monthly. A
+/// monthly hold is returned only while it still belongs to the purse's
+/// current month. A hold from an earlier month was left behind when the
+/// allotment was restored.
 fn reserve_refunds(purse: &Purse, reserve: &PaymentReserve) -> bool {
-    purse.kind != PURSE_KIND_MONTHLY || reserve.period == purse.period
+    purse.kind != PURSE_KIND_MONTHLY || reserve.period == 0 || reserve.period == purse.period
 }
 
 fn apply_record(owner: &mut Owner, line: &LedgerLine) -> Result<bool, WriteError> {
@@ -5590,6 +5592,20 @@ mod purse_sync_tests {
         bad.kind = 9;
         assert!(!apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: bad }).unwrap());
         assert_eq!(owner.purses[0].kind, PURSE_KIND_MONTHLY);
+    }
+
+    #[test]
+    fn a_fixed_hold_still_refunds_after_the_purse_becomes_monthly() {
+        let nov = utc_month_period(1_793_491_200_000);
+        let mut owner = Node::new().owner;
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
+        apply_change_to_owner(&mut owner, &Change::ReservePayment { reserve: hold(1, 1_000_000, 50) }).unwrap();
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: monthly(nov, 4_000_000) }).unwrap();
+        assert_eq!(owner.purses[0].kind, PURSE_KIND_MONTHLY);
+        assert!(apply_change_to_owner(&mut owner, &Change::ReleaseReserve { payment_id: [1; 16] }).unwrap());
+        assert_eq!(owner.purses[0].available_nanodollars, 5_000_000);
+        assert!(owner.reserves.is_empty());
     }
 
     #[test]

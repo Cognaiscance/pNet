@@ -250,6 +250,10 @@ pub fn ui_request(
             let target = redirect_with_error("/purses", remove_purse_alias(&body, ctx));
             respond_redirect(&stream, &target);
         }
+        ("POST", "/purses/edit") => {
+            let target = redirect_with_error("/purses", edit_purse(&body, ctx));
+            respond_redirect(&stream, &target);
+        }
         ("GET",  "/receive-ceilings") => {
             respond_html(&stream, 200, &render_receive_ceilings(ctx, &query), None)
         }
@@ -2948,6 +2952,83 @@ fn add_purse_alias(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     publish_policy(Change::UpsertPurse { purse }, ctx)
 }
 
+fn edit_purse(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let id = match form_field(body, "purse").and_then(|raw| uuid_from_hex(&url_decode(raw))) {
+        Some(id) => id,
+        None => return Some(UI_ERR_BAD_PURSE),
+    };
+    let amount = match form_field(body, "amount")
+        .and_then(|raw| parse_dollar_to_nanodollars(&url_decode(raw)))
+    {
+        Some(amount) => amount,
+        None => return Some(UI_ERR_BAD_PURSE),
+    };
+    let kind = match form_field(body, "kind").map(|raw| url_decode(raw)).as_deref() {
+        Some("fixed") => PURSE_KIND_FIXED,
+        Some("monthly") => PURSE_KIND_MONTHLY,
+        _ => return Some(UI_ERR_BAD_PURSE),
+    };
+
+    // The writer closes last month before the delta is applied, so a raise
+    // does not add last month's remainder on top of the new allotment.
+    super::sync::release_expired_reserves(ctx);
+
+    if kind == PURSE_KIND_FIXED {
+        let stale: Vec<Uuid> = {
+            let node = ctx.node.read().unwrap();
+            let Some(purse) = node.owner.purses.iter().find(|purse| purse.id == id) else {
+                return Some(UI_ERR_BAD_PURSE);
+            };
+            if purse.kind != PURSE_KIND_MONTHLY {
+                Vec::new()
+            } else {
+                let period = purse.period;
+                node.owner.reserves.iter()
+                    .filter(|reserve| {
+                        reserve.purse_id == id && reserve.period != 0 && reserve.period != period
+                    })
+                    .map(|reserve| reserve.payment_id)
+                    .collect()
+            }
+        };
+        for payment_id in stale {
+            if let Some(err) = publish_policy(Change::ReleaseReserve { payment_id }, ctx) {
+                return Some(err);
+            }
+        }
+    }
+
+    let mut purse = match purse_by_id(ctx, body) {
+        Ok(purse) => purse,
+        Err(err) => return Some(err),
+    };
+    let period = if kind == PURSE_KIND_MONTHLY {
+        if purse.kind == PURSE_KIND_MONTHLY {
+            purse.period
+        } else {
+            utc_month_period(unix_time_ms())
+        }
+    } else {
+        0
+    };
+    let Some(delta) = amount.checked_sub(purse.allotment_nanodollars) else {
+        return Some(UI_ERR_BAD_PURSE);
+    };
+    let available = purse.available_nanodollars.saturating_add(delta);
+    if purse.kind == kind
+        && purse.period == period
+        && purse.allotment_nanodollars == amount
+        && purse.available_nanodollars == available
+    {
+        return None;
+    }
+    purse.kind = kind;
+    purse.period = period;
+    purse.allotment_nanodollars = amount;
+    purse.available_nanodollars = available;
+    publish_policy(Change::UpsertPurse { purse }, ctx)
+}
+
 fn remove_purse_alias(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     let mut purse = match purse_by_id(ctx, body) {
         Ok(purse) => purse,
@@ -2992,12 +3073,24 @@ fn render_purses(ctx: &WorkerContext, query: &str) -> String {
             }
             members.push_str("</ul>");
         }
-        let kind = if purse.kind == PURSE_KIND_MONTHLY { "Monthly" } else { "Fixed" };
+        let monthly = purse.kind == PURSE_KIND_MONTHLY;
+        let kind = if monthly { "Monthly" } else { "Fixed" };
+        let fixed_sel = if monthly { "" } else { " selected" };
+        let monthly_sel = if monthly { " selected" } else { "" };
         cards.push_str(&format!(
             "<div class='card'>\
                <h2 style='margin-top:0;font-size:1.1rem'>{name}</h2>\
                <p>{kind}<br>Allotment ${allotment}<br>Available ${available}</p>\
                {members}\
+               <form method='post' action='/purses/edit' style='margin-top:.5rem'>\
+                 <input type='hidden' name='purse' value='{id}'>\
+                 <select name='kind'>\
+                   <option value='fixed'{fixed_sel}>Fixed</option>\
+                   <option value='monthly'{monthly_sel}>Monthly</option>\
+                 </select>\
+                 <input name='amount' value='{allotment}' inputmode='decimal' required>\
+                 <button type='submit'>Save limit</button>\
+               </form>\
                <form method='post' action='/purses/add-alias' style='margin-top:.5rem'>\
                  <input type='hidden' name='purse' value='{id}'>\
                  <input name='alias' maxlength='255' placeholder='app alias' required>\
@@ -3016,7 +3109,8 @@ fn render_purses(ctx: &WorkerContext, query: &str) -> String {
          app aliases you add. It belongs to you, not to one device. A fixed purse does not \
          refill. A monthly purse starts each UTC month at its allotment. Unspent amount does \
          not carry over, and a reserve still open at the month change does not raise the new \
-         month.</p>\
+         month. Saving a new allotment moves the available amount by that same difference. \
+         Signed payments stay. Switching between fixed and monthly does not refill the purse.</p>\
          {banner}\
          {cards}\
          <div class='card'>\
@@ -3115,7 +3209,7 @@ mod policy_ui_tests {
     use crate::wire::{uuid_hex, PURSE_KIND_FIXED, PURSE_KIND_MONTHLY};
 
     use super::{
-        accept_app_invitation, add_purse_alias, create_purse, grant_contact_app,
+        accept_app_invitation, add_purse_alias, create_purse, edit_purse, grant_contact_app,
         invite_contact_app, record_contact_clearing, reject_app_invitation, remove_purse_alias,
         render_app_invitations, render_contact_apps, render_contact_ledger, render_contacts,
         render_purses, render_receive_ceilings, set_receive_ceiling,
@@ -3379,6 +3473,176 @@ mod policy_ui_tests {
         let purse = ctx.node.read().unwrap().owner.purses[0].clone();
         assert_eq!(purse.available_nanodollars, 1_000_000);
         assert_eq!(purse.period, utc_month_period(oct));
+    }
+
+    #[test]
+    fn purse_edit_moves_available_by_the_allotment_delta() {
+        let (ctx, contact) = portal();
+        let now = crate::data_models::unix_time_ms();
+        let current = utc_month_period(now);
+        let earlier = current.saturating_sub(1);
+        assert_ne!(earlier, 0);
+        assert_ne!(earlier, current);
+        let purse_id = [0x41; 16];
+        let our = ctx.node.read().unwrap().owner.user.uuid;
+        let line = pair_line(our, contact, [0x71; 16], 250_000, "clip", false);
+        {
+            let mut node = ctx.node.write().unwrap();
+            node.owner.purses.push(Purse {
+                id: purse_id,
+                name: "media".into(),
+                allotment_nanodollars: 5_000_000,
+                available_nanodollars: 4_000_000,
+                aliases: vec!["discordium".into()],
+                kind: PURSE_KIND_FIXED,
+                period: 0,
+            });
+            node.owner.purses.push(Purse {
+                id: [0x51; 16],
+                name: "budget".into(),
+                allotment_nanodollars: 5_000_000,
+                available_nanodollars: 4_000_000,
+                aliases: vec!["chat".into()],
+                kind: PURSE_KIND_MONTHLY,
+                period: earlier,
+            });
+            node.owner.ledger.push(line.clone());
+        }
+        let page = render_purses(&ctx, "");
+        assert!(page.contains("action='/purses/edit'"));
+        assert!(page.contains("Save limit"));
+        let id = uuid_hex(&purse_id);
+        let budget_id = uuid_hex(&[0x51; 16]);
+
+        assert!(edit_purse(&form(&[("purse", &budget_id), ("kind", "monthly"), ("amount", "0.01")]), &ctx).is_none());
+        {
+            let node = ctx.node.read().unwrap();
+            let budget = node.owner.purses.iter().find(|purse| purse.name == "budget").unwrap();
+            assert_eq!(budget.period, current);
+            assert_eq!(budget.allotment_nanodollars, 10_000_000);
+            assert_eq!(budget.available_nanodollars, 10_000_000);
+            assert_eq!(budget.aliases, vec!["chat".to_string()]);
+        }
+
+        assert!(edit_purse(&form(&[("purse", &id), ("kind", "fixed"), ("amount", "0.01")]), &ctx).is_none());
+        {
+            let node = ctx.node.read().unwrap();
+            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
+            assert_eq!(purse.kind, PURSE_KIND_FIXED);
+            assert_eq!(purse.period, 0);
+            assert_eq!(purse.allotment_nanodollars, 10_000_000);
+            assert_eq!(purse.available_nanodollars, 9_000_000);
+            assert_eq!(purse.name, "media");
+            assert_eq!(purse.aliases, vec!["discordium".to_string()]);
+            assert_eq!(node.owner.ledger, vec![line.clone()]);
+        }
+
+        assert!(edit_purse(&form(&[("purse", &id), ("kind", "fixed"), ("amount", "0")]), &ctx).is_none());
+        let seq = {
+            let node = ctx.node.read().unwrap();
+            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
+            assert_eq!(purse.allotment_nanodollars, 0);
+            assert_eq!(purse.available_nanodollars, -1_000_000);
+            node.owner.private_version.seq
+        };
+
+        assert!(edit_purse(&form(&[("purse", &id), ("kind", "fixed"), ("amount", "0")]), &ctx).is_none());
+        assert_eq!(ctx.node.read().unwrap().owner.private_version.seq, seq);
+        assert!(edit_purse(&form(&[("purse", &id), ("kind", "fixed"), ("amount", "0.0000000001")]), &ctx).is_some());
+        assert!(edit_purse(&form(&[("purse", &id), ("amount", "0")]), &ctx).is_some());
+        assert!(edit_purse(&form(&[("purse", &uuid_hex(&generate_uuid())), ("kind", "fixed"), ("amount", "1")]), &ctx).is_some());
+        {
+            let node = ctx.node.read().unwrap();
+            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
+            assert_eq!(purse.kind, PURSE_KIND_FIXED);
+            assert_eq!(purse.allotment_nanodollars, 0);
+            assert_eq!(purse.available_nanodollars, -1_000_000);
+            assert_eq!(node.owner.private_version.seq, seq);
+        }
+
+        assert!(edit_purse(&form(&[("purse", &id), ("kind", "monthly"), ("amount", "0")]), &ctx).is_none());
+        {
+            let node = ctx.node.read().unwrap();
+            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
+            assert_eq!(purse.kind, PURSE_KIND_MONTHLY);
+            assert_eq!(purse.period, current);
+            assert_eq!(purse.available_nanodollars, -1_000_000);
+            assert_eq!(purse.allotment_nanodollars, 0);
+        }
+        let same_month = [0x61; 16];
+        let previous = [0x62; 16];
+        let from_fixed = [0x63; 16];
+        {
+            let mut node = ctx.node.write().unwrap();
+            let purse = node.owner.purses.iter_mut().find(|purse| purse.id == purse_id).unwrap();
+            purse.available_nanodollars = -1_700_000;
+            node.owner.reserves.push(PaymentReserve {
+                payment_id: same_month,
+                purse_id,
+                amount_nanodollars: 500_000,
+                contact_uuid: contact,
+                destination_alias: "player".into(),
+                note: "same".into(),
+                paying_alias: "discordium".into(),
+                expires_at_ms: now.saturating_add(86_400_000),
+                period: current,
+            });
+            node.owner.reserves.push(PaymentReserve {
+                payment_id: previous,
+                purse_id,
+                amount_nanodollars: 1_000_000,
+                contact_uuid: contact,
+                destination_alias: "player".into(),
+                note: "old".into(),
+                paying_alias: "discordium".into(),
+                expires_at_ms: now.saturating_add(86_400_000),
+                period: earlier,
+            });
+            node.owner.reserves.push(PaymentReserve {
+                payment_id: from_fixed,
+                purse_id,
+                amount_nanodollars: 200_000,
+                contact_uuid: contact,
+                destination_alias: "player".into(),
+                note: "fixed".into(),
+                paying_alias: "discordium".into(),
+                expires_at_ms: now.saturating_add(86_400_000),
+                period: 0,
+            });
+        }
+
+        assert!(edit_purse(&form(&[("purse", &id), ("kind", "fixed"), ("amount", "0")]), &ctx).is_none());
+        {
+            let node = ctx.node.read().unwrap();
+            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
+            assert_eq!(purse.kind, PURSE_KIND_FIXED);
+            assert_eq!(purse.period, 0);
+            assert_eq!(purse.allotment_nanodollars, 0);
+            assert_eq!(purse.available_nanodollars, -1_700_000);
+            assert_eq!(purse.name, "media");
+            assert_eq!(purse.aliases, vec!["discordium".to_string()]);
+            let left: Vec<[u8; 16]> = node.owner.reserves.iter().map(|reserve| reserve.payment_id).collect();
+            assert!(left.contains(&same_month));
+            assert!(left.contains(&from_fixed));
+            assert!(!left.contains(&previous));
+            assert_eq!(node.owner.ledger, vec![line.clone()]);
+        }
+        {
+            let mut node = ctx.node.write().unwrap();
+            for reserve in &mut node.owner.reserves {
+                if reserve.purse_id == purse_id {
+                    reserve.expires_at_ms = 1;
+                }
+            }
+        }
+        super::super::sync::release_expired_reserves_at(&ctx, 2);
+        {
+            let node = ctx.node.read().unwrap();
+            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
+            assert_eq!(purse.available_nanodollars, -1_000_000);
+            assert!(node.owner.reserves.iter().all(|reserve| reserve.purse_id != purse_id));
+            assert_eq!(node.owner.ledger, vec![line]);
+        }
     }
 
     #[test]
