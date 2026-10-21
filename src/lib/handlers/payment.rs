@@ -1,28 +1,32 @@
-//! Offer, accept, refuse, confirm, and repair between the two writers.
+//! Offer, accept, refuse, confirm, repair, and clearing between the two writers.
 //!
 //! A node that is not the writer drops the packet. The purse id never leaves
 //! the payer. A missing receive ceiling is zero, so an offer is refused until
 //! one is stored for that payer. On connect, the writers exchange the payment
-//! ids they hold for the pair and copy any missing signed record.
+//! ids and the clearing ids they hold for the pair, and copy any missing record.
+//! An app does not clear. The owner proposes, and the other owner signs.
 
 use std::net::SocketAddr;
 
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
 use super::super::data_models::{
-    Ed25519SecretKey, Ed25519Signature, LedgerLine, Node, Owner, Uuid, unix_time_ms,
+    ClearingRecord, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, LedgerLine, Node, Owner,
+    Uuid, unix_time_ms,
 };
 use super::super::payment::{
-    body_from_line, claim_exceeds_ceiling, decode_accept, decode_confirm, decode_index, decode_offer,
-    decode_refuse, encode_accept, encode_confirm, encode_offer, encode_refuse, index_plaintexts,
-    line_covers, line_from, line_same_payment, offer_body_ok, pending_covers, pending_from,
-    sign_accept, sign_confirm, sign_offer, sign_refuse, verify_accept, verify_confirm, verify_offer,
-    verify_refuse, OfferBody, INDEX_END, INDEX_START, REFUSE_EXPIRED, REFUSE_MISMATCH,
-    REFUSE_OVER_CEILING,
+    body_from_line, claim_exceeds_ceiling, clearing_body_matches, clearing_body_ok, clearing_for_pair,
+    decode_accept, decode_clearing_proposal, decode_clearing_record, decode_confirm, decode_index,
+    decode_offer, decode_refuse, encode_accept, encode_clearing_proposal, encode_clearing_record,
+    encode_confirm, encode_offer, encode_refuse, index_plaintexts, line_covers, line_from,
+    line_same_payment, normalize_payment_ids, offer_body_ok, ordered_users, pending_covers,
+    pending_from, sign_accept, sign_clearing, sign_confirm, sign_offer, sign_refuse, users_are_pair,
+    verify_accept, verify_clearing, verify_confirm, verify_offer, verify_refuse, ClearingBody,
+    OfferBody, INDEX_END, INDEX_START, REFUSE_EXPIRED, REFUSE_MISMATCH, REFUSE_OVER_CEILING,
 };
 use super::super::wire::{
-    PAYMENT_ACCEPT_OP, PAYMENT_CONFIRM_OP, PAYMENT_INDEX_OP, PAYMENT_OFFER_OP, PAYMENT_RECORD_OP,
-    PAYMENT_REFUSE_OP,
+    CLEARING_INDEX_OP, CLEARING_RECORD_OP, PAYMENT_ACCEPT_OP, PAYMENT_CLEAR_ACK_OP, PAYMENT_CLEAR_OP,
+    PAYMENT_CONFIRM_OP, PAYMENT_INDEX_OP, PAYMENT_OFFER_OP, PAYMENT_RECORD_OP, PAYMENT_REFUSE_OP,
 };
 use super::{find_writer_sg, request_change_idempotent, send, Change, PaymentReject, WriteError, WriterTarget};
 
@@ -313,7 +317,7 @@ fn open_session(ctx: &WorkerContext, buf: &[u8]) -> Option<(Vec<u8>, Uuid, u16)>
     Some((plain, device, conn_id))
 }
 
-/// When a session to a contact comes up, send the payment ids held for that pair.
+/// When a session to a contact comes up, send the payment ids and clearing ids for that pair.
 pub(crate) fn exchange_payment_records(conn_id: u16, ctx: &WorkerContext) {
     let outbound = {
         let node = ctx.node.read().unwrap();
@@ -335,16 +339,281 @@ pub(crate) fn exchange_payment_records(conn_id: u16, ctx: &WorkerContext) {
             .map(|line| (line.payment_id, line.confirm_sig))
             .collect();
         entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.0.cmp(&right.1.0)));
+        let mut clearings: Vec<(Uuid, Ed25519Signature)> = Vec::new();
+        if let Some((lo, hi)) = ordered_users(our, contact) {
+            clearings = node
+                .owner
+                .clearings
+                .iter()
+                .filter(|record| record.user_lo == lo && record.user_hi == hi)
+                .map(|record| (record.clearing_id, record.sig_lo))
+                .collect();
+            clearings.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.0.cmp(&right.1.0)));
+        }
         let dest = conn.peer_addr;
-        let packets: Vec<Vec<u8>> = index_plaintexts(&entries)
+        let mut packets: Vec<Vec<u8>> = index_plaintexts(&entries)
             .into_iter()
             .map(|plain| build_encrypted_packet(PAYMENT_INDEX_OP, conn, &plain))
             .collect();
+        packets.extend(index_plaintexts(&clearings).into_iter().map(|plain| {
+            build_encrypted_packet(CLEARING_INDEX_OP, conn, &plain)
+        }));
         (dest, packets)
     };
     for packet in outbound.1 {
         send(ctx, outbound.0, &packet);
     }
+}
+
+/// The writer signs a clearing for `contact` and sends it. Tests and, later, the
+/// contact page call this. There is no app opcode. A missing line is not proposed.
+/// A record this node already holds for the same body is sent again as the ack.
+pub(crate) fn propose_clearing(ctx: &WorkerContext, contact: Uuid, clearing_id: Uuid, payment_ids: &[Uuid]) {
+    let prepared = {
+        let node = ctx.node.read().unwrap();
+        if !matches!(find_writer_sg(&node), WriterTarget::Local) {
+            return;
+        }
+        if node.owner.key_pair.private_key == Ed25519SecretKey::ZERO {
+            return;
+        }
+        if !node.owner.contact_users.iter().any(|row| row.user.uuid == contact) {
+            return;
+        }
+        let Some(ids) = normalize_payment_ids(payment_ids) else {
+            return;
+        };
+        let Some((user_lo, user_hi)) = ordered_users(node.owner.user.uuid, contact) else {
+            return;
+        };
+        if !ids.iter().all(|id| pair_has_line(&node.owner, contact, *id)) {
+            return;
+        }
+        let body = ClearingBody { clearing_id, user_lo, user_hi, payment_ids: ids };
+        if let Some(stored) = node.owner.clearings.iter().find(|record| clearing_body_matches(record, &body)) {
+            Some((PAYMENT_CLEAR_ACK_OP, encode_clearing_record(stored)))
+        } else {
+            let sig = sign_clearing(&node.owner.key_pair.private_key, &body);
+            Some((PAYMENT_CLEAR_OP, encode_clearing_proposal(&body, &sig)))
+        }
+    };
+    if let Some((op, plain)) = prepared {
+        send_to_user(ctx, contact, op, &plain);
+    }
+}
+
+pub fn payment_clear(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let Some((plain, device, _)) = open_session(ctx, &buf) else {
+        return;
+    };
+    let Some((body, sig)) = decode_clearing_proposal(&plain) else {
+        eprintln!("[payment_clear] bad proposal from {src}");
+        return;
+    };
+    if !clearing_body_ok(&body) {
+        return;
+    }
+    let decision = {
+        let node = ctx.node.read().unwrap();
+        let Some(contact) = contact_user_for_device(&node, device) else {
+            return;
+        };
+        if !clearing_for_pair(&body, node.owner.user.uuid, contact) {
+            return;
+        }
+        let Some(row) = node.owner.contact_users.iter().find(|row| row.user.uuid == contact) else {
+            return;
+        };
+        if node.owner.key_pair.private_key == Ed25519SecretKey::ZERO {
+            return;
+        }
+        if !verify_clearing(&row.public_key, &body, &sig) {
+            eprintln!("[payment_clear] bad signature from {src}");
+            return;
+        }
+        if let Some(stored) = node.owner.clearings.iter().find(|record| clearing_body_matches(record, &body)) {
+            ClearChoice::Resend(encode_clearing_record(stored))
+        } else if body.payment_ids.iter().all(|id| pair_has_line(&node.owner, contact, *id)) {
+            let ours = sign_clearing(&node.owner.key_pair.private_key, &body);
+            let (sig_lo, sig_hi) = if node.owner.user.uuid == body.user_lo {
+                (ours, sig)
+            } else {
+                (sig, ours)
+            };
+            ClearChoice::Store(ClearingRecord {
+                clearing_id: body.clearing_id,
+                user_lo: body.user_lo,
+                user_hi: body.user_hi,
+                payment_ids: body.payment_ids.clone(),
+                sig_lo,
+                sig_hi,
+            })
+        } else {
+            ClearChoice::Wait
+        }
+    };
+    match decision {
+        ClearChoice::Wait => {}
+        ClearChoice::Resend(plain) => send_to_user(ctx, peer_of_clearing(&body, ctx), PAYMENT_CLEAR_ACK_OP, &plain),
+        ClearChoice::Store(record) => {
+            if store_clearing(ctx, record.clone(), src) {
+                let contact = other_user(&record, ctx);
+                let plain = encode_clearing_record(&record);
+                send_to_user(ctx, contact, PAYMENT_CLEAR_ACK_OP, &plain);
+            }
+        }
+    }
+}
+
+pub fn payment_clear_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    accept_signed_clearing(src, buf, ctx, "payment_clear_ack");
+}
+
+pub fn clearing_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let Some((plain, device, conn_id)) = open_session(ctx, &buf) else {
+        return;
+    };
+    let Some((flags, entries)) = decode_index(&plain) else {
+        eprintln!("[clearing_index] bad index from {src}");
+        return;
+    };
+    let replies = {
+        let mut node = ctx.node.write().unwrap();
+        let Some(contact) = contact_user_for_device(&node, device) else {
+            return;
+        };
+        let Some((lo, hi)) = ordered_users(node.owner.user.uuid, contact) else {
+            return;
+        };
+        let finished = {
+            let slot = node.owner.clearing_index.entry(contact).or_default();
+            if (flags & INDEX_START) != 0 {
+                slot.open = true;
+                slot.seen.clear();
+            }
+            if !slot.open {
+                None
+            } else {
+                slot.seen.extend(entries);
+                if (flags & INDEX_END) == 0 {
+                    None
+                } else {
+                    let seen = std::mem::take(&mut slot.seen);
+                    slot.open = false;
+                    Some(seen)
+                }
+            }
+        };
+        let Some(seen) = finished else {
+            return;
+        };
+        let mut replies = Vec::new();
+        for record in &node.owner.clearings {
+            if record.user_lo != lo || record.user_hi != hi {
+                continue;
+            }
+            if seen.iter().any(|(id, sig)| *id == record.clearing_id && *sig == record.sig_lo) {
+                continue;
+            }
+            replies.push(encode_clearing_record(record));
+        }
+        replies
+    };
+    for plain in replies {
+        send_on_conn(ctx, conn_id, CLEARING_RECORD_OP, &plain);
+    }
+}
+
+pub fn clearing_record(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    accept_signed_clearing(src, buf, ctx, "clearing_record");
+}
+
+enum ClearChoice {
+    Wait,
+    Resend(Vec<u8>),
+    Store(ClearingRecord),
+}
+
+fn accept_signed_clearing(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext, label: &str) {
+    let Some((plain, device, _)) = open_session(ctx, &buf) else {
+        return;
+    };
+    let Some(record) = decode_clearing_record(&plain) else {
+        eprintln!("[{label}] bad clearing from {src}");
+        return;
+    };
+    if !clearing_body_ok(&ClearingBody::from_record(&record)) {
+        return;
+    }
+    let accept = {
+        let node = ctx.node.read().unwrap();
+        let Some(contact) = contact_user_for_device(&node, device) else {
+            return;
+        };
+        if !clearing_for_pair(&ClearingBody::from_record(&record), node.owner.user.uuid, contact) {
+            return;
+        }
+        let Some(row) = node.owner.contact_users.iter().find(|row| row.user.uuid == contact) else {
+            return;
+        };
+        if !both_clearing_sigs_ok(&node.owner.key_pair.public_key, &row.public_key, &node.owner.user.uuid, &record) {
+            eprintln!("[{label}] bad signature from {src}");
+            return;
+        }
+        !node.owner.clearings.iter().any(|stored| stored == &record)
+    };
+    if accept {
+        store_clearing(ctx, record, src);
+    }
+}
+
+fn both_clearing_sigs_ok(
+    our_key: &Ed25519PublicKey,
+    contact_key: &Ed25519PublicKey,
+    our: &Uuid,
+    record: &ClearingRecord,
+) -> bool {
+    let body = ClearingBody::from_record(record);
+    let (lo_key, hi_key) = if *our == record.user_lo {
+        (our_key, contact_key)
+    } else {
+        (contact_key, our_key)
+    };
+    verify_clearing(lo_key, &body, &record.sig_lo) && verify_clearing(hi_key, &body, &record.sig_hi)
+}
+
+fn store_clearing(ctx: &WorkerContext, record: ClearingRecord, src: SocketAddr) -> bool {
+    match request_change_idempotent(Change::RecordClearing { record }, ctx) {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("[payment_clear] record failed from {src}: {err:?}");
+            false
+        }
+    }
+}
+
+fn other_user(record: &ClearingRecord, ctx: &WorkerContext) -> Uuid {
+    let node = ctx.node.read().unwrap();
+    if node.owner.user.uuid == record.user_lo {
+        record.user_hi
+    } else {
+        record.user_lo
+    }
+}
+
+fn peer_of_clearing(body: &ClearingBody, ctx: &WorkerContext) -> Uuid {
+    let node = ctx.node.read().unwrap();
+    if node.owner.user.uuid == body.user_lo {
+        body.user_hi
+    } else {
+        body.user_lo
+    }
+}
+
+fn pair_has_line(owner: &Owner, contact: Uuid, payment_id: Uuid) -> bool {
+    owner.ledger.iter().any(|line| {
+        line.payment_id == payment_id && users_are_pair(line.payer, line.payee, owner.user.uuid, contact)
+    })
 }
 
 pub fn payment_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
@@ -444,10 +713,6 @@ pub fn payment_record(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if let Err(err) = request_change_idempotent(Change::RecordLedger { line }, ctx) {
         eprintln!("[payment_record] record failed from {src}: {err:?}");
     }
-}
-
-fn users_are_pair(payer: Uuid, payee: Uuid, our: Uuid, contact: Uuid) -> bool {
-    (payer == our && payee == contact) || (payer == contact && payee == our)
 }
 
 fn contact_user_for_device(node: &Node, device: Uuid) -> Option<Uuid> {

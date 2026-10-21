@@ -174,6 +174,7 @@ pub(crate) const CHANGE_KIND_RELEASE_RESERVE: u8 = 0x10;
 pub(crate) const CHANGE_KIND_RECORD_LEDGER: u8 = 0x11;
 pub(crate) const CHANGE_KIND_STAGE_ACCEPT: u8 = 0x12;
 pub(crate) const CHANGE_KIND_DROP_ACCEPT: u8 = 0x13;
+pub(crate) const CHANGE_KIND_RECORD_CLEARING: u8 = 0x14;
 
 /// Offer, accept, refuse, and confirm between two writers. Session-encrypted.
 pub(crate) const PAYMENT_OFFER_OP: u8 = 0x60;
@@ -184,6 +185,14 @@ pub(crate) const PAYMENT_CONFIRM_OP: u8 = 0x63;
 pub(crate) const PAYMENT_INDEX_OP: u8 = 0x64;
 /// One signed confirmation, sent because the contact's index did not list it.
 pub(crate) const PAYMENT_RECORD_OP: u8 = 0x65;
+/// A proposal that names the payment ids two owners will clear. Session-encrypted.
+pub(crate) const PAYMENT_CLEAR_OP: u8 = 0x66;
+/// The same body with both user signatures. Also the stored clearing.
+pub(crate) const PAYMENT_CLEAR_ACK_OP: u8 = 0x67;
+/// Clearing ids this writer holds for the pair, sent when a contact session comes up.
+pub(crate) const CLEARING_INDEX_OP: u8 = 0x68;
+/// One dual-signed clearing, sent because the contact's index did not list it.
+pub(crate) const CLEARING_RECORD_OP: u8 = 0x69;
 
 // ── Shared min lengths (unencrypted headers / common envelopes) ───────────────
 

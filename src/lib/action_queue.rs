@@ -71,6 +71,10 @@ pub enum Action {
     PaymentConfirm { src: SocketAddr, buf: Vec<u8> },
     PaymentIndex { src: SocketAddr, buf: Vec<u8> },
     PaymentRecord { src: SocketAddr, buf: Vec<u8> },
+    PaymentClear { src: SocketAddr, buf: Vec<u8> },
+    PaymentClearAck { src: SocketAddr, buf: Vec<u8> },
+    ClearingIndex { src: SocketAddr, buf: Vec<u8> },
+    ClearingRecord { src: SocketAddr, buf: Vec<u8> },
 
     // From HTTP UI
     UiRequest {
@@ -213,6 +217,10 @@ impl Action {
             Action::PaymentConfirm { .. } => "PaymentConfirm",
             Action::PaymentIndex { .. } => "PaymentIndex",
             Action::PaymentRecord { .. } => "PaymentRecord",
+            Action::PaymentClear { .. } => "PaymentClear",
+            Action::PaymentClearAck { .. } => "PaymentClearAck",
+            Action::ClearingIndex { .. } => "ClearingIndex",
+            Action::ClearingRecord { .. } => "ClearingRecord",
             Action::UiRequest { .. } => "UiRequest",
             Action::SgPing { .. } => "SgPing",
             Action::DgKeepalive { .. } => "DgKeepalive",
@@ -273,6 +281,10 @@ impl Action {
             Action::PaymentConfirm { src, buf } => handlers::payment_confirm(src, buf, ctx),
             Action::PaymentIndex { src, buf } => handlers::payment_index(src, buf, ctx),
             Action::PaymentRecord { src, buf } => handlers::payment_record(src, buf, ctx),
+            Action::PaymentClear { src, buf } => handlers::payment_clear(src, buf, ctx),
+            Action::PaymentClearAck { src, buf } => handlers::payment_clear_ack(src, buf, ctx),
+            Action::ClearingIndex { src, buf } => handlers::clearing_index(src, buf, ctx),
+            Action::ClearingRecord { src, buf } => handlers::clearing_record(src, buf, ctx),
             Action::UiRequest {
                 stream, method, path, query, cookie, host, origin, referer, body,
             } => {

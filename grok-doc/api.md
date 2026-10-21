@@ -279,6 +279,8 @@ Errors: `bad packet`, `token unknown`, `not approved`.
 
 Same request and same approval check. The lines are confirmed payments whose payer is this user and whose paying alias is the caller's alias. Each line uses the same layout as list incoming.
 
+An app does not clear a tab. The two owners sign that record. A cleared line stays on these lists.
+
 ### Reserve (`0x08`)
 
 ```text

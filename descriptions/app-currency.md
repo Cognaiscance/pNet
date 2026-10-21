@@ -91,7 +91,7 @@ A ledger line counts only as a copy of a record both user keys have signed, incl
 
 When the contacts connect, each sends the list of payment ids it holds for the pair. A missing id is answered with the signed record. A record whose signatures verify is stored and becomes a line. A record that does not verify is discarded. The same id with the same signed bytes is the same payment. If one id arrives as two different signed bodies, both are kept and shown to the owners. The node does not pick a winner.
 
-A cleared tab is another record signed by both user keys. It names the payment ids it settles. A node applies it after those payments are present. The same compare-and-copy step fills in a missing clearing record.
+A cleared tab is another record signed by both user keys. It names the payment ids it settles. The owner who did not start it signs only after each named id is already a line between the pair. The same compare-and-copy step fills in a missing clearing record, including one that arrives before a named line. Once the line is stored, that id no longer counts toward the net.
 
 A contact cannot invent a debt, because that contact cannot sign with the other user key. A lost confirmation is copied across on a later connection. If the payer has already spent the purse again, the debt still stands and the purse shows an overrun.
 
@@ -110,7 +110,7 @@ The dollars, when any are paid, stay outside pNet. Only the owner holds keys for
 - Which clock marks the month, and what happens to a reserve still in flight when the month changes.
 - How the owner raises an allotment, lowers it, or switches a purse between fixed and monthly, and what that does to the unspent available amount. Signed debts stay either way.
 - The starting receive ceiling is zero until a ceiling for that payer is stored. The page that sets it is still unbuilt.
-- Where the owner reads one contact's ledger lines, sees the net, and records a clearing. `/purses` is the page for the limits.
+- The page where the owner reads one contact's ledger, sees the net, and records a clearing. The signed record itself is in place. `/purses` is the page for the limits.
 - Whether many small receivables can be gathered into one balance with a clearing contact, and which outside payment, if any, pays a cleared net. No chain is chosen.
 - Whether a device that is not the writer should carry a reserve to the writer and wait for the result. Today that device refuses the reserve.
 
@@ -134,6 +134,12 @@ The steps below are the build order. A step that is not marked done stays unbuil
 
    A confirmation that arrives after the staged accept expired is stored. Expiry itself still drops the staged accept and does not create a line. Ops `0x06` and `0x07` stay empty.
 6. **App payment lists. Done.** Ops `0x06` and `0x07` return confirmed lines. `0x06` is lines whose payee is this user and whose destination alias is the caller's alias. `0x07` is lines whose payer is this user and whose paying alias is the caller's alias. Each line is the payment id, the amount, the payer, the payee, the paying alias, the destination alias, and the note. The purse id, the expiry, and the signatures are absent. Order is the payment id, then the payer's confirmation signature, so two bodies of one id both appear and the order is the same on every device. A hold that is not confirmed is absent. Another alias's lines are absent, including the note. Count 0 is success. The read does not change a purse or the ledger. An unknown token and an unapproved app are rejected.
-7. **Clearing record.** Both owners sign a record that names payment ids, and those lines drop out of the net. No bank, chain, or clearing contact is attached.
+7. **Clearing record. Done.** Both owners sign a record that names payment ids. The lines stay on the ledger and on ops `0x06` and `0x07`. They no longer count toward the net between that pair, and they no longer count against the receive ceiling. A purse's available amount does not change. No bank, chain, or clearing contact is attached. The page that shows the net is still unbuilt. A test calls the writer to propose a clearing. An app cannot.
+
+   Fabric op `0x66` is the proposal: the body and the proposer's signature. The body is `[clearing id:16][user lo:16][user hi:16][count:u16 be][payment id:16…]`. The two user ids are in byte order, and the payment ids are strictly increasing. At most 64 ids. An empty list is not a record. The signature domain is `pnet-payment-clearing-v1` over that body. Each user signs the same bytes.
+
+   The other owner answers on `0x67` only when every named id is already a line between this pair. A missing id gets no reply. A bad signature is dropped. The plaintext is the body plus both signatures. The same body is stored once. A different body for the same clearing id is kept beside the first, and the net is the union of the named ids. Naming an id drops every body of that payment. A pending accept is not a line, so it is not cleared and still counts toward the ceiling.
+
+   On connect, `0x68` lists clearing ids and the lower user's signature, in the same packet shape as `0x64`. `0x69` copies one dual-signed record. A node that is not the writer drops these packets. A copied record is stored even when a named line is briefly missing, and that id leaves the net once the line is there. The copy does not change a purse. A private snapshot writes the clearing count after the staged accepts. A blob that ends at the staged accepts still loads, with no clearings. Own devices learn a clearing through the private scope.
 
 Monthly reset, changing an allotment after creation, the receive-ceiling control, the contact ledger page, a clearing contact, and any outside payment stay out of these steps until those choices are settled.
