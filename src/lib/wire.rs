@@ -175,6 +175,8 @@ pub(crate) const CHANGE_KIND_RECORD_LEDGER: u8 = 0x11;
 pub(crate) const CHANGE_KIND_STAGE_ACCEPT: u8 = 0x12;
 pub(crate) const CHANGE_KIND_DROP_ACCEPT: u8 = 0x13;
 pub(crate) const CHANGE_KIND_RECORD_CLEARING: u8 = 0x14;
+/// Private-scope. One payer's receive ceiling. Not a session opcode.
+pub(crate) const CHANGE_KIND_SET_RECEIVE_CEILING: u8 = 0x15;
 
 /// Offer, accept, refuse, and confirm between two writers. Session-encrypted.
 pub(crate) const PAYMENT_OFFER_OP: u8 = 0x60;

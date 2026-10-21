@@ -232,6 +232,13 @@ pub fn ui_request(
             let target = redirect_with_error("/purses", remove_purse_alias(&body, ctx));
             respond_redirect(&stream, &target);
         }
+        ("GET",  "/receive-ceilings") => {
+            respond_html(&stream, 200, &render_receive_ceilings(ctx, &query), None)
+        }
+        ("POST", "/receive-ceilings") => {
+            let target = redirect_with_error("/receive-ceilings", set_receive_ceiling(&body, ctx));
+            respond_redirect(&stream, &target);
+        }
         ("GET",  "/applications")  => respond_html(&stream, 200, &render_applications(ctx, &query), None),
         ("POST", "/applications/delete") => {
             let target = redirect_with_error("/applications", reject_app(&body, ctx));
@@ -837,6 +844,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
              <li><a href=\"/pending-apps\">Pending Apps</a> — approve or reject local app registrations</li>\
              <li><a href=\"/applications\">Applications</a> — approved apps on this device</li>\
              <li><a href=\"/purses\">Purses</a> — spending limits for app aliases</li>\
+             <li><a href=\"/receive-ceilings\">Receive ceilings</a> — how much of a contact's credit you will accept</li>\
              <li><a href=\"/contacts\">Contacts</a> — other users you are linked with</li>\
              <li><a href=\"/app-invitations\">App Invitations</a> — requests to accept an app from a contact</li>\
              <li><a href=\"/devices\">Devices</a> — your devices; remove a lost one</li>\
@@ -861,6 +869,11 @@ fn ui_error_banner(query: &str) -> String {
             "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
                 <strong>That purse was not saved.</strong> \
                 Use a name and an app alias, and a dollar amount with at most nine decimal places.\
+            </div>".to_string(),
+        Some(code) if code == UI_ERR_BAD_CEILING =>
+            "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
+                <strong>That ceiling was not saved.</strong> \
+                Choose a contact and a dollar amount with at most nine decimal places.\
             </div>".to_string(),
         Some(code) if code == UI_ERR_REMOVE_SELF =>
             "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
@@ -1563,6 +1576,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
 /// already rolled the local mutation back, so the UI state matches reality.
 pub(crate) const UI_ERR_PUBLISH_FAILED: &str = "publish_failed";
 pub(crate) const UI_ERR_BAD_PURSE: &str = "bad_purse";
+pub(crate) const UI_ERR_BAD_CEILING: &str = "bad_ceiling";
 
 /// The device serving this page cannot remove itself.
 pub(crate) const UI_ERR_REMOVE_SELF: &str = "remove_self";
@@ -2551,6 +2565,7 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
             | "Pending Apps"
             | "Applications"
             | "Purses"
+            | "Receive ceilings"
             | "Contacts"
             | "Contact"
             | "App Invitations"
@@ -2587,6 +2602,7 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
                <a href=\"/pending-apps\">Pending Apps</a>\
                <a href=\"/applications\">Applications</a>\
                <a href=\"/purses\">Purses</a>\
+               <a href=\"/receive-ceilings\">Ceilings</a>\
                <a href=\"/contacts\">Contacts</a>\
                <a href=\"/app-invitations\">App Invitations</a>\
                <a href=\"/devices\">Devices</a>\
@@ -2843,6 +2859,71 @@ fn render_purses(ctx: &WorkerContext, query: &str) -> String {
     layout(ctx, "Purses", &body)
 }
 
+fn set_receive_ceiling(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+    let payer = match form_field(body, "contact").and_then(|raw| uuid_from_hex(&url_decode(raw))) {
+        Some(payer) => payer,
+        None => return Some(UI_ERR_BAD_CEILING),
+    };
+    {
+        let node = ctx.node.read().unwrap();
+        if !node.owner.contact_users.iter().any(|contact| contact.user.uuid == payer) {
+            return Some(UI_ERR_BAD_CEILING);
+        }
+    }
+    let amount = match form_field(body, "amount")
+        .and_then(|raw| parse_dollar_to_nanodollars(&url_decode(raw)))
+    {
+        Some(amount) => amount,
+        None => return Some(UI_ERR_BAD_CEILING),
+    };
+    publish_policy(Change::SetReceiveCeiling { payer, max_nanodollars: amount }, ctx)
+}
+
+fn render_receive_ceilings(ctx: &WorkerContext, query: &str) -> String {
+    let node = ctx.node.read().unwrap();
+    let mut rows: Vec<(String, Uuid, i64)> = node.owner.contact_users.iter().map(|contact| {
+        let max = node.owner.receive_ceilings.iter()
+            .find(|ceiling| ceiling.payer == contact.user.uuid)
+            .map(|ceiling| ceiling.max_nanodollars)
+            .unwrap_or(0);
+        (contact.user.alias.clone(), contact.user.uuid, max)
+    }).collect();
+    drop(node);
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    let banner = ui_error_banner(query);
+    let mut cards = String::new();
+    if rows.is_empty() {
+        cards.push_str("<p class='empty'>No contacts yet.</p>");
+    }
+    for (alias, payer, max) in &rows {
+        let id = uuid_hex(payer);
+        cards.push_str(&format!(
+            "<div class='card'>\
+               <h2 style='margin-top:0;font-size:1.1rem'>{alias}</h2>\
+               <p>Ceiling ${amount}</p>\
+               <form method='post' action='/receive-ceilings'>\
+                 <input type='hidden' name='contact' value='{id}'>\
+                 <input name='amount' inputmode='decimal' placeholder='0.005' required>\
+                 <button type='submit'>Set ceiling</button>\
+               </form>\
+             </div>",
+            alias = html_escape(alias),
+            amount = format_nanodollars(*max),
+        ));
+    }
+
+    let body = format!(
+        "<h1>Receive ceilings</h1>\
+         <p style='color:var(--muted);margin-top:-.5rem'>A contact can pay you only up to the \
+         ceiling you store for them. Until you store one, nothing is accepted. The number stays \
+         on your devices. The contact is not told.</p>\
+         {banner}\
+         {cards}"
+    );
+    layout(ctx, "Receive ceilings", &body)
+}
+
 #[cfg(test)]
 mod policy_ui_tests {
     use std::net::UdpSocket;
@@ -2859,7 +2940,8 @@ mod policy_ui_tests {
     use super::{
         accept_app_invitation, add_purse_alias, create_purse, grant_contact_app,
         invite_contact_app, reject_app_invitation, remove_purse_alias, render_app_invitations,
-        render_contact_apps, render_contacts, render_purses,
+        render_contact_apps, render_contacts, render_purses, render_receive_ceilings,
+        set_receive_ceiling,
     };
 
     fn portal() -> (WorkerContext, [u8; 16]) {
@@ -3053,6 +3135,63 @@ mod policy_ui_tests {
 
         let hub = super::render_config_hub(&ctx);
         assert!(hub.contains("/purses"));
+    }
+
+    #[test]
+    fn receive_ceiling_page_sets_and_replaces_one_contact() {
+        let (ctx, contact) = portal();
+        let hex = uuid_hex(&contact);
+        let page = render_receive_ceilings(&ctx, "");
+        assert!(page.contains("sanosuke"));
+        assert!(page.contains("<p>Ceiling $0</p>"));
+        assert!(page.contains("href=\"/receive-ceilings\""));
+        assert!(!page.contains("ledger"));
+
+        assert!(set_receive_ceiling(&form(&[("contact", &hex), ("amount", "0.005")]), &ctx).is_none());
+        let seq = {
+            let node = ctx.node.read().unwrap();
+            assert_eq!(node.owner.receive_ceilings.len(), 1);
+            assert_eq!(node.owner.receive_ceilings[0].payer, contact);
+            assert_eq!(node.owner.receive_ceilings[0].max_nanodollars, 5_000_000);
+            assert!(node.owner.purses.is_empty());
+            assert!(node.owner.private_version.seq >= 1);
+            node.owner.private_version.seq
+        };
+        let page = render_receive_ceilings(&ctx, "");
+        assert!(page.contains("<p>Ceiling $0.005</p>"));
+
+        assert!(set_receive_ceiling(&form(&[("contact", &hex), ("amount", "0.005")]), &ctx).is_none());
+        assert_eq!(ctx.node.read().unwrap().owner.receive_ceilings.len(), 1);
+        assert_eq!(ctx.node.read().unwrap().owner.private_version.seq, seq);
+
+        assert!(set_receive_ceiling(&form(&[("contact", &hex), ("amount", "0.0000000001")]), &ctx).is_some());
+        assert!(set_receive_ceiling(&form(&[("contact", "not-a-uuid"), ("amount", "1")]), &ctx).is_some());
+        assert!(set_receive_ceiling(
+            &form(&[("contact", &uuid_hex(&generate_uuid())), ("amount", "1")]),
+            &ctx,
+        ).is_some());
+        {
+            let node = ctx.node.read().unwrap();
+            assert_eq!(node.owner.receive_ceilings.len(), 1);
+            assert_eq!(node.owner.receive_ceilings[0].max_nanodollars, 5_000_000);
+            assert_eq!(node.owner.private_version.seq, seq);
+        }
+        let page = render_receive_ceilings(&ctx, "error=bad_ceiling");
+        assert!(page.contains("That ceiling was not saved."));
+
+        assert!(set_receive_ceiling(&form(&[("contact", &hex), ("amount", "0")]), &ctx).is_none());
+        {
+            let node = ctx.node.read().unwrap();
+            assert_eq!(node.owner.receive_ceilings.len(), 1);
+            assert_eq!(node.owner.receive_ceilings[0].max_nanodollars, 0);
+            assert!(node.owner.private_version.seq > seq);
+        }
+        let page = render_receive_ceilings(&ctx, "");
+        assert!(page.contains("<p>Ceiling $0</p>"));
+        assert!(!page.contains("$0.005"));
+
+        let hub = super::render_config_hub(&ctx);
+        assert!(hub.contains("/receive-ceilings"));
     }
 }
 

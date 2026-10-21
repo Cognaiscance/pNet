@@ -60,7 +60,7 @@ Successful mutations answer **302**. The invitation code is not put in the redir
 | `POST /logout` | session | Revoke the session and clear the cookie. |
 | `GET /` | session | Home: owner alias, device alias, grade, links to mounted apps, link to Config. |
 | `GET /dashboard` | session | Redirect to `/`. |
-| `GET /config` | session | Counts and links: devices, invitations, applications, purses, contacts, diagnostics. |
+| `GET /config` | session | Counts and links: devices, invitations, applications, purses, receive ceilings, contacts, diagnostics. |
 | `POST /api/app-web/register` | loopback | Register a portal mount. Plain text. |
 | `POST /api/app-web/unregister` | loopback | Remove a portal mount. Plain text. |
 | `GET /apps/<slug>/…` | session | Reverse-proxy to the registered loopback port. |
@@ -71,6 +71,8 @@ Successful mutations answer **302**. The invitation code is not put in the redir
 | `POST /purses/create` | session | Fields `name`, `amount` (dollars, up to 9 decimal places). Publishes a new purse. |
 | `POST /purses/add-alias` | session | Fields `purse` (hex id), `alias`. Adds that app alias to the purse. |
 | `POST /purses/remove-alias` | session | Fields `purse` (hex id), `alias`. Removes that alias. |
+| `GET /receive-ceilings` | session | Each contact and the receive ceiling stored for that payer. A missing row is shown as zero. |
+| `POST /receive-ceilings` | session | Fields `contact` (user uuid hex), `amount` (dollars, up to 9 decimal places, zero allowed). Publishes that payer's ceiling. A bad amount or an unknown contact is not stored. |
 | `GET /applications` | session | Apps on this device. |
 | `POST /applications/rename` | session | Fields `id`, `alias`. Publishes the alias. Empty alias is a no-op. |
 | `POST /applications/delete` | session | Field `id`. Same removal as reject. |

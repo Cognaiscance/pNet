@@ -1,6 +1,6 @@
 # App currency
 
-**Status:** step 4, the signed offer, is in the node. Steps 5 through 7 stay unbuilt.
+**Status:** steps 1 through 8 are in the node. Monthly reset, allotment edits, the contact ledger page, a clearing contact, and outside payment stay unbuilt.
 
 An approved app will be able to spend a small amount with another pNet node. The node keeps one ledger of those payments. A purse is only a limit on how much an app may add to that ledger. pNet rejects a send that would pass the limit.
 
@@ -56,6 +56,10 @@ The owner creates purses on `/purses`. Creating one sets its name, whether it is
 
 The page shows each purse's allotment and available amount. The same purses appear on every device, because the writer holds them and own devices pull that private record. A reserve lowers the available amount on the writer. Own devices see that amount on the next private pull.
 
+## Receive ceilings
+
+The owner sets a receive ceiling on `/receive-ceilings`. Each contact has one amount: the most of that payer's credit this user will still accept. A contact with no stored ceiling is at zero, so nothing is accepted until the owner stores one. An amount equal to the ceiling is accepted. Zero is a stored ceiling and refuses new credit. A later amount replaces that contact's row. Own devices see the same ceilings. The contact is not told the number, and the change does not move a purse.
+
 ## What an app can ask
 
 An assigned app can ask the local node for three things.
@@ -109,7 +113,7 @@ The dollars, when any are paid, stay outside pNet. Only the owner holds keys for
 
 - Which clock marks the month, and what happens to a reserve still in flight when the month changes.
 - How the owner raises an allotment, lowers it, or switches a purse between fixed and monthly, and what that does to the unspent available amount. Signed debts stay either way.
-- The starting receive ceiling is zero until a ceiling for that payer is stored. The page that sets it is still unbuilt.
+- The starting receive ceiling is zero until a ceiling for that payer is stored. `/receive-ceilings` is the page that sets it.
 - The page where the owner reads one contact's ledger, sees the net, and records a clearing. The signed record itself is in place. `/purses` is the page for the limits.
 - Whether many small receivables can be gathered into one balance with a clearing contact, and which outside payment, if any, pays a cleared net. No chain is chosen.
 - Whether a device that is not the writer should carry a reserve to the writer and wait for the result. Today that device refuses the reserve.
@@ -141,5 +145,6 @@ The steps below are the build order. A step that is not marked done stays unbuil
    The other owner answers on `0x67` only when every named id is already a line between this pair. A missing id gets no reply. A bad signature is dropped. The plaintext is the body plus both signatures. The same body is stored once. A different body for the same clearing id is kept beside the first, and the net is the union of the named ids. Naming an id drops every body of that payment. A pending accept is not a line, so it is not cleared and still counts toward the ceiling.
 
    On connect, `0x68` lists clearing ids and the lower user's signature, in the same packet shape as `0x64`. `0x69` copies one dual-signed record. A node that is not the writer drops these packets. A copied record is stored even when a named line is briefly missing, and that id leaves the net once the line is there. The copy does not change a purse. A private snapshot writes the clearing count after the staged accepts. A blob that ends at the staged accepts still loads, with no clearings. Own devices learn a clearing through the private scope.
+8. **Receive ceiling. Done.** `/receive-ceilings` lists each contact and the ceiling stored for that payer, or zero when no row is stored. The owner posts a dollar amount with at most nine decimal places. Zero is allowed. A bad amount, or a user who is not a contact, is not stored. Private change `0x15` replaces that payer's row. The same payer and amount does not append a second row and does not bump the private version. Own devices apply it from the private log. A purse's available amount, a reserve, and the net do not change. There is no app opcode and no fabric session op. The contact ledger page is still unbuilt.
 
-Monthly reset, changing an allotment after creation, the receive-ceiling control, the contact ledger page, a clearing contact, and any outside payment stay out of these steps until those choices are settled.
+Monthly reset, changing an allotment after creation, the contact ledger page, a clearing contact, and any outside payment stay out of these steps until those choices are settled.
