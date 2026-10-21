@@ -467,6 +467,10 @@ pub enum Change {
     /// one record. A different body of the same id is kept. This does not
     /// change a purse, and it does not require the named lines to be present yet.
     RecordClearing { record: ClearingRecord },
+    /// Private-scope: set one payer's receive ceiling. The same payer and amount
+    /// is a no-op. A different amount replaces that payer's row. This does not
+    /// change a purse, a reserve, or the net. Contacts are not told the number.
+    SetReceiveCeiling { payer: Uuid, max_nanodollars: i64 },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
@@ -496,6 +500,7 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
         Change::StageAccept { .. }             => &[Scope::Private],
         Change::DropAccept { .. }              => &[Scope::Private],
         Change::RecordClearing { .. }          => &[Scope::Private],
+        Change::SetReceiveCeiling { .. }       => &[Scope::Private],
     }
 }
 
@@ -639,6 +644,11 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
         Change::RecordClearing { record } => {
             buf.push(CHANGE_KIND_RECORD_CLEARING);
             push_clearing(&mut buf, record);
+        }
+        Change::SetReceiveCeiling { payer, max_nanodollars } => {
+            buf.push(CHANGE_KIND_SET_RECEIVE_CEILING);
+            buf.extend_from_slice(payer);
+            push_i64(&mut buf, *max_nanodollars);
         }
     }
     buf
@@ -785,6 +795,11 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
         CHANGE_KIND_RECORD_CLEARING => {
             let record = read_clearing(data, &mut pos)?;
             Some(Change::RecordClearing { record })
+        }
+        CHANGE_KIND_SET_RECEIVE_CEILING => {
+            let payer: Uuid = read_arr(data, &mut pos)?;
+            let max_nanodollars = read_i64(data, &mut pos)?;
+            Some(Change::SetReceiveCeiling { payer, max_nanodollars })
         }
         _ => None,
     }
@@ -1006,6 +1021,9 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
         Change::StageAccept { pending } => apply_stage(owner, pending)?,
         Change::DropAccept { payment_id } => apply_drop(owner, *payment_id),
         Change::RecordClearing { record } => apply_clearing(owner, record)?,
+        Change::SetReceiveCeiling { payer, max_nanodollars } => {
+            set_receive_ceiling(owner, *payer, *max_nanodollars)
+        }
     };
     Ok(applied)
 }
@@ -1242,6 +1260,37 @@ pub(crate) fn release_expired_reserves_at(ctx: &WorkerContext, now_ms: u64) {
             eprintln!("[release_expired_reserves] accept {payment_id:?}: {err:?}");
         }
     }
+}
+
+/// Keep one row for `payer`. A repeat of the same amount is a no-op.
+/// A different amount replaces that row. Extra rows for the same payer are
+/// dropped, because the offer path reads the first match.
+fn set_receive_ceiling(owner: &mut Owner, payer: Uuid, max_nanodollars: i64) -> bool {
+    if max_nanodollars < 0 {
+        return false;
+    }
+    let mut kept = false;
+    let mut changed = false;
+    owner.receive_ceilings.retain(|row| {
+        if row.payer != payer {
+            return true;
+        }
+        if kept {
+            changed = true;
+            return false;
+        }
+        kept = true;
+        if row.max_nanodollars != max_nanodollars {
+            changed = true;
+        }
+        true
+    });
+    if let Some(row) = owner.receive_ceilings.iter_mut().find(|row| row.payer == payer) {
+        row.max_nanodollars = max_nanodollars;
+        return changed;
+    }
+    owner.receive_ceilings.push(ReceiveCeiling { payer, max_nanodollars });
+    true
 }
 
 fn upsert_purse(owner: &mut Owner, purse: &Purse) -> bool {
@@ -4198,6 +4247,8 @@ struct MergedState {
     pending: HashMap<Uuid, PendingAccept>,
     /// clearing id → dual-signed records. Two bodies of one id are both kept.
     clearings: HashMap<Uuid, Vec<ClearingRecord>>,
+    /// payer → (ceiling, priority of the write that set it).
+    ceilings: HashMap<Uuid, (i64, EntryPriority)>,
 }
 
 /// Per-contact accumulator: the winning snapshot plus the priority of the
@@ -4281,6 +4332,7 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
         ledger: HashMap::new(),
         pending: HashMap::new(),
         clearings: HashMap::new(),
+        ceilings: HashMap::new(),
     };
 
     // First pass: collect tombstones. Tombstone wins globally for its target,
@@ -4446,6 +4498,18 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
             }
             Change::RecordClearing { record } => {
                 replay_clearing(&mut state, record);
+            }
+            Change::SetReceiveCeiling { payer, max_nanodollars } => {
+                if max_nanodollars < 0 {
+                    continue;
+                }
+                let win = match state.ceilings.get(&payer) {
+                    Some((_, prev)) => prio > *prev,
+                    None => true,
+                };
+                if win {
+                    state.ceilings.insert(payer, (max_nanodollars, prio));
+                }
             }
         }
     }
@@ -4809,6 +4873,20 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
                 continue;
             }
             out.push(Change::RecordClearing { record: record.clone() });
+        }
+    }
+
+    let mut payers: Vec<Uuid> = current.ceilings.keys()
+        .chain(target.ceilings.keys())
+        .copied()
+        .collect();
+    payers.sort();
+    payers.dedup();
+    for payer in payers {
+        let Some((want, _)) = target.ceilings.get(&payer) else { continue };
+        match current.ceilings.get(&payer) {
+            Some((now, _)) if now == want => {}
+            _ => out.push(Change::SetReceiveCeiling { payer, max_nanodollars: *want }),
         }
     }
 
@@ -5615,5 +5693,55 @@ mod purse_sync_tests {
         assert_eq!(owner.clearings.len(), 2);
         assert_eq!(crate::payment::net_nanodollars(&owner, contact), 0);
         assert!(owner.purses.is_empty());
+    }
+
+    #[test]
+    fn merge_applies_a_receive_ceiling_without_moving_the_purse() {
+        let payer = [0x31; 16];
+        let change = Change::SetReceiveCeiling { payer, max_nanodollars: 5_000_000 };
+        assert_eq!(deserialize_change(&serialize_change(&change)).unwrap(), change);
+        let entry = |seq: u64, change: Change| WriteLogEntry {
+            version: SyncVersion { writer_sg_uuid: [0xA1; 16], epoch: 1, seq },
+            scope: Scope::Private,
+            change_payload: serialize_change(&change),
+            committed_at: SystemTime::UNIX_EPOCH,
+        };
+        let created = entry(1, Change::UpsertPurse { purse: media() });
+        let ceiling = entry(2, change);
+        let out = merge_logs(
+            &[created.clone()],
+            &[created, ceiling],
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(out.changes_to_apply.len(), 1, "{:?}", out.changes_to_apply);
+        assert!(matches!(
+            out.changes_to_apply[0],
+            Change::SetReceiveCeiling { max_nanodollars: 5_000_000, .. }
+        ));
+
+        let mut owner = Node::new().owner;
+        apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
+        owner.purses[0].available_nanodollars = 4_000_000;
+        owner.receive_ceilings.push(ReceiveCeiling { payer, max_nanodollars: 1 });
+        owner.receive_ceilings.push(ReceiveCeiling { payer, max_nanodollars: 9 });
+        assert!(apply_change_to_owner(&mut owner, &out.changes_to_apply[0]).unwrap());
+        assert!(!apply_change_to_owner(&mut owner, &out.changes_to_apply[0]).unwrap());
+        assert_eq!(owner.receive_ceilings.len(), 1);
+        assert_eq!(owner.receive_ceilings[0].payer, payer);
+        assert_eq!(owner.receive_ceilings[0].max_nanodollars, 5_000_000);
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
+        assert!(owner.reserves.is_empty());
+        assert!(owner.ledger.is_empty());
+
+        let replaced = Change::SetReceiveCeiling { payer, max_nanodollars: 0 };
+        assert!(apply_change_to_owner(&mut owner, &replaced).unwrap());
+        assert_eq!(owner.receive_ceilings.len(), 1);
+        assert_eq!(owner.receive_ceilings[0].max_nanodollars, 0);
+        assert!(!apply_change_to_owner(&mut owner, &Change::SetReceiveCeiling {
+            payer,
+            max_nanodollars: -1,
+        }).unwrap());
+        assert_eq!(owner.receive_ceilings[0].max_nanodollars, 0);
+        assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
     }
 }
