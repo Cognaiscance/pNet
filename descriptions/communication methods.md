@@ -130,8 +130,10 @@ packet when it decrypts the delivery.
 - Success: `[0x00][count:u16 be]` then, ordered by name then id, each purse
   the caller's alias belongs to:
   `[id:16][name][kind:u8][allotment:i64 be][available:i64 be]`
-- `kind` is 0 (fixed). Amounts are nanodollars. Another alias's purses are
-  absent. Count 0 is success. The read does not change a purse.
+- `kind` is 0 (fixed) or 1 (monthly). Amounts are nanodollars. Another alias's
+  purses are absent. Count 0 is success. The read does not change a purse.
+  A monthly purse refills to its allotment at the UTC month on the writer's
+  clock. Unspent amount does not carry over.
 - Errors: `ERR_BAD_PACKET`, `ERR_TOKEN_UNKNOWN`, `ERR_NOT_APPROVED`
 
 ### 6 — list incoming payments
@@ -155,7 +157,7 @@ packet when it decrypts the delivery.
 - Success: `[0x00][available:i64 be][expires_at_ms:u64 be]`. `available` is what the purse still has. The hold lasts 24 hours from the writer's clock. The same payment id and the same body return this result again and do not reduce the available amount a second time. After a confirmation, the same id returns the purse's current available amount and the line's expiry, and does not reserve again.
 - A node that is not the writer replies `ERR_NO_WRITER` and does not change the purse. When this node is the writer and holds the user key, it signs an offer and sends op `0x60` to the contact. The offer does not name the purse. A missing session leaves the hold until a retry, a refusal, or expiry.
 - Errors: `ERR_BAD_PACKET`, `ERR_TOKEN_UNKNOWN`, `ERR_NOT_APPROVED`, `ERR_NO_WRITER`, `ERR_NOT_IN_PURSE`, `ERR_OVER_PURSE`, `ERR_PAYMENT_MISMATCH`.
-- When the hold expires without a confirmation, the writer adds the amount back. A later reserve with a new payment id can use it. A confirmed payment is not added back.
+- When the hold expires without a confirmation, the writer adds the amount back. A later reserve with a new payment id can use it. A confirmed payment is not added back. A hold taken in an earlier UTC month on a monthly purse is not added back. The new month starts at the allotment.
 
 ### 0x60 — payment offer
 

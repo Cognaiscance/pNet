@@ -254,10 +254,10 @@ The token must belong to an approved app on this device. The reply lists only pu
 0x00
 || count (u16)
 ||   repeated purse
-||     id (16) || name || kind (u8, 0 = fixed) || allotment (i64) || available (i64)
+||     id (16) || name || kind (u8, 0 = fixed, 1 = monthly) || allotment (i64) || available (i64)
 ```
 
-Amounts are nanodollars, big-endian. Kind is 0. Monthly purses are not stored. The count is a `u16` so a later payment list can pass 255 lines without a new header. This read does not change the available amount. Available is signed: a debt copied back after the purse was spent again can make it negative.
+Amounts are nanodollars, big-endian. Kind 0 is a fixed purse. Kind 1 is a monthly purse: the rank-1 writer starts it again at the allotment on each UTC month, and unspent amount does not carry. The count is a `u16` so a later payment list can pass 255 lines without a new header. This read does not change the available amount. Available is signed: a debt copied back after the purse was spent again can make it negative.
 
 Errors: `bad packet`, `token unknown`, `not approved`.
 

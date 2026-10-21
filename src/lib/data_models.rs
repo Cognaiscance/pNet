@@ -866,6 +866,11 @@ pub fn format_nanodollars(amount: i64) -> String {
 /// A user-owned spending limit. Membership is by app alias, so every device
 /// that runs the alias shares it. A reserve reduces `available_nanodollars`
 /// until it expires. Incoming payments do not raise it.
+///
+/// `kind` is [`crate::wire::PURSE_KIND_FIXED`] or
+/// [`crate::wire::PURSE_KIND_MONTHLY`]. `period` is the UTC month
+/// (`year * 12 + month`, January is 0) that `available_nanodollars` belongs
+/// to. A fixed purse stores 0. An old save omits both and loads as fixed.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub struct Purse {
     #[serde(with = "serde_bytes_16")]
@@ -874,6 +879,10 @@ pub struct Purse {
     pub allotment_nanodollars: i64,
     pub available_nanodollars: i64,
     pub aliases: Vec<String>,
+    #[serde(default)]
+    pub kind: u8,
+    #[serde(default)]
+    pub period: u32,
 }
 
 impl Purse {
@@ -907,6 +916,25 @@ pub fn unix_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// UTC calendar month for `now_ms`, as `year * 12 + month` with January as 0.
+/// The rank-1 writer uses this as the month a purse's available amount
+/// belongs to. Unspent amount does not carry into the next period.
+pub fn utc_month_period(now_ms: u64) -> u32 {
+    // Howard Hinnant's civil_from_days, from Unix days.
+    let days = (now_ms / 1000) / 86_400;
+    let z = (days as i64).saturating_add(719_468);
+    let era = if z >= 0 { z } else { z.saturating_sub(146_096) } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    let year = u32::try_from(year).unwrap_or(0);
+    year.saturating_mul(12).saturating_add((month as u32).saturating_sub(1))
+}
+
 /// One hold against a purse. The same `payment_id` is the same hold.
 /// `expires_at_ms` is the writer's clock. Contacts do not receive this record.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -922,6 +950,11 @@ pub struct PaymentReserve {
     pub note: String,
     pub paying_alias: String,
     pub expires_at_ms: u64,
+    /// UTC month the hold was taken against. 0 on a fixed purse and on a
+    /// save from before monthly purses. A release refunds only when this
+    /// still matches the purse's period.
+    #[serde(default)]
+    pub period: u32,
 }
 
 impl PaymentReserve {
@@ -1245,6 +1278,15 @@ mod tests {
         assert_eq!(parse_dollar_to_nanodollars("-1"), None);
         assert_eq!(parse_dollar_to_nanodollars("0.0000000001"), None);
         assert_eq!(parse_dollar_to_nanodollars(""), None);
+    }
+
+    #[test]
+    fn utc_month_period_is_the_calendar_month() {
+        assert_eq!(utc_month_period(0), 1970 * 12);
+        assert_eq!(utc_month_period(2_678_400_000), 1970 * 12 + 1);
+        assert_eq!(utc_month_period(1_790_812_800_000), 2026 * 12 + 9);
+        assert_eq!(utc_month_period(1_793_404_800_000), 2026 * 12 + 9);
+        assert_eq!(utc_month_period(1_793_491_200_000), 2026 * 12 + 10);
     }
 
     #[test]

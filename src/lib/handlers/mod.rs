@@ -810,6 +810,8 @@ mod tests {
             allotment_nanodollars: allotment,
             available_nanodollars: available,
             aliases: aliases.iter().map(|alias| (*alias).to_string()).collect(),
+            kind: PURSE_KIND_FIXED,
+            period: 0,
         });
     }
 
@@ -891,6 +893,26 @@ mod tests {
 
         let after = t.ctx.node.read().unwrap().owner.purses.clone();
         assert_eq!(before, after, "a read must not change the stored purses");
+    }
+
+    #[test]
+    fn app_list_purses_reports_a_monthly_kind() {
+        let t = TestCtx::new();
+        let client = register_and_get_token(&t, "discordium-client", 9091);
+        approve_local_app(&t, &client);
+        install_purse(&t, [0x77; 16], "month", 5_000_000, 4_000_000, &["discordium-client"]);
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            let purse = node.owner.purses.iter_mut().find(|purse| purse.id == [0x77; 16]).unwrap();
+            purse.kind = PURSE_KIND_MONTHLY;
+            purse.period = 2026 * 12 + 9;
+        }
+        app_list_purses(t.app_addr(), client.to_vec(), &t.ctx);
+        let rows = parse_purse_list(&t.recv_reply());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, PURSE_KIND_MONTHLY);
+        assert_eq!(rows[0].allotment, 5_000_000);
+        assert_eq!(rows[0].available, 4_000_000);
     }
 
     #[test]
