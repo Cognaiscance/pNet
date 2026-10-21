@@ -692,28 +692,31 @@ pub struct Owner {
     /// Holds against those purses. Private scope, same as `purses`.
     #[serde(default)]
     pub reserves: Vec<PaymentReserve>,
-    /// How much of one payer's credit this user will still accept.
+    /// How much of one payer's tab this user will still run.
     /// A payer with no row is at zero. Private scope.
-    #[serde(default)]
-    pub receive_ceilings: Vec<ReceiveCeiling>,
-    /// Confirmed payments. Private scope. Ops `0x06` and `0x07` list the lines for one alias.
-    /// A clearing does not remove a line from this list.
-    #[serde(default)]
-    pub ledger: Vec<LedgerLine>,
+    /// The saved name stays `receive_ceilings`.
+    #[serde(default, rename = "receive_ceilings")]
+    pub run_limits: Vec<RunLimit>,
+    /// Confirmed charges. Private scope. Ops `0x06` and `0x07` list the charges for one alias.
+    /// A settlement does not remove a charge from this list.
+    /// The saved name stays `ledger`.
+    #[serde(default, rename = "ledger")]
+    pub charges: Vec<Charge>,
     /// Offers this user signed and has not yet been told are stored.
     /// They count against the payer's ceiling. Private scope.
     #[serde(default)]
     pub pending_accepts: Vec<PendingAccept>,
-    /// Dual-signed clearings. A named payment id no longer counts toward the
-    /// net or the receive ceiling. The line stays on the ledger. Private scope.
-    #[serde(default)]
-    pub clearings: Vec<ClearingRecord>,
+    /// Dual-signed settlements. A named charge no longer counts toward the
+    /// tab or toward what you'll run. The charge stays in this list. Private scope.
+    /// The saved name stays `clearings`.
+    #[serde(default, rename = "clearings")]
+    pub settlements: Vec<Settlement>,
     /// In-progress payment index from a contact. Dropped when the list ends.
     #[serde(skip)]
     pub payment_index: HashMap<Uuid, PaymentIndexAccum>,
-    /// In-progress clearing index from a contact. Separate from `payment_index`.
+    /// In-progress settlement index from a contact. Separate from `payment_index`.
     #[serde(skip)]
-    pub clearing_index: HashMap<Uuid, PaymentIndexAccum>,
+    pub settlement_index: HashMap<Uuid, PaymentIndexAccum>,
 
     /// Latest version of the user's **private** state held by this node.
     /// On the writer SG this is authoritative; on other nodes it's the
@@ -972,18 +975,18 @@ impl PaymentReserve {
     }
 }
 
-/// The most of one payer's credit this user will accept. Missing means zero.
+/// The most of one payer's tab this user will still run. Missing means zero.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
-pub struct ReceiveCeiling {
+pub struct RunLimit {
     #[serde(with = "serde_bytes_16")]
     pub payer: Uuid,
     pub max_nanodollars: i64,
 }
 
-/// A confirmed payment. `purse_id` is the payer's local purse and is zero on
+/// One charge on a tab. `purse_id` is the payer's local purse and is zero on
 /// the payee, who is not told which purse paid.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
-pub struct LedgerLine {
+pub struct Charge {
     #[serde(with = "serde_bytes_16")]
     pub payment_id: Uuid,
     pub amount_nanodollars: i64,
@@ -1006,9 +1009,9 @@ pub struct LedgerLine {
 /// `user_lo` sorts before `user_hi`. `payment_ids` is strictly increasing.
 /// `sig_lo` and `sig_hi` are those users' signatures over the same body.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
-pub struct ClearingRecord {
-    #[serde(with = "serde_bytes_16")]
-    pub clearing_id: Uuid,
+pub struct Settlement {
+    #[serde(with = "serde_bytes_16", rename = "clearing_id")]
+    pub settlement_id: Uuid,
     #[serde(with = "serde_bytes_16")]
     pub user_lo: Uuid,
     #[serde(with = "serde_bytes_16")]
@@ -1232,12 +1235,12 @@ impl Node {
                 outbound_app_invitations:   Vec::new(),
                 purses:                     Vec::new(),
                 reserves:                   Vec::new(),
-                receive_ceilings:           Vec::new(),
-                ledger:                     Vec::new(),
+                run_limits:           Vec::new(),
+                charges:                     Vec::new(),
                 pending_accepts:            Vec::new(),
-                clearings:                  Vec::new(),
+                settlements:                  Vec::new(),
                 payment_index:              HashMap::new(),
-                clearing_index:             HashMap::new(),
+                settlement_index:             HashMap::new(),
                 private_version:            SyncVersion::zero(),
                 public_version:             SyncVersion::zero(),
                 write_log:                  Vec::new(),

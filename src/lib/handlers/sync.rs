@@ -10,15 +10,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
 use super::super::data_models::{
-    AppGrant, AppInvitation, Application, ClearingRecord, Contact, Device, DeviceGrade,
-    Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, LedgerLine, Node, Owner,
-    PaymentReserve, PendingAccept, Purse, ReceiveCeiling,
+    AppGrant, AppInvitation, Application, Settlement, Contact, Device, DeviceGrade,
+    Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Charge, Node, Owner,
+    PaymentReserve, PendingAccept, Purse, RunLimit,
     Scope, SyncVersion, User, Uuid, WriteLogEntry, X25519PublicKey, WRITE_LOG_RETENTION,
     unix_time_ms, utc_month_period, RESERVE_TTL_MS,
 };
 use super::super::payment::{
-    body_from_line, body_from_pending, claim_exceeds_ceiling, clearing_record_ok, decode_accept_at,
-    decode_clearing_record_at, decode_confirm_at, encode_accept, encode_clearing_record, encode_confirm,
+    body_from_line, body_from_pending, claim_exceeds_run, settlement_ok, decode_accept_at,
+    decode_settlement_at, decode_confirm_at, encode_accept, encode_settlement, encode_confirm,
     line_covers, line_from, line_same_payment, offer_body_ok, pending_covers, pending_from,
 };
 use super::super::wire::*;
@@ -453,12 +453,12 @@ pub enum Change {
     /// A repeat of the same hold does not reduce the available amount again.
     ReservePayment { reserve: PaymentReserve },
     /// Private-scope: return a hold to its purse. A missing id is a no-op.
-    /// A payment that already became a ledger line is not refunded.
+    /// A payment that already became a charges line is not refunded.
     ReleaseReserve { payment_id: Uuid },
     /// Private-scope: store one confirmed payment. On the payer this consumes
     /// the matching hold without putting the amount back. On the payee it
     /// requires the staged accept.
-    RecordLedger { line: LedgerLine },
+    RecordCharge { line: Charge },
     /// Private-scope: remember a signed accept so it counts against the ceiling.
     StageAccept { pending: PendingAccept },
     /// Private-scope: forget a staged accept. This does not touch a purse.
@@ -466,11 +466,11 @@ pub enum Change {
     /// Private-scope: store one dual-signed clearing. The same signed bytes are
     /// one record. A different body of the same id is kept. This does not
     /// change a purse, and it does not require the named lines to be present yet.
-    RecordClearing { record: ClearingRecord },
+    RecordSettlement { record: Settlement },
     /// Private-scope: set one payer's receive ceiling. The same payer and amount
     /// is a no-op. A different amount replaces that payer's row. This does not
     /// change a purse, a reserve, or the net. Contacts are not told the number.
-    SetReceiveCeiling { payer: Uuid, max_nanodollars: i64 },
+    SetRunLimit { payer: Uuid, max_nanodollars: i64 },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
@@ -496,11 +496,11 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
         Change::UpsertPurse { .. }             => &[Scope::Private],
         Change::ReservePayment { .. }          => &[Scope::Private],
         Change::ReleaseReserve { .. }          => &[Scope::Private],
-        Change::RecordLedger { .. }            => &[Scope::Private],
+        Change::RecordCharge { .. }            => &[Scope::Private],
         Change::StageAccept { .. }             => &[Scope::Private],
         Change::DropAccept { .. }              => &[Scope::Private],
-        Change::RecordClearing { .. }          => &[Scope::Private],
-        Change::SetReceiveCeiling { .. }       => &[Scope::Private],
+        Change::RecordSettlement { .. }          => &[Scope::Private],
+        Change::SetRunLimit { .. }       => &[Scope::Private],
     }
 }
 
@@ -636,8 +636,8 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
             buf.push(CHANGE_KIND_RELEASE_RESERVE);
             buf.extend_from_slice(payment_id);
         }
-        Change::RecordLedger { line } => {
-            buf.push(CHANGE_KIND_RECORD_LEDGER);
+        Change::RecordCharge { line } => {
+            buf.push(CHANGE_KIND_RECORD_CHARGE);
             push_line(&mut buf, line);
         }
         Change::StageAccept { pending } => {
@@ -648,12 +648,12 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
             buf.push(CHANGE_KIND_DROP_ACCEPT);
             buf.extend_from_slice(payment_id);
         }
-        Change::RecordClearing { record } => {
-            buf.push(CHANGE_KIND_RECORD_CLEARING);
-            push_clearing(&mut buf, record);
+        Change::RecordSettlement { record } => {
+            buf.push(CHANGE_KIND_RECORD_SETTLEMENT);
+            push_settlement(&mut buf, record);
         }
-        Change::SetReceiveCeiling { payer, max_nanodollars } => {
-            buf.push(CHANGE_KIND_SET_RECEIVE_CEILING);
+        Change::SetRunLimit { payer, max_nanodollars } => {
+            buf.push(CHANGE_KIND_SET_RUN_LIMIT);
             buf.extend_from_slice(payer);
             push_i64(&mut buf, *max_nanodollars);
         }
@@ -787,9 +787,9 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
             let payment_id: Uuid = read_arr(data, &mut pos)?;
             Some(Change::ReleaseReserve { payment_id })
         }
-        CHANGE_KIND_RECORD_LEDGER => {
+        CHANGE_KIND_RECORD_CHARGE => {
             let line = read_line(data, &mut pos)?;
-            Some(Change::RecordLedger { line })
+            Some(Change::RecordCharge { line })
         }
         CHANGE_KIND_STAGE_ACCEPT => {
             let pending = read_pending(data, &mut pos)?;
@@ -799,14 +799,14 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
             let payment_id: Uuid = read_arr(data, &mut pos)?;
             Some(Change::DropAccept { payment_id })
         }
-        CHANGE_KIND_RECORD_CLEARING => {
-            let record = read_clearing(data, &mut pos)?;
-            Some(Change::RecordClearing { record })
+        CHANGE_KIND_RECORD_SETTLEMENT => {
+            let record = read_settlement(data, &mut pos)?;
+            Some(Change::RecordSettlement { record })
         }
-        CHANGE_KIND_SET_RECEIVE_CEILING => {
+        CHANGE_KIND_SET_RUN_LIMIT => {
             let payer: Uuid = read_arr(data, &mut pos)?;
             let max_nanodollars = read_i64(data, &mut pos)?;
-            Some(Change::SetReceiveCeiling { payer, max_nanodollars })
+            Some(Change::SetRunLimit { payer, max_nanodollars })
         }
         _ => None,
     }
@@ -1024,12 +1024,12 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
         Change::UpsertPurse { purse } => upsert_purse(owner, purse),
         Change::ReservePayment { reserve } => apply_reserve(owner, reserve)?,
         Change::ReleaseReserve { payment_id } => apply_release(owner, *payment_id),
-        Change::RecordLedger { line } => apply_record(owner, line)?,
+        Change::RecordCharge { line } => apply_charge(owner, line)?,
         Change::StageAccept { pending } => apply_stage(owner, pending)?,
         Change::DropAccept { payment_id } => apply_drop(owner, *payment_id),
-        Change::RecordClearing { record } => apply_clearing(owner, record)?,
-        Change::SetReceiveCeiling { payer, max_nanodollars } => {
-            set_receive_ceiling(owner, *payer, *max_nanodollars)
+        Change::RecordSettlement { record } => apply_settlement(owner, record)?,
+        Change::SetRunLimit { payer, max_nanodollars } => {
+            set_run_limit(owner, *payer, *max_nanodollars)
         }
     };
     Ok(applied)
@@ -1043,7 +1043,7 @@ fn apply_reserve(owner: &mut Owner, reserve: &PaymentReserve) -> Result<bool, Wr
     {
         return Err(WriteError::Validation("reserve fields".into()));
     }
-    if let Some(line) = owner.ledger.iter().find(|line| line.payment_id == reserve.payment_id) {
+    if let Some(line) = owner.charges.iter().find(|line| line.payment_id == reserve.payment_id) {
         if line_same_payment(line, reserve, owner.user.uuid) {
             return Ok(false);
         }
@@ -1070,7 +1070,7 @@ fn apply_reserve(owner: &mut Owner, reserve: &PaymentReserve) -> Result<bool, Wr
 }
 
 fn apply_release(owner: &mut Owner, payment_id: Uuid) -> bool {
-    if owner.ledger.iter().any(|line| line.payment_id == payment_id) {
+    if owner.charges.iter().any(|line| line.payment_id == payment_id) {
         let before = owner.reserves.len();
         owner.reserves.retain(|reserve| reserve.payment_id != payment_id);
         return before != owner.reserves.len();
@@ -1098,23 +1098,23 @@ fn reserve_refunds(purse: &Purse, reserve: &PaymentReserve) -> bool {
     purse.kind != PURSE_KIND_MONTHLY || reserve.period == 0 || reserve.period == purse.period
 }
 
-fn apply_record(owner: &mut Owner, line: &LedgerLine) -> Result<bool, WriteError> {
+fn apply_charge(owner: &mut Owner, line: &Charge) -> Result<bool, WriteError> {
     if !offer_body_ok(&body_from_line(line)) {
-        return Err(WriteError::Validation("ledger fields".into()));
+        return Err(WriteError::Validation("charge fields".into()));
     }
     // The same signed bytes are the same payment. A different body is kept.
     // The purse is charged only for the first body, and only when this record
     // names one purse that lists the paying alias and no matching hold remains.
-    if owner.ledger.iter().any(|stored| same_record(stored, line)) {
+    if owner.charges.iter().any(|stored| same_charge(stored, line)) {
         let removed_reserve = take_matching_reserve(owner, line);
         let removed_pending = take_matching_pending(owner, line);
         return Ok(removed_reserve || removed_pending);
     }
-    if owner.ledger.iter().any(|stored| stored.payment_id == line.payment_id) {
+    if owner.charges.iter().any(|stored| stored.payment_id == line.payment_id) {
         take_matching_pending(owner, line);
         let mut stored = line.clone();
         stored.purse_id = [0u8; 16];
-        owner.ledger.push(stored);
+        owner.charges.push(stored);
         return Ok(true);
     }
     let reserve_purse = owner.reserves.iter().find_map(|reserve| {
@@ -1126,7 +1126,7 @@ fn apply_record(owner: &mut Owner, line: &LedgerLine) -> Result<bool, WriteError
         take_reserve_no_refund(owner, line.payment_id);
         let mut stored = line.clone();
         stored.purse_id = purse_id;
-        owner.ledger.push(stored);
+        owner.charges.push(stored);
         return Ok(true);
     }
     let mut stored = line.clone();
@@ -1136,13 +1136,13 @@ fn apply_record(owner: &mut Owner, line: &LedgerLine) -> Result<bool, WriteError
                 purse.available_nanodollars = purse
                     .available_nanodollars
                     .saturating_sub(stored.amount_nanodollars);
-                owner.ledger.push(stored);
+                owner.charges.push(stored);
                 return Ok(true);
             }
         }
     }
     stored.purse_id = [0u8; 16];
-    owner.ledger.push(stored);
+    owner.charges.push(stored);
     Ok(true)
 }
 
@@ -1151,7 +1151,7 @@ fn apply_stage(owner: &mut Owner, pending: &PendingAccept) -> Result<bool, Write
         return Err(WriteError::Validation("accept fields".into()));
     }
     let body = body_from_pending(pending);
-    if let Some(line) = owner.ledger.iter().find(|line| line.payment_id == pending.payment_id) {
+    if let Some(line) = owner.charges.iter().find(|line| line.payment_id == pending.payment_id) {
         if line_covers(line, &body, &pending.payer_sig) {
             return Ok(false);
         }
@@ -1163,7 +1163,7 @@ fn apply_stage(owner: &mut Owner, pending: &PendingAccept) -> Result<bool, Write
         }
         return Err(WriteError::PaymentRejected(PaymentReject::Mismatch));
     }
-    if claim_exceeds_ceiling(owner, pending.payer, pending.amount_nanodollars, Some(pending.payment_id)) {
+    if claim_exceeds_run(owner, pending.payer, pending.amount_nanodollars, Some(pending.payment_id)) {
         return Err(WriteError::PaymentRejected(PaymentReject::OverCeiling));
     }
     owner.pending_accepts.push(pending.clone());
@@ -1174,18 +1174,18 @@ fn apply_drop(owner: &mut Owner, payment_id: Uuid) -> bool {
     take_pending(owner, payment_id)
 }
 
-fn apply_clearing(owner: &mut Owner, record: &ClearingRecord) -> Result<bool, WriteError> {
-    if !clearing_record_ok(record) {
-        return Err(WriteError::Validation("clearing fields".into()));
+fn apply_settlement(owner: &mut Owner, record: &Settlement) -> Result<bool, WriteError> {
+    if !settlement_ok(record) {
+        return Err(WriteError::Validation("settlement fields".into()));
     }
-    if owner.clearings.iter().any(|stored| stored == record) {
+    if owner.settlements.iter().any(|stored| stored == record) {
         return Ok(false);
     }
-    owner.clearings.push(record.clone());
+    owner.settlements.push(record.clone());
     Ok(true)
 }
 
-fn same_record(left: &LedgerLine, right: &LedgerLine) -> bool {
+fn same_charge(left: &Charge, right: &Charge) -> bool {
     body_from_line(left) == body_from_line(right)
         && left.payer_sig == right.payer_sig
         && left.payee_sig == right.payee_sig
@@ -1198,7 +1198,7 @@ fn take_reserve_no_refund(owner: &mut Owner, payment_id: Uuid) -> bool {
     before != owner.reserves.len()
 }
 
-fn take_matching_reserve(owner: &mut Owner, line: &LedgerLine) -> bool {
+fn take_matching_reserve(owner: &mut Owner, line: &Charge) -> bool {
     let matches = owner.reserves.iter().any(|reserve| {
         reserve.payment_id == line.payment_id && line_same_payment(line, reserve, line.payer)
     });
@@ -1208,7 +1208,7 @@ fn take_matching_reserve(owner: &mut Owner, line: &LedgerLine) -> bool {
     take_reserve_no_refund(owner, line.payment_id)
 }
 
-fn take_matching_pending(owner: &mut Owner, line: &LedgerLine) -> bool {
+fn take_matching_pending(owner: &mut Owner, line: &Charge) -> bool {
     let body = body_from_line(line);
     let matches = owner.pending_accepts.iter().any(|pending| {
         pending.payment_id == line.payment_id
@@ -1284,13 +1284,13 @@ pub(crate) fn release_expired_reserves_at(ctx: &WorkerContext, now_ms: u64) {
 /// Keep one row for `payer`. A repeat of the same amount is a no-op.
 /// A different amount replaces that row. Extra rows for the same payer are
 /// dropped, because the offer path reads the first match.
-fn set_receive_ceiling(owner: &mut Owner, payer: Uuid, max_nanodollars: i64) -> bool {
+fn set_run_limit(owner: &mut Owner, payer: Uuid, max_nanodollars: i64) -> bool {
     if max_nanodollars < 0 {
         return false;
     }
     let mut kept = false;
     let mut changed = false;
-    owner.receive_ceilings.retain(|row| {
+    owner.run_limits.retain(|row| {
         if row.payer != payer {
             return true;
         }
@@ -1304,11 +1304,11 @@ fn set_receive_ceiling(owner: &mut Owner, payer: Uuid, max_nanodollars: i64) -> 
         }
         true
     });
-    if let Some(row) = owner.receive_ceilings.iter_mut().find(|row| row.payer == payer) {
+    if let Some(row) = owner.run_limits.iter_mut().find(|row| row.payer == payer) {
         row.max_nanodollars = max_nanodollars;
         return changed;
     }
-    owner.receive_ceilings.push(ReceiveCeiling { payer, max_nanodollars });
+    owner.run_limits.push(RunLimit { payer, max_nanodollars });
     true
 }
 
@@ -2118,11 +2118,11 @@ fn send_pull_request(scope: Scope, last_seen: SyncVersion, conn_id: u16, ctx: &W
 //
 // The Private-scope state blob is a purse snapshot:
 //   [marker: 0xB7][count: u16][purse…]
-//   then reserves, ceilings, lines, staged accepts, and clearings.
+//   then reserves, ceilings, lines, staged accepts, and settlements.
 //   then each purse's kind and UTC month, and each reserve's month.
 // An empty blob is a legacy writer and does not clear the puller's purses.
-// A blob that ends before the clearing count has no clearings.
-// A blob that ends at the clearings has fixed purses and reserve month 0.
+// A blob that ends before the clearing count has no settlements.
+// A blob that ends at the settlements has fixed purses and reserve month 0.
 
 pub(crate) fn serialize_public_state(node: &Node) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -2236,24 +2236,24 @@ fn push_reserve(buf: &mut Vec<u8>, reserve: &PaymentReserve) {
     buf.extend_from_slice(&reserve.expires_at_ms.to_be_bytes());
 }
 
-fn push_ceiling(buf: &mut Vec<u8>, ceiling: &ReceiveCeiling) {
+fn push_run_limit(buf: &mut Vec<u8>, ceiling: &RunLimit) {
     buf.extend_from_slice(&ceiling.payer);
     push_i64(buf, ceiling.max_nanodollars);
 }
 
-fn read_ceiling(data: &[u8], pos: &mut usize) -> Option<ReceiveCeiling> {
+fn read_run_limit(data: &[u8], pos: &mut usize) -> Option<RunLimit> {
     let payer: Uuid = read_arr(data, pos)?;
     let max_nanodollars = read_i64(data, pos)?;
-    Some(ReceiveCeiling { payer, max_nanodollars })
+    Some(RunLimit { payer, max_nanodollars })
 }
 
-fn push_line(buf: &mut Vec<u8>, line: &LedgerLine) {
+fn push_line(buf: &mut Vec<u8>, line: &Charge) {
     let body = body_from_line(line);
     buf.extend(encode_confirm(&body, &line.payer_sig, &line.payee_sig, &line.confirm_sig));
     buf.extend_from_slice(&line.purse_id);
 }
 
-fn read_line(data: &[u8], pos: &mut usize) -> Option<LedgerLine> {
+fn read_line(data: &[u8], pos: &mut usize) -> Option<Charge> {
     let (body, payer_sig, payee_sig, confirm_sig) = decode_confirm_at(data, pos)?;
     let purse_id: Uuid = read_arr(data, pos)?;
     Some(line_from(&body, purse_id, payer_sig, payee_sig, confirm_sig))
@@ -2269,12 +2269,12 @@ fn read_pending(data: &[u8], pos: &mut usize) -> Option<PendingAccept> {
     Some(pending_from(&body, payer_sig, payee_sig))
 }
 
-fn push_clearing(buf: &mut Vec<u8>, record: &ClearingRecord) {
-    buf.extend(encode_clearing_record(record));
+fn push_settlement(buf: &mut Vec<u8>, record: &Settlement) {
+    buf.extend(encode_settlement(record));
 }
 
-fn read_clearing(data: &[u8], pos: &mut usize) -> Option<ClearingRecord> {
-    decode_clearing_record_at(data, pos)
+fn read_settlement(data: &[u8], pos: &mut usize) -> Option<Settlement> {
+    decode_settlement_at(data, pos)
 }
 
 fn read_reserve(data: &[u8], pos: &mut usize) -> Option<PaymentReserve> {
@@ -2318,17 +2318,17 @@ fn read_reserve_change(data: &[u8], pos: &mut usize) -> Option<PaymentReserve> {
 enum PrivateSnapshot {
     /// Writer predates purses. Leave the puller's purse list alone.
     LegacyEmpty,
-    /// Purses, holds, ceilings, confirmed lines, staged accepts, and clearings.
+    /// Purses, holds, ceilings, confirmed lines, staged accepts, and settlements.
     /// A blob that ends after the purses has no holds. A blob that ends after
     /// the holds has no ceilings, lines, or staged accepts. A blob that ends
-    /// after the staged accepts has no clearings.
+    /// after the staged accepts has no settlements.
     Purses {
         purses: Vec<Purse>,
         reserves: Vec<PaymentReserve>,
-        ceilings: Vec<ReceiveCeiling>,
-        ledger: Vec<LedgerLine>,
+        ceilings: Vec<RunLimit>,
+        charges: Vec<Charge>,
         pending: Vec<PendingAccept>,
-        clearings: Vec<ClearingRecord>,
+        settlements: Vec<Settlement>,
     },
 }
 
@@ -2337,15 +2337,15 @@ fn serialize_private_state(node: &Node) -> Vec<u8> {
     purses.sort_by_key(|purse| purse.id);
     let mut reserves = node.owner.reserves.clone();
     reserves.sort_by_key(|reserve| reserve.payment_id);
-    let mut ceilings = node.owner.receive_ceilings.clone();
+    let mut ceilings = node.owner.run_limits.clone();
     ceilings.sort_by_key(|ceiling| ceiling.payer);
-    let mut ledger = node.owner.ledger.clone();
-    ledger.sort_by_key(|line| line.payment_id);
+    let mut charges = node.owner.charges.clone();
+    charges.sort_by_key(|line| line.payment_id);
     let mut pending = node.owner.pending_accepts.clone();
     pending.sort_by_key(|accept| accept.payment_id);
-    let mut clearings = node.owner.clearings.clone();
-    clearings.sort_by(|left, right| {
-        left.clearing_id.cmp(&right.clearing_id).then(left.sig_lo.0.cmp(&right.sig_lo.0))
+    let mut settlements = node.owner.settlements.clone();
+    settlements.sort_by(|left, right| {
+        left.settlement_id.cmp(&right.settlement_id).then(left.sig_lo.0.cmp(&right.sig_lo.0))
     });
     let mut buf = Vec::new();
     buf.push(PURSE_SNAPSHOT_MARKER);
@@ -2359,19 +2359,19 @@ fn serialize_private_state(node: &Node) -> Vec<u8> {
     }
     push_u16(&mut buf, ceilings.len().min(u16::MAX as usize) as u16);
     for ceiling in ceilings.iter().take(u16::MAX as usize) {
-        push_ceiling(&mut buf, ceiling);
+        push_run_limit(&mut buf, ceiling);
     }
-    push_u16(&mut buf, ledger.len().min(u16::MAX as usize) as u16);
-    for line in ledger.iter().take(u16::MAX as usize) {
+    push_u16(&mut buf, charges.len().min(u16::MAX as usize) as u16);
+    for line in charges.iter().take(u16::MAX as usize) {
         push_line(&mut buf, line);
     }
     push_u16(&mut buf, pending.len().min(u16::MAX as usize) as u16);
     for accept in pending.iter().take(u16::MAX as usize) {
         push_pending(&mut buf, accept);
     }
-    push_u16(&mut buf, clearings.len().min(u16::MAX as usize) as u16);
-    for record in clearings.iter().take(u16::MAX as usize) {
-        push_clearing(&mut buf, record);
+    push_u16(&mut buf, settlements.len().min(u16::MAX as usize) as u16);
+    for record in settlements.iter().take(u16::MAX as usize) {
+        push_settlement(&mut buf, record);
     }
     push_u16(&mut buf, purses.len().min(u16::MAX as usize) as u16);
     for purse in purses.iter().take(u16::MAX as usize) {
@@ -2405,9 +2405,9 @@ fn read_private_snapshot(data: &[u8]) -> Option<PrivateSnapshot> {
             purses,
             reserves: Vec::new(),
             ceilings: Vec::new(),
-            ledger: Vec::new(),
+            charges: Vec::new(),
             pending: Vec::new(),
-            clearings: Vec::new(),
+            settlements: Vec::new(),
         });
     }
     let reserve_count = read_u16(data, &mut pos)? as usize;
@@ -2420,20 +2420,20 @@ fn read_private_snapshot(data: &[u8]) -> Option<PrivateSnapshot> {
             purses,
             reserves,
             ceilings: Vec::new(),
-            ledger: Vec::new(),
+            charges: Vec::new(),
             pending: Vec::new(),
-            clearings: Vec::new(),
+            settlements: Vec::new(),
         });
     }
     let ceiling_count = read_u16(data, &mut pos)? as usize;
     let mut ceilings = Vec::with_capacity(ceiling_count);
     for _ in 0..ceiling_count {
-        ceilings.push(read_ceiling(data, &mut pos)?);
+        ceilings.push(read_run_limit(data, &mut pos)?);
     }
     let line_count = read_u16(data, &mut pos)? as usize;
-    let mut ledger = Vec::with_capacity(line_count);
+    let mut charges = Vec::with_capacity(line_count);
     for _ in 0..line_count {
-        ledger.push(read_line(data, &mut pos)?);
+        charges.push(read_line(data, &mut pos)?);
     }
     let pending_count = read_u16(data, &mut pos)? as usize;
     let mut pending = Vec::with_capacity(pending_count);
@@ -2445,18 +2445,18 @@ fn read_private_snapshot(data: &[u8]) -> Option<PrivateSnapshot> {
             purses,
             reserves,
             ceilings,
-            ledger,
+            charges,
             pending,
-            clearings: Vec::new(),
+            settlements: Vec::new(),
         });
     }
     let clearing_count = read_u16(data, &mut pos)? as usize;
-    let mut clearings = Vec::with_capacity(clearing_count);
+    let mut settlements = Vec::with_capacity(clearing_count);
     for _ in 0..clearing_count {
-        clearings.push(read_clearing(data, &mut pos)?);
+        settlements.push(read_settlement(data, &mut pos)?);
     }
     read_month_tail(data, &mut pos, &mut purses, &mut reserves)?;
-    Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings })
+    Some(PrivateSnapshot::Purses { purses, reserves, ceilings, charges, pending, settlements })
 }
 
 /// Kind and month for each purse, then the month of each reserve. Missing
@@ -2505,14 +2505,14 @@ fn apply_private_state(blob: &[u8], ctx: &WorkerContext) -> bool {
     let Some(snapshot) = read_private_snapshot(blob) else {
         return false;
     };
-    if let PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings } = snapshot {
+    if let PrivateSnapshot::Purses { purses, reserves, ceilings, charges, pending, settlements } = snapshot {
         let mut node = ctx.node.write().unwrap();
         node.owner.purses = purses;
         node.owner.reserves = reserves;
-        node.owner.receive_ceilings = ceilings;
-        node.owner.ledger = ledger;
+        node.owner.run_limits = ceilings;
+        node.owner.charges = charges;
         node.owner.pending_accepts = pending;
-        node.owner.clearings = clearings;
+        node.owner.settlements = settlements;
     }
     true
 }
@@ -3044,7 +3044,7 @@ fn stored_reserve_reply(ctx: &WorkerContext, payment_id: Uuid) -> Option<(i64, u
         let purse = node.owner.purses.iter().find(|purse| purse.id == hold.purse_id)?;
         return Some((purse.available_nanodollars, hold.expires_at_ms));
     }
-    let line = node.owner.ledger.iter().find(|line| line.payment_id == payment_id)?;
+    let line = node.owner.charges.iter().find(|line| line.payment_id == payment_id)?;
     let purse = node.owner.purses.iter().find(|purse| purse.id == line.purse_id)?;
     Some((purse.available_nanodollars, line.expires_at_ms))
 }
@@ -4449,11 +4449,11 @@ struct MergedState {
     reserves: HashMap<Uuid, PaymentReserve>,
     /// payment id → confirmed lines, in the order they were recorded.
     /// Two signed bodies of one id are both kept.
-    ledger: HashMap<Uuid, Vec<LedgerLine>>,
+    charges: HashMap<Uuid, Vec<Charge>>,
     /// payment id → staged accept that is not yet a line.
     pending: HashMap<Uuid, PendingAccept>,
     /// clearing id → dual-signed records. Two bodies of one id are both kept.
-    clearings: HashMap<Uuid, Vec<ClearingRecord>>,
+    settlements: HashMap<Uuid, Vec<Settlement>>,
     /// payer → (ceiling, priority of the write that set it).
     ceilings: HashMap<Uuid, (i64, EntryPriority)>,
 }
@@ -4536,9 +4536,9 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
         they_accept: HashMap::new(),
         purses: HashMap::new(),
         reserves: HashMap::new(),
-        ledger: HashMap::new(),
+        charges: HashMap::new(),
         pending: HashMap::new(),
-        clearings: HashMap::new(),
+        settlements: HashMap::new(),
         ceilings: HashMap::new(),
     };
 
@@ -4700,7 +4700,7 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
             Change::ReleaseReserve { payment_id } => {
                 replay_release(&mut state, payment_id);
             }
-            Change::RecordLedger { line } => {
+            Change::RecordCharge { line } => {
                 replay_record(&mut state, line);
             }
             Change::StageAccept { pending } => {
@@ -4709,10 +4709,10 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
             Change::DropAccept { payment_id } => {
                 state.pending.remove(&payment_id);
             }
-            Change::RecordClearing { record } => {
-                replay_clearing(&mut state, record);
+            Change::RecordSettlement { record } => {
+                replay_settlement(&mut state, record);
             }
-            Change::SetReceiveCeiling { payer, max_nanodollars } => {
+            Change::SetRunLimit { payer, max_nanodollars } => {
                 if max_nanodollars < 0 {
                     continue;
                 }
@@ -5031,28 +5031,28 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
             (None, Some(reserve)) => {
                 out.push(Change::ReservePayment { reserve: reserve.clone() });
             }
-            (Some(_), None) if !target.ledger.contains_key(&id) => {
+            (Some(_), None) if !target.charges.contains_key(&id) => {
                 out.push(Change::ReleaseReserve { payment_id: id });
             }
             _ => {}
         }
     }
 
-    let mut line_ids: Vec<Uuid> = current.ledger.keys()
-        .chain(target.ledger.keys())
+    let mut line_ids: Vec<Uuid> = current.charges.keys()
+        .chain(target.charges.keys())
         .copied()
         .collect();
     line_ids.sort();
     line_ids.dedup();
     for id in line_ids {
-        let current_lines = current.ledger.get(&id).map(Vec::as_slice).unwrap_or(&[]);
-        let Some(target_lines) = target.ledger.get(&id) else { continue };
+        let current_lines = current.charges.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+        let Some(target_lines) = target.charges.get(&id) else { continue };
         // Target order is replay order, so the body that charged is applied first.
         for line in target_lines {
-            if current_lines.iter().any(|stored| same_record(stored, line)) {
+            if current_lines.iter().any(|stored| same_charge(stored, line)) {
                 continue;
             }
-            out.push(Change::RecordLedger { line: line.clone() });
+            out.push(Change::RecordCharge { line: line.clone() });
         }
     }
 
@@ -5064,30 +5064,30 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
     pending_ids.dedup();
     for id in pending_ids {
         match (current.pending.get(&id), target.pending.get(&id)) {
-            (None, Some(pending)) if !target.ledger.contains_key(&id) => {
+            (None, Some(pending)) if !target.charges.contains_key(&id) => {
                 out.push(Change::StageAccept { pending: pending.clone() });
             }
-            (Some(_), None) if !target.ledger.contains_key(&id) => {
+            (Some(_), None) if !target.charges.contains_key(&id) => {
                 out.push(Change::DropAccept { payment_id: id });
             }
             _ => {}
         }
     }
 
-    let mut clearing_ids: Vec<Uuid> = current.clearings.keys()
-        .chain(target.clearings.keys())
+    let mut clearing_ids: Vec<Uuid> = current.settlements.keys()
+        .chain(target.settlements.keys())
         .copied()
         .collect();
     clearing_ids.sort();
     clearing_ids.dedup();
     for id in clearing_ids {
-        let current_rows = current.clearings.get(&id).map(Vec::as_slice).unwrap_or(&[]);
-        let Some(target_rows) = target.clearings.get(&id) else { continue };
+        let current_rows = current.settlements.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+        let Some(target_rows) = target.settlements.get(&id) else { continue };
         for record in target_rows {
             if current_rows.iter().any(|stored| stored == record) {
                 continue;
             }
-            out.push(Change::RecordClearing { record: record.clone() });
+            out.push(Change::RecordSettlement { record: record.clone() });
         }
     }
 
@@ -5101,7 +5101,7 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
         let Some((want, _)) = target.ceilings.get(&payer) else { continue };
         match current.ceilings.get(&payer) {
             Some((now, _)) if now == want => {}
-            _ => out.push(Change::SetReceiveCeiling { payer, max_nanodollars: *want }),
+            _ => out.push(Change::SetRunLimit { payer, max_nanodollars: *want }),
         }
     }
 
@@ -5118,7 +5118,7 @@ fn release_delta(current: &MergedState, target: &MergedState, purse_id: Uuid) ->
         .filter(|reserve| {
             reserve.purse_id == purse_id
                 && !target.reserves.contains_key(&reserve.payment_id)
-                && !target.ledger.contains_key(&reserve.payment_id)
+                && !target.charges.contains_key(&reserve.payment_id)
                 && reserve_refunds(purse, reserve)
         })
         .map(|reserve| reserve.amount_nanodollars)
@@ -5131,7 +5131,7 @@ fn reserve_delta(base: &MergedState, extra: &MergedState, purse_id: Uuid) -> i64
         .filter(|reserve| {
             reserve.purse_id == purse_id
                 && !base.reserves.contains_key(&reserve.payment_id)
-                && !base.ledger.contains_key(&reserve.payment_id)
+                && !base.charges.contains_key(&reserve.payment_id)
         })
         .map(|reserve| reserve.amount_nanodollars)
         .fold(0i64, i64::saturating_add)
@@ -5151,9 +5151,9 @@ fn charge_delta(base: &MergedState, extra: &MergedState, purse_id: Uuid) -> i64 
     let Some((purse, _)) = extra.purses.get(&purse_id) else {
         return 0;
     };
-    extra.ledger.iter().filter_map(|(id, lines)| {
+    extra.charges.iter().filter_map(|(id, lines)| {
         let first = lines.first()?;
-        if first.purse_id != purse_id || base.ledger.contains_key(id) || base.reserves.contains_key(id) {
+        if first.purse_id != purse_id || base.charges.contains_key(id) || base.reserves.contains_key(id) {
             return None;
         }
         if !purse.aliases.iter().any(|alias| alias == &first.paying_alias) {
@@ -5167,7 +5167,7 @@ fn replay_reserve(state: &mut MergedState, reserve: PaymentReserve) {
     if reserve.amount_nanodollars <= 0 {
         return;
     }
-    if state.reserves.contains_key(&reserve.payment_id) || state.ledger.contains_key(&reserve.payment_id) {
+    if state.reserves.contains_key(&reserve.payment_id) || state.charges.contains_key(&reserve.payment_id) {
         return;
     }
     let Some((purse, _)) = state.purses.get_mut(&reserve.purse_id) else {
@@ -5184,7 +5184,7 @@ fn replay_reserve(state: &mut MergedState, reserve: PaymentReserve) {
 }
 
 fn replay_release(state: &mut MergedState, payment_id: Uuid) {
-    if state.ledger.contains_key(&payment_id) {
+    if state.charges.contains_key(&payment_id) {
         state.reserves.remove(&payment_id);
         return;
     }
@@ -5196,12 +5196,12 @@ fn replay_release(state: &mut MergedState, payment_id: Uuid) {
     }
 }
 
-fn matching_reserve_purse(state: &MergedState, line: &LedgerLine) -> Option<Uuid> {
+fn matching_reserve_purse(state: &MergedState, line: &Charge) -> Option<Uuid> {
     let reserve = state.reserves.get(&line.payment_id)?;
     line_same_payment(line, reserve, line.payer).then_some(reserve.purse_id)
 }
 
-fn take_matching_pending_state(state: &mut MergedState, line: &LedgerLine) {
+fn take_matching_pending_state(state: &mut MergedState, line: &Charge) {
     let body = body_from_line(line);
     let matches = state.pending.get(&line.payment_id).is_some_and(|pending| {
         pending_covers(pending, &body, &line.payer_sig) && pending.payee_sig == line.payee_sig
@@ -5211,23 +5211,23 @@ fn take_matching_pending_state(state: &mut MergedState, line: &LedgerLine) {
     }
 }
 
-fn replay_clearing(state: &mut MergedState, record: ClearingRecord) {
-    if !clearing_record_ok(&record) {
+fn replay_settlement(state: &mut MergedState, record: Settlement) {
+    if !settlement_ok(&record) {
         return;
     }
-    let rows = state.clearings.entry(record.clearing_id).or_default();
+    let rows = state.settlements.entry(record.settlement_id).or_default();
     if rows.iter().any(|stored| stored == &record) {
         return;
     }
     rows.push(record);
 }
 
-fn replay_record(state: &mut MergedState, line: LedgerLine) {
+fn replay_record(state: &mut MergedState, line: Charge) {
     if !offer_body_ok(&body_from_line(&line)) {
         return;
     }
-    let same = state.ledger.get(&line.payment_id).is_some_and(|lines| {
-        lines.iter().any(|stored| same_record(stored, &line))
+    let same = state.charges.get(&line.payment_id).is_some_and(|lines| {
+        lines.iter().any(|stored| same_charge(stored, &line))
     });
     if same {
         if matching_reserve_purse(state, &line).is_some() {
@@ -5236,11 +5236,11 @@ fn replay_record(state: &mut MergedState, line: LedgerLine) {
         take_matching_pending_state(state, &line);
         return;
     }
-    if state.ledger.contains_key(&line.payment_id) {
+    if state.charges.contains_key(&line.payment_id) {
         take_matching_pending_state(state, &line);
         let mut stored = line;
         stored.purse_id = [0u8; 16];
-        state.ledger.get_mut(&stored.payment_id).expect("ledger list").push(stored);
+        state.charges.get_mut(&stored.payment_id).expect("ledger list").push(stored);
         return;
     }
     take_matching_pending_state(state, &line);
@@ -5248,7 +5248,7 @@ fn replay_record(state: &mut MergedState, line: LedgerLine) {
         state.reserves.remove(&line.payment_id);
         let mut stored = line;
         stored.purse_id = purse_id;
-        state.ledger.insert(stored.payment_id, vec![stored]);
+        state.charges.insert(stored.payment_id, vec![stored]);
         return;
     }
     let mut stored = line;
@@ -5258,17 +5258,17 @@ fn replay_record(state: &mut MergedState, line: LedgerLine) {
                 purse.available_nanodollars = purse
                     .available_nanodollars
                     .saturating_sub(stored.amount_nanodollars);
-                state.ledger.insert(stored.payment_id, vec![stored]);
+                state.charges.insert(stored.payment_id, vec![stored]);
                 return;
             }
         }
     }
     stored.purse_id = [0u8; 16];
-    state.ledger.insert(stored.payment_id, vec![stored]);
+    state.charges.insert(stored.payment_id, vec![stored]);
 }
 
 fn replay_stage(state: &mut MergedState, pending: PendingAccept) {
-    if state.ledger.contains_key(&pending.payment_id) || state.pending.contains_key(&pending.payment_id) {
+    if state.charges.contains_key(&pending.payment_id) || state.pending.contains_key(&pending.payment_id) {
         return;
     }
     if !offer_body_ok(&body_from_pending(&pending)) {
@@ -5413,8 +5413,8 @@ mod purse_sync_tests {
         serialize_change, serialize_private_state, Change, PrivateSnapshot, ReserveReject, WriteError,
     };
     use crate::data_models::{
-        ClearingRecord, Ed25519Signature, LedgerLine, Node, PaymentReserve, PendingAccept, Purse,
-        ReceiveCeiling,
+        Settlement, Ed25519Signature, Charge, Node, PaymentReserve, PendingAccept, Purse,
+        RunLimit,
         Scope, SyncVersion, WriteLogEntry, utc_month_period,
     };
     use crate::wire::{PURSE_KIND_FIXED, PURSE_KIND_MONTHLY};
@@ -5447,67 +5447,67 @@ mod purse_sync_tests {
         node.owner.purses.push(media());
         let blob = serialize_private_state(&node);
         match read_private_snapshot(&blob) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, charges, pending, settlements }) => {
                 assert_eq!(purses, vec![media()]);
                 assert!(reserves.is_empty());
                 assert!(ceilings.is_empty());
-                assert!(ledger.is_empty());
+                assert!(charges.is_empty());
                 assert!(pending.is_empty());
-                assert!(clearings.is_empty());
+                assert!(settlements.is_empty());
             }
             other => panic!("expected purse snapshot, got {other:?}"),
         }
         // One purse and no reserves: purse-count, id, kind, period, reserve-count.
         let month_tail = 2 + 16 + 1 + 4 + 2;
-        // A writer from step 7 ends at the clearings, before the month tail.
+        // A writer from step 7 ends at the settlements, before the month tail.
         let step7 = &blob[..blob.len() - month_tail];
         match read_private_snapshot(step7) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, charges, pending, settlements }) => {
                 assert_eq!(purses, vec![media()]);
                 assert!(reserves.is_empty());
                 assert!(ceilings.is_empty());
-                assert!(ledger.is_empty());
+                assert!(charges.is_empty());
                 assert!(pending.is_empty());
-                assert!(clearings.is_empty());
+                assert!(settlements.is_empty());
             }
             other => panic!("expected a step-7 snapshot, got {other:?}"),
         }
         // A writer from step 6 ends after the pending count.
         let step6 = &blob[..blob.len() - 2 - month_tail];
         match read_private_snapshot(step6) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, charges, pending, settlements }) => {
                 assert_eq!(purses, vec![media()]);
                 assert!(reserves.is_empty());
                 assert!(ceilings.is_empty());
-                assert!(ledger.is_empty());
+                assert!(charges.is_empty());
                 assert!(pending.is_empty());
-                assert!(clearings.is_empty());
+                assert!(settlements.is_empty());
             }
             other => panic!("expected a step-6 snapshot, got {other:?}"),
         }
         // A writer from step 3 ends after the reserve count.
         let step3 = &blob[..blob.len() - 8 - month_tail];
         match read_private_snapshot(step3) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, charges, pending, settlements }) => {
                 assert_eq!(purses, vec![media()]);
                 assert!(reserves.is_empty());
                 assert!(ceilings.is_empty());
-                assert!(ledger.is_empty());
+                assert!(charges.is_empty());
                 assert!(pending.is_empty());
-                assert!(clearings.is_empty());
+                assert!(settlements.is_empty());
             }
             other => panic!("expected a step-3 snapshot, got {other:?}"),
         }
         // A writer from before holds omits the reserve count too.
         let legacy = &blob[..blob.len() - 10 - month_tail];
         match read_private_snapshot(legacy) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, charges, pending, settlements }) => {
                 assert_eq!(purses, vec![media()]);
                 assert!(reserves.is_empty());
                 assert!(ceilings.is_empty());
-                assert!(ledger.is_empty());
+                assert!(charges.is_empty());
                 assert!(pending.is_empty());
-                assert!(clearings.is_empty());
+                assert!(settlements.is_empty());
             }
             other => panic!("expected a pre-hold snapshot, got {other:?}"),
         }
@@ -5751,13 +5751,13 @@ mod purse_sync_tests {
         node.owner.reserves.push(hold(4, 10, 99));
         let blob = serialize_private_state(&node);
         match read_private_snapshot(&blob) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending, clearings }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, charges, pending, settlements }) => {
                 assert_eq!(purses, vec![media()]);
                 assert_eq!(reserves, vec![hold(4, 10, 99)]);
                 assert!(ceilings.is_empty());
-                assert!(ledger.is_empty());
+                assert!(charges.is_empty());
                 assert!(pending.is_empty());
-                assert!(clearings.is_empty());
+                assert!(settlements.is_empty());
             }
             other => panic!("expected purse and reserve snapshot, got {other:?}"),
         }
@@ -5790,8 +5790,8 @@ mod purse_sync_tests {
         assert_eq!(owner.reserves.len(), 1);
     }
 
-    fn confirmed_line(payer: [u8; 16], reserve: &PaymentReserve) -> LedgerLine {
-        LedgerLine {
+    fn confirmed_line(payer: [u8; 16], reserve: &PaymentReserve) -> Charge {
+        Charge {
             payment_id: reserve.payment_id,
             amount_nanodollars: reserve.amount_nanodollars,
             payer,
@@ -5814,25 +5814,25 @@ mod purse_sync_tests {
         let reserve = hold(7, 1_000_000, 80);
         apply_change_to_owner(&mut owner, &Change::ReservePayment { reserve: reserve.clone() }).unwrap();
         let line = confirmed_line(owner.user.uuid, &reserve);
-        let change = Change::RecordLedger { line: line.clone() };
+        let change = Change::RecordCharge { line: line.clone() };
         assert_eq!(deserialize_change(&serialize_change(&change)).unwrap(), change);
         assert!(apply_change_to_owner(&mut owner, &change).unwrap());
         assert!(!apply_change_to_owner(&mut owner, &change).unwrap());
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
         assert!(owner.reserves.is_empty());
-        assert_eq!(owner.ledger, vec![line]);
+        assert_eq!(owner.charges, vec![line]);
     }
 
     #[test]
-    fn private_snapshot_roundtrips_a_ceiling_a_line_and_a_pending_accept() {
+    fn private_snapshot_roundtrips_a_run_limit_a_charge_and_a_pending_accept() {
         let mut node = Node::new();
         node.owner.purses.push(media());
         let reserve = hold(4, 10, 99);
         node.owner.reserves.push(reserve.clone());
-        let ceiling = ReceiveCeiling { payer: [3; 16], max_nanodollars: 10 };
-        node.owner.receive_ceilings.push(ceiling.clone());
+        let ceiling = RunLimit { payer: [3; 16], max_nanodollars: 10 };
+        node.owner.run_limits.push(ceiling.clone());
         let line = confirmed_line(node.owner.user.uuid, &hold(5, 10, 99));
-        node.owner.ledger.push(line.clone());
+        node.owner.charges.push(line.clone());
         let pending = PendingAccept {
             payment_id: [6; 16],
             amount_nanodollars: 10,
@@ -5847,13 +5847,13 @@ mod purse_sync_tests {
         };
         node.owner.pending_accepts.push(pending.clone());
         match read_private_snapshot(&serialize_private_state(&node)) {
-            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, ledger, pending: staged, clearings }) => {
+            Some(PrivateSnapshot::Purses { purses, reserves, ceilings, charges, pending: staged, settlements }) => {
                 assert_eq!(purses, vec![media()]);
                 assert_eq!(reserves, vec![reserve]);
                 assert_eq!(ceilings, vec![ceiling]);
-                assert_eq!(ledger, vec![line]);
+                assert_eq!(charges, vec![line]);
                 assert_eq!(staged, vec![pending]);
-                assert!(clearings.is_empty());
+                assert!(settlements.is_empty());
             }
             other => panic!("expected the extra private lists, got {other:?}"),
         }
@@ -5871,14 +5871,14 @@ mod purse_sync_tests {
         };
         let created = entry(1, Change::UpsertPurse { purse: media() });
         let reserved = entry(2, Change::ReservePayment { reserve: reserve.clone() });
-        let recorded = entry(3, Change::RecordLedger { line: line.clone() });
+        let recorded = entry(3, Change::RecordCharge { line: line.clone() });
         let out = merge_logs(
             &[created.clone(), reserved.clone()],
             &[created, reserved, recorded],
             &std::collections::HashMap::new(),
         );
         assert_eq!(out.changes_to_apply.len(), 1, "{:?}", out.changes_to_apply);
-        assert!(matches!(out.changes_to_apply[0], Change::RecordLedger { .. }));
+        assert!(matches!(out.changes_to_apply[0], Change::RecordCharge { .. }));
 
         let mut owner = Node::new().owner;
         owner.user.uuid = [0x44; 16];
@@ -5889,7 +5889,7 @@ mod purse_sync_tests {
         }
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
         assert!(owner.reserves.is_empty());
-        assert_eq!(owner.ledger, vec![line]);
+        assert_eq!(owner.charges, vec![line]);
     }
 
     #[test]
@@ -5900,13 +5900,13 @@ mod purse_sync_tests {
         second.note = "other".into();
         second.purse_id = [0u8; 16];
         second.confirm_sig = Ed25519Signature([2; 64]);
-        node.owner.ledger.push(first.clone());
-        node.owner.ledger.push(second.clone());
+        node.owner.charges.push(first.clone());
+        node.owner.charges.push(second.clone());
         match read_private_snapshot(&serialize_private_state(&node)) {
-            Some(PrivateSnapshot::Purses { ledger, .. }) => {
-                assert_eq!(ledger.len(), 2);
-                assert!(ledger.iter().any(|line| line.note == first.note && line.confirm_sig == first.confirm_sig));
-                assert!(ledger.iter().any(|line| line.note == "other" && line.purse_id == [0u8; 16]));
+            Some(PrivateSnapshot::Purses { charges, .. }) => {
+                assert_eq!(charges.len(), 2);
+                assert!(charges.iter().any(|line| line.note == first.note && line.confirm_sig == first.confirm_sig));
+                assert!(charges.iter().any(|line| line.note == "other" && line.purse_id == [0u8; 16]));
             }
             other => panic!("expected both lines, got {other:?}"),
         }
@@ -5920,17 +5920,17 @@ mod purse_sync_tests {
         purse.available_nanodollars = 0;
         apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse }).unwrap();
         let line = confirmed_line([0x44; 16], &hold(7, 1_000_000, 80));
-        assert!(apply_change_to_owner(&mut owner, &Change::RecordLedger { line: line.clone() }).unwrap());
+        assert!(apply_change_to_owner(&mut owner, &Change::RecordCharge { line: line.clone() }).unwrap());
         assert_eq!(owner.purses[0].available_nanodollars, -1_000_000);
         let mut other = line.clone();
         other.note = "other".into();
         other.purse_id = [0x11; 16];
         other.confirm_sig = Ed25519Signature([4; 64]);
-        assert!(apply_change_to_owner(&mut owner, &Change::RecordLedger { line: other }).unwrap());
-        assert!(!apply_change_to_owner(&mut owner, &Change::RecordLedger { line }).unwrap());
+        assert!(apply_change_to_owner(&mut owner, &Change::RecordCharge { line: other }).unwrap());
+        assert!(!apply_change_to_owner(&mut owner, &Change::RecordCharge { line }).unwrap());
         assert_eq!(owner.purses[0].available_nanodollars, -1_000_000);
-        assert_eq!(owner.ledger.len(), 2);
-        assert_eq!(owner.ledger[1].purse_id, [0u8; 16]);
+        assert_eq!(owner.charges.len(), 2);
+        assert_eq!(owner.charges[1].purse_id, [0u8; 16]);
     }
 
     #[test]
@@ -5943,14 +5943,14 @@ mod purse_sync_tests {
             committed_at: SystemTime::UNIX_EPOCH,
         };
         let created = entry(1, Change::UpsertPurse { purse: media() });
-        let recorded = entry(2, Change::RecordLedger { line: line.clone() });
+        let recorded = entry(2, Change::RecordCharge { line: line.clone() });
         let out = merge_logs(
             &[created.clone()],
             &[created.clone(), recorded.clone()],
             &std::collections::HashMap::new(),
         );
         assert_eq!(out.changes_to_apply.len(), 1, "{:?}", out.changes_to_apply);
-        assert!(matches!(out.changes_to_apply[0], Change::RecordLedger { .. }));
+        assert!(matches!(out.changes_to_apply[0], Change::RecordCharge { .. }));
 
         let mut owner = Node::new().owner;
         owner.user.uuid = [0x44; 16];
@@ -5959,7 +5959,7 @@ mod purse_sync_tests {
             apply_change_to_owner(&mut owner, change).unwrap();
         }
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
-        assert_eq!(owner.ledger.len(), 1);
+        assert_eq!(owner.charges.len(), 1);
 
         let again = merge_logs(
             &[created.clone(), recorded.clone()],
@@ -5983,31 +5983,31 @@ mod purse_sync_tests {
             committed_at: SystemTime::UNIX_EPOCH,
         };
         let created = entry(1, Change::UpsertPurse { purse: media() });
-        let recorded = entry(2, Change::RecordLedger { line: first });
-        let extra = entry(3, Change::RecordLedger { line: second });
+        let recorded = entry(2, Change::RecordCharge { line: first });
+        let extra = entry(3, Change::RecordCharge { line: second });
         let out = merge_logs(
             &[created.clone(), recorded.clone()],
             &[created, recorded, extra],
             &std::collections::HashMap::new(),
         );
         assert_eq!(out.changes_to_apply.len(), 1, "{:?}", out.changes_to_apply);
-        assert!(matches!(out.changes_to_apply[0], Change::RecordLedger { .. }));
+        assert!(matches!(out.changes_to_apply[0], Change::RecordCharge { .. }));
 
         let mut owner = Node::new().owner;
         owner.user.uuid = [0x44; 16];
         apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
         let first = confirmed_line([0x44; 16], &hold(7, 1_000_000, 80));
-        apply_change_to_owner(&mut owner, &Change::RecordLedger { line: first }).unwrap();
+        apply_change_to_owner(&mut owner, &Change::RecordCharge { line: first }).unwrap();
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
         apply_change_to_owner(&mut owner, &out.changes_to_apply[0]).unwrap();
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
-        assert_eq!(owner.ledger.len(), 2);
-        assert_eq!(owner.ledger[1].purse_id, [0u8; 16]);
+        assert_eq!(owner.charges.len(), 2);
+        assert_eq!(owner.charges[1].purse_id, [0u8; 16]);
     }
 
-    fn sample_clearing(clearing_id: [u8; 16], payment_id: [u8; 16]) -> ClearingRecord {
-        ClearingRecord {
-            clearing_id,
+    fn sample_settlement(settlement_id: [u8; 16], payment_id: [u8; 16]) -> Settlement {
+        Settlement {
+            settlement_id,
             user_lo: [0x01; 16],
             user_hi: [0x02; 16],
             payment_ids: vec![payment_id],
@@ -6017,48 +6017,48 @@ mod purse_sync_tests {
     }
 
     #[test]
-    fn private_snapshot_roundtrips_a_clearing_and_an_older_blob_has_none() {
+    fn private_snapshot_roundtrips_a_settlement_and_an_older_blob_has_none() {
         let mut node = Node::new();
-        let record = sample_clearing([0xC1; 16], [0x10; 16]);
-        node.owner.clearings.push(record.clone());
+        let record = sample_settlement([0xC1; 16], [0x10; 16]);
+        node.owner.settlements.push(record.clone());
         let blob = serialize_private_state(&node);
         match read_private_snapshot(&blob) {
-            Some(PrivateSnapshot::Purses { clearings, .. }) => assert_eq!(clearings, vec![record]),
+            Some(PrivateSnapshot::Purses { settlements, .. }) => assert_eq!(settlements, vec![record]),
             other => panic!("expected the clearing, got {other:?}"),
         }
         // No purses and no reserves: the month tail is two counts.
         let month_tail = 2 + 2;
-        let step6 = &blob[..blob.len() - month_tail - 2 - encode_len_of_one_clearing()];
+        let step6 = &blob[..blob.len() - month_tail - 2 - encode_len_of_one_settlement()];
         match read_private_snapshot(step6) {
-            Some(PrivateSnapshot::Purses { clearings, ledger, pending, .. }) => {
-                assert!(clearings.is_empty());
-                assert!(ledger.is_empty());
+            Some(PrivateSnapshot::Purses { settlements, charges, pending, .. }) => {
+                assert!(settlements.is_empty());
+                assert!(charges.is_empty());
                 assert!(pending.is_empty());
             }
             other => panic!("expected a snapshot with no clearing section, got {other:?}"),
         }
     }
 
-    fn encode_len_of_one_clearing() -> usize {
-        let record = sample_clearing([0xC1; 16], [0x10; 16]);
-        serialize_change(&Change::RecordClearing { record }).len() - 1
+    fn encode_len_of_one_settlement() -> usize {
+        let record = sample_settlement([0xC1; 16], [0x10; 16]);
+        serialize_change(&Change::RecordSettlement { record }).len() - 1
     }
 
     #[test]
-    fn merge_applies_a_clearing_without_moving_the_purse() {
+    fn merge_applies_a_settlement_without_moving_the_purse() {
         let reserve = hold(7, 1_000_000, 80);
         let line = confirmed_line([0x44; 16], &reserve);
-        let record = sample_clearing([0xC2; 16], reserve.payment_id);
+        let record = sample_settlement([0xC2; 16], reserve.payment_id);
         let entry = |seq: u64, change: Change| WriteLogEntry {
             version: SyncVersion { writer_sg_uuid: [0xA1; 16], epoch: 1, seq },
             scope: Scope::Private,
             change_payload: serialize_change(&change),
             committed_at: SystemTime::UNIX_EPOCH,
         };
-        let change = Change::RecordClearing { record: record.clone() };
+        let change = Change::RecordSettlement { record: record.clone() };
         assert_eq!(deserialize_change(&serialize_change(&change)).unwrap(), change);
         let created = entry(1, Change::UpsertPurse { purse: media() });
-        let recorded = entry(2, Change::RecordLedger { line: line.clone() });
+        let recorded = entry(2, Change::RecordCharge { line: line.clone() });
         let cleared = entry(3, change);
         let out = merge_logs(
             &[created.clone(), recorded.clone()],
@@ -6066,22 +6066,22 @@ mod purse_sync_tests {
             &std::collections::HashMap::new(),
         );
         assert_eq!(out.changes_to_apply.len(), 1, "{:?}", out.changes_to_apply);
-        assert!(matches!(out.changes_to_apply[0], Change::RecordClearing { .. }));
+        assert!(matches!(out.changes_to_apply[0], Change::RecordSettlement { .. }));
 
         let mut owner = Node::new().owner;
         owner.user.uuid = [0x44; 16];
         apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
-        apply_change_to_owner(&mut owner, &Change::RecordLedger { line }).unwrap();
+        apply_change_to_owner(&mut owner, &Change::RecordCharge { line }).unwrap();
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
         assert!(apply_change_to_owner(&mut owner, &out.changes_to_apply[0]).unwrap());
         assert!(!apply_change_to_owner(&mut owner, &out.changes_to_apply[0]).unwrap());
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
-        assert_eq!(owner.clearings.len(), 1);
-        assert_eq!(owner.ledger.len(), 1);
+        assert_eq!(owner.settlements.len(), 1);
+        assert_eq!(owner.charges.len(), 1);
     }
 
     #[test]
-    fn a_second_clearing_body_is_kept_and_the_net_is_the_union() {
+    fn a_second_settlement_body_is_kept_and_the_tab_is_the_union() {
         let mut owner = Node::new().owner;
         owner.user.uuid = [0x11; 16];
         let contact = [0x22; 16];
@@ -6089,27 +6089,27 @@ mod purse_sync_tests {
         let mut second_reserve = hold(2, 250_000, 80);
         second_reserve.payment_id = [2; 16];
         let second_line = confirmed_line(owner.user.uuid, &second_reserve);
-        owner.ledger.push(first_line);
-        owner.ledger.push(second_line);
-        let mut first = sample_clearing([0xC3; 16], [1; 16]);
+        owner.charges.push(first_line);
+        owner.charges.push(second_line);
+        let mut first = sample_settlement([0xC3; 16], [1; 16]);
         first.user_lo = owner.user.uuid;
         first.user_hi = contact;
-        let mut second = sample_clearing([0xC3; 16], [2; 16]);
+        let mut second = sample_settlement([0xC3; 16], [2; 16]);
         second.user_lo = owner.user.uuid;
         second.user_hi = contact;
         second.sig_lo = Ed25519Signature([3; 64]);
-        assert!(apply_change_to_owner(&mut owner, &Change::RecordClearing { record: first }).unwrap());
-        assert_eq!(crate::payment::net_nanodollars(&owner, contact), -250_000);
-        assert!(apply_change_to_owner(&mut owner, &Change::RecordClearing { record: second }).unwrap());
-        assert_eq!(owner.clearings.len(), 2);
-        assert_eq!(crate::payment::net_nanodollars(&owner, contact), 0);
+        assert!(apply_change_to_owner(&mut owner, &Change::RecordSettlement { record: first }).unwrap());
+        assert_eq!(crate::payment::tab_nanodollars(&owner, contact), -250_000);
+        assert!(apply_change_to_owner(&mut owner, &Change::RecordSettlement { record: second }).unwrap());
+        assert_eq!(owner.settlements.len(), 2);
+        assert_eq!(crate::payment::tab_nanodollars(&owner, contact), 0);
         assert!(owner.purses.is_empty());
     }
 
     #[test]
-    fn merge_applies_a_receive_ceiling_without_moving_the_purse() {
+    fn merge_applies_a_run_limit_without_moving_the_purse() {
         let payer = [0x31; 16];
-        let change = Change::SetReceiveCeiling { payer, max_nanodollars: 5_000_000 };
+        let change = Change::SetRunLimit { payer, max_nanodollars: 5_000_000 };
         assert_eq!(deserialize_change(&serialize_change(&change)).unwrap(), change);
         let entry = |seq: u64, change: Change| WriteLogEntry {
             version: SyncVersion { writer_sg_uuid: [0xA1; 16], epoch: 1, seq },
@@ -6127,32 +6127,32 @@ mod purse_sync_tests {
         assert_eq!(out.changes_to_apply.len(), 1, "{:?}", out.changes_to_apply);
         assert!(matches!(
             out.changes_to_apply[0],
-            Change::SetReceiveCeiling { max_nanodollars: 5_000_000, .. }
+            Change::SetRunLimit { max_nanodollars: 5_000_000, .. }
         ));
 
         let mut owner = Node::new().owner;
         apply_change_to_owner(&mut owner, &Change::UpsertPurse { purse: media() }).unwrap();
         owner.purses[0].available_nanodollars = 4_000_000;
-        owner.receive_ceilings.push(ReceiveCeiling { payer, max_nanodollars: 1 });
-        owner.receive_ceilings.push(ReceiveCeiling { payer, max_nanodollars: 9 });
+        owner.run_limits.push(RunLimit { payer, max_nanodollars: 1 });
+        owner.run_limits.push(RunLimit { payer, max_nanodollars: 9 });
         assert!(apply_change_to_owner(&mut owner, &out.changes_to_apply[0]).unwrap());
         assert!(!apply_change_to_owner(&mut owner, &out.changes_to_apply[0]).unwrap());
-        assert_eq!(owner.receive_ceilings.len(), 1);
-        assert_eq!(owner.receive_ceilings[0].payer, payer);
-        assert_eq!(owner.receive_ceilings[0].max_nanodollars, 5_000_000);
+        assert_eq!(owner.run_limits.len(), 1);
+        assert_eq!(owner.run_limits[0].payer, payer);
+        assert_eq!(owner.run_limits[0].max_nanodollars, 5_000_000);
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
         assert!(owner.reserves.is_empty());
-        assert!(owner.ledger.is_empty());
+        assert!(owner.charges.is_empty());
 
-        let replaced = Change::SetReceiveCeiling { payer, max_nanodollars: 0 };
+        let replaced = Change::SetRunLimit { payer, max_nanodollars: 0 };
         assert!(apply_change_to_owner(&mut owner, &replaced).unwrap());
-        assert_eq!(owner.receive_ceilings.len(), 1);
-        assert_eq!(owner.receive_ceilings[0].max_nanodollars, 0);
-        assert!(!apply_change_to_owner(&mut owner, &Change::SetReceiveCeiling {
+        assert_eq!(owner.run_limits.len(), 1);
+        assert_eq!(owner.run_limits[0].max_nanodollars, 0);
+        assert!(!apply_change_to_owner(&mut owner, &Change::SetRunLimit {
             payer,
             max_nanodollars: -1,
         }).unwrap());
-        assert_eq!(owner.receive_ceilings[0].max_nanodollars, 0);
+        assert_eq!(owner.run_limits[0].max_nanodollars, 0);
         assert_eq!(owner.purses[0].available_nanodollars, 4_000_000);
     }
 }

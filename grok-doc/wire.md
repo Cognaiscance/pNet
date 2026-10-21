@@ -54,10 +54,10 @@ The opaque app payload maximum is 4096 bytes on relay, direct app packet, and tu
 | `0x63` | payment confirm | session |
 | `0x64` | payment index | session |
 | `0x65` | payment record | session |
-| `0x66` | clearing proposal | session |
-| `0x67` | clearing ack | session |
-| `0x68` | clearing index | session |
-| `0x69` | clearing record | session |
+| `0x66` | settlement proposal | session |
+| `0x67` | settlement ack | session |
+| `0x68` | settlement index | session |
+| `0x69` | settlement | session |
 | `0x70` | sync write request | session |
 | `0x71` | sync write ack | session |
 | `0x72` | sync update available | session |
@@ -77,7 +77,7 @@ Ops `0x60`–`0x63` are the signed handshake between the two writers. Each plain
 
 Ops `0x64` and `0x65` repair the two books when a contact session comes up. `0x64` lists payment ids and confirmation signatures. `0x65` carries one signed confirmation, still with no purse id. A failed signature is dropped. Two different signed bodies of one id are both kept.
 
-Ops `0x66`–`0x69` clear a tab between the same two owners. `0x66` names the payment ids and carries one signature. `0x67` carries both. `0x68` and `0x69` copy a missing clearing the way `0x64` and `0x65` copy a missing payment. A named line stays on the ledger and drops out of the net. No purse amount changes. An app does not send these ops.
+Ops `0x66`–`0x69` settle a tab between the same two owners. `0x66` names the payment ids and carries one signature. `0x67` carries both. `0x68` and `0x69` copy a missing settlement the way `0x64` and `0x65` copy a missing payment. A named charge stays listed and leaves the tab. No purse amount changes. An app does not send these ops.
 
 ## Reachability
 

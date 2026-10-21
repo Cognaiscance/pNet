@@ -1,31 +1,31 @@
-//! Offer, accept, refuse, confirm, repair, and clearing between the two writers.
+//! Offer, accept, refuse, confirm, repair, and settlement between the two writers.
 //!
 //! A node that is not the writer drops the packet. The purse id never leaves
-//! the payer. A missing receive ceiling is zero, so an offer is refused until
+//! the payer. What you'll run starts at zero, so an offer is refused until
 //! one is stored for that payer. On connect, the writers exchange the payment
-//! ids and the clearing ids they hold for the pair, and copy any missing record.
-//! An app does not clear. The owner proposes, and the other owner signs.
+//! ids and the settlement ids they hold for the pair, and copy any missing record.
+//! An app does not settle. The owner proposes, and the other owner signs.
 
 use std::net::SocketAddr;
 
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
 use super::super::data_models::{
-    ClearingRecord, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, LedgerLine, Node, Owner,
+    Settlement, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Charge, Node, Owner,
     Uuid, unix_time_ms,
 };
 use super::super::payment::{
-    body_from_line, claim_exceeds_ceiling, clearing_body_matches, clearing_body_ok, clearing_for_pair,
-    decode_accept, decode_clearing_proposal, decode_clearing_record, decode_confirm, decode_index,
-    decode_offer, decode_refuse, encode_accept, encode_clearing_proposal, encode_clearing_record,
+    body_from_line, claim_exceeds_run, settlement_body_matches, settlement_body_ok, settlement_for_pair,
+    decode_accept, decode_settlement_proposal, decode_settlement, decode_confirm, decode_index,
+    decode_offer, decode_refuse, encode_accept, encode_settlement_proposal, encode_settlement,
     encode_confirm, encode_offer, encode_refuse, index_plaintexts, line_covers, line_from,
     line_same_payment, normalize_payment_ids, offer_body_ok, ordered_users, pending_covers,
-    pending_from, sign_accept, sign_clearing, sign_confirm, sign_offer, sign_refuse, users_are_pair,
-    verify_accept, verify_clearing, verify_confirm, verify_offer, verify_refuse, ClearingBody,
-    OfferBody, INDEX_END, INDEX_START, REFUSE_EXPIRED, REFUSE_MISMATCH, REFUSE_OVER_CEILING,
+    pending_from, sign_accept, sign_settlement, sign_confirm, sign_offer, sign_refuse, users_are_pair,
+    verify_accept, verify_settlement, verify_confirm, verify_offer, verify_refuse, SettlementBody,
+    OfferBody, INDEX_END, INDEX_START, REFUSE_EXPIRED, REFUSE_MISMATCH, REFUSE_OVER_RUN,
 };
 use super::super::wire::{
-    CLEARING_INDEX_OP, CLEARING_RECORD_OP, PAYMENT_ACCEPT_OP, PAYMENT_CLEAR_ACK_OP, PAYMENT_CLEAR_OP,
+    SETTLEMENT_INDEX_OP, SETTLEMENT_RECORD_OP, PAYMENT_ACCEPT_OP, SETTLEMENT_ACK_OP, SETTLEMENT_PROPOSE_OP,
     PAYMENT_CONFIRM_OP, PAYMENT_INDEX_OP, PAYMENT_OFFER_OP, PAYMENT_RECORD_OP, PAYMENT_REFUSE_OP,
 };
 use super::{find_writer_sg, request_change_idempotent, send, Change, PaymentReject, WriteError, WriterTarget};
@@ -37,7 +37,7 @@ pub(crate) fn deliver_payment(ctx: &WorkerContext, payment_id: Uuid) {
         if node.owner.key_pair.private_key == Ed25519SecretKey::ZERO {
             return;
         }
-        if let Some(line) = node.owner.ledger.iter().find(|line| line.payment_id == payment_id) {
+        if let Some(line) = node.owner.charges.iter().find(|line| line.payment_id == payment_id) {
             let body = body_from_line(line);
             let plain = encode_confirm(&body, &line.payer_sig, &line.payee_sig, &line.confirm_sig);
             Some((line.payee, PAYMENT_CONFIRM_OP, plain))
@@ -86,7 +86,7 @@ pub fn payment_offer(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
         if body.expires_at_ms <= unix_time_ms() {
             Reply::Refuse(REFUSE_EXPIRED)
-        } else if let Some(line) = node.owner.ledger.iter().find(|line| line.payment_id == body.payment_id) {
+        } else if let Some(line) = node.owner.charges.iter().find(|line| line.payment_id == body.payment_id) {
             if line_covers(line, &body, &payer_sig) {
                 Reply::Accept(line.payee_sig)
             } else {
@@ -98,8 +98,8 @@ pub fn payment_offer(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             } else {
                 Reply::Refuse(REFUSE_MISMATCH)
             }
-        } else if claim_exceeds_ceiling(&node.owner, body.payer, body.amount_nanodollars, Some(body.payment_id)) {
-            Reply::Refuse(REFUSE_OVER_CEILING)
+        } else if claim_exceeds_run(&node.owner, body.payer, body.amount_nanodollars, Some(body.payment_id)) {
+            Reply::Refuse(REFUSE_OVER_RUN)
         } else {
             Reply::Stage(sign_accept(&node.owner.key_pair.private_key, &body, &payer_sig))
         }
@@ -125,7 +125,7 @@ pub fn payment_offer(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                     send_to_user(ctx, body.payer, PAYMENT_ACCEPT_OP, &plain);
                 }
                 Err(WriteError::PaymentRejected(PaymentReject::OverCeiling)) => {
-                    send_refuse(ctx, &body, &payer_sig, REFUSE_OVER_CEILING);
+                    send_refuse(ctx, &body, &payer_sig, REFUSE_OVER_RUN);
                 }
                 Err(WriteError::PaymentRejected(PaymentReject::Mismatch)) => {
                     send_refuse(ctx, &body, &payer_sig, REFUSE_MISMATCH);
@@ -161,7 +161,7 @@ pub fn payment_accept(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             eprintln!("[payment_accept] bad signature from {src}");
             return;
         }
-        if let Some(line) = node.owner.ledger.iter().find(|line| line.payment_id == body.payment_id) {
+        if let Some(line) = node.owner.charges.iter().find(|line| line.payment_id == body.payment_id) {
             if line_covers(line, &body, &payer_sig) {
                 AcceptChoice::Resend
             } else {
@@ -184,12 +184,12 @@ pub fn payment_accept(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         AcceptChoice::Ignore => return,
         AcceptChoice::Confirm(line) => line,
     };
-    if request_change_idempotent(Change::RecordLedger { line: confirm.clone() }, ctx).is_err() {
+    if request_change_idempotent(Change::RecordCharge { line: confirm.clone() }, ctx).is_err() {
         return;
     }
     let stored = {
         let node = ctx.node.read().unwrap();
-        node.owner.ledger.iter().any(|line| {
+        node.owner.charges.iter().any(|line| {
             line.payment_id == confirm.payment_id && line.confirm_sig == confirm.confirm_sig
         })
     };
@@ -224,7 +224,7 @@ pub fn payment_refuse(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             eprintln!("[payment_refuse] bad signature from {src}");
             return;
         }
-        if node.owner.ledger.iter().any(|line| line.payment_id == body.payment_id) {
+        if node.owner.charges.iter().any(|line| line.payment_id == body.payment_id) {
             return;
         }
         let Some(reserve) = node.owner.reserves.iter().find(|reserve| reserve.payment_id == body.payment_id) else {
@@ -266,7 +266,7 @@ pub fn payment_confirm(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             eprintln!("[payment_confirm] bad signature from {src}");
             return;
         }
-        if let Some(stored) = node.owner.ledger.iter().find(|line| line.payment_id == body.payment_id) {
+        if let Some(stored) = node.owner.charges.iter().find(|line| line.payment_id == body.payment_id) {
             if line_covers(stored, &body, &payer_sig) && stored.confirm_sig == confirm_sig {
                 return;
             }
@@ -274,7 +274,7 @@ pub fn payment_confirm(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
         line_from(&body, [0u8; 16], payer_sig, payee_sig, confirm_sig)
     };
-    if let Err(err) = request_change_idempotent(Change::RecordLedger { line }, ctx) {
+    if let Err(err) = request_change_idempotent(Change::RecordCharge { line }, ctx) {
         eprintln!("[payment_confirm] record failed from {src}: {err:?}");
     }
 }
@@ -288,7 +288,7 @@ enum Reply {
 enum AcceptChoice {
     Resend,
     Ignore,
-    Confirm(super::super::data_models::LedgerLine),
+    Confirm(super::super::data_models::Charge),
 }
 
 fn send_refuse(ctx: &WorkerContext, body: &OfferBody, payer_sig: &Ed25519Signature, reason: u8) {
@@ -317,7 +317,7 @@ fn open_session(ctx: &WorkerContext, buf: &[u8]) -> Option<(Vec<u8>, Uuid, u16)>
     Some((plain, device, conn_id))
 }
 
-/// When a session to a contact comes up, send the payment ids and clearing ids for that pair.
+/// When a session to a contact comes up, send the payment ids and settlement ids for that pair.
 pub(crate) fn exchange_payment_records(conn_id: u16, ctx: &WorkerContext) {
     let outbound = {
         let node = ctx.node.read().unwrap();
@@ -333,30 +333,30 @@ pub(crate) fn exchange_payment_records(conn_id: u16, ctx: &WorkerContext) {
         let our = node.owner.user.uuid;
         let mut entries: Vec<(Uuid, Ed25519Signature)> = node
             .owner
-            .ledger
+            .charges
             .iter()
             .filter(|line| users_are_pair(line.payer, line.payee, our, contact))
             .map(|line| (line.payment_id, line.confirm_sig))
             .collect();
         entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.0.cmp(&right.1.0)));
-        let mut clearings: Vec<(Uuid, Ed25519Signature)> = Vec::new();
+        let mut settlements: Vec<(Uuid, Ed25519Signature)> = Vec::new();
         if let Some((lo, hi)) = ordered_users(our, contact) {
-            clearings = node
+            settlements = node
                 .owner
-                .clearings
+                .settlements
                 .iter()
                 .filter(|record| record.user_lo == lo && record.user_hi == hi)
-                .map(|record| (record.clearing_id, record.sig_lo))
+                .map(|record| (record.settlement_id, record.sig_lo))
                 .collect();
-            clearings.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.0.cmp(&right.1.0)));
+            settlements.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.0.cmp(&right.1.0)));
         }
         let dest = conn.peer_addr;
         let mut packets: Vec<Vec<u8>> = index_plaintexts(&entries)
             .into_iter()
             .map(|plain| build_encrypted_packet(PAYMENT_INDEX_OP, conn, &plain))
             .collect();
-        packets.extend(index_plaintexts(&clearings).into_iter().map(|plain| {
-            build_encrypted_packet(CLEARING_INDEX_OP, conn, &plain)
+        packets.extend(index_plaintexts(&settlements).into_iter().map(|plain| {
+            build_encrypted_packet(SETTLEMENT_INDEX_OP, conn, &plain)
         }));
         (dest, packets)
     };
@@ -365,10 +365,10 @@ pub(crate) fn exchange_payment_records(conn_id: u16, ctx: &WorkerContext) {
     }
 }
 
-/// The writer signs a clearing for `contact` and sends it. Tests and the contact
-/// ledger page call this. There is no app opcode. A missing line is not proposed.
+/// The writer signs a settlement for `contact` and sends it. Tests and the contact
+/// tab call this. There is no app opcode. A missing charge is not proposed.
 /// A record this node already holds for the same body is sent again as the ack.
-pub(crate) fn propose_clearing(ctx: &WorkerContext, contact: Uuid, clearing_id: Uuid, payment_ids: &[Uuid]) {
+pub(crate) fn propose_settlement(ctx: &WorkerContext, contact: Uuid, settlement_id: Uuid, payment_ids: &[Uuid]) {
     let prepared = {
         let node = ctx.node.read().unwrap();
         if !matches!(find_writer_sg(&node), WriterTarget::Local) {
@@ -389,12 +389,12 @@ pub(crate) fn propose_clearing(ctx: &WorkerContext, contact: Uuid, clearing_id: 
         if !ids.iter().all(|id| pair_has_line(&node.owner, contact, *id)) {
             return;
         }
-        let body = ClearingBody { clearing_id, user_lo, user_hi, payment_ids: ids };
-        if let Some(stored) = node.owner.clearings.iter().find(|record| clearing_body_matches(record, &body)) {
-            Some((PAYMENT_CLEAR_ACK_OP, encode_clearing_record(stored)))
+        let body = SettlementBody { settlement_id, user_lo, user_hi, payment_ids: ids };
+        if let Some(stored) = node.owner.settlements.iter().find(|record| settlement_body_matches(record, &body)) {
+            Some((SETTLEMENT_ACK_OP, encode_settlement(stored)))
         } else {
-            let sig = sign_clearing(&node.owner.key_pair.private_key, &body);
-            Some((PAYMENT_CLEAR_OP, encode_clearing_proposal(&body, &sig)))
+            let sig = sign_settlement(&node.owner.key_pair.private_key, &body);
+            Some((SETTLEMENT_PROPOSE_OP, encode_settlement_proposal(&body, &sig)))
         }
     };
     if let Some((op, plain)) = prepared {
@@ -402,15 +402,15 @@ pub(crate) fn propose_clearing(ctx: &WorkerContext, contact: Uuid, clearing_id: 
     }
 }
 
-pub fn payment_clear(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+pub fn settlement_propose(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let Some((plain, device, _)) = open_session(ctx, &buf) else {
         return;
     };
-    let Some((body, sig)) = decode_clearing_proposal(&plain) else {
-        eprintln!("[payment_clear] bad proposal from {src}");
+    let Some((body, sig)) = decode_settlement_proposal(&plain) else {
+        eprintln!("[settlement_propose] bad proposal from {src}");
         return;
     };
-    if !clearing_body_ok(&body) {
+    if !settlement_body_ok(&body) {
         return;
     }
     let decision = {
@@ -418,7 +418,7 @@ pub fn payment_clear(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let Some(contact) = contact_user_for_device(&node, device) else {
             return;
         };
-        if !clearing_for_pair(&body, node.owner.user.uuid, contact) {
+        if !settlement_for_pair(&body, node.owner.user.uuid, contact) {
             return;
         }
         let Some(row) = node.owner.contact_users.iter().find(|row| row.user.uuid == contact) else {
@@ -427,21 +427,21 @@ pub fn payment_clear(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         if node.owner.key_pair.private_key == Ed25519SecretKey::ZERO {
             return;
         }
-        if !verify_clearing(&row.public_key, &body, &sig) {
-            eprintln!("[payment_clear] bad signature from {src}");
+        if !verify_settlement(&row.public_key, &body, &sig) {
+            eprintln!("[settlement_propose] bad signature from {src}");
             return;
         }
-        if let Some(stored) = node.owner.clearings.iter().find(|record| clearing_body_matches(record, &body)) {
-            ClearChoice::Resend(encode_clearing_record(stored))
+        if let Some(stored) = node.owner.settlements.iter().find(|record| settlement_body_matches(record, &body)) {
+            ClearChoice::Resend(encode_settlement(stored))
         } else if body.payment_ids.iter().all(|id| pair_has_line(&node.owner, contact, *id)) {
-            let ours = sign_clearing(&node.owner.key_pair.private_key, &body);
+            let ours = sign_settlement(&node.owner.key_pair.private_key, &body);
             let (sig_lo, sig_hi) = if node.owner.user.uuid == body.user_lo {
                 (ours, sig)
             } else {
                 (sig, ours)
             };
-            ClearChoice::Store(ClearingRecord {
-                clearing_id: body.clearing_id,
+            ClearChoice::Store(Settlement {
+                settlement_id: body.settlement_id,
                 user_lo: body.user_lo,
                 user_hi: body.user_hi,
                 payment_ids: body.payment_ids.clone(),
@@ -454,22 +454,22 @@ pub fn payment_clear(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     };
     match decision {
         ClearChoice::Wait => {}
-        ClearChoice::Resend(plain) => send_to_user(ctx, peer_of_clearing(&body, ctx), PAYMENT_CLEAR_ACK_OP, &plain),
+        ClearChoice::Resend(plain) => send_to_user(ctx, peer_of_settlement(&body, ctx), SETTLEMENT_ACK_OP, &plain),
         ClearChoice::Store(record) => {
-            if store_clearing(ctx, record.clone(), src) {
+            if store_settlement(ctx, record.clone(), src) {
                 let contact = other_user(&record, ctx);
-                let plain = encode_clearing_record(&record);
-                send_to_user(ctx, contact, PAYMENT_CLEAR_ACK_OP, &plain);
+                let plain = encode_settlement(&record);
+                send_to_user(ctx, contact, SETTLEMENT_ACK_OP, &plain);
             }
         }
     }
 }
 
-pub fn payment_clear_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    accept_signed_clearing(src, buf, ctx, "payment_clear_ack");
+pub fn settlement_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    accept_signed_settlement(src, buf, ctx, "settlement_ack");
 }
 
-pub fn clearing_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+pub fn settlement_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let Some((plain, device, conn_id)) = open_session(ctx, &buf) else {
         return;
     };
@@ -486,7 +486,7 @@ pub fn clearing_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         };
         let finished = {
-            let slot = node.owner.clearing_index.entry(contact).or_default();
+            let slot = node.owner.settlement_index.entry(contact).or_default();
             if (flags & INDEX_START) != 0 {
                 slot.open = true;
                 slot.seen.clear();
@@ -508,41 +508,41 @@ pub fn clearing_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         };
         let mut replies = Vec::new();
-        for record in &node.owner.clearings {
+        for record in &node.owner.settlements {
             if record.user_lo != lo || record.user_hi != hi {
                 continue;
             }
-            if seen.iter().any(|(id, sig)| *id == record.clearing_id && *sig == record.sig_lo) {
+            if seen.iter().any(|(id, sig)| *id == record.settlement_id && *sig == record.sig_lo) {
                 continue;
             }
-            replies.push(encode_clearing_record(record));
+            replies.push(encode_settlement(record));
         }
         replies
     };
     for plain in replies {
-        send_on_conn(ctx, conn_id, CLEARING_RECORD_OP, &plain);
+        send_on_conn(ctx, conn_id, SETTLEMENT_RECORD_OP, &plain);
     }
 }
 
-pub fn clearing_record(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    accept_signed_clearing(src, buf, ctx, "clearing_record");
+pub fn settlement_record(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    accept_signed_settlement(src, buf, ctx, "settlement_record");
 }
 
 enum ClearChoice {
     Wait,
     Resend(Vec<u8>),
-    Store(ClearingRecord),
+    Store(Settlement),
 }
 
-fn accept_signed_clearing(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext, label: &str) {
+fn accept_signed_settlement(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext, label: &str) {
     let Some((plain, device, _)) = open_session(ctx, &buf) else {
         return;
     };
-    let Some(record) = decode_clearing_record(&plain) else {
+    let Some(record) = decode_settlement(&plain) else {
         eprintln!("[{label}] bad clearing from {src}");
         return;
     };
-    if !clearing_body_ok(&ClearingBody::from_record(&record)) {
+    if !settlement_body_ok(&SettlementBody::from_record(&record)) {
         return;
     }
     let accept = {
@@ -550,49 +550,49 @@ fn accept_signed_clearing(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext, la
         let Some(contact) = contact_user_for_device(&node, device) else {
             return;
         };
-        if !clearing_for_pair(&ClearingBody::from_record(&record), node.owner.user.uuid, contact) {
+        if !settlement_for_pair(&SettlementBody::from_record(&record), node.owner.user.uuid, contact) {
             return;
         }
         let Some(row) = node.owner.contact_users.iter().find(|row| row.user.uuid == contact) else {
             return;
         };
-        if !both_clearing_sigs_ok(&node.owner.key_pair.public_key, &row.public_key, &node.owner.user.uuid, &record) {
+        if !both_settlement_sigs_ok(&node.owner.key_pair.public_key, &row.public_key, &node.owner.user.uuid, &record) {
             eprintln!("[{label}] bad signature from {src}");
             return;
         }
-        !node.owner.clearings.iter().any(|stored| stored == &record)
+        !node.owner.settlements.iter().any(|stored| stored == &record)
     };
     if accept {
-        store_clearing(ctx, record, src);
+        store_settlement(ctx, record, src);
     }
 }
 
-fn both_clearing_sigs_ok(
+fn both_settlement_sigs_ok(
     our_key: &Ed25519PublicKey,
     contact_key: &Ed25519PublicKey,
     our: &Uuid,
-    record: &ClearingRecord,
+    record: &Settlement,
 ) -> bool {
-    let body = ClearingBody::from_record(record);
+    let body = SettlementBody::from_record(record);
     let (lo_key, hi_key) = if *our == record.user_lo {
         (our_key, contact_key)
     } else {
         (contact_key, our_key)
     };
-    verify_clearing(lo_key, &body, &record.sig_lo) && verify_clearing(hi_key, &body, &record.sig_hi)
+    verify_settlement(lo_key, &body, &record.sig_lo) && verify_settlement(hi_key, &body, &record.sig_hi)
 }
 
-fn store_clearing(ctx: &WorkerContext, record: ClearingRecord, src: SocketAddr) -> bool {
-    match request_change_idempotent(Change::RecordClearing { record }, ctx) {
+fn store_settlement(ctx: &WorkerContext, record: Settlement, src: SocketAddr) -> bool {
+    match request_change_idempotent(Change::RecordSettlement { record }, ctx) {
         Ok(_) => true,
         Err(err) => {
-            eprintln!("[payment_clear] record failed from {src}: {err:?}");
+            eprintln!("[settlement_propose] record failed from {src}: {err:?}");
             false
         }
     }
 }
 
-fn other_user(record: &ClearingRecord, ctx: &WorkerContext) -> Uuid {
+fn other_user(record: &Settlement, ctx: &WorkerContext) -> Uuid {
     let node = ctx.node.read().unwrap();
     if node.owner.user.uuid == record.user_lo {
         record.user_hi
@@ -601,7 +601,7 @@ fn other_user(record: &ClearingRecord, ctx: &WorkerContext) -> Uuid {
     }
 }
 
-fn peer_of_clearing(body: &ClearingBody, ctx: &WorkerContext) -> Uuid {
+fn peer_of_settlement(body: &SettlementBody, ctx: &WorkerContext) -> Uuid {
     let node = ctx.node.read().unwrap();
     if node.owner.user.uuid == body.user_lo {
         body.user_hi
@@ -611,7 +611,7 @@ fn peer_of_clearing(body: &ClearingBody, ctx: &WorkerContext) -> Uuid {
 }
 
 fn pair_has_line(owner: &Owner, contact: Uuid, payment_id: Uuid) -> bool {
-    owner.ledger.iter().any(|line| {
+    owner.charges.iter().any(|line| {
         line.payment_id == payment_id && users_are_pair(line.payer, line.payee, owner.user.uuid, contact)
     })
 }
@@ -653,7 +653,7 @@ pub fn payment_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         };
         let our = node.owner.user.uuid;
         let mut replies = Vec::new();
-        for line in &node.owner.ledger {
+        for line in &node.owner.charges {
             if !users_are_pair(line.payer, line.payee, our, contact) {
                 continue;
             }
@@ -710,7 +710,7 @@ pub fn payment_record(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         assign_copied_purse(&node.owner, &mut line);
         line
     };
-    if let Err(err) = request_change_idempotent(Change::RecordLedger { line }, ctx) {
+    if let Err(err) = request_change_idempotent(Change::RecordCharge { line }, ctx) {
         eprintln!("[payment_record] record failed from {src}: {err:?}");
     }
 }
@@ -729,7 +729,7 @@ fn contact_user_for_device(node: &Node, device: Uuid) -> Option<Uuid> {
     })
 }
 
-fn same_signed(left: &LedgerLine, right: &LedgerLine) -> bool {
+fn same_signed(left: &Charge, right: &Charge) -> bool {
     body_from_line(left) == body_from_line(right)
         && left.payer_sig == right.payer_sig
         && left.payee_sig == right.payee_sig
@@ -737,11 +737,11 @@ fn same_signed(left: &LedgerLine, right: &LedgerLine) -> bool {
 }
 
 /// Choose the purse id written into the log. Apply and replay use that id.
-fn assign_copied_purse(owner: &Owner, line: &mut LedgerLine) {
-    if owner.ledger.iter().any(|stored| same_signed(stored, line)) {
+fn assign_copied_purse(owner: &Owner, line: &mut Charge) {
+    if owner.charges.iter().any(|stored| same_signed(stored, line)) {
         return;
     }
-    if owner.ledger.iter().any(|stored| stored.payment_id == line.payment_id) || line.payer != owner.user.uuid {
+    if owner.charges.iter().any(|stored| stored.payment_id == line.payment_id) || line.payer != owner.user.uuid {
         line.purse_id = [0u8; 16];
         return;
     }

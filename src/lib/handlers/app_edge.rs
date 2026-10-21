@@ -12,7 +12,7 @@ use super::super::crypto::{
 };
 use super::super::certs::issue_app_cert;
 use super::super::data_models::{
-    Application, Ed25519PublicKey, LedgerLine, PaymentReserve, Uuid, generate_uuid, unix_time_ms,
+    Application, Ed25519PublicKey, Charge, PaymentReserve, Uuid, generate_uuid, unix_time_ms,
     RESERVE_TTL_MS,
 };
 use super::super::wire::*;
@@ -547,7 +547,7 @@ pub fn app_list_purses(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// The purse id, the expiry, and the signatures stay off this reply. A hold that
 /// is not a confirmed line is absent. A line for another alias is absent. Two
 /// signed bodies of one id are both listed. Count 0 is success. This read does
-/// not change a purse or the ledger.
+/// not change a purse or the charges.
 pub fn app_list_incoming(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     list_payments(src, buf, ctx, true);
 }
@@ -566,11 +566,11 @@ fn list_payments(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext, incoming: b
         return;
     };
 
-    let mut lines: Vec<LedgerLine> = {
+    let mut lines: Vec<Charge> = {
         let node = ctx.node.read().unwrap();
         let user = node.owner.user.uuid;
         node.owner
-            .ledger
+            .charges
             .iter()
             .filter(|line| {
                 if incoming {
@@ -690,7 +690,7 @@ pub fn app_reserve(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         match purse {
             None => None,
             Some(purse) => {
-                if let Some(line) = node.owner.ledger.iter().find(|line| line.payment_id == reserve.payment_id) {
+                if let Some(line) = node.owner.charges.iter().find(|line| line.payment_id == reserve.payment_id) {
                     if crate::payment::line_same_payment(line, &reserve, node.owner.user.uuid) {
                         Some((purse.available_nanodollars, line.expires_at_ms))
                     } else {
