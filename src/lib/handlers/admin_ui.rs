@@ -133,6 +133,23 @@ pub fn ui_request(
         return handle_app_web_proxy(stream, &method, &path, &query, &body, ctx);
     }
 
+    if let Some(id) = path.strip_prefix("/contacts/") {
+        if let Some(id) = id.strip_suffix("/ledger") {
+            if !id.is_empty() && !id.contains('/') {
+                if method == "GET" {
+                    return respond_html(&stream, 200, &render_contact_ledger(ctx, id, &query), None);
+                }
+                if method == "POST" {
+                    let target = redirect_with_error(
+                        &format!("/contacts/{id}/ledger"),
+                        record_contact_clearing(ctx, id, &body),
+                    );
+                    return respond_redirect(&stream, &target);
+                }
+            }
+        }
+    }
+
     if method == "GET" {
         if let Some(id) = path.strip_prefix("/contacts/") {
             if !id.is_empty() && !id.contains('/') {
@@ -875,6 +892,11 @@ fn ui_error_banner(query: &str) -> String {
                 <strong>That ceiling was not saved.</strong> \
                 Choose a contact and a dollar amount with at most nine decimal places.\
             </div>".to_string(),
+        Some(code) if code == UI_ERR_BAD_CLEARING =>
+            "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
+                <strong>That clearing was not sent.</strong> \
+                Choose lines already on this contact's ledger. This device has to be the writer and hold the user key. At most 64 lines.\
+            </div>".to_string(),
         Some(code) if code == UI_ERR_REMOVE_SELF =>
             "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
                 <strong>This device cannot remove itself.</strong> \
@@ -1000,7 +1022,8 @@ fn render_contacts(ctx: &WorkerContext) -> String {
                 format!("<ul style='margin:0;padding-left:1.2rem'>{dev_cells}</ul>")
             };
             format!(
-                "<tr><td><a href=\"/contacts/{id}\">{}</a></td><td>{dev_list}</td></tr>",
+                "<tr><td><a href=\"/contacts/{id}\">{}</a> \
+                   <a href=\"/contacts/{id}/ledger\">Ledger</a></td><td>{dev_list}</td></tr>",
                 html_escape(&c.user.alias),
                 id = uuid_hex(&c.user.uuid),
             )
@@ -1207,9 +1230,140 @@ fn render_contact_apps(ctx: &WorkerContext, id_hex: &str, query: &str) -> String
          <p style='color:var(--muted)'>Apps this contact may send to, and whether they accept you. \
             Accepting does not require the app to be installed.</p>\
          {error_banner}{table}\
-         <p><a href='/contacts'>All contacts</a></p>"
+         <p><a href='/contacts/{id_hex}/ledger'>Ledger</a> \
+            · <a href='/contacts'>All contacts</a></p>"
     );
     drop(node);
+    layout(ctx, "Contact", &body)
+}
+
+fn form_fields<'a>(body: &'a [u8], field: &str) -> Vec<&'a str> {
+    let Ok(s) = std::str::from_utf8(body) else {
+        return Vec::new();
+    };
+    let prefix = format!("{field}=");
+    s.split('&').filter_map(|part| part.strip_prefix(prefix.as_str())).collect()
+}
+
+/// Ask the other owner to sign a clearing for the checked lines.
+/// A missing line, an empty list, or more than 64 ids is not sent.
+/// This does not store the record and does not move a purse. The record
+/// lands when the other owner signs it back.
+fn record_contact_clearing(ctx: &WorkerContext, id_hex: &str, body: &[u8]) -> Option<&'static str> {
+    let Some(contact) = uuid_from_hex(id_hex) else {
+        return Some(UI_ERR_BAD_CLEARING);
+    };
+    let raw = form_fields(body, "payment");
+    if raw.is_empty() {
+        return Some(UI_ERR_BAD_CLEARING);
+    }
+    let mut ids = Vec::with_capacity(raw.len());
+    for raw_id in raw {
+        let Some(id) = uuid_from_hex(&url_decode(raw_id)) else {
+            return Some(UI_ERR_BAD_CLEARING);
+        };
+        ids.push(id);
+    }
+    let ids = {
+        let node = ctx.node.read().unwrap();
+        if !matches!(find_writer_sg(&node), WriterTarget::Local) {
+            return Some(UI_ERR_BAD_CLEARING);
+        }
+        if node.owner.key_pair.private_key == Ed25519SecretKey::ZERO {
+            return Some(UI_ERR_BAD_CLEARING);
+        }
+        if !node.owner.contact_users.iter().any(|row| row.user.uuid == contact) {
+            return Some(UI_ERR_BAD_CLEARING);
+        }
+        let Some(ids) = crate::payment::normalize_payment_ids(&ids) else {
+            return Some(UI_ERR_BAD_CLEARING);
+        };
+        let our = node.owner.user.uuid;
+        if !ids.iter().all(|id| {
+            node.owner.ledger.iter().any(|line| {
+                line.payment_id == *id
+                    && crate::payment::users_are_pair(line.payer, line.payee, our, contact)
+            })
+        }) {
+            return Some(UI_ERR_BAD_CLEARING);
+        }
+        ids
+    };
+    super::payment::propose_clearing(ctx, contact, generate_uuid(), &ids);
+    None
+}
+
+fn render_contact_ledger(ctx: &WorkerContext, id_hex: &str, query: &str) -> String {
+    let Some(contact_uuid) = uuid_from_hex(id_hex) else {
+        return layout(ctx, "Contact", "<h1>Ledger</h1><p class='empty'>Unknown contact.</p>");
+    };
+    let node = ctx.node.read().unwrap();
+    let Some(contact) = node.owner.contact_users.iter().find(|row| row.user.uuid == contact_uuid) else {
+        drop(node);
+        return layout(ctx, "Contact", "<h1>Ledger</h1><p class='empty'>That contact is not on this node.</p>");
+    };
+    let name = html_escape(&contact.user.alias);
+    let our = node.owner.user.uuid;
+    let mut lines: Vec<_> = node.owner.ledger.iter()
+        .filter(|line| crate::payment::users_are_pair(line.payer, line.payee, our, contact_uuid))
+        .cloned()
+        .collect();
+    lines.sort_by(|left, right| {
+        left.payment_id.cmp(&right.payment_id).then(left.confirm_sig.0.cmp(&right.confirm_sig.0))
+    });
+    let net = crate::payment::net_nanodollars(&node.owner, contact_uuid);
+    let mut rows = String::new();
+    let mut any_open = false;
+    for line in &lines {
+        let id = uuid_hex(&line.payment_id);
+        let cleared = crate::payment::payment_is_cleared(&node.owner, contact_uuid, line.payment_id);
+        let mark = if cleared {
+            "Cleared".to_string()
+        } else {
+            any_open = true;
+            format!("<input type='checkbox' name='payment' value='{id}'>")
+        };
+        let direction = if line.payee == our { "Incoming" } else { "Sent" };
+        rows.push_str(&format!(
+            "<tr><td><code>{id}</code></td><td>${amount}</td><td>{direction}</td>\
+               <td>{paying} → {destination}</td><td>{note}</td><td>{mark}</td></tr>",
+            amount = format_nanodollars(line.amount_nanodollars),
+            paying = html_escape(&line.paying_alias),
+            destination = html_escape(&line.destination_alias),
+            note = html_escape(&line.note),
+        ));
+    }
+    drop(node);
+
+    let table = if rows.is_empty() {
+        "<p class='empty'>No payments with this contact yet.</p>".to_string()
+    } else {
+        format!(
+            "<table><tr><th>Payment</th><th>Amount</th><th></th><th>Apps</th><th>Note</th><th></th></tr>{rows}</table>"
+        )
+    };
+    let form = if any_open {
+        format!(
+            "<form method='post' action='/contacts/{id_hex}/ledger'>\
+               {table}\
+               <button type='submit'>Record clearing</button>\
+             </form>"
+        )
+    } else {
+        table
+    };
+    let banner = ui_error_banner(query);
+    let body = format!(
+        "<h1>{name}</h1>\
+         <p style='color:var(--muted);margin-top:-.5rem'>Confirmed payments with this contact. \
+         The net is {net} dollars. A positive net is what this contact owes you. \
+         A cleared line stays listed and leaves the net. Record clearing asks this contact to sign. \
+         The purse does not change, and any dollars paid stay outside pNet.</p>\
+         {banner}\
+         {form}\
+         <p><a href='/contacts/{id_hex}'>Apps</a> · <a href='/contacts'>All contacts</a></p>",
+        net = format_nanodollars(net),
+    );
     layout(ctx, "Contact", &body)
 }
 
@@ -1577,6 +1731,7 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
 pub(crate) const UI_ERR_PUBLISH_FAILED: &str = "publish_failed";
 pub(crate) const UI_ERR_BAD_PURSE: &str = "bad_purse";
 pub(crate) const UI_ERR_BAD_CEILING: &str = "bad_ceiling";
+pub(crate) const UI_ERR_BAD_CLEARING: &str = "bad_clearing";
 
 /// The device serving this page cannot remove itself.
 pub(crate) const UI_ERR_REMOVE_SELF: &str = "remove_self";
@@ -2928,20 +3083,21 @@ fn render_receive_ceilings(ctx: &WorkerContext, query: &str) -> String {
 mod policy_ui_tests {
     use std::net::UdpSocket;
     use std::sync::{Arc, RwLock, mpsc};
+    use std::time::{Duration, SystemTime};
 
     use crate::action_queue::WorkerContext;
     use crate::data_models::{
-        AppInvitation, Application, Contact, Device, DeviceGrade, Ed25519KeyPair,
-        Ed25519PublicKey, Ed25519Signature, Node, SyncVersion, User, X25519PublicKey,
-        generate_uuid,
+        ActiveConnection, AppInvitation, Application, ClearingRecord, Contact, Device, DeviceGrade,
+        Ed25519KeyPair, Ed25519PublicKey, Ed25519Signature, LedgerLine, Node, PendingAccept, Purse,
+        SyncVersion, User, X25519PublicKey, generate_uuid,
     };
     use crate::wire::uuid_hex;
 
     use super::{
         accept_app_invitation, add_purse_alias, create_purse, grant_contact_app,
-        invite_contact_app, reject_app_invitation, remove_purse_alias, render_app_invitations,
-        render_contact_apps, render_contacts, render_purses, render_receive_ceilings,
-        set_receive_ceiling,
+        invite_contact_app, record_contact_clearing, reject_app_invitation, remove_purse_alias,
+        render_app_invitations, render_contact_apps, render_contact_ledger, render_contacts,
+        render_purses, render_receive_ceilings, set_receive_ceiling,
     };
 
     fn portal() -> (WorkerContext, [u8; 16]) {
@@ -3192,6 +3348,162 @@ mod policy_ui_tests {
 
         let hub = super::render_config_hub(&ctx);
         assert!(hub.contains("/receive-ceilings"));
+    }
+
+    fn pair_line(our: [u8; 16], contact: [u8; 16], payment: [u8; 16], amount: i64, note: &str, incoming: bool) -> LedgerLine {
+        let (payer, payee) = if incoming { (contact, our) } else { (our, contact) };
+        LedgerLine {
+            payment_id: payment,
+            amount_nanodollars: amount,
+            payer,
+            payee,
+            paying_alias: "discordium-client".into(),
+            destination_alias: "player".into(),
+            note: note.into(),
+            expires_at_ms: 0,
+            purse_id: [0; 16],
+            payer_sig: Ed25519Signature::ZERO,
+            payee_sig: Ed25519Signature::ZERO,
+            confirm_sig: Ed25519Signature([payment[0]; 64]),
+        }
+    }
+
+    #[test]
+    fn contact_ledger_shows_the_net_and_proposes_a_clearing() {
+        let (ctx, contact) = portal();
+        let hex = uuid_hex(&contact);
+        let our = ctx.node.read().unwrap().owner.user.uuid;
+        let open = [0x11; 16];
+        let sent = [0x22; 16];
+        let cleared = [0x33; 16];
+        let (lo, hi) = if our < contact { (our, contact) } else { (contact, our) };
+        {
+            let mut node = ctx.node.write().unwrap();
+            node.owner.ledger.push(pair_line(our, contact, open, 1_000_000, "clip", true));
+            let mut second = pair_line(our, contact, open, 1_000_000, "other", true);
+            second.confirm_sig = Ed25519Signature([0xAB; 64]);
+            node.owner.ledger.push(second);
+            node.owner.ledger.push(pair_line(our, contact, sent, 250_000, "refund", false));
+            node.owner.ledger.push(pair_line(our, contact, cleared, 5_000_000, "settled", true));
+            node.owner.ledger.push(pair_line(our, [0x44; 16], [0x55; 16], 9, "hidden-note", true));
+            node.owner.pending_accepts.push(PendingAccept {
+                payment_id: [0x66; 16],
+                amount_nanodollars: 1,
+                payer: contact,
+                payee: our,
+                paying_alias: "player".into(),
+                destination_alias: "discordium-client".into(),
+                note: "waiting-note".into(),
+                expires_at_ms: 0,
+                payer_sig: Ed25519Signature::ZERO,
+                payee_sig: Ed25519Signature::ZERO,
+            });
+            node.owner.clearings.push(ClearingRecord {
+                clearing_id: [0xC1; 16],
+                user_lo: lo,
+                user_hi: hi,
+                payment_ids: vec![cleared],
+                sig_lo: Ed25519Signature::ZERO,
+                sig_hi: Ed25519Signature::ZERO,
+            });
+            node.owner.purses.push(Purse {
+                id: [0x41; 16],
+                name: "media".into(),
+                allotment_nanodollars: 5_000_000,
+                available_nanodollars: 4_000_000,
+                aliases: Vec::new(),
+            });
+        }
+
+        let apps = render_contact_apps(&ctx, &hex, "");
+        assert!(apps.contains(&format!("/contacts/{hex}/ledger")));
+        let list = render_contacts(&ctx);
+        assert!(list.contains(&format!("/contacts/{hex}/ledger")));
+
+        let page = render_contact_ledger(&ctx, &hex, "");
+        assert!(page.contains("sanosuke"));
+        assert!(page.contains("clip"));
+        assert!(page.contains("other"));
+        assert!(page.contains("refund"));
+        assert!(page.contains("settled"));
+        assert!(page.contains("Incoming"));
+        assert!(page.contains("Sent"));
+        assert!(page.contains("Cleared"));
+        assert!(page.contains("0.00175"));
+        assert!(page.contains(&format!("value='{}'", uuid_hex(&open))));
+        assert!(!page.contains(&format!("value='{}'", uuid_hex(&cleared))));
+        assert!(!page.contains("hidden-note"));
+        assert!(!page.contains("waiting-note"));
+        assert!(page.contains("Record clearing"));
+
+        let open_hex = uuid_hex(&open);
+        assert!(record_contact_clearing(&ctx, &hex, &form(&[("payment", &uuid_hex(&[0x99; 16]))])).is_some());
+        assert!(record_contact_clearing(&ctx, &hex, &form(&[("payment", &open_hex)])).is_some());
+        {
+            let node = ctx.node.read().unwrap();
+            assert_eq!(node.owner.clearings.len(), 1);
+            assert_eq!(node.owner.purses[0].available_nanodollars, 4_000_000);
+            assert_eq!(crate::payment::net_nanodollars(&node.owner, contact), 1_750_000);
+        }
+
+        let mut bulk = String::new();
+        {
+            let mut node = ctx.node.write().unwrap();
+            for n in 0..65u8 {
+                let mut id = [0xA0; 16];
+                id[15] = n;
+                node.owner.ledger.push(pair_line(our, contact, id, 1, "bulk", true));
+                if n > 0 {
+                    bulk.push('&');
+                }
+                bulk.push_str(&format!("payment={}", uuid_hex(&id)));
+            }
+        }
+        ctx.node.write().unwrap().owner.key_pair = crate::crypto::generate_ed25519_keypair();
+        assert!(record_contact_clearing(&ctx, &hex, bulk.as_bytes()).is_some());
+
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let dev = ctx.node.read().unwrap().owner.contact_users[0].user.devices[0].uuid;
+        let dh = crate::crypto::generate_x25519_keypair();
+        ctx.node.write().unwrap().owner.active_connections.insert(7, ActiveConnection {
+            id: 7,
+            timeout: SystemTime::now() + Duration::from_secs(3600),
+            key_pair: dh.clone(),
+            peer_public_key: dh.public_key,
+            peer_active_connection_id: 7,
+            device_uuid: dev,
+            peer_addr: listener.local_addr().unwrap(),
+        });
+
+        assert!(record_contact_clearing(&ctx, &hex, &form(&[("payment", &open_hex)])).is_none());
+        let mut buf = [0u8; 2048];
+        let n = listener.recv(&mut buf).unwrap();
+        assert!(n > 1);
+        assert_eq!(buf[0], 0x66);
+        {
+            let node = ctx.node.read().unwrap();
+            assert_eq!(node.owner.clearings.len(), 1);
+            assert_eq!(node.owner.purses[0].available_nanodollars, 4_000_000);
+            assert_eq!(node.owner.ledger.len(), 70);
+            assert_eq!(crate::payment::net_nanodollars(&node.owner, contact), 1_750_065);
+        }
+        let page = render_contact_ledger(&ctx, &hex, "");
+        assert!(page.contains(&format!("value='{open_hex}'")));
+        assert!(page.contains("0.001750065"));
+
+        let mut again = [0u8; 64];
+        assert!(listener.recv(&mut again).is_err());
+        {
+            let mut node = ctx.node.write().unwrap();
+            let local = node.device_uuid;
+            let dev = node.owner.user.devices.iter_mut().find(|d| d.uuid == local).unwrap();
+            dev.grade = DeviceGrade::DG;
+            dev.sg_rank = None;
+        }
+        assert!(record_contact_clearing(&ctx, &hex, &form(&[("payment", &open_hex)])).is_some());
+        assert!(listener.recv(&mut again).is_err());
+        assert_eq!(ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 4_000_000);
     }
 }
 
