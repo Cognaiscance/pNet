@@ -696,7 +696,7 @@ pub struct Owner {
     /// A payer with no row is at zero. Private scope.
     #[serde(default)]
     pub receive_ceilings: Vec<ReceiveCeiling>,
-    /// Confirmed payments. Private scope. The app lists stay empty until a later step.
+    /// Confirmed payments. Private scope. Ops `0x06` and `0x07` list the lines for one alias.
     #[serde(default)]
     pub ledger: Vec<LedgerLine>,
     /// Offers this user signed and has not yet been told are stored.

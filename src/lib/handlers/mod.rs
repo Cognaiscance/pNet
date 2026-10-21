@@ -938,6 +938,98 @@ mod tests {
         assert_eq!(t.recv_reply(), vec![OK, 0, 0]);
     }
 
+    #[test]
+    fn app_payment_lists_return_the_note_and_hide_other_aliases() {
+        let pair = pair_for_payment();
+        let amount = 1_000_000i64;
+        let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
+        let payee_user = pair.payee.ctx.node.read().unwrap().owner.user.uuid;
+        set_ceiling(&pair.payee, payer_user, amount);
+        let payment = [0xB3; 16];
+        app_reserve(
+            pair.payer.app_addr(),
+            reserve_packet(&pair.token, &pair.purse, amount, &payee_user, "player", "", &payment),
+            &pair.payer.ctx,
+        );
+        assert_eq!(parse_reserve_ok(&pair.payer.recv_reply()).0, 4_000_000);
+
+        // A hold is not a line yet.
+        app_list_sent(pair.payer.app_addr(), pair.token.to_vec(), &pair.payer.ctx);
+        assert_eq!(pair.payer.recv_reply(), vec![OK, 0, 0]);
+        app_list_incoming(pair.payee.app_addr(), pair.payee_token.to_vec(), &pair.payee.ctx);
+        assert_eq!(pair.payee.recv_reply(), vec![OK, 0, 0]);
+
+        finish_handshake(&pair);
+        assert_lists_show_one_payment(&pair, payment, amount, "");
+
+        let other = register_and_get_token(&pair.payer, "other-app", 9301);
+        approve_local_app(&pair.payer, &other);
+        app_list_sent(pair.payer.app_addr(), other.to_vec(), &pair.payer.ctx);
+        assert_eq!(pair.payer.recv_reply(), vec![OK, 0, 0]);
+        app_list_incoming(pair.payer.app_addr(), other.to_vec(), &pair.payer.ctx);
+        assert_eq!(pair.payer.recv_reply(), vec![OK, 0, 0]);
+
+        let stranger = register_and_get_token(&pair.payee, "not-player", 9302);
+        approve_local_app(&pair.payee, &stranger);
+        app_list_incoming(pair.payee.app_addr(), stranger.to_vec(), &pair.payee.ctx);
+        assert_eq!(pair.payee.recv_reply(), vec![OK, 0, 0]);
+
+        let (_, plain) = signed_record(&pair, payment, amount, "other-note");
+        deliver_record(&pair.payee, &pair.payer, &plain);
+        deliver_record(&pair.payer, &pair.payee, &plain);
+
+        let mut hidden = pair.payee.ctx.node.read().unwrap().owner.ledger[0].clone();
+        hidden.payment_id = [0xEE; 16];
+        hidden.destination_alias = "not-player".into();
+        hidden.note = "hidden".into();
+        pair.payee.ctx.node.write().unwrap().owner.ledger.push(hidden);
+
+        let available = pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars;
+        app_list_sent(pair.payer.app_addr(), pair.token.to_vec(), &pair.payer.ctx);
+        let sent = parse_payment_list(&pair.payer.recv_reply());
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|line| {
+            line.payment_id == payment
+                && line.amount == amount
+                && line.payer == payer_user
+                && line.payee == payee_user
+                && line.paying_alias == "discordium-client"
+                && line.destination_alias == "player"
+        }));
+        let payer_notes = {
+            let node = pair.payer.ctx.node.read().unwrap();
+            let mut lines: Vec<_> = node
+                .owner
+                .ledger
+                .iter()
+                .filter(|line| line.payment_id == payment)
+                .cloned()
+                .collect();
+            lines.sort_by(|a, b| a.confirm_sig.0.cmp(&b.confirm_sig.0));
+            lines.into_iter().map(|line| line.note).collect::<Vec<_>>()
+        };
+        assert_eq!(payer_notes.len(), 2);
+        assert!(payer_notes.iter().any(|note| note.is_empty()));
+        assert!(payer_notes.iter().any(|note| note == "other-note"));
+        assert_eq!(sent.iter().map(|line| line.note.clone()).collect::<Vec<_>>(), payer_notes);
+
+        app_list_incoming(pair.payee.app_addr(), pair.payee_token.to_vec(), &pair.payee.ctx);
+        let incoming = parse_payment_list(&pair.payee.recv_reply());
+        assert_eq!(
+            incoming.iter().map(|line| line.note.as_str()).collect::<Vec<_>>(),
+            sent.iter().map(|line| line.note.as_str()).collect::<Vec<_>>()
+        );
+
+        app_list_incoming(pair.payee.app_addr(), stranger.to_vec(), &pair.payee.ctx);
+        let only = parse_payment_list(&pair.payee.recv_reply());
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].note, "hidden");
+        assert_eq!(only[0].destination_alias, "not-player");
+        assert_eq!(only[0].payment_id, [0xEE; 16]);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, available);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), 2);
+    }
+
     // ── App reserve ───────────────────────────────────────────────────────────
 
     fn reserve_packet(
@@ -1309,15 +1401,92 @@ mod tests {
         );
     }
 
-    fn assert_lists_stay_empty(pair: &PaymentPair) {
+    struct ListedPayment {
+        payment_id: [u8; 16],
+        amount: i64,
+        payer: [u8; 16],
+        payee: [u8; 16],
+        paying_alias: String,
+        destination_alias: String,
+        note: String,
+    }
+
+    fn parse_payment_list(reply: &[u8]) -> Vec<ListedPayment> {
+        assert_eq!(reply[0], OK);
+        assert!(reply.len() >= 3, "payment reply shorter than status and count");
+        let count = u16::from_be_bytes([reply[1], reply[2]]) as usize;
+        let mut pos = 3usize;
+        let mut lines = Vec::with_capacity(count);
+        for _ in 0..count {
+            let payment_id: [u8; 16] = reply[pos..pos + 16].try_into().unwrap();
+            pos += 16;
+            let amount = i64::from_be_bytes(reply[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let payer: [u8; 16] = reply[pos..pos + 16].try_into().unwrap();
+            pos += 16;
+            let payee: [u8; 16] = reply[pos..pos + 16].try_into().unwrap();
+            pos += 16;
+            let paying_alias = read_str(reply, &mut pos).unwrap();
+            let destination_alias = read_str(reply, &mut pos).unwrap();
+            let note = read_str(reply, &mut pos).unwrap();
+            lines.push(ListedPayment {
+                payment_id,
+                amount,
+                payer,
+                payee,
+                paying_alias,
+                destination_alias,
+                note,
+            });
+        }
+        assert_eq!(pos, reply.len(), "trailing bytes after the payment list");
+        lines
+    }
+
+    fn one_payment_reply(
+        payment: [u8; 16],
+        amount: i64,
+        payer: [u8; 16],
+        payee: [u8; 16],
+        note: &str,
+    ) -> Vec<u8> {
+        let mut reply = vec![OK, 0, 1];
+        reply.extend_from_slice(&payment);
+        reply.extend_from_slice(&amount.to_be_bytes());
+        reply.extend_from_slice(&payer);
+        reply.extend_from_slice(&payee);
+        push_str(&mut reply, "discordium-client");
+        push_str(&mut reply, "player");
+        push_str(&mut reply, note);
+        reply
+    }
+
+    /// The payer's sent list and the payee's incoming list are that one line.
+    /// The other two lists stay empty. A read leaves the purse and the ledger.
+    fn assert_lists_show_one_payment(pair: &PaymentPair, payment: [u8; 16], amount: i64, note: &str) {
+        let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
+        let payee_user = pair.payee.ctx.node.read().unwrap().owner.user.uuid;
+        let available = pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars;
+        let payer_lines = pair.payer.ctx.node.read().unwrap().owner.ledger.len();
+        let payee_lines = pair.payee.ctx.node.read().unwrap().owner.ledger.len();
+        let expected = one_payment_reply(payment, amount, payer_user, payee_user, note);
+
         app_list_incoming(pair.payer.app_addr(), pair.token.to_vec(), &pair.payer.ctx);
         assert_eq!(pair.payer.recv_reply(), vec![OK, 0, 0]);
         app_list_sent(pair.payer.app_addr(), pair.token.to_vec(), &pair.payer.ctx);
-        assert_eq!(pair.payer.recv_reply(), vec![OK, 0, 0]);
+        let sent = pair.payer.recv_reply();
+        assert_eq!(sent, expected);
+        assert!(!sent.windows(16).any(|window| window == pair.purse));
+
         app_list_incoming(pair.payee.app_addr(), pair.payee_token.to_vec(), &pair.payee.ctx);
-        assert_eq!(pair.payee.recv_reply(), vec![OK, 0, 0]);
+        let incoming = pair.payee.recv_reply();
+        assert_eq!(incoming, expected);
         app_list_sent(pair.payee.app_addr(), pair.payee_token.to_vec(), &pair.payee.ctx);
         assert_eq!(pair.payee.recv_reply(), vec![OK, 0, 0]);
+
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, available);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), payer_lines);
+        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.ledger.len(), payee_lines);
     }
 
     #[test]
@@ -1356,7 +1525,7 @@ mod tests {
         assert_eq!(payer_line.payer_sig, payee_line.payer_sig);
         assert_eq!(payer_line.payee_sig, payee_line.payee_sig);
         assert_eq!(payer_line.confirm_sig, payee_line.confirm_sig);
-        assert_lists_stay_empty(&pair);
+        assert_lists_show_one_payment(&pair, payment, amount, "clip");
 
         reserve_to(&pair, amount, payment);
         let (again, _) = parse_reserve_ok(&pair.payer.recv_reply());
@@ -1555,7 +1724,7 @@ mod tests {
         drop(payee);
         assert_eq!(pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 4_000_000);
         assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), 1);
-        assert_lists_stay_empty(&pair);
+        assert_lists_show_one_payment(&pair, [0xA0; 16], 1_000_000, "clip");
     }
 
     #[test]

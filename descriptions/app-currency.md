@@ -6,7 +6,7 @@ An approved app will be able to spend a small amount with another pNet node. The
 
 Each user issues their own credit. The rank-1 server keeps that user's books, the same way it orders the directory. A payment is an obligation from the paying user to a contact. The two of them may clear the net later. A tab can also stay open.
 
-Read opcodes `0x05`, `0x06`, and `0x07` are assigned. Reserve is opcode `0x08`. After a reserve, the two writers finish the payment on fabric ops `0x60` through `0x63`. A note is at most 255 bytes. `/purses` creates fixed purses and assigns app aliases.
+Read opcodes `0x05`, `0x06`, and `0x07` are assigned. `0x06` and `0x07` return confirmed lines for the caller's alias. Reserve is opcode `0x08`. After a reserve, the two writers finish the payment on fabric ops `0x60` through `0x63`. A note is at most 255 bytes. `/purses` creates fixed purses and assigns app aliases.
 
 ## Who issues
 
@@ -61,10 +61,10 @@ The page shows each purse's allotment and available amount. The same purses appe
 An assigned app can ask the local node for three things.
 
 - The purses it belongs to, with the kind, the allotment, and the available amount of each. The reply also names each purse so the app can tell them apart.
-- Ledger lines sent to this user for this app alias. Each line has the payer, the paying app, the amount, the note, and the payment id. Every device running that alias can read them.
-- Ledger lines this app itself sent.
+- Ledger lines sent to this user for this app alias. Each line has the payment id, the amount, the payer, the payee, the paying app, the destination app, and the note. Every device running that alias can read them.
+- Ledger lines this app itself sent. The fields are the same.
 
-Those questions are local ops `0x05`, `0x06`, and `0x07`. The kind byte is fixed until a monthly purse exists. The two payment lists stay empty. A reserve is local op `0x08`. It lowers the available amount. Once the contact accepts and the payer confirms, both writers store the line, and the lists still return nothing.
+Those questions are local ops `0x05`, `0x06`, and `0x07`. The kind byte is fixed until a monthly purse exists. `0x06` lists lines whose payee is this user and whose destination alias is the caller's alias. `0x07` lists lines whose payer is this user and whose paying alias is the caller's alias. A reserve is local op `0x08`. It lowers the available amount. Once the contact accepts and the payer confirms, both writers store the line, and those two lists return it.
 
 A send names the contact, the amount, the destination app alias, the note, and the payment id. An app that belongs to one purse draws on that purse. An app that belongs to several names which purse covers the send. That name chooses the limit. The payment goes to the user.
 
@@ -133,7 +133,7 @@ The steps below are the build order. A step that is not marked done stays unbuil
    The payee stores a copied record with an empty purse id and does not change a purse. The payer keeps the purse from the matching hold and does not subtract again. If that hold is already gone and exactly one purse lists the paying alias, the available amount is reduced and may go negative. That negative amount is the overrun. If no purse or several purses list the alias, the line is stored and no purse is chosen.
 
    A confirmation that arrives after the staged accept expired is stored. Expiry itself still drops the staged accept and does not create a line. Ops `0x06` and `0x07` stay empty.
-6. **App payment lists.** The incoming list and the sent list return real lines, including the note.
+6. **App payment lists. Done.** Ops `0x06` and `0x07` return confirmed lines. `0x06` is lines whose payee is this user and whose destination alias is the caller's alias. `0x07` is lines whose payer is this user and whose paying alias is the caller's alias. Each line is the payment id, the amount, the payer, the payee, the paying alias, the destination alias, and the note. The purse id, the expiry, and the signatures are absent. Order is the payment id, then the payer's confirmation signature, so two bodies of one id both appear and the order is the same on every device. A hold that is not confirmed is absent. Another alias's lines are absent, including the note. Count 0 is success. The read does not change a purse or the ledger. An unknown token and an unapproved app are rejected.
 7. **Clearing record.** Both owners sign a record that names payment ids, and those lines drop out of the net. No bank, chain, or clearing contact is attached.
 
 Monthly reset, changing an allotment after creation, the receive-ceiling control, the contact ledger page, a clearing contact, and any outside payment stay out of these steps until those choices are settled.

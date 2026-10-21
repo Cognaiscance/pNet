@@ -148,7 +148,7 @@ Success replies start with `0x00`. Errors are `0x01` followed by one code. Send 
 | `0x01` | bad packet | Truncated, bad UTF-8, empty string, port 0, or a source that is not IPv4. |
 | `0x02` | token unknown | Token is not on this device. |
 | `0x03` | no writer | Auto-approve, or an alias change, could not be published. |
-| `0x04` | not approved | Token is valid and `user_approved` is false. Used by send, the purse reads, and reserve. |
+| `0x04` | not approved | Token is valid and `user_approved` is false. Used by send, the purse and payment reads, and reserve. |
 | `0x05` | no route | No session to the destination and no SG to relay through. |
 | `0x06` | payload too large | More than 4096 bytes of app payload. |
 | `0x07` | rate limited | Register or send bucket is empty. |
@@ -261,11 +261,23 @@ Errors: `bad packet`, `token unknown`, `not approved`.
 
 Body: `token (16)`, exactly 16 bytes. Same approval check as list purses.
 
-Success is `0x00 || count (u16)`. The count stays 0. A later step returns the stored lines, which are payments sent to this user for this app alias.
+The reply lists confirmed lines whose payee is this user and whose destination alias is the caller's alias. A hold that is not confirmed is absent. A line for another alias is absent, including its note. Order is payment id, then the payer's confirmation signature. Two different signed bodies of one payment id are both listed. Count 0 is success. The read does not change a purse or the ledger.
+
+```text
+0x00
+|| count (u16)
+||   repeated line
+||     payment id (16) || amount (i64) || payer (16) || payee (16)
+||     paying alias || destination alias || note
+```
+
+Amounts are nanodollars, big-endian. Strings are a length byte and then UTF-8, the same as a purse name. The purse id, the expiry, and the signatures are absent.
+
+Errors: `bad packet`, `token unknown`, `not approved`.
 
 ### List sent (`0x07`)
 
-Same request, same approval check, and the same empty success as list incoming. A later step returns the lines this app sent.
+Same request and same approval check. The lines are confirmed payments whose payer is this user and whose paying alias is the caller's alias. Each line uses the same layout as list incoming.
 
 ### Reserve (`0x08`)
 

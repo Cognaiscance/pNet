@@ -137,13 +137,15 @@ packet when it decrypts the delivery.
 ### 6 — list incoming payments
 
 - Request: `[token:16]` exactly. Same approval check as op 5.
-- Success: `[0x00][count:u16 be]` with count 0. Stored lines are not listed yet.
-- These lines will be payments sent to this user for this app alias.
+- Success: `[0x00][count:u16 be]` then each confirmed line whose payee is this user and whose destination alias is the caller's alias, ordered by payment id and then the payer's confirmation signature:
+  `[payment id:16][amount:i64 be][payer uuid:16][payee uuid:16][paying alias][destination alias][note]`
+- Amounts are nanodollars. Strings are a length byte and then UTF-8, the same as a purse name. The purse id, the expiry, and the signatures are absent. A hold that is not confirmed is absent. A line for another alias is absent. Two signed bodies of one id are both listed. Count 0 is success. The read does not change a purse or the ledger.
+- Errors: `ERR_BAD_PACKET`, `ERR_TOKEN_UNKNOWN`, `ERR_NOT_APPROVED`
 
 ### 7 — list sent payments
 
-- Same request, same approval check, and the same empty success as op 6.
-- These lines will be payments this app sent.
+- Same request, same approval check, and the same line layout as op 6.
+- A line is included when this user is the payer and the paying alias is the caller's alias.
 
 ### 8 — reserve
 
