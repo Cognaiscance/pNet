@@ -112,7 +112,7 @@ pub use app_edge::{
 };
 mod payment;
 pub use payment::{
-    clearing_index, clearing_record, payment_accept, payment_clear, payment_clear_ack,
+    settlement_index, settlement_record, payment_accept, settlement_propose, settlement_ack,
     payment_confirm, payment_index, payment_offer, payment_record, payment_refuse,
 };
 
@@ -1001,7 +1001,7 @@ mod tests {
         let amount = 1_000_000i64;
         let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
         let payee_user = pair.payee.ctx.node.read().unwrap().owner.user.uuid;
-        set_ceiling(&pair.payee, payer_user, amount);
+        set_run(&pair.payee, payer_user, amount);
         let payment = [0xB3; 16];
         app_reserve(
             pair.payer.app_addr(),
@@ -1035,11 +1035,11 @@ mod tests {
         deliver_record(&pair.payee, &pair.payer, &plain);
         deliver_record(&pair.payer, &pair.payee, &plain);
 
-        let mut hidden = pair.payee.ctx.node.read().unwrap().owner.ledger[0].clone();
+        let mut hidden = pair.payee.ctx.node.read().unwrap().owner.charges[0].clone();
         hidden.payment_id = [0xEE; 16];
         hidden.destination_alias = "not-player".into();
         hidden.note = "hidden".into();
-        pair.payee.ctx.node.write().unwrap().owner.ledger.push(hidden);
+        pair.payee.ctx.node.write().unwrap().owner.charges.push(hidden);
 
         let available = pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars;
         app_list_sent(pair.payer.app_addr(), pair.token.to_vec(), &pair.payer.ctx);
@@ -1057,7 +1057,7 @@ mod tests {
             let node = pair.payer.ctx.node.read().unwrap();
             let mut lines: Vec<_> = node
                 .owner
-                .ledger
+                .charges
                 .iter()
                 .filter(|line| line.payment_id == payment)
                 .cloned()
@@ -1084,7 +1084,7 @@ mod tests {
         assert_eq!(only[0].destination_alias, "not-player");
         assert_eq!(only[0].payment_id, [0xEE; 16]);
         assert_eq!(pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, available);
-        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), 2);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.charges.len(), 2);
     }
 
     // ── App reserve ───────────────────────────────────────────────────────────
@@ -1538,9 +1538,9 @@ mod tests {
         PaymentPair { payer, payee, token, payee_token, purse }
     }
 
-    fn set_ceiling(t: &TestCtx, payer: Uuid, max_nanodollars: i64) {
-        t.ctx.node.write().unwrap().owner.receive_ceilings.push(
-            super::super::data_models::ReceiveCeiling { payer, max_nanodollars },
+    fn set_run(t: &TestCtx, payer: Uuid, max_nanodollars: i64) {
+        t.ctx.node.write().unwrap().owner.run_limits.push(
+            super::super::data_models::RunLimit { payer, max_nanodollars },
         );
     }
 
@@ -1638,13 +1638,13 @@ mod tests {
     }
 
     /// The payer's sent list and the payee's incoming list are that one line.
-    /// The other two lists stay empty. A read leaves the purse and the ledger.
+    /// The other two lists stay empty. A read leaves the purse and the charges.
     fn assert_lists_show_one_payment(pair: &PaymentPair, payment: [u8; 16], amount: i64, note: &str) {
         let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
         let payee_user = pair.payee.ctx.node.read().unwrap().owner.user.uuid;
         let available = pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars;
-        let payer_lines = pair.payer.ctx.node.read().unwrap().owner.ledger.len();
-        let payee_lines = pair.payee.ctx.node.read().unwrap().owner.ledger.len();
+        let payer_lines = pair.payer.ctx.node.read().unwrap().owner.charges.len();
+        let payee_lines = pair.payee.ctx.node.read().unwrap().owner.charges.len();
         let expected = one_payment_reply(payment, amount, payer_user, payee_user, note);
 
         app_list_incoming(pair.payer.app_addr(), pair.token.to_vec(), &pair.payer.ctx);
@@ -1661,8 +1661,8 @@ mod tests {
         assert_eq!(pair.payee.recv_reply(), vec![OK, 0, 0]);
 
         assert_eq!(pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, available);
-        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), payer_lines);
-        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.ledger.len(), payee_lines);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.charges.len(), payer_lines);
+        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.charges.len(), payee_lines);
     }
 
     #[test]
@@ -1670,7 +1670,7 @@ mod tests {
         let pair = pair_for_payment();
         let amount = 1_000_000i64;
         let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
-        set_ceiling(&pair.payee, payer_user, amount);
+        set_run(&pair.payee, payer_user, amount);
         let payment = [0x91; 16];
         reserve_to(&pair, amount, payment);
         let (available, _) = parse_reserve_ok(&pair.payer.recv_reply());
@@ -1682,8 +1682,8 @@ mod tests {
             assert_eq!(node.owner.purses[0].available_nanodollars, 4_000_000);
             assert!(node.owner.reserves.is_empty());
             assert!(node.owner.pending_accepts.is_empty());
-            assert_eq!(node.owner.ledger.len(), 1);
-            let line = &node.owner.ledger[0];
+            assert_eq!(node.owner.charges.len(), 1);
+            let line = &node.owner.charges[0];
             assert_eq!(line.payment_id, payment);
             assert_eq!(line.amount_nanodollars, amount);
             assert_eq!(line.note, "clip");
@@ -1694,9 +1694,9 @@ mod tests {
             let node = pair.payee.ctx.node.read().unwrap();
             assert!(node.owner.pending_accepts.is_empty());
             assert!(node.owner.reserves.is_empty());
-            assert_eq!(node.owner.ledger.len(), 1);
-            assert_eq!(node.owner.ledger[0].purse_id, [0u8; 16]);
-            node.owner.ledger[0].clone()
+            assert_eq!(node.owner.charges.len(), 1);
+            assert_eq!(node.owner.charges[0].purse_id, [0u8; 16]);
+            node.owner.charges[0].clone()
         };
         assert_eq!(payer_line.payer_sig, payee_line.payer_sig);
         assert_eq!(payer_line.payee_sig, payee_line.payee_sig);
@@ -1707,16 +1707,16 @@ mod tests {
         let (again, _) = parse_reserve_ok(&pair.payer.recv_reply());
         assert_eq!(again, 4_000_000);
         assert_eq!(pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 4_000_000);
-        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), 1);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.charges.len(), 1);
         assert_eq!(recv_pnet(&pair.payee)[0], PAYMENT_CONFIRM_OP);
     }
 
-    fn refuse_over_ceiling(max: Option<i64>) {
+    fn refuse_over_run(max: Option<i64>) {
         let pair = pair_for_payment();
         let amount = 1_000_000i64;
         if let Some(max) = max {
             let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
-            set_ceiling(&pair.payee, payer_user, max);
+            set_run(&pair.payee, payer_user, max);
         }
         let payment = [0x92; 16];
         reserve_to(&pair, amount, payment);
@@ -1735,7 +1735,7 @@ mod tests {
             &refusal[1..],
         ).expect("refusal decrypts");
         let (_, _, reason, _) = super::super::payment::decode_refuse(&plain).expect("refusal decodes");
-        assert_eq!(reason, super::super::payment::REFUSE_OVER_CEILING);
+        assert_eq!(reason, super::super::payment::REFUSE_OVER_RUN);
         payment_refuse(
             pair.payee.ctx.udp_socket.local_addr().unwrap(),
             refusal[1..].to_vec(),
@@ -1743,26 +1743,26 @@ mod tests {
         );
         assert_eq!(pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 5_000_000);
         assert!(pair.payer.ctx.node.read().unwrap().owner.reserves.is_empty());
-        assert!(pair.payer.ctx.node.read().unwrap().owner.ledger.is_empty());
-        assert!(pair.payee.ctx.node.read().unwrap().owner.ledger.is_empty());
+        assert!(pair.payer.ctx.node.read().unwrap().owner.charges.is_empty());
+        assert!(pair.payee.ctx.node.read().unwrap().owner.charges.is_empty());
         assert!(pair.payee.ctx.node.read().unwrap().owner.pending_accepts.is_empty());
     }
 
     #[test]
-    fn payment_with_no_ceiling_is_refused_and_the_reserve_returns() {
-        refuse_over_ceiling(None);
+    fn payment_with_nothing_to_run_is_refused_and_the_reserve_returns() {
+        refuse_over_run(None);
     }
 
     #[test]
-    fn payment_past_the_ceiling_is_refused_and_the_reserve_returns() {
-        refuse_over_ceiling(Some(999_999));
+    fn payment_past_what_youll_run_is_refused_and_the_reserve_returns() {
+        refuse_over_run(Some(999_999));
     }
 
     #[test]
     fn a_bad_offer_signature_is_dropped() {
         let pair = pair_for_payment();
         let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
-        set_ceiling(&pair.payee, payer_user, 1_000_000);
+        set_run(&pair.payee, payer_user, 1_000_000);
         reserve_to(&pair, 1_000_000, [0x93; 16]);
         assert_eq!(parse_reserve_ok(&pair.payer.recv_reply()).0, 4_000_000);
         let offer = recv_pnet(&pair.payee);
@@ -1782,7 +1782,7 @@ mod tests {
             &pair.payee.ctx,
         );
         assert!(pair.payee.ctx.node.read().unwrap().owner.pending_accepts.is_empty());
-        assert!(pair.payee.ctx.node.read().unwrap().owner.ledger.is_empty());
+        assert!(pair.payee.ctx.node.read().unwrap().owner.charges.is_empty());
         let mut buf = [0u8; 64];
         assert!(pair.payer.ctx.udp_socket.recv_from(&mut buf).is_err());
         let node = pair.payer.ctx.node.read().unwrap();
@@ -1813,7 +1813,7 @@ mod tests {
         release_expired_reserves(&t.ctx);
         let node = t.ctx.node.read().unwrap();
         assert!(node.owner.pending_accepts.is_empty());
-        assert!(node.owner.ledger.is_empty());
+        assert!(node.owner.charges.is_empty());
     }
 
     fn seal(from: &TestCtx, op: u8, plain: &[u8]) -> Vec<u8> {
@@ -1827,7 +1827,7 @@ mod tests {
         payment: [u8; 16],
         amount: i64,
         note: &str,
-    ) -> (super::super::data_models::LedgerLine, Vec<u8>) {
+    ) -> (super::super::data_models::Charge, Vec<u8>) {
         let (payer_sk, payer_user) = {
             let node = pair.payer.ctx.node.read().unwrap();
             (node.owner.key_pair.private_key, node.owner.user.uuid)
@@ -1863,11 +1863,11 @@ mod tests {
     fn connect_copies_a_missing_line_onto_the_payee() {
         let pair = pair_for_payment();
         let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
-        set_ceiling(&pair.payee, payer_user, 1_000_000);
+        set_run(&pair.payee, payer_user, 1_000_000);
         reserve_to(&pair, 1_000_000, [0xA0; 16]);
         assert_eq!(parse_reserve_ok(&pair.payer.recv_reply()).0, 4_000_000);
         finish_handshake(&pair);
-        pair.payee.ctx.node.write().unwrap().owner.ledger.clear();
+        pair.payee.ctx.node.write().unwrap().owner.charges.clear();
 
         super::payment::exchange_payment_records(7, &pair.payer.ctx);
         super::payment::exchange_payment_records(7, &pair.payee.ctx);
@@ -1877,8 +1877,8 @@ mod tests {
         let to_payer_clearing = recv_pnet(&pair.payer);
         assert_eq!(to_payee[0], PAYMENT_INDEX_OP);
         assert_eq!(to_payer[0], PAYMENT_INDEX_OP);
-        assert_eq!(to_payee_clearing[0], CLEARING_INDEX_OP);
-        assert_eq!(to_payer_clearing[0], CLEARING_INDEX_OP);
+        assert_eq!(to_payee_clearing[0], SETTLEMENT_INDEX_OP);
+        assert_eq!(to_payer_clearing[0], SETTLEMENT_INDEX_OP);
         payment_index(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
             to_payee[1..].to_vec(),
@@ -1889,12 +1889,12 @@ mod tests {
             to_payer[1..].to_vec(),
             &pair.payer.ctx,
         );
-        clearing_index(
+        settlement_index(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
             to_payee_clearing[1..].to_vec(),
             &pair.payee.ctx,
         );
-        clearing_index(
+        settlement_index(
             pair.payee.ctx.udp_socket.local_addr().unwrap(),
             to_payer_clearing[1..].to_vec(),
             &pair.payer.ctx,
@@ -1908,12 +1908,12 @@ mod tests {
         );
 
         let payee = pair.payee.ctx.node.read().unwrap();
-        assert_eq!(payee.owner.ledger.len(), 1);
-        assert_eq!(payee.owner.ledger[0].payment_id, [0xA0; 16]);
-        assert_eq!(payee.owner.ledger[0].purse_id, [0u8; 16]);
+        assert_eq!(payee.owner.charges.len(), 1);
+        assert_eq!(payee.owner.charges[0].payment_id, [0xA0; 16]);
+        assert_eq!(payee.owner.charges[0].purse_id, [0u8; 16]);
         drop(payee);
         assert_eq!(pair.payer.ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 4_000_000);
-        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), 1);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.charges.len(), 1);
         assert_lists_show_one_payment(&pair, [0xA0; 16], 1_000_000, "clip");
     }
 
@@ -1921,7 +1921,7 @@ mod tests {
     fn a_returned_debt_overruns_the_purse_that_was_spent_again() {
         let pair = pair_for_payment();
         let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
-        set_ceiling(&pair.payee, payer_user, 5_000_000);
+        set_run(&pair.payee, payer_user, 5_000_000);
         reserve_to(&pair, 1_000_000, [0xA1; 16]);
         assert_eq!(parse_reserve_ok(&pair.payer.recv_reply()).0, 4_000_000);
         let _offer = recv_pnet(&pair.payee);
@@ -1942,13 +1942,13 @@ mod tests {
         {
             let node = pair.payer.ctx.node.read().unwrap();
             assert_eq!(node.owner.purses[0].available_nanodollars, -1_000_000);
-            assert_eq!(node.owner.ledger.len(), 2);
-            let debt = node.owner.ledger.iter().find(|line| line.payment_id == [0xA1; 16]).unwrap();
+            assert_eq!(node.owner.charges.len(), 2);
+            let debt = node.owner.charges.iter().find(|line| line.payment_id == [0xA1; 16]).unwrap();
             assert_eq!(debt.purse_id, pair.purse);
         }
         deliver_record(&pair.payee, &pair.payer, &plain);
         let node = pair.payer.ctx.node.read().unwrap();
-        assert_eq!(node.owner.ledger.len(), 2);
+        assert_eq!(node.owner.charges.len(), 2);
         assert_eq!(node.owner.purses[0].available_nanodollars, -1_000_000);
     }
 
@@ -1963,7 +1963,7 @@ mod tests {
         plain[last] ^= 0xff;
         deliver_record(&pair.payee, &pair.payer, &plain);
         let node = pair.payer.ctx.node.read().unwrap();
-        assert!(node.owner.ledger.is_empty());
+        assert!(node.owner.charges.is_empty());
         assert_eq!(node.owner.reserves.len(), 1);
         assert_eq!(node.owner.purses[0].available_nanodollars, 4_000_000);
         drop(node);
@@ -1975,7 +1975,7 @@ mod tests {
     fn two_signed_bodies_for_one_payment_are_both_kept() {
         let pair = pair_for_payment();
         let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
-        set_ceiling(&pair.payee, payer_user, 1_000_000);
+        set_run(&pair.payee, payer_user, 1_000_000);
         reserve_to(&pair, 1_000_000, [0xD1; 16]);
         assert_eq!(parse_reserve_ok(&pair.payer.recv_reply()).0, 4_000_000);
         finish_handshake(&pair);
@@ -1985,13 +1985,13 @@ mod tests {
 
         let payer = pair.payer.ctx.node.read().unwrap();
         assert_eq!(payer.owner.purses[0].available_nanodollars, 4_000_000);
-        assert_eq!(payer.owner.ledger.len(), 2);
-        assert!(payer.owner.ledger.iter().any(|line| line.note == "clip" && line.purse_id == pair.purse));
-        assert!(payer.owner.ledger.iter().any(|line| line.note == "other" && line.purse_id == [0u8; 16]));
+        assert_eq!(payer.owner.charges.len(), 2);
+        assert!(payer.owner.charges.iter().any(|line| line.note == "clip" && line.purse_id == pair.purse));
+        assert!(payer.owner.charges.iter().any(|line| line.note == "other" && line.purse_id == [0u8; 16]));
         drop(payer);
         let payee = pair.payee.ctx.node.read().unwrap();
-        assert_eq!(payee.owner.ledger.len(), 2);
-        assert!(payee.owner.ledger.iter().all(|line| line.purse_id == [0u8; 16]));
+        assert_eq!(payee.owner.charges.len(), 2);
+        assert!(payee.owner.charges.iter().all(|line| line.purse_id == [0u8; 16]));
     }
 
     #[test]
@@ -2001,8 +2001,8 @@ mod tests {
         let (_, plain) = signed_record(&pair, [0xB1; 16], 1_000_000, "clip");
         deliver_record(&pair.payee, &pair.payer, &plain);
         let node = pair.payer.ctx.node.read().unwrap();
-        assert_eq!(node.owner.ledger.len(), 1);
-        assert_eq!(node.owner.ledger[0].purse_id, [0u8; 16]);
+        assert_eq!(node.owner.charges.len(), 1);
+        assert_eq!(node.owner.charges[0].purse_id, [0u8; 16]);
         assert!(node.owner.purses.iter().all(|purse| purse.available_nanodollars == 5_000_000));
     }
 
@@ -2016,7 +2016,7 @@ mod tests {
             let dev = node.owner.user.devices.iter_mut().find(|device| device.uuid == id).unwrap();
             dev.grade = DeviceGrade::DG;
             dev.sg_rank = None;
-            node.owner.ledger.push(line);
+            node.owner.charges.push(line);
         }
         let plain = super::super::payment::encode_index(
             super::super::payment::INDEX_START | super::super::payment::INDEX_END,
@@ -2030,7 +2030,7 @@ mod tests {
         );
         let mut buf = [0u8; 64];
         assert!(pair.payee.ctx.udp_socket.recv_from(&mut buf).is_err());
-        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), 1);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.charges.len(), 1);
     }
 
     fn payer_available(pair: &PaymentPair) -> i64 {
@@ -2041,29 +2041,29 @@ mod tests {
         let contact = pair.payee.ctx.node.read().unwrap().owner.user.uuid;
         let payer_net = {
             let node = pair.payer.ctx.node.read().unwrap();
-            super::super::payment::net_nanodollars(&node.owner, contact)
+            super::super::payment::tab_nanodollars(&node.owner, contact)
         };
         let payer = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
         let payee_net = {
             let node = pair.payee.ctx.node.read().unwrap();
-            super::super::payment::net_nanodollars(&node.owner, payer)
+            super::super::payment::tab_nanodollars(&node.owner, payer)
         };
         (payer_net, payee_net)
     }
 
-    fn finish_clearing(pair: &PaymentPair, clearing_id: [u8; 16], payment_ids: &[[u8; 16]]) {
+    fn finish_settlement(pair: &PaymentPair, settlement_id: [u8; 16], payment_ids: &[[u8; 16]]) {
         let contact = pair.payee.ctx.node.read().unwrap().owner.user.uuid;
-        super::payment::propose_clearing(&pair.payer.ctx, contact, clearing_id, payment_ids);
+        super::payment::propose_settlement(&pair.payer.ctx, contact, settlement_id, payment_ids);
         let proposal = recv_pnet(&pair.payee);
-        assert_eq!(proposal[0], PAYMENT_CLEAR_OP);
-        super::payment::payment_clear(
+        assert_eq!(proposal[0], SETTLEMENT_PROPOSE_OP);
+        super::payment::settlement_propose(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
             proposal[1..].to_vec(),
             &pair.payee.ctx,
         );
         let ack = recv_pnet(&pair.payer);
-        assert_eq!(ack[0], PAYMENT_CLEAR_ACK_OP);
-        super::payment::payment_clear_ack(
+        assert_eq!(ack[0], SETTLEMENT_ACK_OP);
+        super::payment::settlement_ack(
             pair.payee.ctx.udp_socket.local_addr().unwrap(),
             ack[1..].to_vec(),
             &pair.payer.ctx,
@@ -2072,85 +2072,85 @@ mod tests {
 
     fn confirmed_payment(pair: &PaymentPair, payment: [u8; 16], amount: i64, ceiling: i64) {
         let payer_user = pair.payer.ctx.node.read().unwrap().owner.user.uuid;
-        set_ceiling(&pair.payee, payer_user, ceiling);
+        set_run(&pair.payee, payer_user, ceiling);
         reserve_to(pair, amount, payment);
         let _ = parse_reserve_ok(&pair.payer.recv_reply());
         finish_handshake(pair);
     }
 
     #[test]
-    fn both_owners_sign_a_clearing_and_the_line_leaves_the_net() {
+    fn both_owners_sign_a_settlement_and_the_charge_leaves_the_tab() {
         let pair = pair_for_payment();
         let amount = 1_000_000i64;
         confirmed_payment(&pair, [0x91; 16], amount, amount);
         let available = payer_available(&pair);
         assert_eq!(net_between(&pair), (-amount, amount));
-        finish_clearing(&pair, [0xC1; 16], &[[0x91; 16]]);
+        finish_settlement(&pair, [0xC1; 16], &[[0x91; 16]]);
         assert_eq!(payer_available(&pair), available);
         assert_eq!(net_between(&pair), (0, 0));
-        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.clearings.len(), 1);
-        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.clearings.len(), 1);
-        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), 1);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.settlements.len(), 1);
+        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.settlements.len(), 1);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.charges.len(), 1);
         assert_lists_show_one_payment(&pair, [0x91; 16], amount, "clip");
     }
 
     #[test]
-    fn an_uncleared_payment_stays_in_the_net() {
+    fn an_unsettled_charge_stays_on_the_tab() {
         let pair = pair_for_payment();
         confirmed_payment(&pair, [0x91; 16], 1_000_000, 2_000_000);
         confirmed_payment(&pair, [0x92; 16], 250_000, 2_000_000);
-        finish_clearing(&pair, [0xC1; 16], &[[0x91; 16]]);
+        finish_settlement(&pair, [0xC1; 16], &[[0x91; 16]]);
         assert_eq!(net_between(&pair), (-250_000, 250_000));
         assert_eq!(payer_available(&pair), 5_000_000 - 1_250_000);
-        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), 2);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.charges.len(), 2);
     }
 
     #[test]
-    fn the_same_clearing_is_stored_once_and_a_lost_ack_is_resent() {
+    fn the_same_settlement_is_stored_once_and_a_lost_ack_is_resent() {
         let pair = pair_for_payment();
         confirmed_payment(&pair, [0x91; 16], 1_000_000, 1_000_000);
         let contact = pair.payee.ctx.node.read().unwrap().owner.user.uuid;
-        super::payment::propose_clearing(&pair.payer.ctx, contact, [0xC1; 16], &[[0x91; 16]]);
+        super::payment::propose_settlement(&pair.payer.ctx, contact, [0xC1; 16], &[[0x91; 16]]);
         let first = recv_pnet(&pair.payee);
-        assert_eq!(first[0], PAYMENT_CLEAR_OP);
-        super::payment::payment_clear(
+        assert_eq!(first[0], SETTLEMENT_PROPOSE_OP);
+        super::payment::settlement_propose(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
             first[1..].to_vec(),
             &pair.payee.ctx,
         );
         let ack = recv_pnet(&pair.payer);
-        assert_eq!(ack[0], PAYMENT_CLEAR_ACK_OP);
-        super::payment::propose_clearing(&pair.payer.ctx, contact, [0xC1; 16], &[[0x91; 16]]);
+        assert_eq!(ack[0], SETTLEMENT_ACK_OP);
+        super::payment::propose_settlement(&pair.payer.ctx, contact, [0xC1; 16], &[[0x91; 16]]);
         let second = recv_pnet(&pair.payee);
-        assert_eq!(second[0], PAYMENT_CLEAR_OP);
-        super::payment::payment_clear(
+        assert_eq!(second[0], SETTLEMENT_PROPOSE_OP);
+        super::payment::settlement_propose(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
             second[1..].to_vec(),
             &pair.payee.ctx,
         );
-        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.clearings.len(), 1);
+        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.settlements.len(), 1);
         let resent = recv_pnet(&pair.payer);
-        assert_eq!(resent[0], PAYMENT_CLEAR_ACK_OP);
-        super::payment::payment_clear_ack(
+        assert_eq!(resent[0], SETTLEMENT_ACK_OP);
+        super::payment::settlement_ack(
             pair.payee.ctx.udp_socket.local_addr().unwrap(),
             ack[1..].to_vec(),
             &pair.payer.ctx,
         );
-        super::payment::payment_clear_ack(
+        super::payment::settlement_ack(
             pair.payee.ctx.udp_socket.local_addr().unwrap(),
             resent[1..].to_vec(),
             &pair.payer.ctx,
         );
-        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.clearings.len(), 1);
-        super::payment::propose_clearing(&pair.payer.ctx, contact, [0xC1; 16], &[[0x91; 16]]);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.settlements.len(), 1);
+        super::payment::propose_settlement(&pair.payer.ctx, contact, [0xC1; 16], &[[0x91; 16]]);
         let again = recv_pnet(&pair.payee);
-        assert_eq!(again[0], PAYMENT_CLEAR_ACK_OP);
-        super::payment::payment_clear_ack(
+        assert_eq!(again[0], SETTLEMENT_ACK_OP);
+        super::payment::settlement_ack(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
             again[1..].to_vec(),
             &pair.payee.ctx,
         );
-        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.clearings.len(), 1);
+        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.settlements.len(), 1);
         assert_eq!(payer_available(&pair), 4_000_000);
     }
 
@@ -2158,52 +2158,52 @@ mod tests {
     fn a_missing_payment_id_is_not_signed() {
         let pair = pair_for_payment();
         confirmed_payment(&pair, [0x91; 16], 1_000_000, 1_000_000);
-        pair.payee.ctx.node.write().unwrap().owner.ledger.clear();
+        pair.payee.ctx.node.write().unwrap().owner.charges.clear();
         let contact = pair.payee.ctx.node.read().unwrap().owner.user.uuid;
-        super::payment::propose_clearing(&pair.payer.ctx, contact, [0xC1; 16], &[[0x91; 16]]);
+        super::payment::propose_settlement(&pair.payer.ctx, contact, [0xC1; 16], &[[0x91; 16]]);
         let proposal = recv_pnet(&pair.payee);
-        assert_eq!(proposal[0], PAYMENT_CLEAR_OP);
-        super::payment::payment_clear(
+        assert_eq!(proposal[0], SETTLEMENT_PROPOSE_OP);
+        super::payment::settlement_propose(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
             proposal[1..].to_vec(),
             &pair.payee.ctx,
         );
         let mut buf = [0u8; 64];
         assert!(pair.payer.ctx.udp_socket.recv_from(&mut buf).is_err());
-        assert!(pair.payee.ctx.node.read().unwrap().owner.clearings.is_empty());
-        assert!(pair.payer.ctx.node.read().unwrap().owner.clearings.is_empty());
+        assert!(pair.payee.ctx.node.read().unwrap().owner.settlements.is_empty());
+        assert!(pair.payer.ctx.node.read().unwrap().owner.settlements.is_empty());
     }
 
     #[test]
-    fn a_bad_clearing_signature_is_dropped() {
+    fn a_bad_settlement_signature_is_dropped() {
         let pair = pair_for_payment();
         confirmed_payment(&pair, [0x91; 16], 1_000_000, 1_000_000);
         let contact = pair.payee.ctx.node.read().unwrap().owner.user.uuid;
-        super::payment::propose_clearing(&pair.payer.ctx, contact, [0xC1; 16], &[[0x91; 16]]);
+        super::payment::propose_settlement(&pair.payer.ctx, contact, [0xC1; 16], &[[0x91; 16]]);
         let proposal = recv_pnet(&pair.payee);
-        assert_eq!(proposal[0], PAYMENT_CLEAR_OP);
+        assert_eq!(proposal[0], SETTLEMENT_PROPOSE_OP);
         let mut plain = decrypt_packet_body(&pair.payee.ctx.node.read().unwrap(), &proposal[1..]).unwrap();
         let last = plain.len() - 1;
         plain[last] ^= 0xff;
-        let pkt = seal(&pair.payer, PAYMENT_CLEAR_OP, &plain);
-        super::payment::payment_clear(
+        let pkt = seal(&pair.payer, SETTLEMENT_PROPOSE_OP, &plain);
+        super::payment::settlement_propose(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
             pkt[1..].to_vec(),
             &pair.payee.ctx,
         );
         let mut buf = [0u8; 64];
         assert!(pair.payer.ctx.udp_socket.recv_from(&mut buf).is_err());
-        assert!(pair.payee.ctx.node.read().unwrap().owner.clearings.is_empty());
+        assert!(pair.payee.ctx.node.read().unwrap().owner.settlements.is_empty());
         assert_eq!(payer_available(&pair), 4_000_000);
     }
 
     #[test]
-    fn repair_copies_a_missing_clearing_without_changing_available() {
+    fn repair_copies_a_missing_settlement_without_changing_available() {
         let pair = pair_for_payment();
         confirmed_payment(&pair, [0x91; 16], 1_000_000, 1_000_000);
-        finish_clearing(&pair, [0xC1; 16], &[[0x91; 16]]);
+        finish_settlement(&pair, [0xC1; 16], &[[0x91; 16]]);
         let available = payer_available(&pair);
-        pair.payee.ctx.node.write().unwrap().owner.clearings.clear();
+        pair.payee.ctx.node.write().unwrap().owner.settlements.clear();
         assert_eq!(net_between(&pair).1, 1_000_000);
 
         super::payment::exchange_payment_records(7, &pair.payer.ctx);
@@ -2213,34 +2213,34 @@ mod tests {
         let payer_pi = recv_pnet(&pair.payer);
         let payer_ci = recv_pnet(&pair.payer);
         assert_eq!(payee_pi[0], PAYMENT_INDEX_OP);
-        assert_eq!(payee_ci[0], CLEARING_INDEX_OP);
+        assert_eq!(payee_ci[0], SETTLEMENT_INDEX_OP);
         payment_index(pair.payer.ctx.udp_socket.local_addr().unwrap(), payee_pi[1..].to_vec(), &pair.payee.ctx);
         payment_index(pair.payee.ctx.udp_socket.local_addr().unwrap(), payer_pi[1..].to_vec(), &pair.payer.ctx);
-        clearing_index(pair.payer.ctx.udp_socket.local_addr().unwrap(), payee_ci[1..].to_vec(), &pair.payee.ctx);
-        clearing_index(pair.payee.ctx.udp_socket.local_addr().unwrap(), payer_ci[1..].to_vec(), &pair.payer.ctx);
+        settlement_index(pair.payer.ctx.udp_socket.local_addr().unwrap(), payee_ci[1..].to_vec(), &pair.payee.ctx);
+        settlement_index(pair.payee.ctx.udp_socket.local_addr().unwrap(), payer_ci[1..].to_vec(), &pair.payer.ctx);
         let copied = recv_pnet(&pair.payee);
-        assert_eq!(copied[0], CLEARING_RECORD_OP);
-        clearing_record(
+        assert_eq!(copied[0], SETTLEMENT_RECORD_OP);
+        settlement_record(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
             copied[1..].to_vec(),
             &pair.payee.ctx,
         );
-        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.clearings.len(), 1);
+        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.settlements.len(), 1);
         assert_eq!(net_between(&pair), (0, 0));
         assert_eq!(payer_available(&pair), available);
         assert_lists_show_one_payment(&pair, [0x91; 16], 1_000_000, "clip");
     }
 
     #[test]
-    fn a_clearing_copied_before_the_line_excludes_that_line_from_the_net() {
+    fn a_settlement_copied_before_the_charge_excludes_that_charge_from_the_tab() {
         let pair = pair_for_payment();
         confirmed_payment(&pair, [0x91; 16], 1_000_000, 1_000_000);
-        finish_clearing(&pair, [0xC1; 16], &[[0x91; 16]]);
+        finish_settlement(&pair, [0xC1; 16], &[[0x91; 16]]);
         let available = payer_available(&pair);
         {
             let mut node = pair.payee.ctx.node.write().unwrap();
-            node.owner.ledger.clear();
-            node.owner.clearings.clear();
+            node.owner.charges.clear();
+            node.owner.settlements.clear();
         }
         super::payment::exchange_payment_records(7, &pair.payer.ctx);
         super::payment::exchange_payment_records(7, &pair.payee.ctx);
@@ -2248,17 +2248,17 @@ mod tests {
         let _payee_ci = recv_pnet(&pair.payee);
         let payer_pi = recv_pnet(&pair.payer);
         let payer_ci = recv_pnet(&pair.payer);
-        clearing_index(pair.payee.ctx.udp_socket.local_addr().unwrap(), payer_ci[1..].to_vec(), &pair.payer.ctx);
+        settlement_index(pair.payee.ctx.udp_socket.local_addr().unwrap(), payer_ci[1..].to_vec(), &pair.payer.ctx);
         payment_index(pair.payee.ctx.udp_socket.local_addr().unwrap(), payer_pi[1..].to_vec(), &pair.payer.ctx);
         let clearing_pkt = recv_pnet(&pair.payee);
-        assert_eq!(clearing_pkt[0], CLEARING_RECORD_OP);
-        clearing_record(
+        assert_eq!(clearing_pkt[0], SETTLEMENT_RECORD_OP);
+        settlement_record(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
             clearing_pkt[1..].to_vec(),
             &pair.payee.ctx,
         );
-        assert!(pair.payee.ctx.node.read().unwrap().owner.ledger.is_empty());
-        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.clearings.len(), 1);
+        assert!(pair.payee.ctx.node.read().unwrap().owner.charges.is_empty());
+        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.settlements.len(), 1);
         let line_pkt = recv_pnet(&pair.payee);
         assert_eq!(line_pkt[0], PAYMENT_RECORD_OP);
         payment_record(
@@ -2266,13 +2266,13 @@ mod tests {
             line_pkt[1..].to_vec(),
             &pair.payee.ctx,
         );
-        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.ledger.len(), 1);
+        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.charges.len(), 1);
         assert_eq!(net_between(&pair).1, 0);
         assert_eq!(payer_available(&pair), available);
     }
 
     #[test]
-    fn a_non_writer_drops_a_clearing_index() {
+    fn a_non_writer_drops_a_settlement_index() {
         let pair = pair_for_payment();
         {
             let mut node = pair.payer.ctx.node.write().unwrap();
@@ -2285,19 +2285,19 @@ mod tests {
             super::super::payment::INDEX_START | super::super::payment::INDEX_END,
             &[],
         );
-        let pkt = seal(&pair.payee, CLEARING_INDEX_OP, &plain);
-        clearing_index(
+        let pkt = seal(&pair.payee, SETTLEMENT_INDEX_OP, &plain);
+        settlement_index(
             pair.payee.ctx.udp_socket.local_addr().unwrap(),
             pkt[1..].to_vec(),
             &pair.payer.ctx,
         );
         let mut buf = [0u8; 64];
         assert!(pair.payee.ctx.udp_socket.recv_from(&mut buf).is_err());
-        assert!(pair.payer.ctx.node.read().unwrap().owner.clearings.is_empty());
+        assert!(pair.payer.ctx.node.read().unwrap().owner.settlements.is_empty());
     }
 
     #[test]
-    fn a_cleared_line_frees_ceiling_room_and_does_not_raise_the_purse() {
+    fn a_settled_charge_frees_room_and_does_not_raise_the_purse() {
         let pair = pair_for_payment();
         confirmed_payment(&pair, [0x91; 16], 1_000_000, 1_000_000);
         assert_eq!(payer_available(&pair), 4_000_000);
@@ -2318,7 +2318,7 @@ mod tests {
             &pair.payer.ctx,
         );
         assert_eq!(payer_available(&pair), 4_000_000);
-        finish_clearing(&pair, [0xC1; 16], &[[0x91; 16]]);
+        finish_settlement(&pair, [0xC1; 16], &[[0x91; 16]]);
         assert_eq!(payer_available(&pair), 4_000_000);
         reserve_to(&pair, 1, [0x93; 16]);
         assert_eq!(parse_reserve_ok(&pair.payer.recv_reply()).0, 3_999_999);
@@ -2355,25 +2355,25 @@ mod tests {
         deliver_record(&pair.payee, &pair.payer, &plain);
         deliver_record(&pair.payer, &pair.payee, &plain);
         assert_eq!(net_between(&pair), (-2_000_000, 2_000_000));
-        finish_clearing(&pair, [0xC1; 16], &[[0xD1; 16]]);
+        finish_settlement(&pair, [0xC1; 16], &[[0xD1; 16]]);
         assert_eq!(net_between(&pair), (0, 0));
         assert_eq!(payer_available(&pair), 4_000_000);
-        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.ledger.len(), 2);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.charges.len(), 2);
         app_list_sent(pair.payer.app_addr(), pair.token.to_vec(), &pair.payer.ctx);
         assert_eq!(parse_payment_list(&pair.payer.recv_reply()).len(), 2);
     }
 
     #[test]
-    fn a_second_clearing_body_drops_the_union_from_the_net() {
+    fn a_second_settlement_body_drops_the_union_from_the_tab() {
         let pair = pair_for_payment();
         confirmed_payment(&pair, [0x91; 16], 1_000_000, 2_000_000);
         confirmed_payment(&pair, [0x92; 16], 250_000, 2_000_000);
-        finish_clearing(&pair, [0xC1; 16], &[[0x91; 16]]);
+        finish_settlement(&pair, [0xC1; 16], &[[0x91; 16]]);
         assert_eq!(net_between(&pair), (-250_000, 250_000));
-        finish_clearing(&pair, [0xC1; 16], &[[0x92; 16]]);
+        finish_settlement(&pair, [0xC1; 16], &[[0x92; 16]]);
         assert_eq!(net_between(&pair), (0, 0));
-        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.clearings.len(), 2);
-        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.clearings.len(), 2);
+        assert_eq!(pair.payer.ctx.node.read().unwrap().owner.settlements.len(), 2);
+        assert_eq!(pair.payee.ctx.node.read().unwrap().owner.settlements.len(), 2);
         assert_eq!(payer_available(&pair), 3_750_000);
     }
 
@@ -2384,8 +2384,8 @@ mod tests {
         let (line_b, _) = signed_record(&pair, [0xE2; 16], 1, "b");
         {
             let mut node = pair.payer.ctx.node.write().unwrap();
-            node.owner.ledger.push(line_a.clone());
-            node.owner.ledger.push(line_b.clone());
+            node.owner.charges.push(line_a.clone());
+            node.owner.charges.push(line_b.clone());
         }
         let first = super::super::payment::encode_index(
             super::super::payment::INDEX_START,

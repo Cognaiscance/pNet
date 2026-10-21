@@ -6,7 +6,7 @@
 
 use super::crypto::{ed25519_sign, ed25519_verify};
 use super::data_models::{
-    ClearingRecord, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, LedgerLine, Owner,
+    Settlement, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Charge, Owner,
     PaymentReserve, PendingAccept, Uuid,
 };
 use super::wire::{push_str, read_arr, read_str};
@@ -15,12 +15,12 @@ const OFFER_DOMAIN: &[u8] = b"pnet-payment-offer-v1";
 const ACCEPT_DOMAIN: &[u8] = b"pnet-payment-accept-v1";
 const CONFIRM_DOMAIN: &[u8] = b"pnet-payment-confirm-v1";
 const REFUSE_DOMAIN: &[u8] = b"pnet-payment-refuse-v1";
-const CLEARING_DOMAIN: &[u8] = b"pnet-payment-clearing-v1";
+const SETTLEMENT_DOMAIN: &[u8] = b"pnet-payment-clearing-v1";
 
-/// One clearing names at most this many payment ids, so the record fits one datagram.
-pub(crate) const CLEARING_MAX_IDS: usize = 64;
+/// One settlement names at most this many payment ids, so the record fits one datagram.
+pub(crate) const SETTLEMENT_MAX_IDS: usize = 64;
 
-pub(crate) const REFUSE_OVER_CEILING: u8 = 0x01;
+pub(crate) const REFUSE_OVER_RUN: u8 = 0x01;
 pub(crate) const REFUSE_EXPIRED: u8 = 0x02;
 pub(crate) const REFUSE_MISMATCH: u8 = 0x03;
 
@@ -394,8 +394,8 @@ pub(crate) fn line_from(
     payer_sig: Ed25519Signature,
     payee_sig: Ed25519Signature,
     confirm_sig: Ed25519Signature,
-) -> LedgerLine {
-    LedgerLine {
+) -> Charge {
+    Charge {
         payment_id: body.payment_id,
         amount_nanodollars: body.amount_nanodollars,
         payer: body.payer,
@@ -411,7 +411,7 @@ pub(crate) fn line_from(
     }
 }
 
-pub(crate) fn body_from_line(line: &LedgerLine) -> OfferBody {
+pub(crate) fn body_from_line(line: &Charge) -> OfferBody {
     OfferBody {
         payment_id: line.payment_id,
         amount_nanodollars: line.amount_nanodollars,
@@ -442,12 +442,12 @@ pub(crate) fn pending_covers(pending: &PendingAccept, body: &OfferBody, payer_si
     &body_from_pending(pending) == body && pending.payer_sig == *payer_sig
 }
 
-pub(crate) fn line_covers(line: &LedgerLine, body: &OfferBody, payer_sig: &Ed25519Signature) -> bool {
+pub(crate) fn line_covers(line: &Charge, body: &OfferBody, payer_sig: &Ed25519Signature) -> bool {
     &body_from_line(line) == body && line.payer_sig == *payer_sig
 }
 
 /// Same charge as the hold. The expiry and the purse id are local stamps.
-pub(crate) fn line_same_payment(line: &LedgerLine, reserve: &PaymentReserve, payer: Uuid) -> bool {
+pub(crate) fn line_same_payment(line: &Charge, reserve: &PaymentReserve, payer: Uuid) -> bool {
     line.payment_id == reserve.payment_id
         && line.amount_nanodollars == reserve.amount_nanodollars
         && line.payer == payer
@@ -460,24 +460,24 @@ pub(crate) fn line_same_payment(line: &LedgerLine, reserve: &PaymentReserve, pay
 /// True when this amount would put the payer's open claims above the ceiling.
 /// A missing ceiling is zero. `except` is left out of the sum so a retry of
 /// that payment id is not counted twice.
-pub(crate) fn claim_exceeds_ceiling(
+pub(crate) fn claim_exceeds_run(
     owner: &Owner,
     payer: Uuid,
     amount: i64,
     except: Option<Uuid>,
 ) -> bool {
     let max = owner
-        .receive_ceilings
+        .run_limits
         .iter()
         .find(|ceiling| ceiling.payer == payer)
         .map(|ceiling| ceiling.max_nanodollars.max(0))
         .unwrap_or(0);
     let mut used = 0i64;
-    for line in &owner.ledger {
+    for line in &owner.charges {
         if line.payer == payer
             && line.payee == owner.user.uuid
             && Some(line.payment_id) != except
-            && !payment_is_cleared(owner, payer, line.payment_id)
+            && !charge_is_settled(owner, payer, line.payment_id)
         {
             used = used.saturating_add(line.amount_nanodollars);
         }
@@ -505,7 +505,7 @@ pub(crate) fn users_are_pair(payer: Uuid, payee: Uuid, our: Uuid, contact: Uuid)
     (payer == our && payee == contact) || (payer == contact && payee == our)
 }
 
-/// Sort and drop duplicates. Empty, or more than [`CLEARING_MAX_IDS`] distinct ids, is refused.
+/// Sort and drop duplicates. Empty, or more than [`SETTLEMENT_MAX_IDS`] distinct ids, is refused.
 pub(crate) fn normalize_payment_ids(ids: &[Uuid]) -> Option<Vec<Uuid>> {
     if ids.is_empty() {
         return None;
@@ -513,7 +513,7 @@ pub(crate) fn normalize_payment_ids(ids: &[Uuid]) -> Option<Vec<Uuid>> {
     let mut out = ids.to_vec();
     out.sort();
     out.dedup();
-    if out.is_empty() || out.len() > CLEARING_MAX_IDS {
+    if out.is_empty() || out.len() > SETTLEMENT_MAX_IDS {
         None
     } else {
         Some(out)
@@ -522,17 +522,17 @@ pub(crate) fn normalize_payment_ids(ids: &[Uuid]) -> Option<Vec<Uuid>> {
 
 /// The bytes both user keys sign. No amount, purse, note, or expiry.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) struct ClearingBody {
-    pub clearing_id: Uuid,
+pub(crate) struct SettlementBody {
+    pub settlement_id: Uuid,
     pub user_lo: Uuid,
     pub user_hi: Uuid,
     pub payment_ids: Vec<Uuid>,
 }
 
-impl ClearingBody {
-    pub(crate) fn from_record(record: &ClearingRecord) -> Self {
+impl SettlementBody {
+    pub(crate) fn from_record(record: &Settlement) -> Self {
         Self {
-            clearing_id: record.clearing_id,
+            settlement_id: record.settlement_id,
             user_lo: record.user_lo,
             user_hi: record.user_hi,
             payment_ids: record.payment_ids.clone(),
@@ -541,7 +541,7 @@ impl ClearingBody {
 
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(50 + self.payment_ids.len() * 16);
-        buf.extend_from_slice(&self.clearing_id);
+        buf.extend_from_slice(&self.settlement_id);
         buf.extend_from_slice(&self.user_lo);
         buf.extend_from_slice(&self.user_hi);
         buf.extend_from_slice(&(self.payment_ids.len() as u16).to_be_bytes());
@@ -552,62 +552,62 @@ impl ClearingBody {
     }
 }
 
-pub(crate) fn clearing_body_ok(body: &ClearingBody) -> bool {
+pub(crate) fn settlement_body_ok(body: &SettlementBody) -> bool {
     body.user_lo < body.user_hi
         && !body.payment_ids.is_empty()
-        && body.payment_ids.len() <= CLEARING_MAX_IDS
+        && body.payment_ids.len() <= SETTLEMENT_MAX_IDS
         && body.payment_ids.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-pub(crate) fn clearing_record_ok(record: &ClearingRecord) -> bool {
-    clearing_body_ok(&ClearingBody::from_record(record))
+pub(crate) fn settlement_ok(record: &Settlement) -> bool {
+    settlement_body_ok(&SettlementBody::from_record(record))
 }
 
-pub(crate) fn clearing_for_pair(body: &ClearingBody, our: Uuid, contact: Uuid) -> bool {
+pub(crate) fn settlement_for_pair(body: &SettlementBody, our: Uuid, contact: Uuid) -> bool {
     match ordered_users(our, contact) {
         Some((lo, hi)) => body.user_lo == lo && body.user_hi == hi,
         None => false,
     }
 }
 
-fn decode_clearing_body_at(data: &[u8], pos: &mut usize) -> Option<ClearingBody> {
-    let clearing_id: Uuid = read_arr(data, pos)?;
+fn decode_settlement_body_at(data: &[u8], pos: &mut usize) -> Option<SettlementBody> {
+    let settlement_id: Uuid = read_arr(data, pos)?;
     let user_lo: Uuid = read_arr(data, pos)?;
     let user_hi: Uuid = read_arr(data, pos)?;
     let count = read_u16(data, pos)? as usize;
-    if count == 0 || count > CLEARING_MAX_IDS {
+    if count == 0 || count > SETTLEMENT_MAX_IDS {
         return None;
     }
     let mut payment_ids = Vec::with_capacity(count);
     for _ in 0..count {
         payment_ids.push(read_arr(data, pos)?);
     }
-    Some(ClearingBody { clearing_id, user_lo, user_hi, payment_ids })
+    Some(SettlementBody { settlement_id, user_lo, user_hi, payment_ids })
 }
 
-pub(crate) fn sign_clearing(secret: &Ed25519SecretKey, body: &ClearingBody) -> Ed25519Signature {
+pub(crate) fn sign_settlement(secret: &Ed25519SecretKey, body: &SettlementBody) -> Ed25519Signature {
     let bytes = body.encode();
-    Ed25519Signature(ed25519_sign(secret, &tagged(CLEARING_DOMAIN, &[&bytes])))
+    Ed25519Signature(ed25519_sign(secret, &tagged(SETTLEMENT_DOMAIN, &[&bytes])))
 }
 
-pub(crate) fn verify_clearing(
+pub(crate) fn verify_settlement(
     public_key: &Ed25519PublicKey,
-    body: &ClearingBody,
+    body: &SettlementBody,
     sig: &Ed25519Signature,
 ) -> bool {
     let bytes = body.encode();
-    ed25519_verify(public_key, &tagged(CLEARING_DOMAIN, &[&bytes]), &sig.0)
+    ed25519_verify(public_key, &tagged(SETTLEMENT_DOMAIN, &[&bytes]), &sig.0)
 }
 
-pub(crate) fn encode_clearing_proposal(body: &ClearingBody, sig: &Ed25519Signature) -> Vec<u8> {
+pub(crate) fn encode_settlement_proposal(body: &SettlementBody, sig: &Ed25519Signature) -> Vec<u8> {
     let mut buf = body.encode();
     push_sig(&mut buf, sig);
     buf
 }
 
-pub(crate) fn decode_clearing_proposal(data: &[u8]) -> Option<(ClearingBody, Ed25519Signature)> {
+pub(crate) fn decode_settlement_proposal(data: &[u8]) -> Option<(SettlementBody, Ed25519Signature)> {
     let mut pos = 0usize;
-    let body = decode_clearing_body_at(data, &mut pos)?;
+    let body = decode_settlement_body_at(data, &mut pos)?;
     let sig = read_sig(data, &mut pos)?;
     if pos != data.len() {
         return None;
@@ -615,19 +615,19 @@ pub(crate) fn decode_clearing_proposal(data: &[u8]) -> Option<(ClearingBody, Ed2
     Some((body, sig))
 }
 
-pub(crate) fn encode_clearing_record(record: &ClearingRecord) -> Vec<u8> {
-    let mut buf = ClearingBody::from_record(record).encode();
+pub(crate) fn encode_settlement(record: &Settlement) -> Vec<u8> {
+    let mut buf = SettlementBody::from_record(record).encode();
     push_sig(&mut buf, &record.sig_lo);
     push_sig(&mut buf, &record.sig_hi);
     buf
 }
 
-pub(crate) fn decode_clearing_record_at(data: &[u8], pos: &mut usize) -> Option<ClearingRecord> {
-    let body = decode_clearing_body_at(data, pos)?;
+pub(crate) fn decode_settlement_at(data: &[u8], pos: &mut usize) -> Option<Settlement> {
+    let body = decode_settlement_body_at(data, pos)?;
     let sig_lo = read_sig(data, pos)?;
     let sig_hi = read_sig(data, pos)?;
-    Some(ClearingRecord {
-        clearing_id: body.clearing_id,
+    Some(Settlement {
+        settlement_id: body.settlement_id,
         user_lo: body.user_lo,
         user_hi: body.user_hi,
         payment_ids: body.payment_ids,
@@ -636,28 +636,28 @@ pub(crate) fn decode_clearing_record_at(data: &[u8], pos: &mut usize) -> Option<
     })
 }
 
-pub(crate) fn decode_clearing_record(data: &[u8]) -> Option<ClearingRecord> {
+pub(crate) fn decode_settlement(data: &[u8]) -> Option<Settlement> {
     let mut pos = 0usize;
-    let record = decode_clearing_record_at(data, &mut pos)?;
+    let record = decode_settlement_at(data, &mut pos)?;
     if pos != data.len() {
         return None;
     }
     Some(record)
 }
 
-pub(crate) fn clearing_body_matches(record: &ClearingRecord, body: &ClearingBody) -> bool {
-    record.clearing_id == body.clearing_id
+pub(crate) fn settlement_body_matches(record: &Settlement, body: &SettlementBody) -> bool {
+    record.settlement_id == body.settlement_id
         && record.user_lo == body.user_lo
         && record.user_hi == body.user_hi
         && record.payment_ids == body.payment_ids
 }
 
-/// True when any stored clearing for this pair names `payment_id`.
-pub(crate) fn payment_is_cleared(owner: &Owner, contact: Uuid, payment_id: Uuid) -> bool {
+/// True when any stored settlement for this pair names `payment_id`.
+pub(crate) fn charge_is_settled(owner: &Owner, contact: Uuid, payment_id: Uuid) -> bool {
     let Some((lo, hi)) = ordered_users(owner.user.uuid, contact) else {
         return false;
     };
-    owner.clearings.iter().any(|record| {
+    owner.settlements.iter().any(|record| {
         record.user_lo == lo
             && record.user_hi == hi
             && record.payment_ids.binary_search(&payment_id).is_ok()
@@ -666,13 +666,13 @@ pub(crate) fn payment_is_cleared(owner: &Owner, contact: Uuid, payment_id: Uuid)
 
 /// Incoming uncleared amounts minus outgoing ones. Positive means `contact` owes this user.
 /// A cleared id drops every body of that payment. Pending accepts are not lines.
-pub(crate) fn net_nanodollars(owner: &Owner, contact: Uuid) -> i64 {
+pub(crate) fn tab_nanodollars(owner: &Owner, contact: Uuid) -> i64 {
     let mut net = 0i64;
-    for line in &owner.ledger {
+    for line in &owner.charges {
         if !users_are_pair(line.payer, line.payee, owner.user.uuid, contact) {
             continue;
         }
-        if payment_is_cleared(owner, contact, line.payment_id) {
+        if charge_is_settled(owner, contact, line.payment_id) {
             continue;
         }
         if line.payee == owner.user.uuid {

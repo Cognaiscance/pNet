@@ -141,7 +141,7 @@ packet when it decrypts the delivery.
 - Request: `[token:16]` exactly. Same approval check as op 5.
 - Success: `[0x00][count:u16 be]` then each confirmed line whose payee is this user and whose destination alias is the caller's alias, ordered by payment id and then the payer's confirmation signature:
   `[payment id:16][amount:i64 be][payer uuid:16][payee uuid:16][paying alias][destination alias][note]`
-- Amounts are nanodollars. Strings are a length byte and then UTF-8, the same as a purse name. The purse id, the expiry, and the signatures are absent. A hold that is not confirmed is absent. A line for another alias is absent. Two signed bodies of one id are both listed. Count 0 is success. The read does not change a purse or the ledger.
+- Amounts are nanodollars. Strings are a length byte and then UTF-8, the same as a purse name. The purse id, the expiry, and the signatures are absent. A hold that is not confirmed is absent. A line for another alias is absent. Two signed bodies of one id are both listed. Count 0 is success. The read does not change a purse or the tab.
 - Errors: `ERR_BAD_PACKET`, `ERR_TOKEN_UNKNOWN`, `ERR_NOT_APPROVED`
 
 ### 7 — list sent payments
@@ -163,17 +163,17 @@ packet when it decrypts the delivery.
 
 Session-sealed. The payer's writer sends this to the payee's writer. The plaintext is the offer body and the payer's user-key signature. The body is `[payment id:16][amount:i64 be][payer user uuid:16][payee user uuid:16][paying alias][destination alias][note][expires_at_ms:u64 be]`. The purse id is absent. The signature domain is `pnet-payment-offer-v1`.
 
-The payee's writer drops a packet it cannot open, a bad signature, an offer for another user, or a packet that arrives on a node that is not the writer. An offer past `expires_at_ms` gets a signed refusal with reason `0x02`. An offer whose new claim would pass the ceiling stored for that payer gets reason `0x01`. A missing ceiling is zero. An amount equal to the ceiling is accepted. A different body for a payment id already staged or stored gets reason `0x03`.
+The payee's writer drops a packet it cannot open, a bad signature, an offer for another user, or a packet that arrives on a node that is not the writer. An offer past `expires_at_ms` gets a signed refusal with reason `0x02`. An offer whose new claim would pass the run stored for that payer gets reason `0x01`. A missing run is zero. An amount equal to the run is accepted. A different body for a payment id already staged or stored gets reason `0x03`.
 
 ### 0x61 — payment accept
 
 Session-sealed. The payee's writer sends this after it has signed the offer. The plaintext is the offer body, the payer signature, and the payee signature. The accept domain is `pnet-payment-accept-v1` over the body and the payer signature.
 
-The payer's writer checks both signatures against the held offer. It then signs the confirmation and stores the ledger line, removing the hold without adding the amount back. It sends op `0x63`. A repeat of an accept that is already a line resends that confirmation.
+The payer's writer checks both signatures against the held offer. It then signs the confirmation and stores the charge, removing the hold without adding the amount back. It sends op `0x63`. A repeat of an accept that is already a line resends that confirmation.
 
 ### 0x62 — payment refuse
 
-Session-sealed. The plaintext is the offer body, the payer signature, one reason byte, and the payee signature. The refuse domain is `pnet-payment-refuse-v1` over the body, the payer signature, and the reason byte. Reasons are `0x01` over the ceiling, `0x02` expired, and `0x03` a different body for that payment id.
+Session-sealed. The plaintext is the offer body, the payer signature, one reason byte, and the payee signature. The refuse domain is `pnet-payment-refuse-v1` over the body, the payer signature, and the reason byte. Reasons are `0x01` over the run, `0x02` expired, and `0x03` a different body for that payment id.
 
 A signed refusal that matches the held offer releases it. A refusal after the line exists is ignored. A refusal that does not match the hold is ignored.
 
@@ -195,27 +195,27 @@ Session-sealed. The plaintext is the confirmation from op `0x63` and does not na
 
 The same signed bytes are not stored twice. A different signed body is stored beside the first and does not reduce a purse again. The payee's copy uses an empty purse id. A payer with a matching hold consumes that hold and does not subtract again. A payer with no matching hold reduces the one purse that lists the paying alias, which can leave a negative available amount. If none or several do, the line is stored and no purse is chosen.
 
-### 0x66 — clearing proposal
+### 0x66 — settlement proposal
 
-Session-sealed. One owner sends this to the other. An app does not. The plaintext is the body and the sender's user-key signature. The body is `[clearing id:16][user lo:16][user hi:16][count:u16 be][payment id:16…]`. The user ids are in byte order. The payment ids are strictly increasing, at least one and at most 64. The signature domain is `pnet-payment-clearing-v1` over the body. Both users sign those same bytes.
+Session-sealed. One owner sends this to the other. An app does not. The plaintext is the body and the sender's user-key signature. The body is `[settlement id:16][user lo:16][user hi:16][count:u16 be][payment id:16…]`. The user ids are in byte order. The payment ids are strictly increasing, at least one and at most 64. The signature domain is `pnet-payment-clearing-v1` over the body. Both users sign those same bytes.
 
-The receiver signs only when every named id is already a ledger line between this pair. An id that belongs to some other pair does not count. A missing id gets no reply. A bad signature is dropped. There is no refusal op. A node that is not the writer drops the packet.
+The receiver signs only when every named id is already a charge between this pair. An id that belongs to some other pair does not count. A missing id gets no reply. A bad signature is dropped. There is no refusal op. A node that is not the writer drops the packet.
 
-### 0x67 — clearing ack
+### 0x67 — settlement ack
 
-Session-sealed. The plaintext is the body plus the lower user's signature and then the higher user's signature. This is also the stored record. The same body is stored once and does not change a purse. A different body for the same clearing id is kept beside the first. The net excludes every payment id named by any stored clearing for the pair. The lines stay on the ledger and on ops `0x06` and `0x07`.
+Session-sealed. The plaintext is the body plus the lower user's signature and then the higher user's signature. This is also the stored record. The same body is stored once and does not change a purse. A different body for the same settlement id is kept beside the first. The tab excludes every payment id named by any stored settlement for the pair. The lines stay on the tab and on ops `0x06` and `0x07`.
 
 A repeat of a proposal the receiver has already signed sends this ack again and does not store a second row. If the sender already holds that exact record, a later proposal is this ack instead of a new `0x66`.
 
-### 0x68 — clearing index
+### 0x68 — settlement index
 
-Session-sealed. A writer sends this when a session to one of a contact's devices comes up, after the payment index. It is not sent to an own device. The plaintext has the same shape as op `0x64`: `[flags:u8][count:u16 be]` and then `count` entries of `[clearing id:16][lower-user signature:64]`. Flag `0x01` starts a list. Flag `0x02` ends it. The lower user's signature distinguishes two bodies of one clearing id.
+Session-sealed. A writer sends this when a session to one of a contact's devices comes up, after the payment index. It is not sent to an own device. The plaintext has the same shape as op `0x64`: `[flags:u8][count:u16 be]` and then `count` entries of `[settlement id:16][lower-user signature:64]`. Flag `0x01` starts a list. Flag `0x02` ends it. The lower user's signature distinguishes two bodies of one settlement id.
 
-When the list ends, the receiver sends op `0x69` for each clearing of this pair whose id and lower-user signature are absent. It does not answer with another index. A node that is not the writer drops the packet.
+When the list ends, the receiver sends op `0x69` for each settlement of this pair whose id and lower-user signature are absent. It does not answer with another index. A node that is not the writer drops the packet.
 
-### 0x69 — clearing record
+### 0x69 — settlement record
 
-Session-sealed. The plaintext is the ack from op `0x67`. The receiver stores it when both signatures verify and the two users are this node and the contact that owns the session. A missing payment line does not block the copy. Once that line is stored, the id no longer counts toward the net or toward that payer's receive ceiling. The purse's available amount does not change. A bad signature is dropped.
+Session-sealed. The plaintext is the ack from op `0x67`. The receiver stores it when both signatures verify and the two users are this node and the contact that owns the session. A missing payment line does not block the copy. Once that line is stored, the id no longer counts toward the tab or toward that payer's what you'll run. The purse's available amount does not change. A bad signature is dropped.
 
 ### get-data secrecy (op 2)
 

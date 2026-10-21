@@ -135,15 +135,15 @@ pub fn ui_request(
     }
 
     if let Some(id) = path.strip_prefix("/contacts/") {
-        if let Some(id) = id.strip_suffix("/ledger") {
+        if let Some(id) = id.strip_suffix("/tab") {
             if !id.is_empty() && !id.contains('/') {
                 if method == "GET" {
-                    return respond_html(&stream, 200, &render_contact_ledger(ctx, id, &query), None);
+                    return respond_html(&stream, 200, &render_contact_tab(ctx, id, &query), None);
                 }
                 if method == "POST" {
                     let target = redirect_with_error(
-                        &format!("/contacts/{id}/ledger"),
-                        record_contact_clearing(ctx, id, &body),
+                        &format!("/contacts/{id}/tab"),
+                        settle_contact_tab(ctx, id, &body),
                     );
                     return respond_redirect(&stream, &target);
                 }
@@ -254,11 +254,11 @@ pub fn ui_request(
             let target = redirect_with_error("/purses", edit_purse(&body, ctx));
             respond_redirect(&stream, &target);
         }
-        ("GET",  "/receive-ceilings") => {
-            respond_html(&stream, 200, &render_receive_ceilings(ctx, &query), None)
+        ("GET",  "/what-youll-run") => {
+            respond_html(&stream, 200, &render_what_youll_run(ctx, &query), None)
         }
-        ("POST", "/receive-ceilings") => {
-            let target = redirect_with_error("/receive-ceilings", set_receive_ceiling(&body, ctx));
+        ("POST", "/what-youll-run") => {
+            let target = redirect_with_error("/what-youll-run", set_run_limit(&body, ctx));
             respond_redirect(&stream, &target);
         }
         ("GET",  "/applications")  => respond_html(&stream, 200, &render_applications(ctx, &query), None),
@@ -866,7 +866,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
              <li><a href=\"/pending-apps\">Pending Apps</a> — approve or reject local app registrations</li>\
              <li><a href=\"/applications\">Applications</a> — approved apps on this device</li>\
              <li><a href=\"/purses\">Purses</a> — spending limits for app aliases</li>\
-             <li><a href=\"/receive-ceilings\">Receive ceilings</a> — how much of a contact's credit you will accept</li>\
+             <li><a href=\"/what-youll-run\">What you'll run</a> — how much of a contact's tab you will still accept</li>\
              <li><a href=\"/contacts\">Contacts</a> — other users you are linked with</li>\
              <li><a href=\"/app-invitations\">App Invitations</a> — requests to accept an app from a contact</li>\
              <li><a href=\"/devices\">Devices</a> — your devices; remove a lost one</li>\
@@ -892,15 +892,15 @@ fn ui_error_banner(query: &str) -> String {
                 <strong>That purse was not saved.</strong> \
                 Use a name and an app alias, and a dollar amount with at most nine decimal places.\
             </div>".to_string(),
-        Some(code) if code == UI_ERR_BAD_CEILING =>
+        Some(code) if code == UI_ERR_BAD_RUN =>
             "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
-                <strong>That ceiling was not saved.</strong> \
+                <strong>That amount was not saved.</strong> \
                 Choose a contact and a dollar amount with at most nine decimal places.\
             </div>".to_string(),
-        Some(code) if code == UI_ERR_BAD_CLEARING =>
+        Some(code) if code == UI_ERR_BAD_SETTLEMENT =>
             "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
-                <strong>That clearing was not sent.</strong> \
-                Choose lines already on this contact's ledger. This device has to be the writer and hold the user key. At most 64 lines.\
+                <strong>That settlement was not sent.</strong> \
+                Choose charges already on this contact's tab. This device has to be the writer and hold the user key. At most 64 charges.\
             </div>".to_string(),
         Some(code) if code == UI_ERR_REMOVE_SELF =>
             "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
@@ -1028,7 +1028,7 @@ fn render_contacts(ctx: &WorkerContext) -> String {
             };
             format!(
                 "<tr><td><a href=\"/contacts/{id}\">{}</a> \
-                   <a href=\"/contacts/{id}/ledger\">Ledger</a></td><td>{dev_list}</td></tr>",
+                   <a href=\"/contacts/{id}/tab\">Tab</a></td><td>{dev_list}</td></tr>",
                 html_escape(&c.user.alias),
                 id = uuid_hex(&c.user.uuid),
             )
@@ -1235,7 +1235,7 @@ fn render_contact_apps(ctx: &WorkerContext, id_hex: &str, query: &str) -> String
          <p style='color:var(--muted)'>Apps this contact may send to, and whether they accept you. \
             Accepting does not require the app to be installed.</p>\
          {error_banner}{table}\
-         <p><a href='/contacts/{id_hex}/ledger'>Ledger</a> \
+         <p><a href='/contacts/{id_hex}/tab'>Tab</a> \
             · <a href='/contacts'>All contacts</a></p>"
     );
     drop(node);
@@ -1250,80 +1250,80 @@ fn form_fields<'a>(body: &'a [u8], field: &str) -> Vec<&'a str> {
     s.split('&').filter_map(|part| part.strip_prefix(prefix.as_str())).collect()
 }
 
-/// Ask the other owner to sign a clearing for the checked lines.
-/// A missing line, an empty list, or more than 64 ids is not sent.
-/// This does not store the record and does not move a purse. The record
-/// lands when the other owner signs it back.
-fn record_contact_clearing(ctx: &WorkerContext, id_hex: &str, body: &[u8]) -> Option<&'static str> {
+/// Ask the other owner to settle the checked charges.
+/// A missing charge, an empty list, or more than 64 ids is not sent.
+/// This does not store the settlement and does not move a purse. The
+/// settlement lands when the other owner signs it back.
+fn settle_contact_tab(ctx: &WorkerContext, id_hex: &str, body: &[u8]) -> Option<&'static str> {
     let Some(contact) = uuid_from_hex(id_hex) else {
-        return Some(UI_ERR_BAD_CLEARING);
+        return Some(UI_ERR_BAD_SETTLEMENT);
     };
     let raw = form_fields(body, "payment");
     if raw.is_empty() {
-        return Some(UI_ERR_BAD_CLEARING);
+        return Some(UI_ERR_BAD_SETTLEMENT);
     }
     let mut ids = Vec::with_capacity(raw.len());
     for raw_id in raw {
         let Some(id) = uuid_from_hex(&url_decode(raw_id)) else {
-            return Some(UI_ERR_BAD_CLEARING);
+            return Some(UI_ERR_BAD_SETTLEMENT);
         };
         ids.push(id);
     }
     let ids = {
         let node = ctx.node.read().unwrap();
         if !matches!(find_writer_sg(&node), WriterTarget::Local) {
-            return Some(UI_ERR_BAD_CLEARING);
+            return Some(UI_ERR_BAD_SETTLEMENT);
         }
         if node.owner.key_pair.private_key == Ed25519SecretKey::ZERO {
-            return Some(UI_ERR_BAD_CLEARING);
+            return Some(UI_ERR_BAD_SETTLEMENT);
         }
         if !node.owner.contact_users.iter().any(|row| row.user.uuid == contact) {
-            return Some(UI_ERR_BAD_CLEARING);
+            return Some(UI_ERR_BAD_SETTLEMENT);
         }
         let Some(ids) = crate::payment::normalize_payment_ids(&ids) else {
-            return Some(UI_ERR_BAD_CLEARING);
+            return Some(UI_ERR_BAD_SETTLEMENT);
         };
         let our = node.owner.user.uuid;
         if !ids.iter().all(|id| {
-            node.owner.ledger.iter().any(|line| {
+            node.owner.charges.iter().any(|line| {
                 line.payment_id == *id
                     && crate::payment::users_are_pair(line.payer, line.payee, our, contact)
             })
         }) {
-            return Some(UI_ERR_BAD_CLEARING);
+            return Some(UI_ERR_BAD_SETTLEMENT);
         }
         ids
     };
-    super::payment::propose_clearing(ctx, contact, generate_uuid(), &ids);
+    super::payment::propose_settlement(ctx, contact, generate_uuid(), &ids);
     None
 }
 
-fn render_contact_ledger(ctx: &WorkerContext, id_hex: &str, query: &str) -> String {
+fn render_contact_tab(ctx: &WorkerContext, id_hex: &str, query: &str) -> String {
     let Some(contact_uuid) = uuid_from_hex(id_hex) else {
-        return layout(ctx, "Contact", "<h1>Ledger</h1><p class='empty'>Unknown contact.</p>");
+        return layout(ctx, "Contact", "<h1>Tab</h1><p class='empty'>Unknown contact.</p>");
     };
     let node = ctx.node.read().unwrap();
     let Some(contact) = node.owner.contact_users.iter().find(|row| row.user.uuid == contact_uuid) else {
         drop(node);
-        return layout(ctx, "Contact", "<h1>Ledger</h1><p class='empty'>That contact is not on this node.</p>");
+        return layout(ctx, "Contact", "<h1>Tab</h1><p class='empty'>That contact is not on this node.</p>");
     };
     let name = html_escape(&contact.user.alias);
     let our = node.owner.user.uuid;
-    let mut lines: Vec<_> = node.owner.ledger.iter()
+    let mut lines: Vec<_> = node.owner.charges.iter()
         .filter(|line| crate::payment::users_are_pair(line.payer, line.payee, our, contact_uuid))
         .cloned()
         .collect();
     lines.sort_by(|left, right| {
         left.payment_id.cmp(&right.payment_id).then(left.confirm_sig.0.cmp(&right.confirm_sig.0))
     });
-    let net = crate::payment::net_nanodollars(&node.owner, contact_uuid);
+    let net = crate::payment::tab_nanodollars(&node.owner, contact_uuid);
     let mut rows = String::new();
     let mut any_open = false;
     for line in &lines {
         let id = uuid_hex(&line.payment_id);
-        let cleared = crate::payment::payment_is_cleared(&node.owner, contact_uuid, line.payment_id);
-        let mark = if cleared {
-            "Cleared".to_string()
+        let settled = crate::payment::charge_is_settled(&node.owner, contact_uuid, line.payment_id);
+        let mark = if settled {
+            "Settled".to_string()
         } else {
             any_open = true;
             format!("<input type='checkbox' name='payment' value='{id}'>")
@@ -1341,17 +1341,17 @@ fn render_contact_ledger(ctx: &WorkerContext, id_hex: &str, query: &str) -> Stri
     drop(node);
 
     let table = if rows.is_empty() {
-        "<p class='empty'>No payments with this contact yet.</p>".to_string()
+        "<p class='empty'>No charges with this contact yet.</p>".to_string()
     } else {
         format!(
-            "<table><tr><th>Payment</th><th>Amount</th><th></th><th>Apps</th><th>Note</th><th></th></tr>{rows}</table>"
+            "<table><tr><th>Charge</th><th>Amount</th><th></th><th>Apps</th><th>Note</th><th></th></tr>{rows}</table>"
         )
     };
     let form = if any_open {
         format!(
-            "<form method='post' action='/contacts/{id_hex}/ledger'>\
+            "<form method='post' action='/contacts/{id_hex}/tab'>\
                {table}\
-               <button type='submit'>Record clearing</button>\
+               <button type='submit'>Settle</button>\
              </form>"
         )
     } else {
@@ -1360,9 +1360,9 @@ fn render_contact_ledger(ctx: &WorkerContext, id_hex: &str, query: &str) -> Stri
     let banner = ui_error_banner(query);
     let body = format!(
         "<h1>{name}</h1>\
-         <p style='color:var(--muted);margin-top:-.5rem'>Confirmed payments with this contact. \
-         The net is {net} dollars. A positive net is what this contact owes you. \
-         A cleared line stays listed and leaves the net. Record clearing asks this contact to sign. \
+         <p style='color:var(--muted);margin-top:-.5rem'>Charges with this contact. \
+         On the tab: {net} dollars. A positive amount is what this contact owes you. \
+         A settled charge stays listed and leaves the tab. Settle asks this contact to sign. \
          The purse does not change, and any dollars paid stay outside pNet.</p>\
          {banner}\
          {form}\
@@ -1735,8 +1735,8 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
 /// already rolled the local mutation back, so the UI state matches reality.
 pub(crate) const UI_ERR_PUBLISH_FAILED: &str = "publish_failed";
 pub(crate) const UI_ERR_BAD_PURSE: &str = "bad_purse";
-pub(crate) const UI_ERR_BAD_CEILING: &str = "bad_ceiling";
-pub(crate) const UI_ERR_BAD_CLEARING: &str = "bad_clearing";
+pub(crate) const UI_ERR_BAD_RUN: &str = "bad_run";
+pub(crate) const UI_ERR_BAD_SETTLEMENT: &str = "bad_settlement";
 
 /// The device serving this page cannot remove itself.
 pub(crate) const UI_ERR_REMOVE_SELF: &str = "remove_self";
@@ -2725,7 +2725,7 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
             | "Pending Apps"
             | "Applications"
             | "Purses"
-            | "Receive ceilings"
+            | "What you'll run"
             | "Contacts"
             | "Contact"
             | "App Invitations"
@@ -2762,7 +2762,7 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
                <a href=\"/pending-apps\">Pending Apps</a>\
                <a href=\"/applications\">Applications</a>\
                <a href=\"/purses\">Purses</a>\
-               <a href=\"/receive-ceilings\">Ceilings</a>\
+               <a href=\"/what-youll-run\">What you'll run</a>\
                <a href=\"/contacts\">Contacts</a>\
                <a href=\"/app-invitations\">App Invitations</a>\
                <a href=\"/devices\">Devices</a>\
@@ -3129,30 +3129,30 @@ fn render_purses(ctx: &WorkerContext, query: &str) -> String {
     layout(ctx, "Purses", &body)
 }
 
-fn set_receive_ceiling(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
+fn set_run_limit(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     let payer = match form_field(body, "contact").and_then(|raw| uuid_from_hex(&url_decode(raw))) {
         Some(payer) => payer,
-        None => return Some(UI_ERR_BAD_CEILING),
+        None => return Some(UI_ERR_BAD_RUN),
     };
     {
         let node = ctx.node.read().unwrap();
         if !node.owner.contact_users.iter().any(|contact| contact.user.uuid == payer) {
-            return Some(UI_ERR_BAD_CEILING);
+            return Some(UI_ERR_BAD_RUN);
         }
     }
     let amount = match form_field(body, "amount")
         .and_then(|raw| parse_dollar_to_nanodollars(&url_decode(raw)))
     {
         Some(amount) => amount,
-        None => return Some(UI_ERR_BAD_CEILING),
+        None => return Some(UI_ERR_BAD_RUN),
     };
-    publish_policy(Change::SetReceiveCeiling { payer, max_nanodollars: amount }, ctx)
+    publish_policy(Change::SetRunLimit { payer, max_nanodollars: amount }, ctx)
 }
 
-fn render_receive_ceilings(ctx: &WorkerContext, query: &str) -> String {
+fn render_what_youll_run(ctx: &WorkerContext, query: &str) -> String {
     let node = ctx.node.read().unwrap();
     let mut rows: Vec<(String, Uuid, i64)> = node.owner.contact_users.iter().map(|contact| {
-        let max = node.owner.receive_ceilings.iter()
+        let max = node.owner.run_limits.iter()
             .find(|ceiling| ceiling.payer == contact.user.uuid)
             .map(|ceiling| ceiling.max_nanodollars)
             .unwrap_or(0);
@@ -3171,11 +3171,11 @@ fn render_receive_ceilings(ctx: &WorkerContext, query: &str) -> String {
         cards.push_str(&format!(
             "<div class='card'>\
                <h2 style='margin-top:0;font-size:1.1rem'>{alias}</h2>\
-               <p>Ceiling ${amount}</p>\
-               <form method='post' action='/receive-ceilings'>\
+               <p>You'll run ${amount}</p>\
+               <form method='post' action='/what-youll-run'>\
                  <input type='hidden' name='contact' value='{id}'>\
                  <input name='amount' inputmode='decimal' placeholder='0.005' required>\
-                 <button type='submit'>Set ceiling</button>\
+                 <button type='submit'>Save</button>\
                </form>\
              </div>",
             alias = html_escape(alias),
@@ -3184,14 +3184,14 @@ fn render_receive_ceilings(ctx: &WorkerContext, query: &str) -> String {
     }
 
     let body = format!(
-        "<h1>Receive ceilings</h1>\
-         <p style='color:var(--muted);margin-top:-.5rem'>A contact can pay you only up to the \
-         ceiling you store for them. Until you store one, nothing is accepted. The number stays \
-         on your devices. The contact is not told.</p>\
+        "<h1>What you'll run</h1>\
+         <p style='color:var(--muted);margin-top:-.5rem'>A contact can put charges on your tab \
+         only up to the amount you store for them. Until you store one, nothing is accepted. \
+         The number stays on your devices. The contact is not told.</p>\
          {banner}\
          {cards}"
     );
-    layout(ctx, "Receive ceilings", &body)
+    layout(ctx, "What you'll run", &body)
 }
 
 #[cfg(test)]
@@ -3202,17 +3202,17 @@ mod policy_ui_tests {
 
     use crate::action_queue::WorkerContext;
     use crate::data_models::{
-        ActiveConnection, AppInvitation, Application, ClearingRecord, Contact, Device, DeviceGrade,
-        Ed25519KeyPair, Ed25519PublicKey, Ed25519Signature, LedgerLine, Node, PaymentReserve,
+        ActiveConnection, AppInvitation, Application, Settlement, Contact, Device, DeviceGrade,
+        Ed25519KeyPair, Ed25519PublicKey, Ed25519Signature, Charge, Node, PaymentReserve,
         PendingAccept, Purse, SyncVersion, User, X25519PublicKey, generate_uuid, utc_month_period,
     };
     use crate::wire::{uuid_hex, PURSE_KIND_FIXED, PURSE_KIND_MONTHLY};
 
     use super::{
         accept_app_invitation, add_purse_alias, create_purse, edit_purse, grant_contact_app,
-        invite_contact_app, record_contact_clearing, reject_app_invitation, remove_purse_alias,
-        render_app_invitations, render_contact_apps, render_contact_ledger, render_contacts,
-        render_purses, render_receive_ceilings, set_receive_ceiling,
+        invite_contact_app, settle_contact_tab, reject_app_invitation, remove_purse_alias,
+        render_app_invitations, render_contact_apps, render_contact_tab, render_contacts,
+        render_purses, render_what_youll_run, set_run_limit,
     };
 
     fn portal() -> (WorkerContext, [u8; 16]) {
@@ -3507,7 +3507,7 @@ mod policy_ui_tests {
                 kind: PURSE_KIND_MONTHLY,
                 period: earlier,
             });
-            node.owner.ledger.push(line.clone());
+            node.owner.charges.push(line.clone());
         }
         let page = render_purses(&ctx, "");
         assert!(page.contains("action='/purses/edit'"));
@@ -3535,7 +3535,7 @@ mod policy_ui_tests {
             assert_eq!(purse.available_nanodollars, 9_000_000);
             assert_eq!(purse.name, "media");
             assert_eq!(purse.aliases, vec!["discordium".to_string()]);
-            assert_eq!(node.owner.ledger, vec![line.clone()]);
+            assert_eq!(node.owner.charges, vec![line.clone()]);
         }
 
         assert!(edit_purse(&form(&[("purse", &id), ("kind", "fixed"), ("amount", "0")]), &ctx).is_none());
@@ -3626,7 +3626,7 @@ mod policy_ui_tests {
             assert!(left.contains(&same_month));
             assert!(left.contains(&from_fixed));
             assert!(!left.contains(&previous));
-            assert_eq!(node.owner.ledger, vec![line.clone()]);
+            assert_eq!(node.owner.charges, vec![line.clone()]);
         }
         {
             let mut node = ctx.node.write().unwrap();
@@ -3642,70 +3642,70 @@ mod policy_ui_tests {
             let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
             assert_eq!(purse.available_nanodollars, -1_000_000);
             assert!(node.owner.reserves.iter().all(|reserve| reserve.purse_id != purse_id));
-            assert_eq!(node.owner.ledger, vec![line]);
+            assert_eq!(node.owner.charges, vec![line]);
         }
     }
 
     #[test]
-    fn receive_ceiling_page_sets_and_replaces_one_contact() {
+    fn what_youll_run_sets_and_replaces_one_contact() {
         let (ctx, contact) = portal();
         let hex = uuid_hex(&contact);
-        let page = render_receive_ceilings(&ctx, "");
+        let page = render_what_youll_run(&ctx, "");
         assert!(page.contains("sanosuke"));
-        assert!(page.contains("<p>Ceiling $0</p>"));
-        assert!(page.contains("href=\"/receive-ceilings\""));
+        assert!(page.contains("<p>You'll run $0</p>"));
+        assert!(page.contains("href=\"/what-youll-run\""));
         assert!(!page.contains("ledger"));
 
-        assert!(set_receive_ceiling(&form(&[("contact", &hex), ("amount", "0.005")]), &ctx).is_none());
+        assert!(set_run_limit(&form(&[("contact", &hex), ("amount", "0.005")]), &ctx).is_none());
         let seq = {
             let node = ctx.node.read().unwrap();
-            assert_eq!(node.owner.receive_ceilings.len(), 1);
-            assert_eq!(node.owner.receive_ceilings[0].payer, contact);
-            assert_eq!(node.owner.receive_ceilings[0].max_nanodollars, 5_000_000);
+            assert_eq!(node.owner.run_limits.len(), 1);
+            assert_eq!(node.owner.run_limits[0].payer, contact);
+            assert_eq!(node.owner.run_limits[0].max_nanodollars, 5_000_000);
             assert!(node.owner.purses.is_empty());
             assert!(node.owner.private_version.seq >= 1);
             node.owner.private_version.seq
         };
-        let page = render_receive_ceilings(&ctx, "");
-        assert!(page.contains("<p>Ceiling $0.005</p>"));
+        let page = render_what_youll_run(&ctx, "");
+        assert!(page.contains("<p>You'll run $0.005</p>"));
 
-        assert!(set_receive_ceiling(&form(&[("contact", &hex), ("amount", "0.005")]), &ctx).is_none());
-        assert_eq!(ctx.node.read().unwrap().owner.receive_ceilings.len(), 1);
+        assert!(set_run_limit(&form(&[("contact", &hex), ("amount", "0.005")]), &ctx).is_none());
+        assert_eq!(ctx.node.read().unwrap().owner.run_limits.len(), 1);
         assert_eq!(ctx.node.read().unwrap().owner.private_version.seq, seq);
 
-        assert!(set_receive_ceiling(&form(&[("contact", &hex), ("amount", "0.0000000001")]), &ctx).is_some());
-        assert!(set_receive_ceiling(&form(&[("contact", "not-a-uuid"), ("amount", "1")]), &ctx).is_some());
-        assert!(set_receive_ceiling(
+        assert!(set_run_limit(&form(&[("contact", &hex), ("amount", "0.0000000001")]), &ctx).is_some());
+        assert!(set_run_limit(&form(&[("contact", "not-a-uuid"), ("amount", "1")]), &ctx).is_some());
+        assert!(set_run_limit(
             &form(&[("contact", &uuid_hex(&generate_uuid())), ("amount", "1")]),
             &ctx,
         ).is_some());
         {
             let node = ctx.node.read().unwrap();
-            assert_eq!(node.owner.receive_ceilings.len(), 1);
-            assert_eq!(node.owner.receive_ceilings[0].max_nanodollars, 5_000_000);
+            assert_eq!(node.owner.run_limits.len(), 1);
+            assert_eq!(node.owner.run_limits[0].max_nanodollars, 5_000_000);
             assert_eq!(node.owner.private_version.seq, seq);
         }
-        let page = render_receive_ceilings(&ctx, "error=bad_ceiling");
-        assert!(page.contains("That ceiling was not saved."));
+        let page = render_what_youll_run(&ctx, "error=bad_run");
+        assert!(page.contains("That amount was not saved."));
 
-        assert!(set_receive_ceiling(&form(&[("contact", &hex), ("amount", "0")]), &ctx).is_none());
+        assert!(set_run_limit(&form(&[("contact", &hex), ("amount", "0")]), &ctx).is_none());
         {
             let node = ctx.node.read().unwrap();
-            assert_eq!(node.owner.receive_ceilings.len(), 1);
-            assert_eq!(node.owner.receive_ceilings[0].max_nanodollars, 0);
+            assert_eq!(node.owner.run_limits.len(), 1);
+            assert_eq!(node.owner.run_limits[0].max_nanodollars, 0);
             assert!(node.owner.private_version.seq > seq);
         }
-        let page = render_receive_ceilings(&ctx, "");
-        assert!(page.contains("<p>Ceiling $0</p>"));
+        let page = render_what_youll_run(&ctx, "");
+        assert!(page.contains("<p>You'll run $0</p>"));
         assert!(!page.contains("$0.005"));
 
         let hub = super::render_config_hub(&ctx);
-        assert!(hub.contains("/receive-ceilings"));
+        assert!(hub.contains("/what-youll-run"));
     }
 
-    fn pair_line(our: [u8; 16], contact: [u8; 16], payment: [u8; 16], amount: i64, note: &str, incoming: bool) -> LedgerLine {
+    fn pair_line(our: [u8; 16], contact: [u8; 16], payment: [u8; 16], amount: i64, note: &str, incoming: bool) -> Charge {
         let (payer, payee) = if incoming { (contact, our) } else { (our, contact) };
-        LedgerLine {
+        Charge {
             payment_id: payment,
             amount_nanodollars: amount,
             payer,
@@ -3722,7 +3722,7 @@ mod policy_ui_tests {
     }
 
     #[test]
-    fn contact_ledger_shows_the_net_and_proposes_a_clearing() {
+    fn contact_tab_shows_the_amount_and_settles() {
         let (ctx, contact) = portal();
         let hex = uuid_hex(&contact);
         let our = ctx.node.read().unwrap().owner.user.uuid;
@@ -3732,13 +3732,13 @@ mod policy_ui_tests {
         let (lo, hi) = if our < contact { (our, contact) } else { (contact, our) };
         {
             let mut node = ctx.node.write().unwrap();
-            node.owner.ledger.push(pair_line(our, contact, open, 1_000_000, "clip", true));
+            node.owner.charges.push(pair_line(our, contact, open, 1_000_000, "clip", true));
             let mut second = pair_line(our, contact, open, 1_000_000, "other", true);
             second.confirm_sig = Ed25519Signature([0xAB; 64]);
-            node.owner.ledger.push(second);
-            node.owner.ledger.push(pair_line(our, contact, sent, 250_000, "refund", false));
-            node.owner.ledger.push(pair_line(our, contact, cleared, 5_000_000, "settled", true));
-            node.owner.ledger.push(pair_line(our, [0x44; 16], [0x55; 16], 9, "hidden-note", true));
+            node.owner.charges.push(second);
+            node.owner.charges.push(pair_line(our, contact, sent, 250_000, "refund", false));
+            node.owner.charges.push(pair_line(our, contact, cleared, 5_000_000, "settled", true));
+            node.owner.charges.push(pair_line(our, [0x44; 16], [0x55; 16], 9, "hidden-note", true));
             node.owner.pending_accepts.push(PendingAccept {
                 payment_id: [0x66; 16],
                 amount_nanodollars: 1,
@@ -3751,8 +3751,8 @@ mod policy_ui_tests {
                 payer_sig: Ed25519Signature::ZERO,
                 payee_sig: Ed25519Signature::ZERO,
             });
-            node.owner.clearings.push(ClearingRecord {
-                clearing_id: [0xC1; 16],
+            node.owner.settlements.push(Settlement {
+                settlement_id: [0xC1; 16],
                 user_lo: lo,
                 user_hi: hi,
                 payment_ids: vec![cleared],
@@ -3771,11 +3771,11 @@ mod policy_ui_tests {
         }
 
         let apps = render_contact_apps(&ctx, &hex, "");
-        assert!(apps.contains(&format!("/contacts/{hex}/ledger")));
+        assert!(apps.contains(&format!("/contacts/{hex}/tab")));
         let list = render_contacts(&ctx);
-        assert!(list.contains(&format!("/contacts/{hex}/ledger")));
+        assert!(list.contains(&format!("/contacts/{hex}/tab")));
 
-        let page = render_contact_ledger(&ctx, &hex, "");
+        let page = render_contact_tab(&ctx, &hex, "");
         assert!(page.contains("sanosuke"));
         assert!(page.contains("clip"));
         assert!(page.contains("other"));
@@ -3783,22 +3783,22 @@ mod policy_ui_tests {
         assert!(page.contains("settled"));
         assert!(page.contains("Incoming"));
         assert!(page.contains("Sent"));
-        assert!(page.contains("Cleared"));
+        assert!(page.contains("Settled"));
         assert!(page.contains("0.00175"));
         assert!(page.contains(&format!("value='{}'", uuid_hex(&open))));
         assert!(!page.contains(&format!("value='{}'", uuid_hex(&cleared))));
         assert!(!page.contains("hidden-note"));
         assert!(!page.contains("waiting-note"));
-        assert!(page.contains("Record clearing"));
+        assert!(page.contains("Settle"));
 
         let open_hex = uuid_hex(&open);
-        assert!(record_contact_clearing(&ctx, &hex, &form(&[("payment", &uuid_hex(&[0x99; 16]))])).is_some());
-        assert!(record_contact_clearing(&ctx, &hex, &form(&[("payment", &open_hex)])).is_some());
+        assert!(settle_contact_tab(&ctx, &hex, &form(&[("payment", &uuid_hex(&[0x99; 16]))])).is_some());
+        assert!(settle_contact_tab(&ctx, &hex, &form(&[("payment", &open_hex)])).is_some());
         {
             let node = ctx.node.read().unwrap();
-            assert_eq!(node.owner.clearings.len(), 1);
+            assert_eq!(node.owner.settlements.len(), 1);
             assert_eq!(node.owner.purses[0].available_nanodollars, 4_000_000);
-            assert_eq!(crate::payment::net_nanodollars(&node.owner, contact), 1_750_000);
+            assert_eq!(crate::payment::tab_nanodollars(&node.owner, contact), 1_750_000);
         }
 
         let mut bulk = String::new();
@@ -3807,7 +3807,7 @@ mod policy_ui_tests {
             for n in 0..65u8 {
                 let mut id = [0xA0; 16];
                 id[15] = n;
-                node.owner.ledger.push(pair_line(our, contact, id, 1, "bulk", true));
+                node.owner.charges.push(pair_line(our, contact, id, 1, "bulk", true));
                 if n > 0 {
                     bulk.push('&');
                 }
@@ -3815,7 +3815,7 @@ mod policy_ui_tests {
             }
         }
         ctx.node.write().unwrap().owner.key_pair = crate::crypto::generate_ed25519_keypair();
-        assert!(record_contact_clearing(&ctx, &hex, bulk.as_bytes()).is_some());
+        assert!(settle_contact_tab(&ctx, &hex, bulk.as_bytes()).is_some());
 
         let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
         listener.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
@@ -3831,19 +3831,19 @@ mod policy_ui_tests {
             peer_addr: listener.local_addr().unwrap(),
         });
 
-        assert!(record_contact_clearing(&ctx, &hex, &form(&[("payment", &open_hex)])).is_none());
+        assert!(settle_contact_tab(&ctx, &hex, &form(&[("payment", &open_hex)])).is_none());
         let mut buf = [0u8; 2048];
         let n = listener.recv(&mut buf).unwrap();
         assert!(n > 1);
         assert_eq!(buf[0], 0x66);
         {
             let node = ctx.node.read().unwrap();
-            assert_eq!(node.owner.clearings.len(), 1);
+            assert_eq!(node.owner.settlements.len(), 1);
             assert_eq!(node.owner.purses[0].available_nanodollars, 4_000_000);
-            assert_eq!(node.owner.ledger.len(), 70);
-            assert_eq!(crate::payment::net_nanodollars(&node.owner, contact), 1_750_065);
+            assert_eq!(node.owner.charges.len(), 70);
+            assert_eq!(crate::payment::tab_nanodollars(&node.owner, contact), 1_750_065);
         }
-        let page = render_contact_ledger(&ctx, &hex, "");
+        let page = render_contact_tab(&ctx, &hex, "");
         assert!(page.contains(&format!("value='{open_hex}'")));
         assert!(page.contains("0.001750065"));
 
@@ -3856,7 +3856,7 @@ mod policy_ui_tests {
             dev.grade = DeviceGrade::DG;
             dev.sg_rank = None;
         }
-        assert!(record_contact_clearing(&ctx, &hex, &form(&[("payment", &open_hex)])).is_some());
+        assert!(settle_contact_tab(&ctx, &hex, &form(&[("payment", &open_hex)])).is_some());
         assert!(listener.recv(&mut again).is_err());
         assert_eq!(ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 4_000_000);
     }

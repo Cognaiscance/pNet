@@ -60,7 +60,7 @@ Successful mutations answer **302**. The invitation code is not put in the redir
 | `POST /logout` | session | Revoke the session and clear the cookie. |
 | `GET /` | session | Home: owner alias, device alias, grade, links to mounted apps, link to Config. |
 | `GET /dashboard` | session | Redirect to `/`. |
-| `GET /config` | session | Counts and links: devices, invitations, applications, purses, receive ceilings, contacts, diagnostics. |
+| `GET /config` | session | Counts and links: devices, invitations, applications, purses, what you'll run, contacts, diagnostics. |
 | `POST /api/app-web/register` | loopback | Register a portal mount. Plain text. |
 | `POST /api/app-web/unregister` | loopback | Remove a portal mount. Plain text. |
 | `GET /apps/<slug>/…` | session | Reverse-proxy to the registered loopback port. |
@@ -72,15 +72,15 @@ Successful mutations answer **302**. The invitation code is not put in the redir
 | `POST /purses/edit` | session | Fields `purse` (hex id), `kind` (`fixed` or `monthly`), `amount`. Moves the available amount by the allotment difference. The same kind and amount does not bump the private version. |
 | `POST /purses/add-alias` | session | Fields `purse` (hex id), `alias`. Adds that app alias to the purse. |
 | `POST /purses/remove-alias` | session | Fields `purse` (hex id), `alias`. Removes that alias. |
-| `GET /receive-ceilings` | session | Each contact and the receive ceiling stored for that payer. A missing row is shown as zero. |
-| `POST /receive-ceilings` | session | Fields `contact` (user uuid hex), `amount` (dollars, up to 9 decimal places, zero allowed). Publishes that payer's ceiling. A bad amount or an unknown contact is not stored. |
+| `GET /what-youll-run` | session | Each contact and what you'll run for that payer. A missing row is shown as zero. |
+| `POST /what-youll-run` | session | Fields `contact` (user uuid hex), `amount` (dollars, up to 9 decimal places, zero allowed). Publishes that payer's amount. A bad amount or an unknown contact is not stored. |
 | `GET /applications` | session | Apps on this device. |
 | `POST /applications/rename` | session | Fields `id`, `alias`. Publishes the alias. Empty alias is a no-op. |
 | `POST /applications/delete` | session | Field `id`. Same removal as reject. |
-| `GET /contacts` | session | Contact list and a form to enter a contact code. Each contact links to its ledger. |
+| `GET /contacts` | session | Contact list and a form to enter a contact code. Each contact links to its tab. |
 | `POST /contacts/enter` | session | Field `code`. Starts a contact exchange. |
-| `GET /contacts/<32 hex>/ledger` | session | Confirmed lines with that contact, which are cleared, and the net in dollars. A line with anyone else is absent. A pending accept is absent. |
-| `POST /contacts/<32 hex>/ledger` | session | Repeated field `payment` (hex id). The writer proposes a clearing for those lines. An empty list, an id that is not a line for the pair, or more than 64 ids is not sent. The purse does not change. The record is stored when the other owner signs. |
+| `GET /contacts/<32 hex>/tab` | session | Charges with that contact, which are settled, and the amount on the tab. A charge with anyone else is absent. A pending accept is absent. |
+| `POST /contacts/<32 hex>/tab` | session | Repeated field `payment` (hex id). The writer proposes a settlement for those charges. An empty list, an id that is not a charge for the pair, or more than 64 ids is not sent. The purse does not change. The record is stored when the other owner signs. |
 | `GET /devices` | session | Own devices, sessions, hosts. |
 | `POST /devices/sync` | session | Pull from the writer, then redirect to `/devices`. |
 | `POST /devices/remove` | session | Field `id` (device UUID hex). Publishes `RemoveDevice`. |
@@ -266,7 +266,7 @@ Errors: `bad packet`, `token unknown`, `not approved`.
 
 Body: `token (16)`, exactly 16 bytes. Same approval check as list purses.
 
-The reply lists confirmed lines whose payee is this user and whose destination alias is the caller's alias. A hold that is not confirmed is absent. A line for another alias is absent, including its note. Order is payment id, then the payer's confirmation signature. Two different signed bodies of one payment id are both listed. Count 0 is success. The read does not change a purse or the ledger.
+The reply lists confirmed lines whose payee is this user and whose destination alias is the caller's alias. A hold that is not confirmed is absent. A line for another alias is absent, including its note. Order is payment id, then the payer's confirmation signature. Two different signed bodies of one payment id are both listed. Count 0 is success. The read does not change a purse or the tab.
 
 ```text
 0x00
@@ -284,7 +284,7 @@ Errors: `bad packet`, `token unknown`, `not approved`.
 
 Same request and same approval check. The lines are confirmed payments whose payer is this user and whose paying alias is the caller's alias. Each line uses the same layout as list incoming.
 
-An app does not clear a tab. The two owners sign that record. A cleared line stays on these lists.
+An app does not clear a tab. The two owners sign that record. A settled line stays on these lists.
 
 ### Reserve (`0x08`)
 
