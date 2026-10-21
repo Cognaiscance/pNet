@@ -295,7 +295,7 @@ token (16) || purse id (16) || amount (i64) || contact uuid (16)
 
 The token must belong to an approved app on this device, and that app's alias must be a member of the purse. The amount is nanodollars and must be greater than zero. The destination alias is trimmed. The note is opaque UTF-8, at most 255 bytes, and may be empty. Nothing follows the payment id.
 
-This node applies the reserve only when it is the writer. Any other node replies `no writer` and leaves the purse as it is. When the writer holds the user key and has a session to that contact, it signs an offer and sends it. The offer does not name the purse. The app reply is the same either way. A missing session leaves the hold until a retry, a refusal, or expiry. The reply does not change when the contact later accepts or refuses. The next purse read shows the restored available amount after a refusal or an expiry.
+When this node is the writer, it stores the hold. When it is not, it sends the reserve to the writer and waits. It does not change its own purse. The reply's available amount is the writer's. This device's purse copy changes when the private record arrives. No reachable writer, or no answer, is `no writer`. When the writer holds the user key and has a session to that contact, it signs an offer and sends it. A device that is not the writer does not sign the offer. The offer does not name the purse. The app reply is the same either way. A missing session leaves the hold until a retry, a refusal, or expiry. The reply does not change when the contact later accepts or refuses. The next purse read shows the restored available amount after a refusal or an expiry, once this device has the writer's purse.
 
 Success:
 

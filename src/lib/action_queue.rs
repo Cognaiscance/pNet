@@ -44,6 +44,43 @@ impl PendingInvites {
     }
 }
 
+/// App sockets waiting for a reserve the writer has not answered yet.
+///
+/// The pool worker registers the app address and returns. It does not park.
+/// The write ack replies to every address, and a timeout thread replies
+/// `no writer` to one address if it is still waiting.
+#[derive(Default)]
+pub struct PendingReserves {
+    slots: Mutex<HashMap<Uuid, Vec<SocketAddr>>>,
+}
+
+impl PendingReserves {
+    pub fn push(&self, payment_id: Uuid, src: SocketAddr) {
+        self.slots.lock().unwrap().entry(payment_id).or_default().push(src);
+    }
+
+    /// Take every waiter for this payment. A later timeout finds nothing.
+    pub fn take(&self, payment_id: Uuid) -> Vec<SocketAddr> {
+        self.slots.lock().unwrap().remove(&payment_id).unwrap_or_default()
+    }
+
+    /// Drop one waiter. True when that address was still waiting.
+    pub fn cancel_one(&self, payment_id: Uuid, src: SocketAddr) -> bool {
+        let mut slots = self.slots.lock().unwrap();
+        let Some(waiters) = slots.get_mut(&payment_id) else {
+            return false;
+        };
+        let Some(pos) = waiters.iter().position(|waiter| *waiter == src) else {
+            return false;
+        };
+        waiters.remove(pos);
+        if waiters.is_empty() {
+            slots.remove(&payment_id);
+        }
+        true
+    }
+}
+
 pub const PRIORITY_HIGH:   u8 = 0;
 pub const PRIORITY_NORMAL: u8 = 1;
 pub const PRIORITY_LOW:    u8 = 2;
@@ -168,6 +205,8 @@ pub struct WorkerContext {
     pub scheduler_tx: mpsc::Sender<ScheduleRequest>,
     /// Rendezvous for DG→SG invitation requests (op 0x35/0x36).
     pub pending_invites: Arc<PendingInvites>,
+    /// App reserve forwarded to the writer. Not persisted.
+    pub pending_reserves: Arc<PendingReserves>,
     /// In-memory admin UI sessions (cookie → expiry). Not persisted.
     pub sessions: Arc<super::admin_auth::SessionStore>,
     /// Local app API rate limits (register/send token buckets).

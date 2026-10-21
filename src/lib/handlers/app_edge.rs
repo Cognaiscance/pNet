@@ -609,11 +609,14 @@ fn list_payments(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext, incoming: b
 /// alias is trimmed and must be a normal app alias. The note is opaque UTF-8,
 /// at most 255 bytes, and may be empty. No bytes may follow the payment id.
 ///
-/// This node reserves only when it is the writer. Any other node replies
-/// `ERR_NO_WRITER` and leaves the purse unchanged. After the hold, the writer
-/// signs an offer and sends it when it has the user key and a session to that
-/// contact. The offer does not name the purse. A missing session leaves the hold
-/// in place until a retry, a refusal, or expiry.
+/// When this node is the writer, it stores the hold. Any other node sends the
+/// reserve to the writer and does not change its own purse. It replies to the
+/// app when the writer's ack arrives. No reachable writer, or no answer within
+/// [`RESERVE_FORWARD_WAIT`], is `ERR_NO_WRITER`. The writer stamps the expiry
+/// from its own clock. After the hold, the writer signs an offer and sends it
+/// when it has the user key and a session to that contact. A device that is
+/// not the writer does not sign the offer. The offer does not name the purse.
+/// A missing session leaves the hold in place until a retry, a refusal, or expiry.
 ///
 /// Success: `[OK][available: i64 BE][expires_at_ms: u64 BE]`. The available
 /// amount is what that purse still has after this hold. A repeat of the same
@@ -634,9 +637,16 @@ pub fn app_reserve(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let Some(paying_alias) = approved_alias(src, &parsed.token, ctx) else {
         return;
     };
-    if !matches!(find_writer_sg_probing(ctx), WriterTarget::Local) {
-        send_error(ctx, src, ERR_NO_WRITER);
-        return;
+    match find_writer_sg_probing(ctx) {
+        WriterTarget::Local => {}
+        WriterTarget::Remote(_) => {
+            forward_reserve(src, parsed, paying_alias, ctx);
+            return;
+        }
+        WriterTarget::Unreachable => {
+            send_error(ctx, src, ERR_NO_WRITER);
+            return;
+        }
     }
 
     release_expired_reserves(ctx);
@@ -708,6 +718,42 @@ pub fn app_reserve(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     reply.extend_from_slice(&expires_at_ms.to_be_bytes());
     send(ctx, src, &reply);
     super::payment::deliver_payment(ctx, reserve.payment_id);
+}
+
+/// How long a device waits for the writer to answer a forwarded reserve.
+/// The worker does not block. A timeout thread replies `ERR_NO_WRITER`.
+const RESERVE_FORWARD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send the reserve to the writer and remember the app socket. The writer's
+/// clock stamps the expiry, so this copy carries none.
+fn forward_reserve(src: SocketAddr, parsed: ParsedReserve, paying_alias: String, ctx: &WorkerContext) {
+    let reserve = PaymentReserve {
+        payment_id: parsed.payment_id,
+        purse_id: parsed.purse_id,
+        amount_nanodollars: parsed.amount,
+        contact_uuid: parsed.contact_uuid,
+        destination_alias: parsed.destination_alias,
+        note: parsed.note,
+        paying_alias,
+        expires_at_ms: 0,
+        period: 0,
+    };
+    let payment_id = reserve.payment_id;
+    ctx.pending_reserves.push(payment_id, src);
+    if request_change_idempotent(Change::ReservePayment { reserve }, ctx).is_err() {
+        if ctx.pending_reserves.cancel_one(payment_id, src) {
+            send_error(ctx, src, ERR_NO_WRITER);
+        }
+        return;
+    }
+    let pending = std::sync::Arc::clone(&ctx.pending_reserves);
+    let socket = std::sync::Arc::clone(&ctx.udp_socket);
+    std::thread::spawn(move || {
+        std::thread::sleep(RESERVE_FORWARD_WAIT);
+        if pending.cancel_one(payment_id, src) {
+            let _ = socket.send_to(&[STATUS_ERR, ERR_NO_WRITER], src);
+        }
+    });
 }
 
 struct ParsedReserve {

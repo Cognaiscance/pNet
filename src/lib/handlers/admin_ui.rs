@@ -3269,6 +3269,7 @@ mod policy_ui_tests {
             writer_tx,
             scheduler_tx,
             pending_invites: Default::default(),
+            pending_reserves: Default::default(),
             sessions: Arc::new(crate::admin_auth::SessionStore::new()),
             app_rate_limits: Arc::new(std::sync::Mutex::new(crate::app_api::AppRateLimiter::new())),
             dns_cache: Arc::new(std::sync::Mutex::new(crate::dns_cache::DnsCache::new())),

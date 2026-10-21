@@ -14,7 +14,7 @@ use super::super::data_models::{
     Ed25519KeyPair, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, LedgerLine, Node, Owner,
     PaymentReserve, PendingAccept, Purse, ReceiveCeiling,
     Scope, SyncVersion, User, Uuid, WriteLogEntry, X25519PublicKey, WRITE_LOG_RETENTION,
-    unix_time_ms, utc_month_period,
+    unix_time_ms, utc_month_period, RESERVE_TTL_MS,
 };
 use super::super::payment::{
     body_from_line, body_from_pending, claim_exceeds_ceiling, clearing_record_ok, decode_accept_at,
@@ -2866,9 +2866,13 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
     };
 
-    let Some(change) = deserialize_change(&plaintext) else {
+    let Some(mut change) = deserialize_change(&plaintext) else {
         eprintln!("[sync_write_request] unparseable change from {src}");
         return;
+    };
+    let reserve_payment = match &change {
+        Change::ReservePayment { reserve } => Some(reserve.payment_id),
+        _ => None,
     };
 
     let (target, local_uuid) = {
@@ -2876,8 +2880,21 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         (find_writer_sg(&node), node.device_uuid)
     };
 
-    let (result, private_v, public_v, bumped) = match target {
+    let (result, private_v, public_v, bumped, failure_code) = match target {
         WriterTarget::Local => {
+            if let Change::ReservePayment { reserve } = &mut change {
+                // The sender's clock is not the hold. Stamp it here, after the
+                // month roll, so a forwarded reserve uses this writer's time.
+                release_expired_reserves(ctx);
+                reserve.expires_at_ms = unix_time_ms().saturating_add(RESERVE_TTL_MS);
+                let purse_id = reserve.purse_id;
+                reserve.period = {
+                    let node = ctx.node.read().unwrap();
+                    node.owner.purses.iter().find(|purse| purse.id == purse_id).map(|purse| {
+                        if purse.kind == PURSE_KIND_MONTHLY { purse.period } else { 0 }
+                    }).unwrap_or(0)
+                };
+            }
             let (pre_priv, pre_pub) = {
                 let node = ctx.node.read().unwrap();
                 (node.owner.private_version, node.owner.public_version)
@@ -2885,37 +2902,55 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             match apply_change_locally(&change, local_uuid, ctx) {
                 Ok((priv_v, pub_v)) => {
                     let bumped = bumped_scopes(pre_priv, pre_pub, priv_v, pub_v);
-                    (WRITE_ACK_OK, priv_v, pub_v, bumped)
+                    (WRITE_ACK_OK, priv_v, pub_v, bumped, None)
                 }
                 Err(WriteError::Validation(msg)) => {
                     eprintln!("[sync_write_request] validation error from {src}: {msg}");
                     let node = ctx.node.read().unwrap();
-                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new())
+                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new(), Some(ERR_BAD_PACKET))
                 }
                 Err(WriteError::ReserveRejected(reason)) => {
                     eprintln!("[sync_write_request] reserve rejected from {src}: {reason:?}");
+                    let code = match reason {
+                        ReserveReject::NotMember => ERR_NOT_IN_PURSE,
+                        ReserveReject::OverPurse => ERR_OVER_PURSE,
+                        ReserveReject::Mismatch => ERR_PAYMENT_MISMATCH,
+                    };
                     let node = ctx.node.read().unwrap();
-                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new())
+                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new(), Some(code))
                 }
                 Err(WriteError::PaymentRejected(reason)) => {
                     eprintln!("[sync_write_request] payment rejected from {src}: {reason:?}");
                     let node = ctx.node.read().unwrap();
-                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new())
+                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new(), Some(ERR_PAYMENT_MISMATCH))
                 }
                 Err(WriteError::Unreachable) => {
                     // Cannot occur in the Local branch — defensive only.
                     let node = ctx.node.read().unwrap();
-                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new())
+                    (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new(), Some(ERR_NO_WRITER))
                 }
             }
         }
         WriterTarget::Remote(_) | WriterTarget::Unreachable => {
             let node = ctx.node.read().unwrap();
-            (WRITE_ACK_NOT_WRITER, node.owner.private_version, node.owner.public_version, Vec::new())
+            (WRITE_ACK_NOT_WRITER, node.owner.private_version, node.owner.public_version, Vec::new(), Some(ERR_NO_WRITER))
         }
     };
 
-    let body = build_write_ack_body(result, private_v, public_v);
+    let mut body = build_write_ack_body(result, private_v, public_v);
+    if let Some(payment_id) = reserve_payment {
+        let (code, available, expires_at_ms) = if result == WRITE_ACK_OK {
+            stored_reserve_reply(ctx, payment_id)
+                .map(|(available, expires_at_ms)| (0, available, expires_at_ms))
+                .unwrap_or((ERR_PAYMENT_MISMATCH, 0, 0))
+        } else {
+            (failure_code.unwrap_or(ERR_BAD_PACKET), 0, 0)
+        };
+        body.extend_from_slice(&payment_id);
+        body.push(code);
+        body.extend_from_slice(&available.to_be_bytes());
+        body.extend_from_slice(&expires_at_ms.to_be_bytes());
+    }
     let pkt_and_addr: Option<(Vec<u8>, SocketAddr)> = {
         let node = ctx.node.read().unwrap();
         node.owner.active_connections.get(&conn_id)
@@ -2929,6 +2964,11 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     };
     send(ctx, addr, &pkt);
+    if result == WRITE_ACK_OK {
+        if let Some(payment_id) = reserve_payment {
+            super::payment::deliver_payment(ctx, payment_id);
+        }
+    }
 
     // Fan out UpdateAvailable notifications to peers when the write actually
     // changed state. The originator gets one too — its `sync_update_available`
@@ -2983,6 +3023,30 @@ pub fn sync_write_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         "[sync_write_ack] from {src} result={result} private=(e={},s={}) public=(e={},s={}) (phase 5: pull on accepted)",
         private_v.epoch, private_v.seq, public_v.epoch, public_v.seq,
     );
+    // A forwarded reserve continues past the versions: payment id, app code,
+    // available, expiry. An older ack ends here and is not a reserve result.
+    let Some(payment_id) = slice_arr::<16>(&plaintext, pos) else { return };
+    let Some(code) = plaintext.get(pos + 16).copied() else { return };
+    let Some(available) = slice_arr::<8>(&plaintext, pos + 17) else { return };
+    let Some(expires_at_ms) = slice_arr::<8>(&plaintext, pos + 25) else { return };
+    super::finish_forwarded_reserve(
+        ctx,
+        payment_id,
+        code,
+        i64::from_be_bytes(available),
+        u64::from_be_bytes(expires_at_ms),
+    );
+}
+
+fn stored_reserve_reply(ctx: &WorkerContext, payment_id: Uuid) -> Option<(i64, u64)> {
+    let node = ctx.node.read().unwrap();
+    if let Some(hold) = node.owner.reserves.iter().find(|hold| hold.payment_id == payment_id) {
+        let purse = node.owner.purses.iter().find(|purse| purse.id == hold.purse_id)?;
+        return Some((purse.available_nanodollars, hold.expires_at_ms));
+    }
+    let line = node.owner.ledger.iter().find(|line| line.payment_id == payment_id)?;
+    let purse = node.owner.purses.iter().find(|purse| purse.id == line.purse_id)?;
+    Some((purse.available_nanodollars, line.expires_at_ms))
 }
 
 /// Op 0x72 — Sync update available (writer SG → notify list).
