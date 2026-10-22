@@ -2857,7 +2857,7 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, SYNC_WRITE_REQUEST_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[sync_write_request] decryption failed from {src}");
@@ -2997,7 +2997,7 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 pub fn sync_write_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, SYNC_WRITE_ACK_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[sync_write_ack] decryption failed from {src}");
@@ -3065,7 +3065,7 @@ pub fn sync_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext)
 
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, SYNC_UPDATE_AVAILABLE_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[sync_update_available] decryption failed from {src}");
@@ -3141,7 +3141,7 @@ pub fn sync_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, SYNC_PULL_REQUEST_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[sync_pull_request] decryption failed from {src}");
@@ -3212,7 +3212,7 @@ pub fn sync_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 pub fn sync_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, SYNC_PULL_RESPONSE_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[sync_pull_response] decryption failed from {src}");
@@ -3299,7 +3299,7 @@ pub fn cross_user_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
 
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, CROSS_USER_UPDATE_AVAILABLE_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[cross_user_update_available] decryption failed from {src}");
@@ -3373,7 +3373,7 @@ pub fn cross_user_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
 
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, CROSS_USER_PULL_REQUEST_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[cross_user_pull_request] decryption failed from {src}");
@@ -3450,7 +3450,7 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
 
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, CROSS_USER_PULL_RESPONSE_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[cross_user_pull_response] decryption failed from {src}");
@@ -3673,7 +3673,7 @@ pub fn watermark_probe_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
 
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, WATERMARK_PROBE_REQUEST_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[watermark_probe_request] decryption failed from {src}");
@@ -3729,7 +3729,7 @@ pub fn watermark_probe_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
 
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, WATERMARK_PROBE_RESPONSE_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[watermark_probe_response] decryption failed from {src}");
@@ -4063,7 +4063,7 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, MERGE_PROPOSAL_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[merge_proposal] decryption failed from {src}");
@@ -4321,7 +4321,7 @@ pub fn merge_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
     let plaintext = {
         let node = ctx.node.read().unwrap();
-        match decrypt_packet_body(&node, &buf) {
+        match decrypt_packet_body(&node, MERGE_ACK_OP, &buf) {
             Some(pt) => pt,
             None => {
                 eprintln!("[merge_ack] decryption failed from {src}");

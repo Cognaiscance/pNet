@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{
-    aead_domain, aead_key_from_dh, generate_x25519_keypair, xchacha20_decrypt,
+    aead_domain, aead_key_from_dh, decrypt_packet_body, generate_x25519_keypair, open_with_opcode,
 };
 use super::super::data_models::{
     ActiveConnection, ActiveTunnel, Node, PendingTunnel, PendingTunnelConnection, X25519PublicKey,
@@ -323,31 +323,41 @@ pub fn tunnel_connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
 /// Op 0x51 — Tunnel forward (DG → SG).
 ///
-/// The SG looks up the tunnel by ID, identifies the outbound leg, and forwards
-/// the nonce+ciphertext payload as-is without decryption (op 0x54).
+/// The datagram is a session-sealed packet. The SG opens it with the device
+/// session named by the connection id, which proves the sender holds that
+/// session key. The body is `[tunnel_id: u16][tunnel nonce: 24][tunnel
+/// ciphertext]`. The tunnel ciphertext stays sealed with the DG↔DG key. The
+/// SG checks this session is one leg of the tunnel and forwards the tunnel
+/// blob as `0x54`.
 ///
-/// Payload: [sender_sg_conn_id: u16][tunnel_id: u16][nonce: 24][ciphertext...]
-///
-/// The SG does not decrypt; it still caps the blob at
-/// [`MAX_TUNNEL_FORWARD_BLOB`] so an oversized opaque cannot be amplified.
+/// The forwarded blob is capped at [`MAX_TUNNEL_FORWARD_BLOB`].
 pub fn tunnel_forward(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    if buf.len() < 28 {
+    if buf.len() < ENCRYPTED_BODY_HEADER_LEN {
         eprintln!("[tunnel_forward] packet too short from {src}");
         return;
     }
     let sender_sg_conn_id = u16::from_be_bytes([buf[0], buf[1]]);
-    let tunnel_id         = u16::from_be_bytes([buf[2], buf[3]]);
-    let payload           = &buf[4..]; // nonce + ciphertext, forwarded as-is
-    if payload.len() > MAX_TUNNEL_FORWARD_BLOB {
-        eprintln!(
-            "[tunnel_forward] blob too large ({} > {MAX_TUNNEL_FORWARD_BLOB}) tunnel {tunnel_id} from {src}",
-            payload.len()
-        );
-        return;
-    }
 
-    let dest_host = {
+    let forwarded = {
         let mut node = ctx.node.write().unwrap();
+        let Some(plaintext) = decrypt_packet_body(&node, TUNNEL_FORWARD_OP, &buf) else {
+            eprintln!("[tunnel_forward] decryption failed from {src}");
+            return;
+        };
+        if plaintext.len() < 2 + 24 + 16 {
+            eprintln!("[tunnel_forward] plaintext too short from {src}");
+            return;
+        }
+        let tunnel_id = u16::from_be_bytes([plaintext[0], plaintext[1]]);
+        let payload = plaintext[2..].to_vec();
+        if payload.len() > MAX_TUNNEL_FORWARD_BLOB {
+            eprintln!(
+                "[tunnel_forward] blob too large ({} > {MAX_TUNNEL_FORWARD_BLOB}) tunnel {tunnel_id} from {src}",
+                payload.len()
+            );
+            return;
+        }
+
         let Some(tunnel) = node.owner.active_tunnels.get_mut(&tunnel_id) else {
             eprintln!("[tunnel_forward] unknown tunnel_id {tunnel_id} from {src}");
             return;
@@ -364,16 +374,18 @@ pub fn tunnel_forward(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
         tunnel.last_used_at = Instant::now();
 
-        node.owner.active_connections.get(&out_conn_id)
-            .map(|c| c.peer_addr)
+        node.owner
+            .active_connections
+            .get(&out_conn_id)
+            .map(|c| (c.peer_addr, tunnel_id, payload))
     };
 
-    if let Some(dest) = dest_host {
+    if let Some((dest, tunnel_id, payload)) = forwarded {
         // Forward as TUNNEL_DELIVERY (0x54): [op][tunnel_id: u16][nonce+ciphertext]
         let mut pkt = Vec::with_capacity(3 + payload.len());
         pkt.push(TUNNEL_DELIVERY_OP);
         pkt.extend_from_slice(&tunnel_id.to_be_bytes());
-        pkt.extend_from_slice(payload);
+        pkt.extend_from_slice(&payload);
         fabric_event(
             "tunnel_forward",
             &[
@@ -393,6 +405,10 @@ pub fn tunnel_forward(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// `dg_tunnel_map`) and pushes it to the target local app.
 ///
 /// Payload: [tunnel_id: u16][nonce: 24][ciphertext...]
+///
+/// The tunnel plaintext starts with an opcode. An inner `0x54` matches the
+/// outer byte. An inner `0x51` is accepted when `src` is this tunnel
+/// connection's `peer_addr`, the forwarding server. Any other pair is dropped.
 ///
 /// Decrypted app payload must be ≤ [`MAX_APP_PAYLOAD`].
 /// Destination app must be **user-approved** or the push is dropped.
@@ -422,7 +438,19 @@ pub fn tunnel_delivery(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             &conn.peer_public_key,
             aead_domain::TUNNEL,
         );
-        let Some(plaintext) = xchacha20_decrypt(&aead_key, &nonce, ciphertext) else {
+        // The sender sealed opcode 0x51. The SG rewrote the outer byte to
+        // 0x54 and did not touch the ciphertext. Accept that pair only when
+        // this datagram came from the server that carries the tunnel. That
+        // address is the peer_addr stored when the handshake arrived.
+        let from_forwarder = conn.peer_addr == src;
+        let also_accept = if from_forwarder { Some(TUNNEL_FORWARD_OP) } else { None };
+        let Some(plaintext) = open_with_opcode(
+            TUNNEL_DELIVERY_OP,
+            &aead_key,
+            &nonce,
+            ciphertext,
+            also_accept,
+        ) else {
             eprintln!("[tunnel_delivery] decryption failed for tunnel {tunnel_id} from {src}");
             return;
         };
