@@ -56,7 +56,7 @@ pub(crate) fn deliver_payment(ctx: &WorkerContext, payment_id: Uuid) {
 }
 
 pub fn payment_offer(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device, _)) = open_session(ctx, &buf) else {
+    let Some((plain, device, _)) = open_session(ctx, PAYMENT_OFFER_OP, &buf) else {
         return;
     };
     let Some((body, payer_sig)) = decode_offer(&plain) else {
@@ -137,7 +137,7 @@ pub fn payment_offer(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 }
 
 pub fn payment_accept(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device, _)) = open_session(ctx, &buf) else {
+    let Some((plain, device, _)) = open_session(ctx, PAYMENT_ACCEPT_OP, &buf) else {
         return;
     };
     let Some((body, payer_sig, payee_sig)) = decode_accept(&plain) else {
@@ -200,7 +200,7 @@ pub fn payment_accept(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 }
 
 pub fn payment_refuse(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device, _)) = open_session(ctx, &buf) else {
+    let Some((plain, device, _)) = open_session(ctx, PAYMENT_REFUSE_OP, &buf) else {
         return;
     };
     let Some((body, payer_sig, reason, payee_sig)) = decode_refuse(&plain) else {
@@ -241,7 +241,7 @@ pub fn payment_refuse(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 }
 
 pub fn payment_confirm(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device, _)) = open_session(ctx, &buf) else {
+    let Some((plain, device, _)) = open_session(ctx, PAYMENT_CONFIRM_OP, &buf) else {
         return;
     };
     let Some((body, payer_sig, payee_sig, confirm_sig)) = decode_confirm(&plain) else {
@@ -303,7 +303,7 @@ fn send_refuse(ctx: &WorkerContext, body: &OfferBody, payer_sig: &Ed25519Signatu
     send_to_user(ctx, body.payer, PAYMENT_REFUSE_OP, &plain);
 }
 
-fn open_session(ctx: &WorkerContext, buf: &[u8]) -> Option<(Vec<u8>, Uuid, u16)> {
+fn open_session(ctx: &WorkerContext, op: u8, buf: &[u8]) -> Option<(Vec<u8>, Uuid, u16)> {
     if buf.len() < 2 {
         return None;
     }
@@ -312,7 +312,7 @@ fn open_session(ctx: &WorkerContext, buf: &[u8]) -> Option<(Vec<u8>, Uuid, u16)>
     if !matches!(find_writer_sg(&node), WriterTarget::Local) {
         return None;
     }
-    let plain = decrypt_packet_body(&node, buf)?;
+    let plain = decrypt_packet_body(&node, op, buf)?;
     let device = node.owner.active_connections.get(&conn_id)?.device_uuid;
     Some((plain, device, conn_id))
 }
@@ -403,7 +403,7 @@ pub(crate) fn propose_settlement(ctx: &WorkerContext, contact: Uuid, settlement_
 }
 
 pub fn settlement_propose(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device, _)) = open_session(ctx, &buf) else {
+    let Some((plain, device, _)) = open_session(ctx, SETTLEMENT_PROPOSE_OP, &buf) else {
         return;
     };
     let Some((body, sig)) = decode_settlement_proposal(&plain) else {
@@ -466,11 +466,11 @@ pub fn settlement_propose(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 }
 
 pub fn settlement_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    accept_signed_settlement(src, buf, ctx, "settlement_ack");
+    accept_signed_settlement(src, SETTLEMENT_ACK_OP, buf, ctx, "settlement_ack");
 }
 
 pub fn settlement_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device, conn_id)) = open_session(ctx, &buf) else {
+    let Some((plain, device, conn_id)) = open_session(ctx, SETTLEMENT_INDEX_OP, &buf) else {
         return;
     };
     let Some((flags, entries)) = decode_index(&plain) else {
@@ -525,7 +525,7 @@ pub fn settlement_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 }
 
 pub fn settlement_record(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    accept_signed_settlement(src, buf, ctx, "settlement_record");
+    accept_signed_settlement(src, SETTLEMENT_RECORD_OP, buf, ctx, "settlement_record");
 }
 
 enum SettleChoice {
@@ -534,8 +534,14 @@ enum SettleChoice {
     Store(Settlement),
 }
 
-fn accept_signed_settlement(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext, label: &str) {
-    let Some((plain, device, _)) = open_session(ctx, &buf) else {
+fn accept_signed_settlement(
+    src: SocketAddr,
+    op: u8,
+    buf: Vec<u8>,
+    ctx: &WorkerContext,
+    label: &str,
+) {
+    let Some((plain, device, _)) = open_session(ctx, op, &buf) else {
         return;
     };
     let Some(record) = decode_settlement(&plain) else {
@@ -617,7 +623,7 @@ fn pair_has_line(owner: &Owner, contact: Uuid, payment_id: Uuid) -> bool {
 }
 
 pub fn payment_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device, conn_id)) = open_session(ctx, &buf) else {
+    let Some((plain, device, conn_id)) = open_session(ctx, PAYMENT_INDEX_OP, &buf) else {
         return;
     };
     let Some((flags, entries)) = decode_index(&plain) else {
@@ -671,7 +677,7 @@ pub fn payment_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 }
 
 pub fn payment_record(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
-    let Some((plain, device, _)) = open_session(ctx, &buf) else {
+    let Some((plain, device, _)) = open_session(ctx, PAYMENT_RECORD_OP, &buf) else {
         return;
     };
     let Some((body, payer_sig, payee_sig, confirm_sig)) = decode_confirm(&plain) else {

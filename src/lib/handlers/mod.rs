@@ -1732,6 +1732,7 @@ mod tests {
         assert_eq!(refusal[0], PAYMENT_REFUSE_OP);
         let plain = decrypt_packet_body(
             &pair.payer.ctx.node.read().unwrap(),
+            PAYMENT_REFUSE_OP,
             &refusal[1..],
         ).expect("refusal decrypts");
         let (_, _, reason, _) = super::super::payment::decode_refuse(&plain).expect("refusal decodes");
@@ -1767,8 +1768,12 @@ mod tests {
         assert_eq!(parse_reserve_ok(&pair.payer.recv_reply()).0, 4_000_000);
         let offer = recv_pnet(&pair.payee);
         assert_eq!(offer[0], PAYMENT_OFFER_OP);
-        let mut plain = decrypt_packet_body(&pair.payee.ctx.node.read().unwrap(), &offer[1..])
-            .expect("offer decrypts");
+        let mut plain = decrypt_packet_body(
+            &pair.payee.ctx.node.read().unwrap(),
+            PAYMENT_OFFER_OP,
+            &offer[1..],
+        )
+        .expect("offer decrypts");
         let last = plain.len() - 1;
         plain[last] ^= 0xff;
         let pkt = {
@@ -2182,7 +2187,12 @@ mod tests {
         super::payment::propose_settlement(&pair.payer.ctx, contact, [0xC1; 16], &[[0x91; 16]]);
         let proposal = recv_pnet(&pair.payee);
         assert_eq!(proposal[0], SETTLEMENT_PROPOSE_OP);
-        let mut plain = decrypt_packet_body(&pair.payee.ctx.node.read().unwrap(), &proposal[1..]).unwrap();
+        let mut plain = decrypt_packet_body(
+            &pair.payee.ctx.node.read().unwrap(),
+            SETTLEMENT_PROPOSE_OP,
+            &proposal[1..],
+        )
+        .unwrap();
         let last = plain.len() - 1;
         plain[last] ^= 0xff;
         let pkt = seal(&pair.payer, SETTLEMENT_PROPOSE_OP, &plain);
@@ -2409,7 +2419,12 @@ mod tests {
         );
         let record = recv_pnet(&pair.payee);
         assert_eq!(record[0], PAYMENT_RECORD_OP);
-        let plain = decrypt_packet_body(&pair.payee.ctx.node.read().unwrap(), &record[1..]).unwrap();
+        let plain = decrypt_packet_body(
+            &pair.payee.ctx.node.read().unwrap(),
+            PAYMENT_RECORD_OP,
+            &record[1..],
+        )
+        .unwrap();
         let (body, _, _, _) = super::super::payment::decode_confirm(&plain).unwrap();
         assert_eq!(body.payment_id, line_b.payment_id);
         assert!(pair.payee.ctx.udp_socket.recv_from(&mut buf).is_err());
