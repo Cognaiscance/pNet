@@ -273,7 +273,6 @@ fn main() {
         writer_tx:    writer.sender(),
         scheduler_tx,
         pending_invites: Default::default(),
-        pending_reserves: Default::default(),
         sessions:     Arc::new(pnet::admin_auth::SessionStore::new()),
         app_rate_limits: Arc::new(std::sync::Mutex::new(pnet::app_api::AppRateLimiter::new())),
         dns_cache:    Arc::new(std::sync::Mutex::new(pnet::dns_cache::DnsCache::new())),
@@ -387,7 +386,6 @@ mod tests {
             writer_tx:    writer.sender(),
             scheduler_tx,
             pending_invites: Default::default(),
-            pending_reserves: Default::default(),
             sessions:     Arc::new(pnet::admin_auth::SessionStore::new()),
             app_rate_limits: Arc::new(std::sync::Mutex::new(
                 pnet::app_api::AppRateLimiter::new(),

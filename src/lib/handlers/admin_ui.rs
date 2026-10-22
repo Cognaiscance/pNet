@@ -27,9 +27,8 @@ use super::super::app_web::{
 };
 use super::super::crypto::{generate_ed25519_keypair, generate_x25519_keypair};
 use super::super::data_models::{
-    AppInvitation, Device, DeviceGrade, Ed25519SecretKey, Node, Purse, Uuid, CONNECTION_LIFETIME,
-    WRITE_LOG_RETENTION, format_nanodollars, generate_uuid, parse_dollar_to_nanodollars,
-    unix_time_ms, utc_month_period,
+    AppInvitation, Device, DeviceGrade, Ed25519SecretKey, Node, Uuid, CONNECTION_LIFETIME,
+    WRITE_LOG_RETENTION, generate_uuid,
 };
 use super::super::wire::*;
 use super::{
@@ -134,23 +133,6 @@ pub fn ui_request(
         return handle_app_web_proxy(stream, &method, &path, &query, &body, ctx);
     }
 
-    if let Some(id) = path.strip_prefix("/contacts/") {
-        if let Some(id) = id.strip_suffix("/tab") {
-            if !id.is_empty() && !id.contains('/') {
-                if method == "GET" {
-                    return respond_html(&stream, 200, &render_contact_tab(ctx, id, &query), None);
-                }
-                if method == "POST" {
-                    let target = redirect_with_error(
-                        &format!("/contacts/{id}/tab"),
-                        settle_contact_tab(ctx, id, &body),
-                    );
-                    return respond_redirect(&stream, &target);
-                }
-            }
-        }
-    }
-
     if method == "GET" {
         if let Some(id) = path.strip_prefix("/contacts/") {
             if !id.is_empty() && !id.contains('/') {
@@ -235,30 +217,6 @@ pub fn ui_request(
         }
         ("POST", "/pending-apps/reject")  => {
             let target = redirect_with_error("/pending-apps", reject_app(&body, ctx));
-            respond_redirect(&stream, &target);
-        }
-        ("GET",  "/purses") => respond_html(&stream, 200, &render_purses(ctx, &query), None),
-        ("POST", "/purses/create") => {
-            let target = redirect_with_error("/purses", create_purse(&body, ctx));
-            respond_redirect(&stream, &target);
-        }
-        ("POST", "/purses/add-alias") => {
-            let target = redirect_with_error("/purses", add_purse_alias(&body, ctx));
-            respond_redirect(&stream, &target);
-        }
-        ("POST", "/purses/remove-alias") => {
-            let target = redirect_with_error("/purses", remove_purse_alias(&body, ctx));
-            respond_redirect(&stream, &target);
-        }
-        ("POST", "/purses/edit") => {
-            let target = redirect_with_error("/purses", edit_purse(&body, ctx));
-            respond_redirect(&stream, &target);
-        }
-        ("GET",  "/what-youll-run") => {
-            respond_html(&stream, 200, &render_what_youll_run(ctx, &query), None)
-        }
-        ("POST", "/what-youll-run") => {
-            let target = redirect_with_error("/what-youll-run", set_run_limit(&body, ctx));
             respond_redirect(&stream, &target);
         }
         ("GET",  "/applications")  => respond_html(&stream, 200, &render_applications(ctx, &query), None),
@@ -865,8 +823,6 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
            <ul class=\"config-links\">\
              <li><a href=\"/pending-apps\">Pending Apps</a> — approve or reject local app registrations</li>\
              <li><a href=\"/applications\">Applications</a> — approved apps on this device</li>\
-             <li><a href=\"/purses\">Purses</a> — spending limits for app aliases</li>\
-             <li><a href=\"/what-youll-run\">What you'll run</a> — how much of a contact's tab you will still accept</li>\
              <li><a href=\"/contacts\">Contacts</a> — other users you are linked with</li>\
              <li><a href=\"/app-invitations\">App Invitations</a> — requests to accept an app from a contact</li>\
              <li><a href=\"/devices\">Devices</a> — your devices; remove a lost one</li>\
@@ -886,21 +842,6 @@ fn ui_error_banner(query: &str) -> String {
             "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
                 <strong>Could not publish change:</strong> no reachable writer SG. \
                 The local change has been rolled back; retry when an SG is online.\
-            </div>".to_string(),
-        Some(code) if code == UI_ERR_BAD_PURSE =>
-            "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
-                <strong>That purse was not saved.</strong> \
-                Use a name and an app alias, and a dollar amount with at most nine decimal places.\
-            </div>".to_string(),
-        Some(code) if code == UI_ERR_BAD_RUN =>
-            "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
-                <strong>That amount was not saved.</strong> \
-                Choose a contact and a dollar amount with at most nine decimal places.\
-            </div>".to_string(),
-        Some(code) if code == UI_ERR_BAD_SETTLEMENT =>
-            "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
-                <strong>That settlement was not sent.</strong> \
-                Choose charges already on this contact's tab. This device has to be the writer and hold the user key. At most 64 charges.\
             </div>".to_string(),
         Some(code) if code == UI_ERR_REMOVE_SELF =>
             "<div class='card' style='background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-border)'>\
@@ -1027,8 +968,7 @@ fn render_contacts(ctx: &WorkerContext) -> String {
                 format!("<ul style='margin:0;padding-left:1.2rem'>{dev_cells}</ul>")
             };
             format!(
-                "<tr><td><a href=\"/contacts/{id}\">{}</a> \
-                   <a href=\"/contacts/{id}/tab\">Tab</a></td><td>{dev_list}</td></tr>",
+                "<tr><td><a href=\"/contacts/{id}\">{}</a></td><td>{dev_list}</td></tr>",
                 html_escape(&c.user.alias),
                 id = uuid_hex(&c.user.uuid),
             )
@@ -1235,140 +1175,9 @@ fn render_contact_apps(ctx: &WorkerContext, id_hex: &str, query: &str) -> String
          <p style='color:var(--muted)'>Apps this contact may send to, and whether they accept you. \
             Accepting does not require the app to be installed.</p>\
          {error_banner}{table}\
-         <p><a href='/contacts/{id_hex}/tab'>Tab</a> \
-            · <a href='/contacts'>All contacts</a></p>"
+         <p><a href='/contacts'>All contacts</a></p>"
     );
     drop(node);
-    layout(ctx, "Contact", &body)
-}
-
-fn form_fields<'a>(body: &'a [u8], field: &str) -> Vec<&'a str> {
-    let Ok(s) = std::str::from_utf8(body) else {
-        return Vec::new();
-    };
-    let prefix = format!("{field}=");
-    s.split('&').filter_map(|part| part.strip_prefix(prefix.as_str())).collect()
-}
-
-/// Ask the other owner to settle the checked charges.
-/// A missing charge, an empty list, or more than 64 ids is not sent.
-/// This does not store the settlement and does not move a purse. The
-/// settlement lands when the other owner signs it back.
-fn settle_contact_tab(ctx: &WorkerContext, id_hex: &str, body: &[u8]) -> Option<&'static str> {
-    let Some(contact) = uuid_from_hex(id_hex) else {
-        return Some(UI_ERR_BAD_SETTLEMENT);
-    };
-    let raw = form_fields(body, "payment");
-    if raw.is_empty() {
-        return Some(UI_ERR_BAD_SETTLEMENT);
-    }
-    let mut ids = Vec::with_capacity(raw.len());
-    for raw_id in raw {
-        let Some(id) = uuid_from_hex(&url_decode(raw_id)) else {
-            return Some(UI_ERR_BAD_SETTLEMENT);
-        };
-        ids.push(id);
-    }
-    let ids = {
-        let node = ctx.node.read().unwrap();
-        if !matches!(find_writer_sg(&node), WriterTarget::Local) {
-            return Some(UI_ERR_BAD_SETTLEMENT);
-        }
-        if node.owner.key_pair.private_key == Ed25519SecretKey::ZERO {
-            return Some(UI_ERR_BAD_SETTLEMENT);
-        }
-        if !node.owner.contact_users.iter().any(|row| row.user.uuid == contact) {
-            return Some(UI_ERR_BAD_SETTLEMENT);
-        }
-        let Some(ids) = crate::payment::normalize_payment_ids(&ids) else {
-            return Some(UI_ERR_BAD_SETTLEMENT);
-        };
-        let our = node.owner.user.uuid;
-        if !ids.iter().all(|id| {
-            node.owner.charges.iter().any(|line| {
-                line.payment_id == *id
-                    && crate::payment::users_are_pair(line.payer, line.payee, our, contact)
-            })
-        }) {
-            return Some(UI_ERR_BAD_SETTLEMENT);
-        }
-        ids
-    };
-    super::payment::propose_settlement(ctx, contact, generate_uuid(), &ids);
-    None
-}
-
-fn render_contact_tab(ctx: &WorkerContext, id_hex: &str, query: &str) -> String {
-    let Some(contact_uuid) = uuid_from_hex(id_hex) else {
-        return layout(ctx, "Contact", "<h1>Tab</h1><p class='empty'>Unknown contact.</p>");
-    };
-    let node = ctx.node.read().unwrap();
-    let Some(contact) = node.owner.contact_users.iter().find(|row| row.user.uuid == contact_uuid) else {
-        drop(node);
-        return layout(ctx, "Contact", "<h1>Tab</h1><p class='empty'>That contact is not on this node.</p>");
-    };
-    let name = html_escape(&contact.user.alias);
-    let our = node.owner.user.uuid;
-    let mut lines: Vec<_> = node.owner.charges.iter()
-        .filter(|line| crate::payment::users_are_pair(line.payer, line.payee, our, contact_uuid))
-        .cloned()
-        .collect();
-    lines.sort_by(|left, right| {
-        left.payment_id.cmp(&right.payment_id).then(left.confirm_sig.0.cmp(&right.confirm_sig.0))
-    });
-    let net = crate::payment::tab_nanodollars(&node.owner, contact_uuid);
-    let mut rows = String::new();
-    let mut any_open = false;
-    for line in &lines {
-        let id = uuid_hex(&line.payment_id);
-        let settled = crate::payment::charge_is_settled(&node.owner, contact_uuid, line.payment_id);
-        let mark = if settled {
-            "Settled".to_string()
-        } else {
-            any_open = true;
-            format!("<input type='checkbox' name='payment' value='{id}'>")
-        };
-        let direction = if line.payee == our { "Incoming" } else { "Sent" };
-        rows.push_str(&format!(
-            "<tr><td><code>{id}</code></td><td>${amount}</td><td>{direction}</td>\
-               <td>{paying} → {destination}</td><td>{note}</td><td>{mark}</td></tr>",
-            amount = format_nanodollars(line.amount_nanodollars),
-            paying = html_escape(&line.paying_alias),
-            destination = html_escape(&line.destination_alias),
-            note = html_escape(&line.note),
-        ));
-    }
-    drop(node);
-
-    let table = if rows.is_empty() {
-        "<p class='empty'>No charges with this contact yet.</p>".to_string()
-    } else {
-        format!(
-            "<table><tr><th>Charge</th><th>Amount</th><th></th><th>Apps</th><th>Note</th><th></th></tr>{rows}</table>"
-        )
-    };
-    let form = if any_open {
-        format!(
-            "<form method='post' action='/contacts/{id_hex}/tab'>\
-               {table}\
-               <button type='submit'>Settle</button>\
-             </form>"
-        )
-    } else {
-        table
-    };
-    let banner = ui_error_banner(query);
-    let body = format!(
-        "<h1>{name}</h1>\
-         <p style='color:var(--muted);margin-top:-.5rem'>Charges with this contact. \
-         On the tab: {net} dollars. A positive amount is what this contact owes you. \
-         A settled charge stays listed and leaves the tab. Settle asks this contact to sign. \
-         The purse does not change, and any dollars paid stay outside pNet.</p>\
-         {banner}\
-         {form}\
-         <p><a href='/contacts/{id_hex}'>Apps</a> · <a href='/contacts'>All contacts</a></p>",
-        net = format_nanodollars(net),
-    );
     layout(ctx, "Contact", &body)
 }
 
@@ -1734,9 +1543,6 @@ pub(crate) fn render_diagnostics(ctx: &WorkerContext) -> String {
 /// reaches the sync v1 layer but cannot be published. The handler has
 /// already rolled the local mutation back, so the UI state matches reality.
 pub(crate) const UI_ERR_PUBLISH_FAILED: &str = "publish_failed";
-pub(crate) const UI_ERR_BAD_PURSE: &str = "bad_purse";
-pub(crate) const UI_ERR_BAD_RUN: &str = "bad_run";
-pub(crate) const UI_ERR_BAD_SETTLEMENT: &str = "bad_settlement";
 
 /// The device serving this page cannot remove itself.
 pub(crate) const UI_ERR_REMOVE_SELF: &str = "remove_self";
@@ -2724,8 +2530,6 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
         "Config"
             | "Pending Apps"
             | "Applications"
-            | "Purses"
-            | "What you'll run"
             | "Contacts"
             | "Contact"
             | "App Invitations"
@@ -2761,8 +2565,6 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
                <a href=\"/config\">Overview</a>\
                <a href=\"/pending-apps\">Pending Apps</a>\
                <a href=\"/applications\">Applications</a>\
-               <a href=\"/purses\">Purses</a>\
-               <a href=\"/what-youll-run\">What you'll run</a>\
                <a href=\"/contacts\">Contacts</a>\
                <a href=\"/app-invitations\">App Invitations</a>\
                <a href=\"/devices\">Devices</a>\
@@ -2884,335 +2686,22 @@ fn setup_layout(body: &str) -> String {
     )
 }
 
-fn clean_purse_name(raw: &str) -> Option<String> {
-    let name = url_decode(raw).trim().to_string();
-    if name.is_empty() || name.len() > 255 || name.chars().any(|c| c.is_control()) {
-        None
-    } else {
-        Some(name)
-    }
-}
-
-fn purse_by_id(ctx: &WorkerContext, body: &[u8]) -> Result<Purse, &'static str> {
-    let id = form_field(body, "purse")
-        .and_then(|raw| uuid_from_hex(&url_decode(raw)))
-        .ok_or(UI_ERR_BAD_PURSE)?;
-    ctx.node.read().unwrap().owner.purses.iter()
-        .find(|purse| purse.id == id)
-        .cloned()
-        .ok_or(UI_ERR_BAD_PURSE)
-}
-
-fn create_purse(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
-    let name = match form_field(body, "name").and_then(clean_purse_name) {
-        Some(name) => name,
-        None => return Some(UI_ERR_BAD_PURSE),
-    };
-    let amount = match form_field(body, "amount")
-        .and_then(|raw| parse_dollar_to_nanodollars(&url_decode(raw)))
-    {
-        Some(amount) => amount,
-        None => return Some(UI_ERR_BAD_PURSE),
-    };
-    let kind = match form_field(body, "kind").map(|raw| url_decode(raw)).as_deref() {
-        None => PURSE_KIND_FIXED,
-        Some("fixed") => PURSE_KIND_FIXED,
-        Some("monthly") => PURSE_KIND_MONTHLY,
-        Some(_) => return Some(UI_ERR_BAD_PURSE),
-    };
-    let period = if kind == PURSE_KIND_MONTHLY {
-        utc_month_period(unix_time_ms())
-    } else {
-        0
-    };
-    publish_policy(Change::UpsertPurse {
-        purse: Purse {
-            id: generate_uuid(),
-            name,
-            allotment_nanodollars: amount,
-            available_nanodollars: amount,
-            aliases: Vec::new(),
-            kind,
-            period,
-        },
-    }, ctx)
-}
-
-fn add_purse_alias(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
-    let mut purse = match purse_by_id(ctx, body) {
-        Ok(purse) => purse,
-        Err(err) => return Some(err),
-    };
-    let Some(alias) = form_field(body, "alias").and_then(clean_app_alias) else {
-        return Some(UI_ERR_BAD_PURSE);
-    };
-    if !purse.aliases.iter().any(|existing| existing == &alias) {
-        purse.aliases.push(alias);
-    }
-    publish_policy(Change::UpsertPurse { purse }, ctx)
-}
-
-fn edit_purse(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
-    let id = match form_field(body, "purse").and_then(|raw| uuid_from_hex(&url_decode(raw))) {
-        Some(id) => id,
-        None => return Some(UI_ERR_BAD_PURSE),
-    };
-    let amount = match form_field(body, "amount")
-        .and_then(|raw| parse_dollar_to_nanodollars(&url_decode(raw)))
-    {
-        Some(amount) => amount,
-        None => return Some(UI_ERR_BAD_PURSE),
-    };
-    let kind = match form_field(body, "kind").map(|raw| url_decode(raw)).as_deref() {
-        Some("fixed") => PURSE_KIND_FIXED,
-        Some("monthly") => PURSE_KIND_MONTHLY,
-        _ => return Some(UI_ERR_BAD_PURSE),
-    };
-
-    // The writer closes last month before the delta is applied, so a raise
-    // does not add last month's remainder on top of the new allotment.
-    super::sync::release_expired_reserves(ctx);
-
-    if kind == PURSE_KIND_FIXED {
-        let stale: Vec<Uuid> = {
-            let node = ctx.node.read().unwrap();
-            let Some(purse) = node.owner.purses.iter().find(|purse| purse.id == id) else {
-                return Some(UI_ERR_BAD_PURSE);
-            };
-            if purse.kind != PURSE_KIND_MONTHLY {
-                Vec::new()
-            } else {
-                let period = purse.period;
-                node.owner.reserves.iter()
-                    .filter(|reserve| {
-                        reserve.purse_id == id && reserve.period != 0 && reserve.period != period
-                    })
-                    .map(|reserve| reserve.payment_id)
-                    .collect()
-            }
-        };
-        for payment_id in stale {
-            if let Some(err) = publish_policy(Change::ReleaseReserve { payment_id }, ctx) {
-                return Some(err);
-            }
-        }
-    }
-
-    let mut purse = match purse_by_id(ctx, body) {
-        Ok(purse) => purse,
-        Err(err) => return Some(err),
-    };
-    let period = if kind == PURSE_KIND_MONTHLY {
-        if purse.kind == PURSE_KIND_MONTHLY {
-            purse.period
-        } else {
-            utc_month_period(unix_time_ms())
-        }
-    } else {
-        0
-    };
-    let Some(delta) = amount.checked_sub(purse.allotment_nanodollars) else {
-        return Some(UI_ERR_BAD_PURSE);
-    };
-    let available = purse.available_nanodollars.saturating_add(delta);
-    if purse.kind == kind
-        && purse.period == period
-        && purse.allotment_nanodollars == amount
-        && purse.available_nanodollars == available
-    {
-        return None;
-    }
-    purse.kind = kind;
-    purse.period = period;
-    purse.allotment_nanodollars = amount;
-    purse.available_nanodollars = available;
-    publish_policy(Change::UpsertPurse { purse }, ctx)
-}
-
-fn remove_purse_alias(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
-    let mut purse = match purse_by_id(ctx, body) {
-        Ok(purse) => purse,
-        Err(err) => return Some(err),
-    };
-    let Some(alias) = form_field(body, "alias").and_then(clean_app_alias) else {
-        return Some(UI_ERR_BAD_PURSE);
-    };
-    purse.aliases.retain(|existing| existing != &alias);
-    publish_policy(Change::UpsertPurse { purse }, ctx)
-}
-
-fn render_purses(ctx: &WorkerContext, query: &str) -> String {
-    let node = ctx.node.read().unwrap();
-    let mut purses = node.owner.purses.clone();
-    drop(node);
-    purses.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
-
-    let banner = ui_error_banner(query);
-    let mut cards = String::new();
-    if purses.is_empty() {
-        cards.push_str("<p class='empty'>No purses yet.</p>");
-    }
-    for purse in &purses {
-        let id = uuid_hex(&purse.id);
-        let mut members = String::new();
-        if purse.aliases.is_empty() {
-            members.push_str("<p class='empty'>No apps on this purse.</p>");
-        } else {
-            members.push_str("<ul>");
-            for alias in &purse.aliases {
-                members.push_str(&format!(
-                    "<li>{alias} \
-                     <form method='post' action='/purses/remove-alias' style='display:inline;margin:0'>\
-                       <input type='hidden' name='purse' value='{id}'>\
-                       <input type='hidden' name='alias' value='{alias_attr}'>\
-                       <button type='submit'>Remove</button>\
-                     </form></li>",
-                    alias = html_escape(alias),
-                    alias_attr = html_escape(alias),
-                ));
-            }
-            members.push_str("</ul>");
-        }
-        let monthly = purse.kind == PURSE_KIND_MONTHLY;
-        let kind = if monthly { "Monthly" } else { "Fixed" };
-        let fixed_sel = if monthly { "" } else { " selected" };
-        let monthly_sel = if monthly { " selected" } else { "" };
-        cards.push_str(&format!(
-            "<div class='card'>\
-               <h2 style='margin-top:0;font-size:1.1rem'>{name}</h2>\
-               <p>{kind}<br>Allotment ${allotment}<br>Available ${available}</p>\
-               {members}\
-               <form method='post' action='/purses/edit' style='margin-top:.5rem'>\
-                 <input type='hidden' name='purse' value='{id}'>\
-                 <select name='kind'>\
-                   <option value='fixed'{fixed_sel}>Fixed</option>\
-                   <option value='monthly'{monthly_sel}>Monthly</option>\
-                 </select>\
-                 <input name='amount' value='{allotment}' inputmode='decimal' required>\
-                 <button type='submit'>Save limit</button>\
-               </form>\
-               <form method='post' action='/purses/add-alias' style='margin-top:.5rem'>\
-                 <input type='hidden' name='purse' value='{id}'>\
-                 <input name='alias' maxlength='255' placeholder='app alias' required>\
-                 <button type='submit'>Add app</button>\
-               </form>\
-             </div>",
-            name = html_escape(&purse.name),
-            allotment = format_nanodollars(purse.allotment_nanodollars),
-            available = format_nanodollars(purse.available_nanodollars),
-        ));
-    }
-
-    let body = format!(
-        "<h1>Purses</h1>\
-         <p style='color:var(--muted);margin-top:-.5rem'>A purse is a spending limit for the \
-         app aliases you add. It belongs to you, not to one device. A fixed purse does not \
-         refill. A monthly purse starts each UTC month at its allotment. Unspent amount does \
-         not carry over, and a reserve still open at the month change does not raise the new \
-         month. Saving a new allotment moves the available amount by that same difference. \
-         Signed payments stay. Switching between fixed and monthly does not refill the purse.</p>\
-         {banner}\
-         {cards}\
-         <div class='card'>\
-           <h2 style='margin-top:0;font-size:1rem'>New purse</h2>\
-           <form method='post' action='/purses/create'>\
-             <input name='name' maxlength='255' placeholder='name' required>\
-             <select name='kind'>\
-               <option value='fixed' selected>Fixed</option>\
-               <option value='monthly'>Monthly</option>\
-             </select>\
-             <input name='amount' inputmode='decimal' placeholder='0.005' required>\
-             <button type='submit'>Create purse</button>\
-           </form>\
-         </div>"
-    );
-    layout(ctx, "Purses", &body)
-}
-
-fn set_run_limit(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
-    let payer = match form_field(body, "contact").and_then(|raw| uuid_from_hex(&url_decode(raw))) {
-        Some(payer) => payer,
-        None => return Some(UI_ERR_BAD_RUN),
-    };
-    {
-        let node = ctx.node.read().unwrap();
-        if !node.owner.contact_users.iter().any(|contact| contact.user.uuid == payer) {
-            return Some(UI_ERR_BAD_RUN);
-        }
-    }
-    let amount = match form_field(body, "amount")
-        .and_then(|raw| parse_dollar_to_nanodollars(&url_decode(raw)))
-    {
-        Some(amount) => amount,
-        None => return Some(UI_ERR_BAD_RUN),
-    };
-    publish_policy(Change::SetRunLimit { payer, max_nanodollars: amount }, ctx)
-}
-
-fn render_what_youll_run(ctx: &WorkerContext, query: &str) -> String {
-    let node = ctx.node.read().unwrap();
-    let mut rows: Vec<(String, Uuid, i64)> = node.owner.contact_users.iter().map(|contact| {
-        let max = node.owner.run_limits.iter()
-            .find(|ceiling| ceiling.payer == contact.user.uuid)
-            .map(|ceiling| ceiling.max_nanodollars)
-            .unwrap_or(0);
-        (contact.user.alias.clone(), contact.user.uuid, max)
-    }).collect();
-    drop(node);
-    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-    let banner = ui_error_banner(query);
-    let mut cards = String::new();
-    if rows.is_empty() {
-        cards.push_str("<p class='empty'>No contacts yet.</p>");
-    }
-    for (alias, payer, max) in &rows {
-        let id = uuid_hex(payer);
-        cards.push_str(&format!(
-            "<div class='card'>\
-               <h2 style='margin-top:0;font-size:1.1rem'>{alias}</h2>\
-               <p>You'll run ${amount}</p>\
-               <form method='post' action='/what-youll-run'>\
-                 <input type='hidden' name='contact' value='{id}'>\
-                 <input name='amount' inputmode='decimal' placeholder='0.005' required>\
-                 <button type='submit'>Save</button>\
-               </form>\
-             </div>",
-            alias = html_escape(alias),
-            amount = format_nanodollars(*max),
-        ));
-    }
-
-    let body = format!(
-        "<h1>What you'll run</h1>\
-         <p style='color:var(--muted);margin-top:-.5rem'>A contact can put charges on your tab \
-         only up to the amount you store for them. Until you store one, nothing is accepted. \
-         The number stays on your devices. The contact is not told.</p>\
-         {banner}\
-         {cards}"
-    );
-    layout(ctx, "What you'll run", &body)
-}
-
 #[cfg(test)]
 mod policy_ui_tests {
     use std::net::UdpSocket;
     use std::sync::{Arc, RwLock, mpsc};
-    use std::time::{Duration, SystemTime};
 
     use crate::action_queue::WorkerContext;
     use crate::data_models::{
-        ActiveConnection, AppInvitation, Application, Settlement, Contact, Device, DeviceGrade,
-        Ed25519KeyPair, Ed25519PublicKey, Ed25519Signature, Charge, Node, PaymentReserve,
-        PendingAccept, Purse, SyncVersion, User, X25519PublicKey, generate_uuid, utc_month_period,
+        AppInvitation, Application, Contact, Device, DeviceGrade, Ed25519KeyPair,
+        Ed25519PublicKey, Ed25519Signature, Node, SyncVersion, User, X25519PublicKey,
+        generate_uuid,
     };
-    use crate::wire::{uuid_hex, PURSE_KIND_FIXED, PURSE_KIND_MONTHLY};
+    use crate::wire::uuid_hex;
 
     use super::{
-        accept_app_invitation, add_purse_alias, create_purse, edit_purse, grant_contact_app,
-        invite_contact_app, settle_contact_tab, reject_app_invitation, remove_purse_alias,
-        render_app_invitations, render_contact_apps, render_contact_tab, render_contacts,
-        render_purses, render_what_youll_run, set_run_limit,
+        accept_app_invitation, grant_contact_app, invite_contact_app, reject_app_invitation,
+        render_app_invitations, render_contact_apps, render_contacts,
     };
 
     fn portal() -> (WorkerContext, [u8; 16]) {
@@ -3269,7 +2758,6 @@ mod policy_ui_tests {
             writer_tx,
             scheduler_tx,
             pending_invites: Default::default(),
-            pending_reserves: Default::default(),
             sessions: Arc::new(crate::admin_auth::SessionStore::new()),
             app_rate_limits: Arc::new(std::sync::Mutex::new(crate::app_api::AppRateLimiter::new())),
             dns_cache: Arc::new(std::sync::Mutex::new(crate::dns_cache::DnsCache::new())),
@@ -3366,499 +2854,6 @@ mod policy_ui_tests {
         }
         let invites = render_app_invitations(&ctx, "");
         assert!(invites.contains("No app invitations."));
-    }
-
-    #[test]
-    fn purse_page_creates_assigns_and_removes_an_alias() {
-        let (ctx, _) = portal();
-        let page = render_purses(&ctx, "");
-        assert!(page.contains("No purses yet."));
-        assert!(page.contains("href=\"/purses\""));
-
-        assert!(create_purse(&form(&[("name", "media"), ("amount", "0.005")]), &ctx).is_none());
-        let purse_id = {
-            let node = ctx.node.read().unwrap();
-            assert_eq!(node.owner.purses.len(), 1);
-            let purse = &node.owner.purses[0];
-            assert_eq!(purse.name, "media");
-            assert_eq!(purse.kind, PURSE_KIND_FIXED);
-            assert_eq!(purse.period, 0);
-            assert_eq!(purse.allotment_nanodollars, 5_000_000);
-            assert_eq!(purse.available_nanodollars, 5_000_000);
-            assert!(purse.aliases.is_empty());
-            assert!(node.owner.private_version.seq >= 1);
-            uuid_hex(&purse.id)
-        };
-        let page = render_purses(&ctx, "");
-        assert!(page.contains("media"));
-        assert!(page.contains("$0.005"));
-        assert!(page.contains("Fixed"));
-        assert!(page.contains("Allotment"));
-        assert!(page.contains("Available"));
-        assert!(page.contains("value='monthly'"));
-
-        assert!(create_purse(&form(&[("name", "clips"), ("kind", "monthly"), ("amount", "0.005")]), &ctx).is_none());
-        {
-            let node = ctx.node.read().unwrap();
-            let monthly = node.owner.purses.iter().find(|purse| purse.name == "clips").unwrap();
-            assert_eq!(monthly.kind, PURSE_KIND_MONTHLY);
-            assert_eq!(monthly.period, utc_month_period(crate::data_models::unix_time_ms()));
-            assert_eq!(monthly.available_nanodollars, 5_000_000);
-        }
-        assert!(render_purses(&ctx, "").contains("Monthly"));
-        assert!(create_purse(&form(&[("name", "no-kind"), ("kind", "weekly"), ("amount", "0.005")]), &ctx).is_some());
-        assert_eq!(ctx.node.read().unwrap().owner.purses.len(), 2);
-
-        assert!(create_purse(&form(&[("name", "nope"), ("amount", "0.0000000001")]), &ctx).is_some());
-        assert_eq!(ctx.node.read().unwrap().owner.purses.len(), 2);
-
-        assert!(add_purse_alias(&form(&[("purse", &purse_id), ("alias", "discordium")]), &ctx).is_none());
-        assert_eq!(ctx.node.read().unwrap().owner.purses[0].aliases, vec!["discordium".to_string()]);
-        let page = render_purses(&ctx, "");
-        assert!(page.contains("discordium"));
-        assert!(page.contains("/purses/remove-alias"));
-
-        assert!(remove_purse_alias(&form(&[("purse", &purse_id), ("alias", "discordium")]), &ctx).is_none());
-        assert!(ctx.node.read().unwrap().owner.purses[0].aliases.is_empty());
-
-        let hub = super::render_config_hub(&ctx);
-        assert!(hub.contains("/purses"));
-    }
-
-    #[test]
-    fn the_writer_refills_a_monthly_purse_without_refunding_last_month() {
-        let (ctx, _) = portal();
-        let oct = 1_790_812_800_000u64;
-        let nov = 1_793_491_200_000u64;
-        {
-            let mut node = ctx.node.write().unwrap();
-            node.owner.purses.push(Purse {
-                id: [0x41; 16],
-                name: "month".into(),
-                allotment_nanodollars: 5_000_000,
-                available_nanodollars: 4_000_000,
-                aliases: vec!["chat".into()],
-                kind: PURSE_KIND_MONTHLY,
-                period: utc_month_period(oct),
-            });
-            node.owner.reserves.push(PaymentReserve {
-                payment_id: [0x42; 16],
-                purse_id: [0x41; 16],
-                amount_nanodollars: 1_000_000,
-                contact_uuid: [0x43; 16],
-                destination_alias: "player".into(),
-                note: "clip".into(),
-                paying_alias: "chat".into(),
-                expires_at_ms: oct,
-                period: utc_month_period(oct),
-            });
-        }
-        super::super::sync::release_expired_reserves_at(&ctx, nov);
-        {
-            let node = ctx.node.read().unwrap();
-            let purse = &node.owner.purses[0];
-            assert_eq!(purse.period, utc_month_period(nov));
-            assert_eq!(purse.available_nanodollars, 5_000_000);
-            assert!(node.owner.reserves.is_empty());
-        }
-        {
-            let mut node = ctx.node.write().unwrap();
-            node.owner.purses[0].available_nanodollars = 1_000_000;
-            node.owner.purses[0].period = utc_month_period(oct);
-            let local = node.device_uuid;
-            let dev = node.owner.user.devices.iter_mut().find(|d| d.uuid == local).unwrap();
-            dev.grade = DeviceGrade::DG;
-            dev.sg_rank = None;
-        }
-        super::super::sync::release_expired_reserves_at(&ctx, nov);
-        let purse = ctx.node.read().unwrap().owner.purses[0].clone();
-        assert_eq!(purse.available_nanodollars, 1_000_000);
-        assert_eq!(purse.period, utc_month_period(oct));
-    }
-
-    #[test]
-    fn purse_edit_moves_available_by_the_allotment_delta() {
-        let (ctx, contact) = portal();
-        let now = crate::data_models::unix_time_ms();
-        let current = utc_month_period(now);
-        let earlier = current.saturating_sub(1);
-        assert_ne!(earlier, 0);
-        assert_ne!(earlier, current);
-        let purse_id = [0x41; 16];
-        let our = ctx.node.read().unwrap().owner.user.uuid;
-        let line = pair_line(our, contact, [0x71; 16], 250_000, "clip", false);
-        {
-            let mut node = ctx.node.write().unwrap();
-            node.owner.purses.push(Purse {
-                id: purse_id,
-                name: "media".into(),
-                allotment_nanodollars: 5_000_000,
-                available_nanodollars: 4_000_000,
-                aliases: vec!["discordium".into()],
-                kind: PURSE_KIND_FIXED,
-                period: 0,
-            });
-            node.owner.purses.push(Purse {
-                id: [0x51; 16],
-                name: "budget".into(),
-                allotment_nanodollars: 5_000_000,
-                available_nanodollars: 4_000_000,
-                aliases: vec!["chat".into()],
-                kind: PURSE_KIND_MONTHLY,
-                period: earlier,
-            });
-            node.owner.charges.push(line.clone());
-        }
-        let page = render_purses(&ctx, "");
-        assert!(page.contains("action='/purses/edit'"));
-        assert!(page.contains("Save limit"));
-        let id = uuid_hex(&purse_id);
-        let budget_id = uuid_hex(&[0x51; 16]);
-
-        assert!(edit_purse(&form(&[("purse", &budget_id), ("kind", "monthly"), ("amount", "0.01")]), &ctx).is_none());
-        {
-            let node = ctx.node.read().unwrap();
-            let budget = node.owner.purses.iter().find(|purse| purse.name == "budget").unwrap();
-            assert_eq!(budget.period, current);
-            assert_eq!(budget.allotment_nanodollars, 10_000_000);
-            assert_eq!(budget.available_nanodollars, 10_000_000);
-            assert_eq!(budget.aliases, vec!["chat".to_string()]);
-        }
-
-        assert!(edit_purse(&form(&[("purse", &id), ("kind", "fixed"), ("amount", "0.01")]), &ctx).is_none());
-        {
-            let node = ctx.node.read().unwrap();
-            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
-            assert_eq!(purse.kind, PURSE_KIND_FIXED);
-            assert_eq!(purse.period, 0);
-            assert_eq!(purse.allotment_nanodollars, 10_000_000);
-            assert_eq!(purse.available_nanodollars, 9_000_000);
-            assert_eq!(purse.name, "media");
-            assert_eq!(purse.aliases, vec!["discordium".to_string()]);
-            assert_eq!(node.owner.charges, vec![line.clone()]);
-        }
-
-        assert!(edit_purse(&form(&[("purse", &id), ("kind", "fixed"), ("amount", "0")]), &ctx).is_none());
-        let seq = {
-            let node = ctx.node.read().unwrap();
-            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
-            assert_eq!(purse.allotment_nanodollars, 0);
-            assert_eq!(purse.available_nanodollars, -1_000_000);
-            node.owner.private_version.seq
-        };
-
-        assert!(edit_purse(&form(&[("purse", &id), ("kind", "fixed"), ("amount", "0")]), &ctx).is_none());
-        assert_eq!(ctx.node.read().unwrap().owner.private_version.seq, seq);
-        assert!(edit_purse(&form(&[("purse", &id), ("kind", "fixed"), ("amount", "0.0000000001")]), &ctx).is_some());
-        assert!(edit_purse(&form(&[("purse", &id), ("amount", "0")]), &ctx).is_some());
-        assert!(edit_purse(&form(&[("purse", &uuid_hex(&generate_uuid())), ("kind", "fixed"), ("amount", "1")]), &ctx).is_some());
-        {
-            let node = ctx.node.read().unwrap();
-            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
-            assert_eq!(purse.kind, PURSE_KIND_FIXED);
-            assert_eq!(purse.allotment_nanodollars, 0);
-            assert_eq!(purse.available_nanodollars, -1_000_000);
-            assert_eq!(node.owner.private_version.seq, seq);
-        }
-
-        assert!(edit_purse(&form(&[("purse", &id), ("kind", "monthly"), ("amount", "0")]), &ctx).is_none());
-        {
-            let node = ctx.node.read().unwrap();
-            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
-            assert_eq!(purse.kind, PURSE_KIND_MONTHLY);
-            assert_eq!(purse.period, current);
-            assert_eq!(purse.available_nanodollars, -1_000_000);
-            assert_eq!(purse.allotment_nanodollars, 0);
-        }
-        let same_month = [0x61; 16];
-        let previous = [0x62; 16];
-        let from_fixed = [0x63; 16];
-        {
-            let mut node = ctx.node.write().unwrap();
-            let purse = node.owner.purses.iter_mut().find(|purse| purse.id == purse_id).unwrap();
-            purse.available_nanodollars = -1_700_000;
-            node.owner.reserves.push(PaymentReserve {
-                payment_id: same_month,
-                purse_id,
-                amount_nanodollars: 500_000,
-                contact_uuid: contact,
-                destination_alias: "player".into(),
-                note: "same".into(),
-                paying_alias: "discordium".into(),
-                expires_at_ms: now.saturating_add(86_400_000),
-                period: current,
-            });
-            node.owner.reserves.push(PaymentReserve {
-                payment_id: previous,
-                purse_id,
-                amount_nanodollars: 1_000_000,
-                contact_uuid: contact,
-                destination_alias: "player".into(),
-                note: "old".into(),
-                paying_alias: "discordium".into(),
-                expires_at_ms: now.saturating_add(86_400_000),
-                period: earlier,
-            });
-            node.owner.reserves.push(PaymentReserve {
-                payment_id: from_fixed,
-                purse_id,
-                amount_nanodollars: 200_000,
-                contact_uuid: contact,
-                destination_alias: "player".into(),
-                note: "fixed".into(),
-                paying_alias: "discordium".into(),
-                expires_at_ms: now.saturating_add(86_400_000),
-                period: 0,
-            });
-        }
-
-        assert!(edit_purse(&form(&[("purse", &id), ("kind", "fixed"), ("amount", "0")]), &ctx).is_none());
-        {
-            let node = ctx.node.read().unwrap();
-            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
-            assert_eq!(purse.kind, PURSE_KIND_FIXED);
-            assert_eq!(purse.period, 0);
-            assert_eq!(purse.allotment_nanodollars, 0);
-            assert_eq!(purse.available_nanodollars, -1_700_000);
-            assert_eq!(purse.name, "media");
-            assert_eq!(purse.aliases, vec!["discordium".to_string()]);
-            let left: Vec<[u8; 16]> = node.owner.reserves.iter().map(|reserve| reserve.payment_id).collect();
-            assert!(left.contains(&same_month));
-            assert!(left.contains(&from_fixed));
-            assert!(!left.contains(&previous));
-            assert_eq!(node.owner.charges, vec![line.clone()]);
-        }
-        {
-            let mut node = ctx.node.write().unwrap();
-            for reserve in &mut node.owner.reserves {
-                if reserve.purse_id == purse_id {
-                    reserve.expires_at_ms = 1;
-                }
-            }
-        }
-        super::super::sync::release_expired_reserves_at(&ctx, 2);
-        {
-            let node = ctx.node.read().unwrap();
-            let purse = node.owner.purses.iter().find(|purse| purse.id == purse_id).unwrap();
-            assert_eq!(purse.available_nanodollars, -1_000_000);
-            assert!(node.owner.reserves.iter().all(|reserve| reserve.purse_id != purse_id));
-            assert_eq!(node.owner.charges, vec![line]);
-        }
-    }
-
-    #[test]
-    fn what_youll_run_sets_and_replaces_one_contact() {
-        let (ctx, contact) = portal();
-        let hex = uuid_hex(&contact);
-        let page = render_what_youll_run(&ctx, "");
-        assert!(page.contains("sanosuke"));
-        assert!(page.contains("<p>You'll run $0</p>"));
-        assert!(page.contains("href=\"/what-youll-run\""));
-        assert!(!page.contains("ledger"));
-
-        assert!(set_run_limit(&form(&[("contact", &hex), ("amount", "0.005")]), &ctx).is_none());
-        let seq = {
-            let node = ctx.node.read().unwrap();
-            assert_eq!(node.owner.run_limits.len(), 1);
-            assert_eq!(node.owner.run_limits[0].payer, contact);
-            assert_eq!(node.owner.run_limits[0].max_nanodollars, 5_000_000);
-            assert!(node.owner.purses.is_empty());
-            assert!(node.owner.private_version.seq >= 1);
-            node.owner.private_version.seq
-        };
-        let page = render_what_youll_run(&ctx, "");
-        assert!(page.contains("<p>You'll run $0.005</p>"));
-
-        assert!(set_run_limit(&form(&[("contact", &hex), ("amount", "0.005")]), &ctx).is_none());
-        assert_eq!(ctx.node.read().unwrap().owner.run_limits.len(), 1);
-        assert_eq!(ctx.node.read().unwrap().owner.private_version.seq, seq);
-
-        assert!(set_run_limit(&form(&[("contact", &hex), ("amount", "0.0000000001")]), &ctx).is_some());
-        assert!(set_run_limit(&form(&[("contact", "not-a-uuid"), ("amount", "1")]), &ctx).is_some());
-        assert!(set_run_limit(
-            &form(&[("contact", &uuid_hex(&generate_uuid())), ("amount", "1")]),
-            &ctx,
-        ).is_some());
-        {
-            let node = ctx.node.read().unwrap();
-            assert_eq!(node.owner.run_limits.len(), 1);
-            assert_eq!(node.owner.run_limits[0].max_nanodollars, 5_000_000);
-            assert_eq!(node.owner.private_version.seq, seq);
-        }
-        let page = render_what_youll_run(&ctx, "error=bad_run");
-        assert!(page.contains("That amount was not saved."));
-
-        assert!(set_run_limit(&form(&[("contact", &hex), ("amount", "0")]), &ctx).is_none());
-        {
-            let node = ctx.node.read().unwrap();
-            assert_eq!(node.owner.run_limits.len(), 1);
-            assert_eq!(node.owner.run_limits[0].max_nanodollars, 0);
-            assert!(node.owner.private_version.seq > seq);
-        }
-        let page = render_what_youll_run(&ctx, "");
-        assert!(page.contains("<p>You'll run $0</p>"));
-        assert!(!page.contains("$0.005"));
-
-        let hub = super::render_config_hub(&ctx);
-        assert!(hub.contains("/what-youll-run"));
-    }
-
-    fn pair_line(our: [u8; 16], contact: [u8; 16], payment: [u8; 16], amount: i64, note: &str, incoming: bool) -> Charge {
-        let (payer, payee) = if incoming { (contact, our) } else { (our, contact) };
-        Charge {
-            payment_id: payment,
-            amount_nanodollars: amount,
-            payer,
-            payee,
-            paying_alias: "discordium-client".into(),
-            destination_alias: "player".into(),
-            note: note.into(),
-            expires_at_ms: 0,
-            purse_id: [0; 16],
-            payer_sig: Ed25519Signature::ZERO,
-            payee_sig: Ed25519Signature::ZERO,
-            confirm_sig: Ed25519Signature([payment[0]; 64]),
-        }
-    }
-
-    #[test]
-    fn contact_tab_shows_the_amount_and_settles() {
-        let (ctx, contact) = portal();
-        let hex = uuid_hex(&contact);
-        let our = ctx.node.read().unwrap().owner.user.uuid;
-        let open = [0x11; 16];
-        let sent = [0x22; 16];
-        let cleared = [0x33; 16];
-        let (lo, hi) = if our < contact { (our, contact) } else { (contact, our) };
-        {
-            let mut node = ctx.node.write().unwrap();
-            node.owner.charges.push(pair_line(our, contact, open, 1_000_000, "clip", true));
-            let mut second = pair_line(our, contact, open, 1_000_000, "other", true);
-            second.confirm_sig = Ed25519Signature([0xAB; 64]);
-            node.owner.charges.push(second);
-            node.owner.charges.push(pair_line(our, contact, sent, 250_000, "refund", false));
-            node.owner.charges.push(pair_line(our, contact, cleared, 5_000_000, "settled", true));
-            node.owner.charges.push(pair_line(our, [0x44; 16], [0x55; 16], 9, "hidden-note", true));
-            node.owner.pending_accepts.push(PendingAccept {
-                payment_id: [0x66; 16],
-                amount_nanodollars: 1,
-                payer: contact,
-                payee: our,
-                paying_alias: "player".into(),
-                destination_alias: "discordium-client".into(),
-                note: "waiting-note".into(),
-                expires_at_ms: 0,
-                payer_sig: Ed25519Signature::ZERO,
-                payee_sig: Ed25519Signature::ZERO,
-            });
-            node.owner.settlements.push(Settlement {
-                settlement_id: [0xC1; 16],
-                user_lo: lo,
-                user_hi: hi,
-                payment_ids: vec![cleared],
-                sig_lo: Ed25519Signature::ZERO,
-                sig_hi: Ed25519Signature::ZERO,
-            });
-            node.owner.purses.push(Purse {
-                id: [0x41; 16],
-                name: "media".into(),
-                allotment_nanodollars: 5_000_000,
-                available_nanodollars: 4_000_000,
-                aliases: Vec::new(),
-                kind: PURSE_KIND_FIXED,
-                period: 0,
-            });
-        }
-
-        let apps = render_contact_apps(&ctx, &hex, "");
-        assert!(apps.contains(&format!("/contacts/{hex}/tab")));
-        let list = render_contacts(&ctx);
-        assert!(list.contains(&format!("/contacts/{hex}/tab")));
-
-        let page = render_contact_tab(&ctx, &hex, "");
-        assert!(page.contains("sanosuke"));
-        assert!(page.contains("clip"));
-        assert!(page.contains("other"));
-        assert!(page.contains("refund"));
-        assert!(page.contains("settled"));
-        assert!(page.contains("Incoming"));
-        assert!(page.contains("Sent"));
-        assert!(page.contains("Settled"));
-        assert!(page.contains("0.00175"));
-        assert!(page.contains(&format!("value='{}'", uuid_hex(&open))));
-        assert!(!page.contains(&format!("value='{}'", uuid_hex(&cleared))));
-        assert!(!page.contains("hidden-note"));
-        assert!(!page.contains("waiting-note"));
-        assert!(page.contains("Settle"));
-
-        let open_hex = uuid_hex(&open);
-        assert!(settle_contact_tab(&ctx, &hex, &form(&[("payment", &uuid_hex(&[0x99; 16]))])).is_some());
-        assert!(settle_contact_tab(&ctx, &hex, &form(&[("payment", &open_hex)])).is_some());
-        {
-            let node = ctx.node.read().unwrap();
-            assert_eq!(node.owner.settlements.len(), 1);
-            assert_eq!(node.owner.purses[0].available_nanodollars, 4_000_000);
-            assert_eq!(crate::payment::tab_nanodollars(&node.owner, contact), 1_750_000);
-        }
-
-        let mut bulk = String::new();
-        {
-            let mut node = ctx.node.write().unwrap();
-            for n in 0..65u8 {
-                let mut id = [0xA0; 16];
-                id[15] = n;
-                node.owner.charges.push(pair_line(our, contact, id, 1, "bulk", true));
-                if n > 0 {
-                    bulk.push('&');
-                }
-                bulk.push_str(&format!("payment={}", uuid_hex(&id)));
-            }
-        }
-        ctx.node.write().unwrap().owner.key_pair = crate::crypto::generate_ed25519_keypair();
-        assert!(settle_contact_tab(&ctx, &hex, bulk.as_bytes()).is_some());
-
-        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
-        listener.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        let dev = ctx.node.read().unwrap().owner.contact_users[0].user.devices[0].uuid;
-        let dh = crate::crypto::generate_x25519_keypair();
-        ctx.node.write().unwrap().owner.active_connections.insert(7, ActiveConnection {
-            id: 7,
-            timeout: SystemTime::now() + Duration::from_secs(3600),
-            key_pair: dh.clone(),
-            peer_public_key: dh.public_key,
-            peer_active_connection_id: 7,
-            device_uuid: dev,
-            peer_addr: listener.local_addr().unwrap(),
-        });
-
-        assert!(settle_contact_tab(&ctx, &hex, &form(&[("payment", &open_hex)])).is_none());
-        let mut buf = [0u8; 2048];
-        let n = listener.recv(&mut buf).unwrap();
-        assert!(n > 1);
-        assert_eq!(buf[0], 0x66);
-        {
-            let node = ctx.node.read().unwrap();
-            assert_eq!(node.owner.settlements.len(), 1);
-            assert_eq!(node.owner.purses[0].available_nanodollars, 4_000_000);
-            assert_eq!(node.owner.charges.len(), 70);
-            assert_eq!(crate::payment::tab_nanodollars(&node.owner, contact), 1_750_065);
-        }
-        let page = render_contact_tab(&ctx, &hex, "");
-        assert!(page.contains(&format!("value='{open_hex}'")));
-        assert!(page.contains("0.001750065"));
-
-        let mut again = [0u8; 64];
-        assert!(listener.recv(&mut again).is_err());
-        {
-            let mut node = ctx.node.write().unwrap();
-            let local = node.device_uuid;
-            let dev = node.owner.user.devices.iter_mut().find(|d| d.uuid == local).unwrap();
-            dev.grade = DeviceGrade::DG;
-            dev.sg_rank = None;
-        }
-        assert!(settle_contact_tab(&ctx, &hex, &form(&[("payment", &open_hex)])).is_some());
-        assert!(listener.recv(&mut again).is_err());
-        assert_eq!(ctx.node.read().unwrap().owner.purses[0].available_nanodollars, 4_000_000);
     }
 }
 
