@@ -59,6 +59,7 @@ Each tag notes the on-disk `format_version` it writes (`data persistence.md`) an
 |-----|----------------|-----------|
 | `v0.1.0` | 1 | no older tag; this is the first release |
 | `v0.2.0` | 2 | `v0.1.0` for connect, relay, and app packets. Own servers of one user upgrade together before grants are written. |
+| `v0.2.1` | 2 | no older tag. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 
 ## Rollout expectation
 
