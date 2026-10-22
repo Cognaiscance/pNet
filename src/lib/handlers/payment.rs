@@ -432,7 +432,7 @@ pub fn settlement_propose(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         }
         if let Some(stored) = node.owner.settlements.iter().find(|record| settlement_body_matches(record, &body)) {
-            ClearChoice::Resend(encode_settlement(stored))
+            SettleChoice::Resend(encode_settlement(stored))
         } else if body.payment_ids.iter().all(|id| pair_has_line(&node.owner, contact, *id)) {
             let ours = sign_settlement(&node.owner.key_pair.private_key, &body);
             let (sig_lo, sig_hi) = if node.owner.user.uuid == body.user_lo {
@@ -440,7 +440,7 @@ pub fn settlement_propose(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             } else {
                 (sig, ours)
             };
-            ClearChoice::Store(Settlement {
+            SettleChoice::Store(Settlement {
                 settlement_id: body.settlement_id,
                 user_lo: body.user_lo,
                 user_hi: body.user_hi,
@@ -449,13 +449,13 @@ pub fn settlement_propose(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 sig_hi,
             })
         } else {
-            ClearChoice::Wait
+            SettleChoice::Wait
         }
     };
     match decision {
-        ClearChoice::Wait => {}
-        ClearChoice::Resend(plain) => send_to_user(ctx, peer_of_settlement(&body, ctx), SETTLEMENT_ACK_OP, &plain),
-        ClearChoice::Store(record) => {
+        SettleChoice::Wait => {}
+        SettleChoice::Resend(plain) => send_to_user(ctx, peer_of_settlement(&body, ctx), SETTLEMENT_ACK_OP, &plain),
+        SettleChoice::Store(record) => {
             if store_settlement(ctx, record.clone(), src) {
                 let contact = other_user(&record, ctx);
                 let plain = encode_settlement(&record);
@@ -474,7 +474,7 @@ pub fn settlement_index(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     };
     let Some((flags, entries)) = decode_index(&plain) else {
-        eprintln!("[clearing_index] bad index from {src}");
+        eprintln!("[settlement_index] bad index from {src}");
         return;
     };
     let replies = {
@@ -528,7 +528,7 @@ pub fn settlement_record(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     accept_signed_settlement(src, buf, ctx, "settlement_record");
 }
 
-enum ClearChoice {
+enum SettleChoice {
     Wait,
     Resend(Vec<u8>),
     Store(Settlement),
@@ -539,7 +539,7 @@ fn accept_signed_settlement(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext, 
         return;
     };
     let Some(record) = decode_settlement(&plain) else {
-        eprintln!("[{label}] bad clearing from {src}");
+        eprintln!("[{label}] bad settlement from {src}");
         return;
     };
     if !settlement_body_ok(&SettlementBody::from_record(&record)) {

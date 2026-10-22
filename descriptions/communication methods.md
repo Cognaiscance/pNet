@@ -197,7 +197,7 @@ The same signed bytes are not stored twice. A different signed body is stored be
 
 ### 0x66 — settlement proposal
 
-Session-sealed. One owner sends this to the other. An app does not. The plaintext is the body and the sender's user-key signature. The body is `[settlement id:16][user lo:16][user hi:16][count:u16 be][payment id:16…]`. The user ids are in byte order. The payment ids are strictly increasing, at least one and at most 64. The signature domain is `pnet-payment-clearing-v1` over the body. Both users sign those same bytes.
+Session-sealed. One owner sends this to the other. An app does not. The plaintext is the body and the sender's user-key signature. The body is `[settlement id:16][user lo:16][user hi:16][count:u16 be][payment id:16…]`. The user ids are in byte order. The payment ids are strictly increasing, at least one and at most 64. The signature domain is `pnet-payment-settlement-v1` over the body. Both users sign those same bytes.
 
 The receiver signs only when every named id is already a charge between this pair. An id that belongs to some other pair does not count. A missing id gets no reply. A bad signature is dropped. There is no refusal op. A node that is not the writer drops the packet.
 
