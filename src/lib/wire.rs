@@ -34,12 +34,6 @@ pub(crate) const ERR_NO_ROUTE: u8 = 0x05;
 pub(crate) const ERR_PAYLOAD_TOO_LARGE: u8 = 0x06;
 /// Register or send rate limit exceeded (token bucket).
 pub(crate) const ERR_RATE_LIMITED: u8 = 0x07;
-/// The purse is missing, or the caller's alias is not a member.
-pub(crate) const ERR_NOT_IN_PURSE: u8 = 0x08;
-/// The amount is greater than the purse's available amount.
-pub(crate) const ERR_OVER_PURSE: u8 = 0x09;
-/// This payment id is already reserved with a different body.
-pub(crate) const ERR_PAYMENT_MISMATCH: u8 = 0x0A;
 
 /// Fabric-wide maximum **opaque app payload** length in bytes.
 ///
@@ -72,19 +66,6 @@ pub(crate) const APP_UPDATE_OP: u8 = 0x01;
 pub(crate) const APP_GET_DATA_OP: u8 = 0x02;
 pub(crate) const APP_SEND_PACKET_OP: u8 = 0x03;
 pub(crate) const APP_PUSH_OP: u8 = 0x04;
-/// Approved app asks for the purses its alias belongs to.
-pub(crate) const APP_LIST_PURSES_OP: u8 = 0x05;
-/// Approved app asks for confirmed payments sent to its alias.
-pub(crate) const APP_LIST_INCOMING_OP: u8 = 0x06;
-/// Approved app asks for confirmed payments its alias sent.
-pub(crate) const APP_LIST_SENT_OP: u8 = 0x07;
-/// Approved app reserves purse funds for one payment id. The contact is not told.
-pub(crate) const APP_RESERVE_OP: u8 = 0x08;
-
-/// Kind byte on a list-purses entry. A fixed purse does not refill.
-pub(crate) const PURSE_KIND_FIXED: u8 = 0x00;
-/// Kind byte on a list-purses entry. A monthly purse refills at the UTC month.
-pub(crate) const PURSE_KIND_MONTHLY: u8 = 0x01;
 
 // ── Peer fabric op bytes ──────────────────────────────────────────────────────
 
@@ -175,33 +156,6 @@ pub(crate) const CHANGE_KIND_FORGET_APP_INVITATION: u8 = 0x0A;
 pub(crate) const CHANGE_KIND_PUT_OUTBOUND_APP_INVITATION: u8 = 0x0B;
 pub(crate) const CHANGE_KIND_FORGET_OUTBOUND_APP_INVITATION: u8 = 0x0C;
 pub(crate) const CHANGE_KIND_SET_CONTACT_THEY_ACCEPT: u8 = 0x0D;
-pub(crate) const CHANGE_KIND_UPSERT_PURSE: u8 = 0x0E;
-pub(crate) const CHANGE_KIND_RESERVE_PAYMENT: u8 = 0x0F;
-pub(crate) const CHANGE_KIND_RELEASE_RESERVE: u8 = 0x10;
-pub(crate) const CHANGE_KIND_RECORD_CHARGE: u8 = 0x11;
-pub(crate) const CHANGE_KIND_STAGE_ACCEPT: u8 = 0x12;
-pub(crate) const CHANGE_KIND_DROP_ACCEPT: u8 = 0x13;
-pub(crate) const CHANGE_KIND_RECORD_SETTLEMENT: u8 = 0x14;
-/// Private-scope. How much of one payer's tab this user will still run. Not a session opcode.
-pub(crate) const CHANGE_KIND_SET_RUN_LIMIT: u8 = 0x15;
-
-/// Offer, accept, refuse, and confirm between two writers. Session-encrypted.
-pub(crate) const PAYMENT_OFFER_OP: u8 = 0x60;
-pub(crate) const PAYMENT_ACCEPT_OP: u8 = 0x61;
-pub(crate) const PAYMENT_REFUSE_OP: u8 = 0x62;
-pub(crate) const PAYMENT_CONFIRM_OP: u8 = 0x63;
-/// Payment ids this writer holds for the pair, sent when a contact session comes up.
-pub(crate) const PAYMENT_INDEX_OP: u8 = 0x64;
-/// One signed confirmation, sent because the contact's index did not list it.
-pub(crate) const PAYMENT_RECORD_OP: u8 = 0x65;
-/// A proposal that names the charges two owners will settle. Session-encrypted.
-pub(crate) const SETTLEMENT_PROPOSE_OP: u8 = 0x66;
-/// The same body with both user signatures. Also the stored settlement.
-pub(crate) const SETTLEMENT_ACK_OP: u8 = 0x67;
-/// Settlement ids this writer holds for the pair, sent when a contact session comes up.
-pub(crate) const SETTLEMENT_INDEX_OP: u8 = 0x68;
-/// One dual-signed settlement, sent because the contact's index did not list it.
-pub(crate) const SETTLEMENT_RECORD_OP: u8 = 0x69;
 
 // ── Shared min lengths (unencrypted headers / common envelopes) ───────────────
 

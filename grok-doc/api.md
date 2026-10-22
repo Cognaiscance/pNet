@@ -3,7 +3,7 @@
 Two interfaces face programs and people on this machine.
 
 - The **owner HTTP site** is how a person sets up the node, signs in, and edits the directory. Most responses are HTML. Two routes are plain text and exist for a local app to register a web mount.
-- The **UDP app API** is how a co-located application registers, reads its purses, reserves funds, and sends payloads. It shares the fabric socket (default `127.0.0.1:7777`). Request ops `0x00`–`0x03` and `0x05`–`0x08` are accepted from loopback only, unless `PNET_APP_API_REMOTE` is `1`, `true`, or `yes`.
+- The **UDP app API** is how a co-located application registers and sends payloads. It shares the fabric socket (default `127.0.0.1:7777`). Ops `0x00`–`0x03` are accepted from loopback only, unless `PNET_APP_API_REMOTE` is `1`, `true`, or `yes`.
 
 Peer-to-peer datagrams are in [wire.md](wire.md). How the process is put together is in [README.md](README.md).
 
@@ -60,27 +60,18 @@ Successful mutations answer **302**. The invitation code is not put in the redir
 | `POST /logout` | session | Revoke the session and clear the cookie. |
 | `GET /` | session | Home: owner alias, device alias, grade, links to mounted apps, link to Config. |
 | `GET /dashboard` | session | Redirect to `/`. |
-| `GET /config` | session | Counts and links: devices, invitations, applications, purses, what you'll run, contacts, diagnostics. |
+| `GET /config` | session | Counts and links: devices, invitations, applications, contacts, diagnostics. |
 | `POST /api/app-web/register` | loopback | Register a portal mount. Plain text. |
 | `POST /api/app-web/unregister` | loopback | Remove a portal mount. Plain text. |
 | `GET /apps/<slug>/…` | session | Reverse-proxy to the registered loopback port. |
 | `GET /pending-apps` | session | Apps on this device with `user_approved` false. |
 | `POST /pending-apps/approve` | session | Field `id` (hex). Sign an app certificate and publish it. |
 | `POST /pending-apps/reject` | session | Field `id`. Remove the app and publish the removal. |
-| `GET /purses` | session | Spending purses: kind, name, allotment, available amount, member aliases. |
-| `POST /purses/create` | session | Fields `name`, `kind` (`fixed` or `monthly`; missing means fixed), `amount` (dollars, up to 9 decimal places). Publishes a new purse. |
-| `POST /purses/edit` | session | Fields `purse` (hex id), `kind` (`fixed` or `monthly`), `amount`. Moves the available amount by the allotment difference. The same kind and amount does not bump the private version. |
-| `POST /purses/add-alias` | session | Fields `purse` (hex id), `alias`. Adds that app alias to the purse. |
-| `POST /purses/remove-alias` | session | Fields `purse` (hex id), `alias`. Removes that alias. |
-| `GET /what-youll-run` | session | Each contact and what you'll run for that payer. A missing row is shown as zero. |
-| `POST /what-youll-run` | session | Fields `contact` (user uuid hex), `amount` (dollars, up to 9 decimal places, zero allowed). Publishes that payer's amount. A bad amount or an unknown contact is not stored. |
 | `GET /applications` | session | Apps on this device. |
 | `POST /applications/rename` | session | Fields `id`, `alias`. Publishes the alias. Empty alias is a no-op. |
 | `POST /applications/delete` | session | Field `id`. Same removal as reject. |
-| `GET /contacts` | session | Contact list and a form to enter a contact code. Each contact links to its tab. |
+| `GET /contacts` | session | Contact list and a form to enter a contact code. |
 | `POST /contacts/enter` | session | Field `code`. Starts a contact exchange. |
-| `GET /contacts/<32 hex>/tab` | session | Charges with that contact, which are settled, and the amount on the tab. A charge with anyone else is absent. A pending accept is absent. |
-| `POST /contacts/<32 hex>/tab` | session | Repeated field `payment` (hex id). The writer proposes a settlement for those charges. An empty list, an id that is not a charge for the pair, or more than 64 ids is not sent. The purse does not change. The record is stored when the other owner signs. |
 | `GET /devices` | session | Own devices, sessions, hosts. |
 | `POST /devices/sync` | session | Pull from the writer, then redirect to `/devices`. |
 | `POST /devices/remove` | session | Field `id` (device UUID hex). Publishes `RemoveDevice`. |
@@ -132,7 +123,7 @@ The table is memory only. It is empty after restart. The home page lists mounts.
 
 Send a datagram to the node's UDP port. The first byte is the operation. The rest is the body below. Replies come back to the source address.
 
-Request ops `0x00`–`0x03` and `0x05`–`0x08` from a non-loopback address are dropped with a log line when remote access is off. Op `0x04` is not a request. The node sends it to the app.
+Ops `0x00`–`0x03` from a non-loopback address are dropped with a log line when remote access is off. Op `0x04` is not a request. The node sends it to the app.
 
 | Byte | Name | Who sends it |
 | --- | --- | --- |
@@ -141,10 +132,6 @@ Request ops `0x00`–`0x03` and `0x05`–`0x08` from a non-loopback address are 
 | `0x02` | get data | app → node |
 | `0x03` | send packet | app → node |
 | `0x04` | push | node → app |
-| `0x05` | list purses | app → node |
-| `0x06` | list incoming | app → node |
-| `0x07` | list sent | app → node |
-| `0x08` | reserve | app → node |
 
 Success replies start with `0x00`. Errors are `0x01` followed by one code. Send (`0x03`) sends nothing on success.
 
@@ -153,13 +140,10 @@ Success replies start with `0x00`. Errors are `0x01` followed by one code. Send 
 | `0x01` | bad packet | Truncated, bad UTF-8, empty string, port 0, or a source that is not IPv4. |
 | `0x02` | token unknown | Token is not on this device. |
 | `0x03` | no writer | Auto-approve, or an alias change, could not be published. |
-| `0x04` | not approved | Token is valid and `user_approved` is false. Used by send, the purse and payment reads, and reserve. |
+| `0x04` | not approved | Token is valid and `user_approved` is false. Used by send. |
 | `0x05` | no route | No session to the destination and no SG to relay through. |
 | `0x06` | payload too large | More than 4096 bytes of app payload. |
 | `0x07` | rate limited | Register or send bucket is empty. |
-| `0x08` | not in purse | The purse is missing, or this app's alias is not a member. |
-| `0x09` | over purse | The amount is greater than the available amount. |
-| `0x0A` | payment mismatch | This payment id is already reserved with a different body. |
 
 Register is limited per source IP: capacity 10, refill 2 tokens per second. Send is limited per source IP and per token: capacity 200, refill 100 per second. Idle buckets are dropped about once a minute.
 
@@ -244,65 +228,3 @@ The node sends this to `host` of an approved local app:
 ```
 
 Unapproved apps are not pushed to. The sender app id is the fabric app id, not a token. The node does not wait for the app to answer.
-
-### List purses (`0x05`)
-
-Body: `token (16)`, exactly 16 bytes. A shorter or longer body is `bad packet`.
-
-The token must belong to an approved app on this device. The reply lists only purses whose member aliases include that app's alias. Order is name, then id. A purse that belongs to another alias is absent, including its name and amounts. An app with no purse gets a count of zero, which is success.
-
-```text
-0x00
-|| count (u16)
-||   repeated purse
-||     id (16) || name || kind (u8, 0 = fixed, 1 = monthly) || allotment (i64) || available (i64)
-```
-
-Amounts are nanodollars, big-endian. Kind 0 is a fixed purse. Kind 1 is a monthly purse: the rank-1 writer starts it again at the allotment on each UTC month, and unspent amount does not carry. The count is a `u16` so a later payment list can pass 255 lines without a new header. This read does not change the available amount. Available is signed: a debt copied back after the purse was spent again can make it negative.
-
-Errors: `bad packet`, `token unknown`, `not approved`.
-
-### List incoming (`0x06`)
-
-Body: `token (16)`, exactly 16 bytes. Same approval check as list purses.
-
-The reply lists confirmed lines whose payee is this user and whose destination alias is the caller's alias. A hold that is not confirmed is absent. A line for another alias is absent, including its note. Order is payment id, then the payer's confirmation signature. Two different signed bodies of one payment id are both listed. Count 0 is success. The read does not change a purse or the tab.
-
-```text
-0x00
-|| count (u16)
-||   repeated line
-||     payment id (16) || amount (i64) || payer (16) || payee (16)
-||     paying alias || destination alias || note
-```
-
-Amounts are nanodollars, big-endian. Strings are a length byte and then UTF-8, the same as a purse name. The purse id, the expiry, and the signatures are absent.
-
-Errors: `bad packet`, `token unknown`, `not approved`.
-
-### List sent (`0x07`)
-
-Same request and same approval check. The lines are confirmed payments whose payer is this user and whose paying alias is the caller's alias. Each line uses the same layout as list incoming.
-
-An app does not clear a tab. The two owners sign that record. A settled line stays on these lists.
-
-### Reserve (`0x08`)
-
-```text
-token (16) || purse id (16) || amount (i64) || contact uuid (16)
-|| destination alias || note || payment id (16)
-```
-
-The token must belong to an approved app on this device, and that app's alias must be a member of the purse. The amount is nanodollars and must be greater than zero. The destination alias is trimmed. The note is opaque UTF-8, at most 255 bytes, and may be empty. Nothing follows the payment id.
-
-When this node is the writer, it stores the hold. When it is not, it sends the reserve to the writer and waits. It does not change its own purse. The reply's available amount is the writer's. This device's purse copy changes when the private record arrives. No reachable writer, or no answer, is `no writer`. When the writer holds the user key and has a session to that contact, it signs an offer and sends it. A device that is not the writer does not sign the offer. The offer does not name the purse. The app reply is the same either way. A missing session leaves the hold until a retry, a refusal, or expiry. The reply does not change when the contact later accepts or refuses. The next purse read shows the restored available amount after a refusal or an expiry, once this device has the writer's purse.
-
-Success:
-
-```text
-0x00 || available (i64) || expires at (u64, unix milliseconds)
-```
-
-`available` is what that purse still has after the hold. The hold lasts 24 hours from the writer's clock. The same payment id with the same body returns this result again and does not reduce the available amount a second time. After the payer has confirmed the line, the same id returns the current available amount and that line's expiry, and does not reserve again. A different body for an id that is still held, or for an id already confirmed with a different body, is `payment mismatch`. When an unconfirmed hold expires, the writer adds the amount back. The check runs about once a minute, and also at the start of the next reserve. A confirmed payment is not added back.
-
-Errors: `bad packet`, `token unknown`, `not approved`, `no writer`, `not in purse`, `over purse`, `payment mismatch`. An amount equal to the available amount succeeds and leaves zero.

@@ -12,7 +12,6 @@ pub mod dns_cache;
 pub mod fuzz;
 pub mod handlers;
 pub mod http_server;
-pub mod payment;
 pub mod persistence;
 pub mod scheduler;
 pub mod thread_pool;

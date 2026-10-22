@@ -1,6 +1,6 @@
 # Wire protocol
 
-Peers and the local node share one IPv4 UDP socket (default port 7777). The first byte selects the handler. An unknown byte is logged and dropped. App request ops `0x00`–`0x03` and `0x05`–`0x08` are the local API in [api.md](api.md) and are filtered by source address. Op `0x04` is a push the node sends. Every other op below is accepted from any source. There is no separate peer port.
+Peers and the local node share one IPv4 UDP socket (default port 7777). The first byte selects the handler. An unknown byte is logged and dropped. App ops `0x00`–`0x03` are the local API in [api.md](api.md) and are filtered by source address. Every other op below is accepted from any source. There is no separate peer port.
 
 Integers are big-endian unless marked LE. Strings are `u8` length plus UTF-8. UUIDs are 16 bytes. The device layout used inside several payloads is the one in the app API's get-data section.
 
@@ -50,16 +50,6 @@ The opaque app payload maximum is 4096 bytes on relay, direct app packet, and tu
 | `0x52` | tunnel connect request | cleartext |
 | `0x53` | tunnel connect ack | cleartext |
 | `0x54` | tunnel delivery | tunnel AEAD inside |
-| `0x60` | payment offer | session |
-| `0x61` | payment accept | session |
-| `0x62` | payment refuse | session |
-| `0x63` | payment confirm | session |
-| `0x64` | payment index | session |
-| `0x65` | payment record | session |
-| `0x66` | settlement proposal | session |
-| `0x67` | settlement ack | session |
-| `0x68` | settlement index | session |
-| `0x69` | settlement | session |
 | `0x70` | sync write request | session |
 | `0x71` | sync write ack | session |
 | `0x72` | sync update available | session |
@@ -72,14 +62,6 @@ The opaque app payload maximum is 4096 bytes on relay, direct app packet, and tu
 | `0x79` | merge ack | session |
 | `0x7A` | watermark probe request | session |
 | `0x7B` | watermark probe response | session |
-
-## Payment
-
-Ops `0x60`–`0x63` are the signed handshake between the two writers. Each plaintext is sealed with the session key. The offer names the amount, both user ids, both app aliases, the note, the payment id, and the expiry. It does not name a purse. The payee accepts, refuses, or the payer confirms. A node that is not the writer drops the packet. The local app is not on this path. Its reserve reply stays op `0x08`.
-
-Ops `0x64` and `0x65` repair the two books when a contact session comes up. `0x64` lists payment ids and confirmation signatures. `0x65` carries one signed confirmation, still with no purse id. A failed signature is dropped. Two different signed bodies of one id are both kept.
-
-Ops `0x66`–`0x69` settle a tab between the same two owners. `0x66` names the payment ids and carries one signature. `0x67` carries both. `0x68` and `0x69` copy a missing settlement the way `0x64` and `0x65` copy a missing payment. A named charge stays listed and leaves the tab. No purse amount changes. An app does not send these ops.
 
 ## Reachability
 
@@ -288,14 +270,6 @@ result (u8) || private version (28) || public version (28)
 | `0` | Accepted. |
 | `1` | This node is not the writer. |
 | `2` | The change did not parse as a valid mutation. |
-
-When the change is a reserve, the ack continues:
-
-```text
-payment id (16) || app code (u8) || available (i64) || expires at (u64)
-```
-
-App code `0` is success. Any other byte is the app error. The device that forwarded the reserve replies to the app from this tail and does not change its own purse. An ack that ends at the versions is not a reserve result. The writer stamps the expiry from its own clock before it stores the hold. A repeat of the same hold keeps the stored expiry.
 
 **Update available (`0x72`).** Session plaintext: `scope || version (28)`. If the version is newer from the same writer, or from a different writer, the receiver sends a pull request.
 

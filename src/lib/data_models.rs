@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddrV4;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 pub const TUNNEL_THRESHOLD:      u32      = 10;
 pub const TUNNEL_COUNTER_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -651,13 +651,6 @@ pub struct PendingDeviceAcceptance {
     pub expected_signing_pk: Ed25519PublicKey,
 }
 
-/// Payment ids a contact has listed on the current session. Not written to disk.
-#[derive(Default)]
-pub struct PaymentIndexAccum {
-    pub open: bool,
-    pub seen: Vec<(Uuid, Ed25519Signature)>,
-}
-
 /// The local owner of this node. Extends User with contacts and a long-term key pair.
 #[derive(Serialize, Deserialize)]
 pub struct Owner {
@@ -686,34 +679,6 @@ pub struct Owner {
     /// Invitations we have sent and still publish to that contact.
     #[serde(default)]
     pub outbound_app_invitations: Vec<AppInvitation>,
-    /// Fixed spending limits for this user. Private scope: own devices only.
-    #[serde(default)]
-    pub purses: Vec<Purse>,
-    /// Holds against those purses. Private scope, same as `purses`.
-    #[serde(default)]
-    pub reserves: Vec<PaymentReserve>,
-    /// How much of one payer's tab this user will still run.
-    /// A payer with no row is at zero. Private scope.
-    #[serde(default)]
-    pub run_limits: Vec<RunLimit>,
-    /// Confirmed charges. Private scope. Ops `0x06` and `0x07` list the charges for one alias.
-    /// A settlement does not remove a charge from this list.
-    #[serde(default)]
-    pub charges: Vec<Charge>,
-    /// Offers this user signed and has not yet been told are stored.
-    /// They count against the payer's ceiling. Private scope.
-    #[serde(default)]
-    pub pending_accepts: Vec<PendingAccept>,
-    /// Dual-signed settlements. A named charge no longer counts toward the
-    /// tab or toward what you'll run. The charge stays in this list. Private scope.
-    #[serde(default)]
-    pub settlements: Vec<Settlement>,
-    /// In-progress payment index from a contact. Dropped when the list ends.
-    #[serde(skip)]
-    pub payment_index: HashMap<Uuid, PaymentIndexAccum>,
-    /// In-progress settlement index from a contact. Separate from `payment_index`.
-    #[serde(skip)]
-    pub settlement_index: HashMap<Uuid, PaymentIndexAccum>,
 
     /// Latest version of the user's **private** state held by this node.
     /// On the writer SG this is authoritative; on other nodes it's the
@@ -807,233 +772,6 @@ pub struct Contact {
     /// CrossUserPullRequest so the reply is `NoUpdates` when caught up.
     #[serde(default)]
     pub last_seen_public_version: SyncVersion,
-}
-
-/// One nanodollar is $0.000000001. Purse amounts are counts of these.
-pub const NANODOLLARS_PER_DOLLAR: i64 = 1_000_000_000;
-
-/// Parse a non-negative dollar amount into nanodollars.
-/// At most nine digits are allowed after the decimal point. `0.005` is
-/// `5_000_000`. A leading `+`, a minus sign, or a tenth decimal place is rejected.
-pub fn parse_dollar_to_nanodollars(raw: &str) -> Option<i64> {
-    let s = raw.trim();
-    if s.is_empty() || s.starts_with('+') || s.starts_with('-') {
-        return None;
-    }
-    let (whole, frac) = match s.split_once('.') {
-        Some((whole, frac)) => (whole, frac),
-        None => (s, ""),
-    };
-    if frac.len() > 9 || (whole.is_empty() && frac.is_empty()) {
-        return None;
-    }
-    if !whole.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let whole_n: i64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
-    let whole_nanos = whole_n.checked_mul(NANODOLLARS_PER_DOLLAR)?;
-    let mut padded = frac.to_string();
-    while padded.len() < 9 {
-        padded.push('0');
-    }
-    let frac_n: i64 = padded.parse().ok()?;
-    whole_nanos.checked_add(frac_n)
-}
-
-/// Format a nanodollar count as a dollar amount. Trailing zeros after the
-/// decimal point are omitted. `5_000_000` is `0.005`.
-pub fn format_nanodollars(amount: i64) -> String {
-    let negative = amount < 0;
-    let magnitude = amount.unsigned_abs();
-    let whole = magnitude / (NANODOLLARS_PER_DOLLAR as u64);
-    let frac = magnitude % (NANODOLLARS_PER_DOLLAR as u64);
-    let mut frac_s = format!("{frac:09}");
-    while frac_s.ends_with('0') {
-        frac_s.pop();
-    }
-    let body = if frac_s.is_empty() {
-        whole.to_string()
-    } else {
-        format!("{whole}.{frac_s}")
-    };
-    if negative {
-        format!("-{body}")
-    } else {
-        body
-    }
-}
-
-/// A user-owned spending limit. Membership is by app alias, so every device
-/// that runs the alias shares it. A reserve reduces `available_nanodollars`
-/// until it expires. Incoming payments do not raise it.
-///
-/// `kind` is [`crate::wire::PURSE_KIND_FIXED`] or
-/// [`crate::wire::PURSE_KIND_MONTHLY`]. `period` is the UTC month
-/// (`year * 12 + month`, January is 0) that `available_nanodollars` belongs
-/// to. A fixed purse stores 0. An old save omits both and loads as fixed.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
-pub struct Purse {
-    #[serde(with = "serde_bytes_16")]
-    pub id: Uuid,
-    pub name: String,
-    pub allotment_nanodollars: i64,
-    pub available_nanodollars: i64,
-    pub aliases: Vec<String>,
-    #[serde(default)]
-    pub kind: u8,
-    #[serde(default)]
-    pub period: u32,
-}
-
-impl Purse {
-    /// Sort and deduplicate aliases. Drop an alias that is empty, longer
-    /// than 255 bytes, or contains a control character.
-    pub fn normalized(&self) -> Self {
-        let mut aliases: Vec<String> = self.aliases.iter()
-            .map(|alias| alias.trim().to_string())
-            .filter(|alias| {
-                !alias.is_empty()
-                    && alias.len() <= 255
-                    && !alias.chars().any(|c| c.is_control())
-            })
-            .collect();
-        aliases.sort();
-        aliases.dedup();
-        Purse { aliases, ..self.clone() }
-    }
-}
-
-/// How long a reserve holds purse funds before the writer gives them back.
-/// A confirmed payment consumes the hold first. Twenty-four hours is long
-/// enough for the contact to answer the same day.
-pub const RESERVE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
-
-/// Milliseconds since the Unix epoch. A clock that is not set returns 0.
-pub fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
-/// UTC calendar month for `now_ms`, as `year * 12 + month` with January as 0.
-/// The rank-1 writer uses this as the month a purse's available amount
-/// belongs to. Unspent amount does not carry into the next period.
-pub fn utc_month_period(now_ms: u64) -> u32 {
-    // Howard Hinnant's civil_from_days, from Unix days.
-    let days = (now_ms / 1000) / 86_400;
-    let z = (days as i64).saturating_add(719_468);
-    let era = if z >= 0 { z } else { z.saturating_sub(146_096) } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let year = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    let year = u32::try_from(year).unwrap_or(0);
-    year.saturating_mul(12).saturating_add((month as u32).saturating_sub(1))
-}
-
-/// One hold against a purse. The same `payment_id` is the same hold.
-/// `expires_at_ms` is the writer's clock. Contacts do not receive this record.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
-pub struct PaymentReserve {
-    #[serde(with = "serde_bytes_16")]
-    pub payment_id: Uuid,
-    #[serde(with = "serde_bytes_16")]
-    pub purse_id: Uuid,
-    pub amount_nanodollars: i64,
-    #[serde(with = "serde_bytes_16")]
-    pub contact_uuid: Uuid,
-    pub destination_alias: String,
-    pub note: String,
-    pub paying_alias: String,
-    pub expires_at_ms: u64,
-    /// UTC month the hold was taken against. 0 on a fixed purse and on a
-    /// save from before monthly purses. A monthly hold is returned only while
-    /// this matches the purse's period. Period 0 is still returned after the
-    /// purse becomes monthly.
-    #[serde(default)]
-    pub period: u32,
-}
-
-impl PaymentReserve {
-    /// The fields that make a retry the same hold. The expiry is the writer's
-    /// stamp and is not part of the identity.
-    pub fn same_hold(&self, other: &Self) -> bool {
-        self.payment_id == other.payment_id
-            && self.purse_id == other.purse_id
-            && self.amount_nanodollars == other.amount_nanodollars
-            && self.contact_uuid == other.contact_uuid
-            && self.destination_alias == other.destination_alias
-            && self.note == other.note
-            && self.paying_alias == other.paying_alias
-    }
-}
-
-/// The most of one payer's tab this user will still run. Missing means zero.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
-pub struct RunLimit {
-    #[serde(with = "serde_bytes_16")]
-    pub payer: Uuid,
-    pub max_nanodollars: i64,
-}
-
-/// One charge on a tab. `purse_id` is the payer's local purse and is zero on
-/// the payee, who is not told which purse paid.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
-pub struct Charge {
-    #[serde(with = "serde_bytes_16")]
-    pub payment_id: Uuid,
-    pub amount_nanodollars: i64,
-    #[serde(with = "serde_bytes_16")]
-    pub payer: Uuid,
-    #[serde(with = "serde_bytes_16")]
-    pub payee: Uuid,
-    pub paying_alias: String,
-    pub destination_alias: String,
-    pub note: String,
-    pub expires_at_ms: u64,
-    #[serde(with = "serde_bytes_16")]
-    pub purse_id: Uuid,
-    pub payer_sig: Ed25519Signature,
-    pub payee_sig: Ed25519Signature,
-    pub confirm_sig: Ed25519Signature,
-}
-
-/// A tab both owners signed off. It names payment ids and carries no amount.
-/// `user_lo` sorts before `user_hi`. `payment_ids` is strictly increasing.
-/// `sig_lo` and `sig_hi` are those users' signatures over the same body.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
-pub struct Settlement {
-    #[serde(with = "serde_bytes_16")]
-    pub settlement_id: Uuid,
-    #[serde(with = "serde_bytes_16")]
-    pub user_lo: Uuid,
-    #[serde(with = "serde_bytes_16")]
-    pub user_hi: Uuid,
-    pub payment_ids: Vec<Uuid>,
-    pub sig_lo: Ed25519Signature,
-    pub sig_hi: Ed25519Signature,
-}
-
-/// An offer this user has signed and is still waiting to hear was stored.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
-pub struct PendingAccept {
-    #[serde(with = "serde_bytes_16")]
-    pub payment_id: Uuid,
-    pub amount_nanodollars: i64,
-    #[serde(with = "serde_bytes_16")]
-    pub payer: Uuid,
-    #[serde(with = "serde_bytes_16")]
-    pub payee: Uuid,
-    pub paying_alias: String,
-    pub destination_alias: String,
-    pub note: String,
-    pub expires_at_ms: u64,
-    pub payer_sig: Ed25519Signature,
-    pub payee_sig: Ed25519Signature,
 }
 
 /// We allow `contact_uuid` to send to our apps whose alias is `app_alias`.
@@ -1230,14 +968,6 @@ impl Node {
                 app_invitations:            Vec::new(),
                 seen_app_invitation_ids:    Vec::new(),
                 outbound_app_invitations:   Vec::new(),
-                purses:                     Vec::new(),
-                reserves:                   Vec::new(),
-                run_limits:           Vec::new(),
-                charges:                     Vec::new(),
-                pending_accepts:            Vec::new(),
-                settlements:                  Vec::new(),
-                payment_index:              HashMap::new(),
-                settlement_index:             HashMap::new(),
                 private_version:            SyncVersion::zero(),
                 public_version:             SyncVersion::zero(),
                 write_log:                  Vec::new(),
@@ -1266,29 +996,6 @@ mod tests {
 
     fn writer_a() -> Uuid { [0xAA; 16] }
     fn writer_b() -> Uuid { [0xBB; 16] }
-
-    #[test]
-    fn dollar_amounts_use_nanodollars() {
-        assert_eq!(parse_dollar_to_nanodollars("0.005"), Some(5_000_000));
-        assert_eq!(parse_dollar_to_nanodollars(".005"), Some(5_000_000));
-        assert_eq!(parse_dollar_to_nanodollars("1"), Some(1_000_000_000));
-        assert_eq!(parse_dollar_to_nanodollars("0.000000001"), Some(1));
-        assert_eq!(format_nanodollars(5_000_000), "0.005");
-        assert_eq!(format_nanodollars(1_000_000_000), "1");
-        assert_eq!(format_nanodollars(-1), "-0.000000001");
-        assert_eq!(parse_dollar_to_nanodollars("-1"), None);
-        assert_eq!(parse_dollar_to_nanodollars("0.0000000001"), None);
-        assert_eq!(parse_dollar_to_nanodollars(""), None);
-    }
-
-    #[test]
-    fn utc_month_period_is_the_calendar_month() {
-        assert_eq!(utc_month_period(0), 1970 * 12);
-        assert_eq!(utc_month_period(2_678_400_000), 1970 * 12 + 1);
-        assert_eq!(utc_month_period(1_790_812_800_000), 2026 * 12 + 9);
-        assert_eq!(utc_month_period(1_793_404_800_000), 2026 * 12 + 9);
-        assert_eq!(utc_month_period(1_793_491_200_000), 2026 * 12 + 10);
-    }
 
     #[test]
     fn try_fill_random_fills_buffer() {
@@ -1386,52 +1093,6 @@ mod tests {
         assert_eq!(restored.owner.private_version.seq,   1);
         assert_eq!(restored.owner.public_version.epoch,  1);
         assert_eq!(restored.owner.public_version.seq,    2);
-    }
-
-    #[test]
-    fn saved_payment_names_are_the_tab_names() {
-        let mut node = Node::new();
-        node.owner.run_limits.push(RunLimit {
-            payer: [0x11; 16],
-            max_nanodollars: 5,
-        });
-        node.owner.charges.push(Charge {
-            payment_id: [0x22; 16],
-            amount_nanodollars: 1,
-            payer: [0x11; 16],
-            payee: [0x33; 16],
-            paying_alias: "payer-app".into(),
-            destination_alias: "payee-app".into(),
-            note: String::new(),
-            expires_at_ms: 0,
-            purse_id: [0; 16],
-            payer_sig: Ed25519Signature::ZERO,
-            payee_sig: Ed25519Signature::ZERO,
-            confirm_sig: Ed25519Signature::ZERO,
-        });
-        node.owner.settlements.push(Settlement {
-            settlement_id: [0x44; 16],
-            user_lo: [0x11; 16],
-            user_hi: [0x33; 16],
-            payment_ids: vec![[0x22; 16]],
-            sig_lo: Ed25519Signature::ZERO,
-            sig_hi: Ed25519Signature::ZERO,
-        });
-
-        let saved = toml::to_string(&node).expect("serialize");
-        assert!(saved.contains("run_limits"));
-        assert!(saved.contains("[[owner.charges]]"));
-        assert!(saved.contains("[[owner.settlements]]"));
-        assert!(saved.contains("settlement_id"));
-        assert!(!saved.contains("receive_ceilings"));
-        assert!(!saved.contains("ledger"));
-        assert!(!saved.contains("clearings"));
-        assert!(!saved.contains("clearing_id"));
-
-        let restored: Node = toml::from_str(&saved).expect("deserialize");
-        assert_eq!(restored.owner.run_limits, node.owner.run_limits);
-        assert_eq!(restored.owner.charges, node.owner.charges);
-        assert_eq!(restored.owner.settlements, node.owner.settlements);
     }
 
     #[test]

@@ -8,17 +8,12 @@ use super::action_queue::{Action, PRIORITY_HIGH};
 use super::app_api::app_api_source_allowed;
 use super::thread_pool::SharedQueue;
 use super::wire::{
-    slice_arr, APP_GET_DATA_OP, APP_LIST_INCOMING_OP, APP_LIST_PURSES_OP, APP_LIST_SENT_OP,
-    APP_RESERVE_OP,
-    APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_PACKET_OP, APP_UPDATE_OP,
+    slice_arr, APP_GET_DATA_OP, APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_PACKET_OP, APP_UPDATE_OP,
     BOOTSTRAP_REQUEST_OP, BOOTSTRAP_RESPONSE_OP, CONNECT_ACK_OP, CONNECT_REQUEST_OP,
     CONTACT_REQUEST_OP, CONTACT_RESPONSE_OP, CONN_RESET_OP, CROSS_USER_PULL_REQUEST_OP,
     CROSS_USER_PULL_RESPONSE_OP, CROSS_USER_UPDATE_AVAILABLE_OP, DEVICE_REGISTER_OP,
     DG_KEEPALIVE_OP, GENERATE_INVITATION_REQUEST_OP, GENERATE_INVITATION_RESPONSE_OP,
-    SETTLEMENT_INDEX_OP, SETTLEMENT_RECORD_OP, MERGE_ACK_OP, MERGE_PROPOSAL_OP, PAYMENT_ACCEPT_OP,
-    SETTLEMENT_ACK_OP, SETTLEMENT_PROPOSE_OP, PAYMENT_CONFIRM_OP, PAYMENT_INDEX_OP, PAYMENT_OFFER_OP,
-    PAYMENT_RECORD_OP, PAYMENT_REFUSE_OP, RELAY_PACKET_OP, SG_PING_OP,
-    SYNC_PULL_REQUEST_OP,
+    MERGE_ACK_OP, MERGE_PROPOSAL_OP, RELAY_PACKET_OP, SG_PING_OP, SYNC_PULL_REQUEST_OP,
     SYNC_PULL_RESPONSE_OP, SYNC_UPDATE_AVAILABLE_OP, SYNC_WRITE_ACK_OP, SYNC_WRITE_REQUEST_OP,
     TUNNEL_CONNECT_ACK_OP, TUNNEL_CONNECT_REQUEST_OP, TUNNEL_DELIVERY_OP, TUNNEL_FORWARD_OP,
     TUNNEL_INIT_OP, WATERMARK_PROBE_REQUEST_OP, WATERMARK_PROBE_RESPONSE_OP,
@@ -76,20 +71,12 @@ impl UdpListener {
                 let op = buf[0];
                 let payload = buf[1..len].to_vec();
 
-                // Local app requests (0x00–0x03 and 0x05–0x08): loopback-only
-                // by default. Op 0x04 is a push the node sends, not a request.
-                // Peer fabric ops stay open on the public UDP socket.
+                // Local app control plane (ops 0x00–0x03): loopback-only by
+                // default. Peer fabric ops stay open on the public UDP socket.
                 // Opt in with PNET_APP_API_REMOTE=1 (e.g. Docker sidecar apps).
                 let is_app_api = matches!(
                     op,
-                    APP_REGISTER_OP
-                        | APP_UPDATE_OP
-                        | APP_GET_DATA_OP
-                        | APP_SEND_PACKET_OP
-                        | APP_LIST_PURSES_OP
-                        | APP_LIST_INCOMING_OP
-                        | APP_LIST_SENT_OP
-                        | APP_RESERVE_OP
+                    APP_REGISTER_OP | APP_UPDATE_OP | APP_GET_DATA_OP | APP_SEND_PACKET_OP
                 );
                 if is_app_api && !app_api_source_allowed(src) {
                     eprintln!(
@@ -104,20 +91,6 @@ impl UdpListener {
                     APP_UPDATE_OP => Action::AppUpdate { src, buf: payload },
                     APP_GET_DATA_OP => Action::AppGetData { src, buf: payload },
                     APP_SEND_PACKET_OP => Action::AppSendPacket { src, buf: payload },
-                    APP_LIST_PURSES_OP => Action::AppListPurses { src, buf: payload },
-                    APP_LIST_INCOMING_OP => Action::AppListIncoming { src, buf: payload },
-                    APP_LIST_SENT_OP => Action::AppListSent { src, buf: payload },
-                    APP_RESERVE_OP => Action::AppReserve { src, buf: payload },
-                    PAYMENT_OFFER_OP => Action::PaymentOffer { src, buf: payload },
-                    PAYMENT_ACCEPT_OP => Action::PaymentAccept { src, buf: payload },
-                    PAYMENT_REFUSE_OP => Action::PaymentRefuse { src, buf: payload },
-                    PAYMENT_CONFIRM_OP => Action::PaymentConfirm { src, buf: payload },
-                    PAYMENT_INDEX_OP => Action::PaymentIndex { src, buf: payload },
-                    PAYMENT_RECORD_OP => Action::PaymentRecord { src, buf: payload },
-                    SETTLEMENT_PROPOSE_OP => Action::SettlementPropose { src, buf: payload },
-                    SETTLEMENT_ACK_OP => Action::SettlementAck { src, buf: payload },
-                    SETTLEMENT_INDEX_OP => Action::SettlementIndex { src, buf: payload },
-                    SETTLEMENT_RECORD_OP => Action::Settlement { src, buf: payload },
                     SG_PING_OP => {
                         let Some(nonce) = slice_arr::<16>(&payload, 0) else {
                             eprintln!("[udp] sg_ping too short from {src}");
@@ -224,20 +197,6 @@ mod tests {
             (0x01, |a| matches!(a, Action::AppUpdate        { .. })),
             (0x02, |a| matches!(a, Action::AppGetData       { .. })),
             (0x03, |a| matches!(a, Action::AppSendPacket    { .. })),
-            (0x05, |a| matches!(a, Action::AppListPurses    { .. })),
-            (0x06, |a| matches!(a, Action::AppListIncoming  { .. })),
-            (0x07, |a| matches!(a, Action::AppListSent      { .. })),
-            (0x08, |a| matches!(a, Action::AppReserve       { .. })),
-            (0x60, |a| matches!(a, Action::PaymentOffer     { .. })),
-            (0x61, |a| matches!(a, Action::PaymentAccept    { .. })),
-            (0x62, |a| matches!(a, Action::PaymentRefuse    { .. })),
-            (0x63, |a| matches!(a, Action::PaymentConfirm   { .. })),
-            (0x64, |a| matches!(a, Action::PaymentIndex     { .. })),
-            (0x65, |a| matches!(a, Action::PaymentRecord    { .. })),
-            (0x66, |a| matches!(a, Action::SettlementPropose     { .. })),
-            (0x67, |a| matches!(a, Action::SettlementAck  { .. })),
-            (0x68, |a| matches!(a, Action::SettlementIndex    { .. })),
-            (0x69, |a| matches!(a, Action::Settlement   { .. })),
             (0x10, |a| matches!(a, Action::SgPing           { .. })),
             (0x20, |a| matches!(a, Action::ConnectRequest   { .. })),
             (0x21, |a| matches!(a, Action::ConnectAck       { .. })),

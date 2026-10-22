@@ -44,43 +44,6 @@ impl PendingInvites {
     }
 }
 
-/// App sockets waiting for a reserve the writer has not answered yet.
-///
-/// The pool worker registers the app address and returns. It does not park.
-/// The write ack replies to every address, and a timeout thread replies
-/// `no writer` to one address if it is still waiting.
-#[derive(Default)]
-pub struct PendingReserves {
-    slots: Mutex<HashMap<Uuid, Vec<SocketAddr>>>,
-}
-
-impl PendingReserves {
-    pub fn push(&self, payment_id: Uuid, src: SocketAddr) {
-        self.slots.lock().unwrap().entry(payment_id).or_default().push(src);
-    }
-
-    /// Take every waiter for this payment. A later timeout finds nothing.
-    pub fn take(&self, payment_id: Uuid) -> Vec<SocketAddr> {
-        self.slots.lock().unwrap().remove(&payment_id).unwrap_or_default()
-    }
-
-    /// Drop one waiter. True when that address was still waiting.
-    pub fn cancel_one(&self, payment_id: Uuid, src: SocketAddr) -> bool {
-        let mut slots = self.slots.lock().unwrap();
-        let Some(waiters) = slots.get_mut(&payment_id) else {
-            return false;
-        };
-        let Some(pos) = waiters.iter().position(|waiter| *waiter == src) else {
-            return false;
-        };
-        waiters.remove(pos);
-        if waiters.is_empty() {
-            slots.remove(&payment_id);
-        }
-        true
-    }
-}
-
 pub const PRIORITY_HIGH:   u8 = 0;
 pub const PRIORITY_NORMAL: u8 = 1;
 pub const PRIORITY_LOW:    u8 = 2;
@@ -98,20 +61,6 @@ pub enum Action {
     AppUpdate     { src: SocketAddr, buf: Vec<u8> },
     AppGetData    { src: SocketAddr, buf: Vec<u8> },
     AppSendPacket { src: SocketAddr, buf: Vec<u8> },
-    AppListPurses { src: SocketAddr, buf: Vec<u8> },
-    AppListIncoming { src: SocketAddr, buf: Vec<u8> },
-    AppListSent { src: SocketAddr, buf: Vec<u8> },
-    AppReserve { src: SocketAddr, buf: Vec<u8> },
-    PaymentOffer { src: SocketAddr, buf: Vec<u8> },
-    PaymentAccept { src: SocketAddr, buf: Vec<u8> },
-    PaymentRefuse { src: SocketAddr, buf: Vec<u8> },
-    PaymentConfirm { src: SocketAddr, buf: Vec<u8> },
-    PaymentIndex { src: SocketAddr, buf: Vec<u8> },
-    PaymentRecord { src: SocketAddr, buf: Vec<u8> },
-    SettlementPropose { src: SocketAddr, buf: Vec<u8> },
-    SettlementAck { src: SocketAddr, buf: Vec<u8> },
-    SettlementIndex { src: SocketAddr, buf: Vec<u8> },
-    Settlement { src: SocketAddr, buf: Vec<u8> },
 
     // From HTTP UI
     UiRequest {
@@ -170,8 +119,6 @@ pub enum Action {
 
     // Scheduled
     PollSG,
-    /// Writer gives back purse holds whose expiry has passed.
-    ReleaseExpiredReserves,
     MaintainConnections,
     KeepAliveDG,
     CleanupTunnels,
@@ -205,8 +152,6 @@ pub struct WorkerContext {
     pub scheduler_tx: mpsc::Sender<ScheduleRequest>,
     /// Rendezvous for DG→SG invitation requests (op 0x35/0x36).
     pub pending_invites: Arc<PendingInvites>,
-    /// App reserve forwarded to the writer. Not persisted.
-    pub pending_reserves: Arc<PendingReserves>,
     /// In-memory admin UI sessions (cookie → expiry). Not persisted.
     pub sessions: Arc<super::admin_auth::SessionStore>,
     /// Local app API rate limits (register/send token buckets).
@@ -246,20 +191,6 @@ impl Action {
             Action::AppUpdate { .. } => "AppUpdate",
             Action::AppGetData { .. } => "AppGetData",
             Action::AppSendPacket { .. } => "AppSendPacket",
-            Action::AppListPurses { .. } => "AppListPurses",
-            Action::AppListIncoming { .. } => "AppListIncoming",
-            Action::AppListSent { .. } => "AppListSent",
-            Action::AppReserve { .. } => "AppReserve",
-            Action::PaymentOffer { .. } => "PaymentOffer",
-            Action::PaymentAccept { .. } => "PaymentAccept",
-            Action::PaymentRefuse { .. } => "PaymentRefuse",
-            Action::PaymentConfirm { .. } => "PaymentConfirm",
-            Action::PaymentIndex { .. } => "PaymentIndex",
-            Action::PaymentRecord { .. } => "PaymentRecord",
-            Action::SettlementPropose { .. } => "SettlementPropose",
-            Action::SettlementAck { .. } => "SettlementAck",
-            Action::SettlementIndex { .. } => "SettlementIndex",
-            Action::Settlement { .. } => "Settlement",
             Action::UiRequest { .. } => "UiRequest",
             Action::SgPing { .. } => "SgPing",
             Action::DgKeepalive { .. } => "DgKeepalive",
@@ -293,7 +224,6 @@ impl Action {
             Action::TunnelConnectRequest { .. } => "TunnelConnectRequest",
             Action::TunnelConnectAck { .. } => "TunnelConnectAck",
             Action::PollSG => "PollSG",
-            Action::ReleaseExpiredReserves => "ReleaseExpiredReserves",
             Action::MaintainConnections => "MaintainConnections",
             Action::KeepAliveDG => "KeepAliveDG",
             Action::CleanupTunnels => "CleanupTunnels",
@@ -310,20 +240,6 @@ impl Action {
             Action::AppUpdate     { src, buf } => handlers::app_update(src, buf, ctx),
             Action::AppGetData    { src, buf } => handlers::app_get_data(src, buf, ctx),
             Action::AppSendPacket { src, buf } => handlers::app_send_packet(src, buf, ctx),
-            Action::AppListPurses { src, buf } => handlers::app_list_purses(src, buf, ctx),
-            Action::AppListIncoming { src, buf } => handlers::app_list_incoming(src, buf, ctx),
-            Action::AppListSent { src, buf } => handlers::app_list_sent(src, buf, ctx),
-            Action::AppReserve { src, buf } => handlers::app_reserve(src, buf, ctx),
-            Action::PaymentOffer { src, buf } => handlers::payment_offer(src, buf, ctx),
-            Action::PaymentAccept { src, buf } => handlers::payment_accept(src, buf, ctx),
-            Action::PaymentRefuse { src, buf } => handlers::payment_refuse(src, buf, ctx),
-            Action::PaymentConfirm { src, buf } => handlers::payment_confirm(src, buf, ctx),
-            Action::PaymentIndex { src, buf } => handlers::payment_index(src, buf, ctx),
-            Action::PaymentRecord { src, buf } => handlers::payment_record(src, buf, ctx),
-            Action::SettlementPropose { src, buf } => handlers::settlement_propose(src, buf, ctx),
-            Action::SettlementAck { src, buf } => handlers::settlement_ack(src, buf, ctx),
-            Action::SettlementIndex { src, buf } => handlers::settlement_index(src, buf, ctx),
-            Action::Settlement { src, buf } => handlers::settlement_record(src, buf, ctx),
             Action::UiRequest {
                 stream, method, path, query, cookie, host, origin, referer, body,
             } => {
@@ -363,7 +279,6 @@ impl Action {
             Action::TunnelConnectRequest { src, buf } => handlers::tunnel_connect_request(src, buf, ctx),
             Action::TunnelConnectAck     { src, buf } => handlers::tunnel_connect_ack(src, buf, ctx),
             Action::PollSG                           => handlers::poll_sg(ctx),
-            Action::ReleaseExpiredReserves           => handlers::release_expired_reserves(ctx),
             Action::MaintainConnections              => handlers::maintain_connections(ctx),
             Action::KeepAliveDG                      => handlers::keepalive_dg(ctx),
             Action::CleanupTunnels                   => handlers::cleanup_tunnels(ctx),
