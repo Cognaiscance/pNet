@@ -15,7 +15,7 @@ const OFFER_DOMAIN: &[u8] = b"pnet-payment-offer-v1";
 const ACCEPT_DOMAIN: &[u8] = b"pnet-payment-accept-v1";
 const CONFIRM_DOMAIN: &[u8] = b"pnet-payment-confirm-v1";
 const REFUSE_DOMAIN: &[u8] = b"pnet-payment-refuse-v1";
-const SETTLEMENT_DOMAIN: &[u8] = b"pnet-payment-clearing-v1";
+const SETTLEMENT_DOMAIN: &[u8] = b"pnet-payment-settlement-v1";
 
 /// One settlement names at most this many payment ids, so the record fits one datagram.
 pub(crate) const SETTLEMENT_MAX_IDS: usize = 64;

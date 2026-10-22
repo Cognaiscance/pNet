@@ -463,7 +463,7 @@ pub enum Change {
     StageAccept { pending: PendingAccept },
     /// Private-scope: forget a staged accept. This does not touch a purse.
     DropAccept { payment_id: Uuid },
-    /// Private-scope: store one dual-signed clearing. The same signed bytes are
+    /// Private-scope: store one dual-signed settlement. The same signed bytes are
     /// one record. A different body of the same id is kept. This does not
     /// change a purse, and it does not require the named lines to be present yet.
     RecordSettlement { record: Settlement },
@@ -2121,7 +2121,7 @@ fn send_pull_request(scope: Scope, last_seen: SyncVersion, conn_id: u16, ctx: &W
 //   then reserves, ceilings, lines, staged accepts, and settlements.
 //   then each purse's kind and UTC month, and each reserve's month.
 // An empty blob is a legacy writer and does not clear the puller's purses.
-// A blob that ends before the clearing count has no settlements.
+// A blob that ends before the settlement count has no settlements.
 // A blob that ends at the settlements has fixed purses and reserve month 0.
 
 pub(crate) fn serialize_public_state(node: &Node) -> Vec<u8> {
@@ -2450,9 +2450,9 @@ fn read_private_snapshot(data: &[u8]) -> Option<PrivateSnapshot> {
             settlements: Vec::new(),
         });
     }
-    let clearing_count = read_u16(data, &mut pos)? as usize;
-    let mut settlements = Vec::with_capacity(clearing_count);
-    for _ in 0..clearing_count {
+    let settlement_count = read_u16(data, &mut pos)? as usize;
+    let mut settlements = Vec::with_capacity(settlement_count);
+    for _ in 0..settlement_count {
         settlements.push(read_settlement(data, &mut pos)?);
     }
     read_month_tail(data, &mut pos, &mut purses, &mut reserves)?;
@@ -4452,7 +4452,7 @@ struct MergedState {
     charges: HashMap<Uuid, Vec<Charge>>,
     /// payment id → staged accept that is not yet a line.
     pending: HashMap<Uuid, PendingAccept>,
-    /// clearing id → dual-signed records. Two bodies of one id are both kept.
+    /// settlement id → dual-signed records. Two bodies of one id are both kept.
     settlements: HashMap<Uuid, Vec<Settlement>>,
     /// payer → (ceiling, priority of the write that set it).
     ceilings: HashMap<Uuid, (i64, EntryPriority)>,
@@ -5074,13 +5074,13 @@ fn diff_states(current: &MergedState, target: &MergedState) -> Vec<Change> {
         }
     }
 
-    let mut clearing_ids: Vec<Uuid> = current.settlements.keys()
+    let mut settlement_ids: Vec<Uuid> = current.settlements.keys()
         .chain(target.settlements.keys())
         .copied()
         .collect();
-    clearing_ids.sort();
-    clearing_ids.dedup();
-    for id in clearing_ids {
+    settlement_ids.sort();
+    settlement_ids.dedup();
+    for id in settlement_ids {
         let current_rows = current.settlements.get(&id).map(Vec::as_slice).unwrap_or(&[]);
         let Some(target_rows) = target.settlements.get(&id) else { continue };
         for record in target_rows {
@@ -5240,7 +5240,7 @@ fn replay_record(state: &mut MergedState, line: Charge) {
         take_matching_pending_state(state, &line);
         let mut stored = line;
         stored.purse_id = [0u8; 16];
-        state.charges.get_mut(&stored.payment_id).expect("ledger list").push(stored);
+        state.charges.get_mut(&stored.payment_id).expect("charge list").push(stored);
         return;
     }
     take_matching_pending_state(state, &line);
@@ -6024,7 +6024,7 @@ mod purse_sync_tests {
         let blob = serialize_private_state(&node);
         match read_private_snapshot(&blob) {
             Some(PrivateSnapshot::Purses { settlements, .. }) => assert_eq!(settlements, vec![record]),
-            other => panic!("expected the clearing, got {other:?}"),
+            other => panic!("expected the settlement, got {other:?}"),
         }
         // No purses and no reserves: the month tail is two counts.
         let month_tail = 2 + 2;
@@ -6035,7 +6035,7 @@ mod purse_sync_tests {
                 assert!(charges.is_empty());
                 assert!(pending.is_empty());
             }
-            other => panic!("expected a snapshot with no clearing section, got {other:?}"),
+            other => panic!("expected a snapshot with no settlement section, got {other:?}"),
         }
     }
 

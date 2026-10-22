@@ -1872,13 +1872,13 @@ mod tests {
         super::payment::exchange_payment_records(7, &pair.payer.ctx);
         super::payment::exchange_payment_records(7, &pair.payee.ctx);
         let to_payee = recv_pnet(&pair.payee);
-        let to_payee_clearing = recv_pnet(&pair.payee);
+        let to_payee_settlement = recv_pnet(&pair.payee);
         let to_payer = recv_pnet(&pair.payer);
-        let to_payer_clearing = recv_pnet(&pair.payer);
+        let to_payer_settlement = recv_pnet(&pair.payer);
         assert_eq!(to_payee[0], PAYMENT_INDEX_OP);
         assert_eq!(to_payer[0], PAYMENT_INDEX_OP);
-        assert_eq!(to_payee_clearing[0], SETTLEMENT_INDEX_OP);
-        assert_eq!(to_payer_clearing[0], SETTLEMENT_INDEX_OP);
+        assert_eq!(to_payee_settlement[0], SETTLEMENT_INDEX_OP);
+        assert_eq!(to_payer_settlement[0], SETTLEMENT_INDEX_OP);
         payment_index(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
             to_payee[1..].to_vec(),
@@ -1891,12 +1891,12 @@ mod tests {
         );
         settlement_index(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
-            to_payee_clearing[1..].to_vec(),
+            to_payee_settlement[1..].to_vec(),
             &pair.payee.ctx,
         );
         settlement_index(
             pair.payee.ctx.udp_socket.local_addr().unwrap(),
-            to_payer_clearing[1..].to_vec(),
+            to_payer_settlement[1..].to_vec(),
             &pair.payer.ctx,
         );
         let record = recv_pnet(&pair.payee);
@@ -2250,11 +2250,11 @@ mod tests {
         let payer_ci = recv_pnet(&pair.payer);
         settlement_index(pair.payee.ctx.udp_socket.local_addr().unwrap(), payer_ci[1..].to_vec(), &pair.payer.ctx);
         payment_index(pair.payee.ctx.udp_socket.local_addr().unwrap(), payer_pi[1..].to_vec(), &pair.payer.ctx);
-        let clearing_pkt = recv_pnet(&pair.payee);
-        assert_eq!(clearing_pkt[0], SETTLEMENT_RECORD_OP);
+        let settlement_pkt = recv_pnet(&pair.payee);
+        assert_eq!(settlement_pkt[0], SETTLEMENT_RECORD_OP);
         settlement_record(
             pair.payer.ctx.udp_socket.local_addr().unwrap(),
-            clearing_pkt[1..].to_vec(),
+            settlement_pkt[1..].to_vec(),
             &pair.payee.ctx,
         );
         assert!(pair.payee.ctx.node.read().unwrap().owner.charges.is_empty());

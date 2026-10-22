@@ -694,13 +694,11 @@ pub struct Owner {
     pub reserves: Vec<PaymentReserve>,
     /// How much of one payer's tab this user will still run.
     /// A payer with no row is at zero. Private scope.
-    /// The saved name stays `receive_ceilings`.
-    #[serde(default, rename = "receive_ceilings")]
+    #[serde(default)]
     pub run_limits: Vec<RunLimit>,
     /// Confirmed charges. Private scope. Ops `0x06` and `0x07` list the charges for one alias.
     /// A settlement does not remove a charge from this list.
-    /// The saved name stays `ledger`.
-    #[serde(default, rename = "ledger")]
+    #[serde(default)]
     pub charges: Vec<Charge>,
     /// Offers this user signed and has not yet been told are stored.
     /// They count against the payer's ceiling. Private scope.
@@ -708,8 +706,7 @@ pub struct Owner {
     pub pending_accepts: Vec<PendingAccept>,
     /// Dual-signed settlements. A named charge no longer counts toward the
     /// tab or toward what you'll run. The charge stays in this list. Private scope.
-    /// The saved name stays `clearings`.
-    #[serde(default, rename = "clearings")]
+    #[serde(default)]
     pub settlements: Vec<Settlement>,
     /// In-progress payment index from a contact. Dropped when the list ends.
     #[serde(skip)]
@@ -1010,7 +1007,7 @@ pub struct Charge {
 /// `sig_lo` and `sig_hi` are those users' signatures over the same body.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub struct Settlement {
-    #[serde(with = "serde_bytes_16", rename = "clearing_id")]
+    #[serde(with = "serde_bytes_16")]
     pub settlement_id: Uuid,
     #[serde(with = "serde_bytes_16")]
     pub user_lo: Uuid,
@@ -1389,6 +1386,52 @@ mod tests {
         assert_eq!(restored.owner.private_version.seq,   1);
         assert_eq!(restored.owner.public_version.epoch,  1);
         assert_eq!(restored.owner.public_version.seq,    2);
+    }
+
+    #[test]
+    fn saved_payment_names_are_the_tab_names() {
+        let mut node = Node::new();
+        node.owner.run_limits.push(RunLimit {
+            payer: [0x11; 16],
+            max_nanodollars: 5,
+        });
+        node.owner.charges.push(Charge {
+            payment_id: [0x22; 16],
+            amount_nanodollars: 1,
+            payer: [0x11; 16],
+            payee: [0x33; 16],
+            paying_alias: "payer-app".into(),
+            destination_alias: "payee-app".into(),
+            note: String::new(),
+            expires_at_ms: 0,
+            purse_id: [0; 16],
+            payer_sig: Ed25519Signature::ZERO,
+            payee_sig: Ed25519Signature::ZERO,
+            confirm_sig: Ed25519Signature::ZERO,
+        });
+        node.owner.settlements.push(Settlement {
+            settlement_id: [0x44; 16],
+            user_lo: [0x11; 16],
+            user_hi: [0x33; 16],
+            payment_ids: vec![[0x22; 16]],
+            sig_lo: Ed25519Signature::ZERO,
+            sig_hi: Ed25519Signature::ZERO,
+        });
+
+        let saved = toml::to_string(&node).expect("serialize");
+        assert!(saved.contains("run_limits"));
+        assert!(saved.contains("[[owner.charges]]"));
+        assert!(saved.contains("[[owner.settlements]]"));
+        assert!(saved.contains("settlement_id"));
+        assert!(!saved.contains("receive_ceilings"));
+        assert!(!saved.contains("ledger"));
+        assert!(!saved.contains("clearings"));
+        assert!(!saved.contains("clearing_id"));
+
+        let restored: Node = toml::from_str(&saved).expect("deserialize");
+        assert_eq!(restored.owner.run_limits, node.owner.run_limits);
+        assert_eq!(restored.owner.charges, node.owner.charges);
+        assert_eq!(restored.owner.settlements, node.owner.settlements);
     }
 
     #[test]
