@@ -92,3 +92,5 @@ NAT routers typically expire idle UDP mappings after 30–120 seconds. For an SG
 An earlier design included a `Heartbeat` action to ping all peers and keep NAT pinholes open between arbitrary nodes. This was removed when the SG/DG architecture was introduced: DGs no longer communicate directly with other DGs, so the hole-punching concern between arbitrary pairs of nodes no longer applies.
 
 `KeepAliveDG` is the targeted replacement. It addresses the one remaining NAT concern — keeping the DG→SG mapping alive so the SG can push packets back to the DG — without the broader scope of the original Heartbeat.
+
+SG-to-SG direct paths bring a narrower hole punch back. The SG instructs both sides, and the path is used only after a probe answer. See `descriptions/direct-path.md`. The five-minute `MaintainConnections` pass also clears an unstable flag whose address-change window has gone quiet.

@@ -2,6 +2,8 @@
 
 This document describes how two pNet nodes communicate with each other directly — distinct from how apps communicate with their local pNet node.
 
+A later direct UDP path beside the SG relay (LAN, then hole punch, with app grades) is specified in `descriptions/direct-path.md`. The session opcodes and the relay below stay the path that works before that probe is up.
+
 ## Platform contract: IPv4 only (v1)
 
 The fabric is **IPv4-only** in v1: peer hosts, UDP fabric sockets, session
