@@ -277,6 +277,12 @@ impl DirectBook {
             .unwrap_or(false)
     }
 
+    /// A peer reported that its address moved or its link went down.
+    /// The direct path drops now, before the probe time-to-live.
+    pub fn note_peer_down(&mut self, device: &[u8; 16]) {
+        self.drop_direct(device);
+    }
+
     pub fn drop_direct(&mut self, device: &[u8; 16]) {
         if let Some(peer) = self.peers.get_mut(device) {
             peer.lan_up_until = None;
@@ -375,6 +381,34 @@ mod tests {
         book.note_observed(dev, lan, t0);
         assert!(!book.begin_punch(&dev, "192.168.0.8:7777".parse().unwrap()));
         assert!(!book.punch_is_up(&dev, t0));
+    }
+
+    #[test]
+    fn late_probe_goes_cold_and_a_notify_drops_sooner() {
+        let mut book = DirectBook::new();
+        let dev = [4u8; 16];
+        let t0 = Instant::now();
+        let lan_a: SocketAddr = "10.0.0.2:7777".parse().unwrap();
+        let lan_b: SocketAddr = "10.0.0.3:7777".parse().unwrap();
+        book.note_observed(dev, lan_a, t0);
+        assert!(book.begin_lan_probe(&dev, lan_b));
+        assert!(book.answer_lan(&dev, t0, Duration::from_secs(30)));
+        let later = t0 + Duration::from_secs(31);
+        assert!(!book.lan_is_up(&dev, later));
+        assert_eq!(
+            choose_path(Grade::Fast, book.lan_is_up(&dev, later), false, false),
+            PathChoice::Sg
+        );
+
+        assert!(book.begin_lan_probe(&dev, lan_b));
+        assert!(book.answer_lan(&dev, t0, Duration::from_secs(30)));
+        assert!(book.lan_is_up(&dev, t0 + Duration::from_secs(5)));
+        book.note_peer_down(&dev);
+        assert!(!book.lan_is_up(&dev, t0 + Duration::from_secs(5)));
+        assert_eq!(
+            choose_path(Grade::Fast, false, false, false),
+            PathChoice::Sg
+        );
     }
 
     #[test]
