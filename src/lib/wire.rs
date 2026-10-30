@@ -96,6 +96,12 @@ pub(crate) const OBSERVED_ADDR_OP: u8 = 0x16;
 pub(crate) const LAN_PROBE_OP: u8 = 0x17;
 /// Answer to a LAN probe. Body is the answering device uuid, 16 bytes.
 pub(crate) const LAN_PROBE_ACK_OP: u8 = 0x18;
+/// SG tells one side the other's observed address and to punch. Same 22-byte body as 0x16.
+pub(crate) const PUNCH_INVITE_OP: u8 = 0x19;
+/// Hole-punch datagram. Body is the sender device uuid.
+pub(crate) const PUNCH_OP: u8 = 0x1A;
+/// Answer to a hole punch. Body is the answering device uuid.
+pub(crate) const PUNCH_ACK_OP: u8 = 0x1B;
 pub(crate) const APP_PACKET_OP: u8 = 0x41;
 
 pub(crate) const TUNNEL_INIT_OP: u8 = 0x50;

@@ -118,6 +118,103 @@ fn send_lan_probes(ctx: &WorkerContext, local: [u8; 16], due: &[([u8; 16], Socke
     }
 }
 
+/// Op 0x19 — the SG tells this node to punch toward a peer's observed address.
+/// One instruction names one peer. This node sends the punch datagram.
+fn share_punch_invites(ctx: &WorkerContext, a: [u8; 16], b: [u8; 16]) {
+    let Some((addr_a, addr_b)) = ctx.direct_book.lock().ok().and_then(|mut book| {
+        book.take_punch_invite(a, b)
+    }) else {
+        return;
+    };
+    let packets: Vec<(SocketAddr, Vec<u8>)> = {
+        let node = ctx.node.read().unwrap();
+        let mut out = Vec::new();
+        for (who, peer, peer_addr) in [(a, b, addr_b), (b, a, addr_a)] {
+            let Some(body) = crate::direct_path::encode_observation(&peer, peer_addr) else {
+                continue;
+            };
+            let Some(conn) = node
+                .owner
+                .active_connections
+                .values()
+                .find(|c| c.device_uuid == who)
+            else {
+                continue;
+            };
+            out.push((
+                conn.peer_addr,
+                build_encrypted_packet(PUNCH_INVITE_OP, conn, &body),
+            ));
+        }
+        out
+    };
+    for (addr, pkt) in packets {
+        send(ctx, addr, &pkt);
+    }
+}
+
+pub fn punch_invite(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let plain = {
+        let node = ctx.node.read().unwrap();
+        decrypt_packet_body(&node, PUNCH_INVITE_OP, &buf)
+    };
+    let Some(plain) = plain else {
+        eprintln!("[punch_invite] decryption failed from {src}");
+        return;
+    };
+    let Some((peer, addr)) = crate::direct_path::decode_observation(&plain) else {
+        return;
+    };
+    let local = ctx.node.read().unwrap().device_uuid;
+    let start = {
+        let Ok(mut book) = ctx.direct_book.lock() else {
+            return;
+        };
+        book.note_observed(peer, addr, std::time::Instant::now());
+        let ours = book
+            .observed(&local)
+            .unwrap_or_else(|| SocketAddr::from(([203, 0, 113, 1], 9)));
+        book.begin_punch(&peer, ours)
+    };
+    if start {
+        let mut pkt = Vec::with_capacity(17);
+        pkt.push(PUNCH_OP);
+        pkt.extend_from_slice(&local);
+        send(ctx, addr, &pkt);
+    }
+}
+
+/// Op 0x1A — a hole-punch datagram. Answer it. The path stays down until
+/// our own punch is answered from the stored address.
+pub fn punch_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 16 {
+        return;
+    }
+    let local = ctx.node.read().unwrap().device_uuid;
+    let mut ack = Vec::with_capacity(17);
+    ack.push(PUNCH_ACK_OP);
+    let _peer_uuid = &buf[..16];
+    ack.extend_from_slice(&local);
+    send(ctx, src, &ack);
+}
+
+/// Op 0x1B — the answer to our punch.
+pub fn punch_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 16 {
+        return;
+    }
+    let mut peer = [0u8; 16];
+    peer.copy_from_slice(&buf[..16]);
+    if let Ok(mut book) = ctx.direct_book.lock() {
+        book.accept_punch_ack(
+            &peer,
+            src,
+            std::time::Instant::now(),
+            crate::direct_path::probe_ttl(false),
+        );
+    }
+}
+
 /// Op 0x17 — a LAN probe. Answer it when the source is on our private range.
 /// The path stays down until our own probe is answered.
 pub fn lan_probe(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
@@ -547,6 +644,9 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         if let Some((sender, true)) = tell_observation {
             share_observation(ctx, sender, dest_device_uuid, src);
         }
+        if let Some(sender) = sender_uuid {
+            share_punch_invites(ctx, sender, dest_device_uuid);
+        }
         return;
     }
 
@@ -574,6 +674,9 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     send(ctx, dest, &pkt);
     if let Some((sender, true)) = tell_observation {
         share_observation(ctx, sender, dest_device_uuid, src);
+    }
+    if let Some(sender) = sender_uuid {
+        share_punch_invites(ctx, sender, dest_device_uuid);
     }
 
     // Tunnel threshold: count relay packets per (sender, dest) pair on this SG.

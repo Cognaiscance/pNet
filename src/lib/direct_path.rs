@@ -3,7 +3,7 @@
 //! Nothing here is written into the directory snapshot. See
 //! `descriptions/direct-path.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,8 @@ pub struct DirectBook {
     peers: HashMap<[u8; 16], PeerPath>,
     self_unstable: bool,
     self_changes: Vec<Instant>,
+    /// Pairs already told to punch. Order-independent.
+    punch_invited: HashSet<([u8; 16], [u8; 16])>,
 }
 
 const UNSTABLE_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -60,7 +62,7 @@ impl DirectBook {
     /// Record the UDP source the SG saw for `device`.
     /// A repeat of the same address is not an address change.
     pub fn note_observed(&mut self, device: [u8; 16], addr: SocketAddr, now: Instant) -> Observe {
-        match self.peers.get_mut(&device) {
+        let result = match self.peers.get_mut(&device) {
             None => {
                 self.peers.insert(
                     device,
@@ -91,7 +93,15 @@ impl DirectBook {
                 peer.unstable = unstable_window(&peer.changes, now);
                 Observe::Replaced
             }
+        };
+        if result == Observe::Replaced {
+            self.forget_punch_pair(device);
         }
+        result
+    }
+
+    fn forget_punch_pair(&mut self, device: [u8; 16]) {
+        self.punch_invited.retain(|(x, y)| *x != device && *y != device);
     }
 
     /// This node's own address moved. Returns whether it is now unstable.
@@ -366,8 +376,49 @@ impl DirectBook {
         if same_lan(peer.observed, local_observed) {
             return false;
         }
+        if peer.punch_probe_sent {
+            return false;
+        }
         peer.punch_probe_sent = true;
         true
+    }
+
+    /// Both addresses are known and not on the same LAN. Returns each side's
+    /// address once: `(addr_a, addr_b)` matching the arguments.
+    pub fn take_punch_invite(
+        &mut self,
+        a: [u8; 16],
+        b: [u8; 16],
+    ) -> Option<(SocketAddr, SocketAddr)> {
+        if a == b {
+            return None;
+        }
+        let addr_a = self.observed(&a)?;
+        let addr_b = self.observed(&b)?;
+        if same_lan(addr_a, addr_b) {
+            return None;
+        }
+        let key = if a <= b { (a, b) } else { (b, a) };
+        if !self.punch_invited.insert(key) {
+            return None;
+        }
+        Some((addr_a, addr_b))
+    }
+
+    pub fn accept_punch_ack(
+        &mut self,
+        peer: &[u8; 16],
+        from: SocketAddr,
+        now: Instant,
+        ttl: Duration,
+    ) -> bool {
+        let Some(expected) = self.observed(peer) else {
+            return false;
+        };
+        if expected != from {
+            return false;
+        }
+        self.answer_punch(peer, now, ttl)
     }
 
     pub fn answer_punch(&mut self, device: &[u8; 16], now: Instant, ttl: Duration) -> bool {
@@ -471,6 +522,26 @@ mod tests {
         assert!(!book.begin_lan_probe(&dev, lan_b, t0));
         assert!(!same_lan(public, lan_b));
         assert!(same_lan(lan_a, lan_b));
+    }
+
+    #[test]
+    fn punch_invite_is_one_pair_when_ranges_differ() {
+        let mut book = DirectBook::new();
+        let a = [1u8; 16];
+        let b = [2u8; 16];
+        let t0 = Instant::now();
+        let addr_a: SocketAddr = "198.51.100.4:7777".parse().unwrap();
+        let addr_b: SocketAddr = "203.0.113.9:7777".parse().unwrap();
+        let lan_a: SocketAddr = "192.168.1.4:7777".parse().unwrap();
+        let lan_b: SocketAddr = "192.168.1.9:7777".parse().unwrap();
+        assert!(book.take_punch_invite(a, b).is_none());
+        book.note_observed(a, addr_a, t0);
+        book.note_observed(b, addr_b, t0);
+        assert_eq!(book.take_punch_invite(a, b), Some((addr_a, addr_b)));
+        assert!(book.take_punch_invite(b, a).is_none());
+        book.note_observed(a, lan_a, t0);
+        book.note_observed(b, lan_b, t0);
+        assert!(book.take_punch_invite(a, b).is_none());
     }
 
     #[test]
