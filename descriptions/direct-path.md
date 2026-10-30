@@ -43,13 +43,3 @@ The node keeps the last three timestamps of its own address changes. Three chang
 A LAN path stays up after its probe answer until an address-change or link-down notice. Time alone does not drop it.
 
 A punch path stays up for 30 seconds after its probe answer when the send is fast, and for 10 seconds when the send is cellphone. App packets do not move that deadline. When it passes, the next send uses the relay. A later punch answer starts the deadline again. A notify drops either path immediately.
-
-## Later: device status
-
-Do this after the direct-path work above is finished. pNet should be able to say whether a device is reachable. An app send stays fire-and-forget. The status is separate from that send.
-
-A time-to-live does not mean the other machine is off. It means the last proof is old, so the next app packet uses the relay. That packet does not, by itself, start a new check.
-
-A LAN path stays up until an address-change or link-down notice. It does not expire just because time passed. A punch path keeps a short deadline, because the mapping can die while both machines are still on.
-
-Reachability is a probe answer. After a quiet period, or after a punch deadline, the next send starts that probe again. No answer means pNet marks the device unreachable. An answer marks it reachable and starts the direct path again when the grade wants one. A powered-off machine sends no notice, so this missed answer is the only signal. The app is not told unless it asks pNet for the status.

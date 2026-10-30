@@ -2,7 +2,7 @@
 
 This document describes how two pNet nodes communicate with each other directly — distinct from how apps communicate with their local pNet node.
 
-A later direct UDP path beside the SG relay (LAN, then hole punch, with app grades) is specified in `descriptions/direct-path.md`. The session opcodes and the relay below stay the path that works before that probe is up. Device reachability, learned from a missed probe rather than from an idle timer, is the follow-on in that same note.
+A later direct UDP path beside the SG relay (LAN, then hole punch, with app grades) is specified in `descriptions/direct-path.md`. The session opcodes and the relay below stay the path that works before that probe is up.
 
 ## Platform contract: IPv4 only (v1)
 
