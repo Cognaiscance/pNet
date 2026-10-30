@@ -384,12 +384,7 @@ pub fn punch_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let mut peer = [0u8; 16];
     peer.copy_from_slice(&buf[..16]);
     if let Ok(mut book) = ctx.direct_book.lock() {
-        book.accept_punch_ack(
-            &peer,
-            src,
-            std::time::Instant::now(),
-            crate::direct_path::probe_ttl(false),
-        );
+        book.accept_punch_ack(&peer, src, std::time::Instant::now());
     }
 }
 
@@ -442,12 +437,7 @@ pub fn lan_probe_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let mut peer = [0u8; 16];
     peer.copy_from_slice(&buf[..16]);
     if let Ok(mut book) = ctx.direct_book.lock() {
-        book.accept_lan_ack(
-            &peer,
-            src,
-            std::time::Instant::now(),
-            crate::direct_path::probe_ttl(false),
-        );
+        book.accept_lan_ack(&peer, src);
     }
 }
 

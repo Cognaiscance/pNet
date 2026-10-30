@@ -25,8 +25,10 @@ pub struct PeerPath {
     pub observed: SocketAddr,
     pub changes: Vec<Instant>,
     pub unstable: bool,
-    pub lan_up_until: Option<Instant>,
-    pub punch_up_until: Option<Instant>,
+    pub lan_up: bool,
+    /// When the punch probe was answered. Fast stays up 30s from this instant.
+    /// Cellphone stays up 10s. Absent means the punch is down.
+    pub punch_answered_at: Option<Instant>,
     pub lan_probe_sent: bool,
     pub punch_probe_sent: bool,
 }
@@ -76,8 +78,8 @@ impl DirectBook {
                         observed: addr,
                         changes: Vec::new(),
                         unstable: false,
-                        lan_up_until: None,
-                        punch_up_until: None,
+                        lan_up: false,
+                        punch_answered_at: None,
                         lan_probe_sent: false,
                         punch_probe_sent: false,
                     },
@@ -92,8 +94,8 @@ impl DirectBook {
                     peer.changes.drain(0..peer.changes.len() - 3);
                 }
                 // A new address drops any direct path that was aimed at the old one.
-                peer.lan_up_until = None;
-                peer.punch_up_until = None;
+                peer.lan_up = false;
+                peer.punch_answered_at = None;
                 peer.lan_probe_sent = false;
                 peer.punch_probe_sent = false;
                 let next = unstable_window(&peer.changes, now);
@@ -361,24 +363,16 @@ fn private_block(o: [u8; 4]) -> Option<u8> {
 impl DirectBook {
     /// Start a LAN probe when both observed addresses share a private range.
     /// Returns false when the ranges do not match. Does not mark the path up.
-    pub fn begin_lan_probe(
-        &mut self,
-        device: &[u8; 16],
-        local_observed: SocketAddr,
-        now: Instant,
-    ) -> bool {
+    pub fn begin_lan_probe(&mut self, device: &[u8; 16], local_observed: SocketAddr) -> bool {
         let Some(peer) = self.peers.get_mut(device) else {
             return false;
         };
         if !same_lan(peer.observed, local_observed) {
             return false;
         }
+        // An answered LAN path stays up until a notice. Do not probe again.
         if peer.lan_probe_sent {
-            match peer.lan_up_until {
-                Some(until) if until > now => return false,
-                Some(_) => peer.lan_probe_sent = false,
-                None => return false,
-            }
+            return false;
         }
         peer.lan_probe_sent = true;
         true
@@ -399,7 +393,7 @@ impl DirectBook {
             let (Some(ours), Some(theirs)) = (ours, theirs) else {
                 continue;
             };
-            if self.begin_lan_probe(&id, ours, Instant::now()) {
+            if self.begin_lan_probe(&id, ours) {
                 out.push((id, theirs));
             }
         }
@@ -407,40 +401,30 @@ impl DirectBook {
     }
 
     /// The probe answer counts only from the address we stored for that peer.
-    pub fn accept_lan_ack(
-        &mut self,
-        peer: &[u8; 16],
-        from: SocketAddr,
-        now: Instant,
-        ttl: Duration,
-    ) -> bool {
+    pub fn accept_lan_ack(&mut self, peer: &[u8; 16], from: SocketAddr) -> bool {
         let Some(expected) = self.observed(peer) else {
             return false;
         };
         if expected != from {
             return false;
         }
-        self.answer_lan(peer, now, ttl)
+        self.answer_lan(peer)
     }
 
-    /// The LAN probe was answered. The path stays down until this is called.
-    pub fn answer_lan(&mut self, device: &[u8; 16], now: Instant, ttl: Duration) -> bool {
+    /// The LAN probe was answered. The path stays up until a notice clears it.
+    pub fn answer_lan(&mut self, device: &[u8; 16]) -> bool {
         let Some(peer) = self.peers.get_mut(device) else {
             return false;
         };
         if !peer.lan_probe_sent {
             return false;
         }
-        peer.lan_up_until = Some(now + ttl);
+        peer.lan_up = true;
         true
     }
 
-    pub fn lan_is_up(&self, device: &[u8; 16], now: Instant) -> bool {
-        self.peers
-            .get(device)
-            .and_then(|p| p.lan_up_until)
-            .map(|until| until > now)
-            .unwrap_or(false)
+    pub fn lan_is_up(&self, device: &[u8; 16]) -> bool {
+        self.peers.get(device).map(|p| p.lan_up).unwrap_or(false)
     }
 
     /// Ask this side to punch toward `peer_public`. The path stays down
@@ -481,38 +465,33 @@ impl DirectBook {
         Some((addr_a, addr_b))
     }
 
-    pub fn accept_punch_ack(
-        &mut self,
-        peer: &[u8; 16],
-        from: SocketAddr,
-        now: Instant,
-        ttl: Duration,
-    ) -> bool {
+    pub fn accept_punch_ack(&mut self, peer: &[u8; 16], from: SocketAddr, now: Instant) -> bool {
         let Some(expected) = self.observed(peer) else {
             return false;
         };
         if expected != from {
             return false;
         }
-        self.answer_punch(peer, now, ttl)
+        self.answer_punch(peer, now)
     }
 
-    pub fn answer_punch(&mut self, device: &[u8; 16], now: Instant, ttl: Duration) -> bool {
+    /// A punch answer starts the short deadline. App traffic does not refresh it.
+    pub fn answer_punch(&mut self, device: &[u8; 16], now: Instant) -> bool {
         let Some(peer) = self.peers.get_mut(device) else {
             return false;
         };
         if !peer.punch_probe_sent {
             return false;
         }
-        peer.punch_up_until = Some(now + ttl);
+        peer.punch_answered_at = Some(now);
         true
     }
 
-    pub fn punch_is_up(&self, device: &[u8; 16], now: Instant) -> bool {
+    pub fn punch_is_up(&self, device: &[u8; 16], now: Instant, cellphone: bool) -> bool {
         self.peers
             .get(device)
-            .and_then(|p| p.punch_up_until)
-            .map(|until| until > now)
+            .and_then(|p| p.punch_answered_at)
+            .map(|at| now.saturating_duration_since(at) < probe_ttl(cellphone))
             .unwrap_or(false)
     }
 
@@ -524,8 +503,8 @@ impl DirectBook {
 
     pub fn drop_direct(&mut self, device: &[u8; 16]) {
         if let Some(peer) = self.peers.get_mut(device) {
-            peer.lan_up_until = None;
-            peer.punch_up_until = None;
+            peer.lan_up = false;
+            peer.punch_answered_at = None;
             peer.lan_probe_sent = false;
             peer.punch_probe_sent = false;
         }
@@ -585,17 +564,17 @@ mod tests {
         let other: SocketAddr = "10.1.1.5:7777".parse().unwrap();
         let public: SocketAddr = "203.0.113.8:7777".parse().unwrap();
         book.note_observed(dev, lan_a, t0);
-        assert!(book.begin_lan_probe(&dev, lan_b, t0));
-        assert!(!book.lan_is_up(&dev, t0));
-        assert!(book.answer_lan(&dev, t0, Duration::from_secs(30)));
-        assert!(book.lan_is_up(&dev, t0));
+        assert!(book.begin_lan_probe(&dev, lan_b));
+        assert!(!book.lan_is_up(&dev));
+        assert!(book.answer_lan(&dev));
+        assert!(book.lan_is_up(&dev));
 
         book.note_observed(dev, other, t0);
-        assert!(!book.begin_lan_probe(&dev, lan_b, t0));
-        assert!(!book.lan_is_up(&dev, t0));
+        assert!(!book.begin_lan_probe(&dev, lan_b));
+        assert!(!book.lan_is_up(&dev));
 
         book.note_observed(dev, public, t0);
-        assert!(!book.begin_lan_probe(&dev, lan_b, t0));
+        assert!(!book.begin_lan_probe(&dev, lan_b));
         assert!(!same_lan(public, lan_b));
         assert!(same_lan(lan_a, lan_b));
     }
@@ -633,13 +612,37 @@ mod tests {
         let right = encode_punch_invite(public_b).unwrap();
         assert_ne!(left, right);
         assert!(book.begin_punch(&dev, public_b));
-        assert!(!book.punch_is_up(&dev, t0));
-        assert!(book.answer_punch(&dev, t0, Duration::from_secs(30)));
-        assert!(book.punch_is_up(&dev, t0));
+        assert!(!book.punch_is_up(&dev, t0, false));
+        assert!(book.answer_punch(&dev, t0));
+        assert!(book.punch_is_up(&dev, t0, false));
 
         book.note_observed(dev, lan, t0);
         assert!(!book.begin_punch(&dev, "192.168.0.8:7777".parse().unwrap()));
-        assert!(!book.punch_is_up(&dev, t0));
+        assert!(!book.punch_is_up(&dev, t0, false));
+    }
+
+    #[test]
+    fn punch_expires_sooner_for_cellphone_and_lan_does_not_expire() {
+        let mut book = DirectBook::new();
+        let dev = [5u8; 16];
+        let t0 = Instant::now();
+        let public_a: SocketAddr = "198.51.100.4:7777".parse().unwrap();
+        let public_b: SocketAddr = "198.51.100.9:7777".parse().unwrap();
+        book.note_observed(dev, public_a, t0);
+        assert!(book.begin_punch(&dev, public_b));
+        assert!(book.answer_punch(&dev, t0));
+        assert!(book.punch_is_up(&dev, t0 + Duration::from_secs(9), true));
+        assert!(!book.punch_is_up(&dev, t0 + Duration::from_secs(10), true));
+        assert!(book.punch_is_up(&dev, t0 + Duration::from_secs(29), false));
+        assert!(!book.punch_is_up(&dev, t0 + Duration::from_secs(30), false));
+
+        let lan_a: SocketAddr = "10.0.0.2:7777".parse().unwrap();
+        let lan_b: SocketAddr = "10.0.0.3:7777".parse().unwrap();
+        book.note_observed(dev, lan_a, t0);
+        assert!(book.begin_lan_probe(&dev, lan_b));
+        assert!(book.answer_lan(&dev));
+        assert!(book.lan_is_up(&dev));
+        assert!(!book.begin_lan_probe(&dev, lan_b));
     }
 
     #[test]
@@ -688,20 +691,16 @@ mod tests {
         let lan_a: SocketAddr = "10.0.0.2:7777".parse().unwrap();
         let lan_b: SocketAddr = "10.0.0.3:7777".parse().unwrap();
         book.note_observed(dev, lan_a, t0);
-        assert!(book.begin_lan_probe(&dev, lan_b, t0));
-        assert!(book.answer_lan(&dev, t0, Duration::from_secs(30)));
-        let later = t0 + Duration::from_secs(31);
-        assert!(!book.lan_is_up(&dev, later));
+        assert!(book.begin_lan_probe(&dev, lan_b));
+        assert!(book.answer_lan(&dev));
+        assert!(book.lan_is_up(&dev));
         assert_eq!(
-            choose_path(Grade::Fast, book.lan_is_up(&dev, later), false, false),
-            PathChoice::Sg
+            choose_path(Grade::Fast, book.lan_is_up(&dev), false, false),
+            PathChoice::Lan
         );
 
-        assert!(book.begin_lan_probe(&dev, lan_b, later));
-        assert!(book.answer_lan(&dev, t0, Duration::from_secs(30)));
-        assert!(book.lan_is_up(&dev, t0 + Duration::from_secs(5)));
         book.note_peer_down(&dev);
-        assert!(!book.lan_is_up(&dev, t0 + Duration::from_secs(5)));
+        assert!(!book.lan_is_up(&dev));
         assert_eq!(
             choose_path(Grade::Fast, false, false, false),
             PathChoice::Sg
@@ -825,11 +824,11 @@ mod tests {
         book.note_observed(peer, theirs, t0);
         assert_eq!(book.lan_probes_due(&local), vec![(peer, theirs)]);
         assert!(book.lan_probes_due(&local).is_empty());
-        assert!(!book.lan_is_up(&peer, t0));
-        assert!(!book.accept_lan_ack(&peer, other, t0, Duration::from_secs(30)));
-        assert!(!book.lan_is_up(&peer, t0));
-        assert!(book.accept_lan_ack(&peer, theirs, t0, Duration::from_secs(30)));
-        assert!(book.lan_is_up(&peer, t0));
+        assert!(!book.lan_is_up(&peer));
+        assert!(!book.accept_lan_ack(&peer, other));
+        assert!(!book.lan_is_up(&peer));
+        assert!(book.accept_lan_ack(&peer, theirs));
+        assert!(book.lan_is_up(&peer));
     }
 
     #[test]

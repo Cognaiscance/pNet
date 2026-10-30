@@ -606,8 +606,8 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
     if let Some((pkt, mut dest)) = out {
         if let Ok(book) = ctx.direct_book.lock() {
             let now = std::time::Instant::now();
-            let lan = book.lan_is_up(&dest_device_uuid, now);
-            let punch = book.punch_is_up(&dest_device_uuid, now);
+            let lan = book.lan_is_up(&dest_device_uuid);
+            let punch = book.punch_is_up(&dest_device_uuid, now, grade.cellphone());
             let unstable = book.is_unstable(&dest_device_uuid);
             let choice = crate::direct_path::choose_path(grade, lan, punch, unstable);
             if matches!(

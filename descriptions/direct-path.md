@@ -40,7 +40,9 @@ The node keeps the last three timestamps of its own address changes. Three chang
 
 ## Time-to-live
 
-A fast direct probe stays up for 30 seconds after the last answer. A cellphone probe stays up for 10 seconds. A later answer refreshes the deadline. A notify of address change or link down drops the path immediately.
+A LAN path stays up after its probe answer until an address-change or link-down notice. Time alone does not drop it.
+
+A punch path stays up for 30 seconds after its probe answer when the send is fast, and for 10 seconds when the send is cellphone. App packets do not move that deadline. When it passes, the next send uses the relay. A later punch answer starts the deadline again. A notify drops either path immediately.
 
 ## Later: device status
 
