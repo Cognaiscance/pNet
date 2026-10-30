@@ -35,7 +35,10 @@ pub struct PeerPath {
 #[derive(Debug, Default)]
 pub struct DirectBook {
     peers: HashMap<[u8; 16], PeerPath>,
+    // Filled in when a node records its own address changes (later step).
+    #[allow(dead_code)]
     self_unstable: bool,
+    #[allow(dead_code)]
     self_changes: Vec<Instant>,
 }
 
@@ -118,6 +121,72 @@ pub fn decode_observation(body: &[u8]) -> Option<([u8; 16], SocketAddr)> {
 }
 
 /// How long a direct probe stays up after the last answer.
+/// Both addresses are private and sit in the same RFC1918 block.
+pub fn same_lan(a: SocketAddr, b: SocketAddr) -> bool {
+    let (Some(ao), Some(bo)) = (v4_octets(a), v4_octets(b)) else {
+        return false;
+    };
+    match (private_block(ao), private_block(bo)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn v4_octets(addr: SocketAddr) -> Option<[u8; 4]> {
+    match addr {
+        SocketAddr::V4(v) => Some(v.ip().octets()),
+        SocketAddr::V6(_) => None,
+    }
+}
+
+/// 1 = 10/8, 2 = 172.16/12, 3 = 192.168/16.
+fn private_block(o: [u8; 4]) -> Option<u8> {
+    if o[0] == 10 {
+        Some(1)
+    } else if o[0] == 172 && (o[1] & 0xf0) == 16 {
+        Some(2)
+    } else if o[0] == 192 && o[1] == 168 {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+impl DirectBook {
+    /// Start a LAN probe when both observed addresses share a private range.
+    /// Returns false when the ranges do not match. Does not mark the path up.
+    pub fn begin_lan_probe(&mut self, device: &[u8; 16], local_observed: SocketAddr) -> bool {
+        let Some(peer) = self.peers.get_mut(device) else {
+            return false;
+        };
+        if !same_lan(peer.observed, local_observed) {
+            return false;
+        }
+        peer.lan_probe_sent = true;
+        true
+    }
+
+    /// The LAN probe was answered. The path stays down until this is called.
+    pub fn answer_lan(&mut self, device: &[u8; 16], now: Instant, ttl: Duration) -> bool {
+        let Some(peer) = self.peers.get_mut(device) else {
+            return false;
+        };
+        if !peer.lan_probe_sent {
+            return false;
+        }
+        peer.lan_up_until = Some(now + ttl);
+        true
+    }
+
+    pub fn lan_is_up(&self, device: &[u8; 16], now: Instant) -> bool {
+        self.peers
+            .get(device)
+            .and_then(|p| p.lan_up_until)
+            .map(|until| until > now)
+            .unwrap_or(false)
+    }
+}
+
 pub fn probe_ttl(cellphone: bool) -> Duration {
     if cellphone {
         Duration::from_secs(10)
@@ -147,6 +216,31 @@ mod tests {
         assert_eq!(book.note_observed(dev, addr(2), t0), Observe::Replaced);
         assert_eq!(book.observed(&dev), Some(addr(2)));
         assert_eq!(book.peer(&dev).unwrap().changes.len(), 2);
+    }
+
+    #[test]
+    fn lan_probe_only_when_ranges_match() {
+        let mut book = DirectBook::new();
+        let dev = [1u8; 16];
+        let t0 = Instant::now();
+        let lan_a: SocketAddr = "192.168.1.10:7777".parse().unwrap();
+        let lan_b: SocketAddr = "192.168.1.20:7777".parse().unwrap();
+        let other: SocketAddr = "10.1.1.5:7777".parse().unwrap();
+        let public: SocketAddr = "203.0.113.8:7777".parse().unwrap();
+        book.note_observed(dev, lan_a, t0);
+        assert!(book.begin_lan_probe(&dev, lan_b));
+        assert!(!book.lan_is_up(&dev, t0));
+        assert!(book.answer_lan(&dev, t0, Duration::from_secs(30)));
+        assert!(book.lan_is_up(&dev, t0));
+
+        book.note_observed(dev, other, t0);
+        assert!(!book.begin_lan_probe(&dev, lan_b));
+        assert!(!book.lan_is_up(&dev, t0));
+
+        book.note_observed(dev, public, t0);
+        assert!(!book.begin_lan_probe(&dev, lan_b));
+        assert!(!same_lan(public, lan_b));
+        assert!(same_lan(lan_a, lan_b));
     }
 
     #[test]
