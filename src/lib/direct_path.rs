@@ -35,11 +35,21 @@ pub struct PeerPath {
 #[derive(Debug, Default)]
 pub struct DirectBook {
     peers: HashMap<[u8; 16], PeerPath>,
-    // Filled in when a node records its own address changes (later step).
-    #[allow(dead_code)]
     self_unstable: bool,
-    #[allow(dead_code)]
     self_changes: Vec<Instant>,
+}
+
+const UNSTABLE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Three address changes inside five minutes, and the newest still inside
+/// that window, marks the node unstable.
+pub fn unstable_window(stamps: &[Instant], now: Instant) -> bool {
+    if stamps.len() < 3 {
+        return false;
+    }
+    let last = &stamps[stamps.len() - 3..];
+    now.saturating_duration_since(last[0]) <= UNSTABLE_WINDOW
+        && now.saturating_duration_since(last[2]) <= UNSTABLE_WINDOW
 }
 
 impl DirectBook {
@@ -56,7 +66,7 @@ impl DirectBook {
                     device,
                     PeerPath {
                         observed: addr,
-                        changes: vec![now],
+                        changes: Vec::new(),
                         unstable: false,
                         lan_up_until: None,
                         punch_up_until: None,
@@ -78,8 +88,31 @@ impl DirectBook {
                 peer.punch_up_until = None;
                 peer.lan_probe_sent = false;
                 peer.punch_probe_sent = false;
+                peer.unstable = unstable_window(&peer.changes, now);
                 Observe::Replaced
             }
+        }
+    }
+
+    /// This node's own address moved. Returns whether it is now unstable.
+    pub fn note_self_change(&mut self, now: Instant) -> bool {
+        self.self_changes.push(now);
+        if self.self_changes.len() > 3 {
+            self.self_changes.drain(0..self.self_changes.len() - 3);
+        }
+        self.self_unstable = unstable_window(&self.self_changes, now);
+        self.self_unstable
+    }
+
+    pub fn self_unstable(&self) -> bool {
+        self.self_unstable
+    }
+
+    /// Five-minute maintenance. Clears the flag when the window no longer holds.
+    pub fn sweep_unstable(&mut self, now: Instant) {
+        self.self_unstable = unstable_window(&self.self_changes, now);
+        for peer in self.peers.values_mut() {
+            peer.unstable = unstable_window(&peer.changes, now);
         }
     }
 
@@ -330,10 +363,10 @@ mod tests {
         assert_eq!(book.note_observed(dev, addr(1), t0), Observe::New);
         assert_eq!(book.observed(&dev), Some(addr(1)));
         assert_eq!(book.note_observed(dev, addr(1), t0), Observe::Same);
-        assert_eq!(book.peer(&dev).unwrap().changes.len(), 1);
+        assert!(book.peer(&dev).unwrap().changes.is_empty());
         assert_eq!(book.note_observed(dev, addr(2), t0), Observe::Replaced);
         assert_eq!(book.observed(&dev), Some(addr(2)));
-        assert_eq!(book.peer(&dev).unwrap().changes.len(), 2);
+        assert_eq!(book.peer(&dev).unwrap().changes.len(), 1);
     }
 
     #[test]
@@ -381,6 +414,36 @@ mod tests {
         book.note_observed(dev, lan, t0);
         assert!(!book.begin_punch(&dev, "192.168.0.8:7777".parse().unwrap()));
         assert!(!book.punch_is_up(&dev, t0));
+    }
+
+    #[test]
+    fn three_changes_in_five_minutes_marks_unstable_and_a_quiet_window_clears_it() {
+        let mut book = DirectBook::new();
+        let t0 = Instant::now();
+        assert!(!book.note_self_change(t0));
+        assert!(!book.note_self_change(t0 + Duration::from_secs(10)));
+        assert!(book.note_self_change(t0 + Duration::from_secs(20)));
+        assert!(book.self_unstable());
+        // Fast may still use a direct path. Cellphone may not.
+        assert_eq!(
+            choose_path(Grade::Fast, true, false, book.self_unstable()),
+            PathChoice::Lan
+        );
+        assert_eq!(
+            choose_path(Grade::Cellphone, true, false, true),
+            PathChoice::Sg
+        );
+        book.sweep_unstable(t0 + Duration::from_secs(5 * 60 + 1));
+        assert!(!book.self_unstable());
+
+        let dev = [8u8; 16];
+        let a = addr(1);
+        book.note_observed(dev, a, t0);
+        book.note_observed(dev, addr(2), t0);
+        book.note_observed(dev, addr(3), t0 + Duration::from_secs(1));
+        assert!(!book.peer(&dev).unwrap().unstable);
+        book.note_observed(dev, addr(4), t0 + Duration::from_secs(2));
+        assert!(book.peer(&dev).unwrap().unstable);
     }
 
     #[test]

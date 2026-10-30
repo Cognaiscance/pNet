@@ -429,6 +429,9 @@ fn update_rank1_failover_flag(ctx: &WorkerContext) {
 /// Triggered at startup and then every MAINTAIN_CONNECTIONS_INTERVAL.
 pub fn maintain_connections(ctx: &WorkerContext) {
     let now = SystemTime::now();
+    if let Ok(mut book) = ctx.direct_book.lock() {
+        book.sweep_unstable(std::time::Instant::now());
+    }
 
     // ── Evict PendingConnections whose ConnectAck never arrived ───────────────
     // A silent rejection on the SG side (e.g. a ConnectRequest that lost the
