@@ -102,6 +102,9 @@ pub(crate) const PUNCH_INVITE_OP: u8 = 0x19;
 pub(crate) const PUNCH_OP: u8 = 0x1A;
 /// Answer to a hole punch. Body is the answering device uuid.
 pub(crate) const PUNCH_ACK_OP: u8 = 0x1B;
+/// Direct paths for this device are down now. Body: device uuid (16) || fan (1).
+/// `fan` is 0 when the receiver should tell peers, 1 when it should only drop.
+pub(crate) const PATH_DOWN_OP: u8 = 0x1C;
 pub(crate) const APP_PACKET_OP: u8 = 0x41;
 
 pub(crate) const TUNNEL_INIT_OP: u8 = 0x50;

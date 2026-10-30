@@ -281,6 +281,24 @@ pub(crate) fn find_pull_source(node: &Node) -> WriterTarget {
     WriterTarget::Unreachable
 }
 
+/// Lowest `sg_rank` among the SGs of the user who owns `device`, connected or not.
+pub(crate) fn rank1_sg_uuid(node: &Node, device: &Uuid) -> Option<Uuid> {
+    let devices = if node.owner.user.devices.iter().any(|d| d.uuid == *device) {
+        &node.owner.user.devices
+    } else {
+        node.owner
+            .contact_users
+            .iter()
+            .find(|c| c.user.devices.iter().any(|d| d.uuid == *device))
+            .map(|c| &c.user.devices)?
+    };
+    devices
+        .iter()
+        .filter(|d| matches!(d.grade, DeviceGrade::SG))
+        .min_by_key(|d| d.sg_rank.unwrap_or(u32::MAX))
+        .map(|d| d.uuid)
+}
+
 /// Return the UUID of the highest-ranked SG that owns `dest_device_uuid` and
 /// currently has an active connection on this node.  Returns `None` if no
 /// ranked SG with an active connection is found.

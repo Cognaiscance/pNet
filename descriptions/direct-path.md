@@ -8,7 +8,7 @@ App bytes still have a path through a server-grade node. This note adds a second
 
 A UDP send means the local stack accepted the datagram. It does not mean the peer received it. Each direct path has its own probe and probe answer. The path is up only after the answer. It goes cold when the next answer is late. A cold path is dropped. The next app packet uses the SG, and that packet may start a new direct attempt.
 
-When a node's own address changes, or a link goes down, that node tells its rank-1 SG in the same turn. The rank-1 SG tells the peer. Both drop the direct path without waiting for the probe time-to-live. After that down period, the next packet through the SG may try the direct path again.
+When a node's own address changes, or a direct send fails, that node tells its rank-1 SG in the same turn with op `0x1C`. The rank-1 SG tells the other connected peers. Each receiver drops the LAN path and the punch path for that device without waiting for the probe time-to-live. The app packet still uses the relay. After that down period, the next packet through the SG may try the direct path again.
 
 Apps are not asked to report receipt. The node probes.
 

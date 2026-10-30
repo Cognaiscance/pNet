@@ -99,14 +99,101 @@ pub fn observed_addr(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     };
     let local = ctx.node.read().unwrap().device_uuid;
-    let due = {
+    let (observed, due) = {
         let Ok(mut book) = ctx.direct_book.lock() else {
             return;
         };
-        book.note_observed(device, addr, std::time::Instant::now());
-        book.lan_probes_due(&local)
+        let observed = book.note_observed(device, addr, std::time::Instant::now());
+        let due = book.lan_probes_due(&local);
+        (observed, due)
     };
+    if matches!(observed, crate::direct_path::Observe::Replaced) {
+        if device == local {
+            if let Ok(mut book) = ctx.direct_book.lock() {
+                book.note_self_change(std::time::Instant::now());
+            }
+        }
+        announce_path_down(ctx, device);
+    }
     send_lan_probes(ctx, local, &due);
+}
+
+/// Tell rank-1, or the other peers when this node is rank-1, that `device`
+/// has no direct path. The app relay is unchanged.
+fn announce_path_down(ctx: &WorkerContext, device: [u8; 16]) {
+    if let Ok(mut book) = ctx.direct_book.lock() {
+        book.note_peer_down(&device);
+    }
+    let packets = {
+        let node = ctx.node.read().unwrap();
+        let local = node.device_uuid;
+        let rank1 = routing::rank1_sg_uuid(&node, &device);
+        let we_are_rank1 = rank1 == Some(local) || rank1.is_none();
+        let connected: Vec<[u8; 16]> = node
+            .owner
+            .active_connections
+            .values()
+            .map(|c| c.device_uuid)
+            .collect();
+        let targets = crate::direct_path::path_down_recipients(
+            local,
+            device,
+            we_are_rank1,
+            rank1,
+            &connected,
+        );
+        let mut body = [0u8; 17];
+        body[..16].copy_from_slice(&device);
+        body[16] = if we_are_rank1 { 1 } else { 0 };
+        let mut out = Vec::new();
+        for id in targets {
+            let Some(conn) = node
+                .owner
+                .active_connections
+                .values()
+                .find(|c| c.device_uuid == id)
+            else {
+                continue;
+            };
+            out.push((
+                conn.peer_addr,
+                build_encrypted_packet(PATH_DOWN_OP, conn, &body),
+            ));
+        }
+        out
+    };
+    for (addr, pkt) in packets {
+        send(ctx, addr, &pkt);
+    }
+}
+
+pub fn path_down(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let plain = {
+        let node = ctx.node.read().unwrap();
+        decrypt_packet_body(&node, PATH_DOWN_OP, &buf)
+    };
+    let Some(plain) = plain else {
+        eprintln!("[path_down] decryption failed from {src}");
+        return;
+    };
+    if plain.len() < 17 {
+        return;
+    }
+    let mut device = [0u8; 16];
+    device.copy_from_slice(&plain[..16]);
+    if let Ok(mut book) = ctx.direct_book.lock() {
+        book.note_peer_down(&device);
+    }
+    if plain[16] == 0 {
+        let we_are_rank1 = {
+            let node = ctx.node.read().unwrap();
+            let rank1 = routing::rank1_sg_uuid(&node, &device);
+            rank1 == Some(node.device_uuid) || rank1.is_none()
+        };
+        if we_are_rank1 {
+            announce_path_down(ctx, device);
+        }
+    }
 }
 
 fn send_lan_probes(ctx: &WorkerContext, local: [u8; 16], due: &[([u8; 16], SocketAddr)]) {
@@ -114,7 +201,9 @@ fn send_lan_probes(ctx: &WorkerContext, local: [u8; 16], due: &[([u8; 16], Socke
         let mut pkt = Vec::with_capacity(17);
         pkt.push(LAN_PROBE_OP);
         pkt.extend_from_slice(&local);
-        send(ctx, *addr, &pkt);
+        if ctx.udp_socket.send_to(&pkt, *addr).is_err() {
+            announce_path_down(ctx, local);
+        }
     }
 }
 
@@ -180,7 +269,9 @@ pub fn punch_invite(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let mut pkt = Vec::with_capacity(17);
         pkt.push(PUNCH_OP);
         pkt.extend_from_slice(&local);
-        send(ctx, addr, &pkt);
+        if ctx.udp_socket.send_to(&pkt, addr).is_err() {
+            announce_path_down(ctx, local);
+        }
     }
 }
 
@@ -615,12 +706,11 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // after the app packet, so a peer still reads the app datagram first.
     let tell_observation = sender_uuid.and_then(|sender| {
         ctx.direct_book.lock().ok().map(|mut book| {
+            let observed = book.note_observed(sender, src, std::time::Instant::now());
             (
                 sender,
-                !matches!(
-                    book.note_observed(sender, src, std::time::Instant::now()),
-                    crate::direct_path::Observe::Same
-                ),
+                !matches!(observed, crate::direct_path::Observe::Same),
+                matches!(observed, crate::direct_path::Observe::Replaced),
             )
         })
     });
@@ -641,8 +731,11 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         push.extend_from_slice(&sender_app_id);
         push.extend_from_slice(&payload);
         send(ctx, SocketAddr::V4(app_host), &push);
-        if let Some((sender, true)) = tell_observation {
+        if let Some((sender, true, _)) = tell_observation {
             share_observation(ctx, sender, dest_device_uuid, src);
+        }
+        if let Some((sender, _, true)) = tell_observation {
+            announce_path_down(ctx, sender);
         }
         if let Some(sender) = sender_uuid {
             share_punch_invites(ctx, sender, dest_device_uuid);
@@ -672,8 +765,11 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     };
 
     send(ctx, dest, &pkt);
-    if let Some((sender, true)) = tell_observation {
+    if let Some((sender, true, _)) = tell_observation {
         share_observation(ctx, sender, dest_device_uuid, src);
+    }
+    if let Some((sender, _, true)) = tell_observation {
+        announce_path_down(ctx, sender);
     }
     if let Some(sender) = sender_uuid {
         share_punch_invites(ctx, sender, dest_device_uuid);

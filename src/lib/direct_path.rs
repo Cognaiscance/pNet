@@ -139,6 +139,28 @@ impl DirectBook {
     }
 }
 
+/// Who hears that `down` lost its direct path.
+/// A node that is not rank-1 tells rank-1. Rank-1 tells every other connected peer.
+pub fn path_down_recipients(
+    local: [u8; 16],
+    down: [u8; 16],
+    we_are_rank1: bool,
+    rank1: Option<[u8; 16]>,
+    connected: &[[u8; 16]],
+) -> Vec<[u8; 16]> {
+    if !we_are_rank1 {
+        return match rank1 {
+            Some(rank1) if rank1 != local && rank1 != down => vec![rank1],
+            _ => Vec::new(),
+        };
+    }
+    connected
+        .iter()
+        .copied()
+        .filter(|id| *id != local && *id != down)
+        .collect()
+}
+
 /// Who should be told about an address the local node just observed.
 /// The destination hears it once. The sender hears the address the SG saw
 /// for them, so they can compare ranges. The sender's rank-1 SG hears it
@@ -688,6 +710,23 @@ mod tests {
             choose_path(Grade::Cellphone, true, false, false),
             PathChoice::Lan
         );
+    }
+
+    #[test]
+    fn path_down_goes_to_rank1_then_the_other_peers() {
+        let local = [1u8; 16];
+        let down = [2u8; 16];
+        let rank1 = [3u8; 16];
+        let peer = [4u8; 16];
+        assert_eq!(
+            path_down_recipients(local, down, false, Some(rank1), &[rank1, peer]),
+            vec![rank1]
+        );
+        assert_eq!(
+            path_down_recipients(rank1, down, true, Some(rank1), &[local, down, peer]),
+            vec![local, peer]
+        );
+        assert!(path_down_recipients(local, down, false, None, &[peer]).is_empty());
     }
 
     #[test]

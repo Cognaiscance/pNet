@@ -114,6 +114,7 @@ pub enum Action {
     PunchInvite        { src: SocketAddr, buf: Vec<u8> },
     PunchPacket        { src: SocketAddr, buf: Vec<u8> },
     PunchAck           { src: SocketAddr, buf: Vec<u8> },
+    PathDown           { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
     // Tunnel
@@ -231,6 +232,7 @@ impl Action {
             Action::PunchInvite { .. } => "PunchInvite",
             Action::PunchPacket { .. } => "PunchPacket",
             Action::PunchAck { .. } => "PunchAck",
+            Action::PathDown { .. } => "PathDown",
             Action::AppPacket { .. } => "AppPacket",
             Action::TunnelInit { .. } => "TunnelInit",
             Action::TunnelForward { .. } => "TunnelForward",
@@ -294,6 +296,7 @@ impl Action {
             Action::PunchInvite        { src, buf }   => handlers::punch_invite(src, buf, ctx),
             Action::PunchPacket        { src, buf }   => handlers::punch_packet(src, buf, ctx),
             Action::PunchAck           { src, buf }   => handlers::punch_ack(src, buf, ctx),
+            Action::PathDown           { src, buf }   => handlers::path_down(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
             Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),
             Action::TunnelForward        { src, buf } => handlers::tunnel_forward(src, buf, ctx),
