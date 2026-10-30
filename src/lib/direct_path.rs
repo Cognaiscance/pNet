@@ -233,6 +233,59 @@ impl DirectBook {
             .map(|until| until > now)
             .unwrap_or(false)
     }
+
+    /// Ask this side to punch toward `peer_public`. The path stays down
+    /// until `answer_punch`. A LAN that already matches is not a punch.
+    pub fn begin_punch(&mut self, device: &[u8; 16], local_observed: SocketAddr) -> bool {
+        let Some(peer) = self.peers.get_mut(device) else {
+            return false;
+        };
+        if same_lan(peer.observed, local_observed) {
+            return false;
+        }
+        peer.punch_probe_sent = true;
+        true
+    }
+
+    pub fn answer_punch(&mut self, device: &[u8; 16], now: Instant, ttl: Duration) -> bool {
+        let Some(peer) = self.peers.get_mut(device) else {
+            return false;
+        };
+        if !peer.punch_probe_sent {
+            return false;
+        }
+        peer.punch_up_until = Some(now + ttl);
+        true
+    }
+
+    pub fn punch_is_up(&self, device: &[u8; 16], now: Instant) -> bool {
+        self.peers
+            .get(device)
+            .and_then(|p| p.punch_up_until)
+            .map(|until| until > now)
+            .unwrap_or(false)
+    }
+
+    pub fn drop_direct(&mut self, device: &[u8; 16]) {
+        if let Some(peer) = self.peers.get_mut(device) {
+            peer.lan_up_until = None;
+            peer.punch_up_until = None;
+            peer.lan_probe_sent = false;
+            peer.punch_probe_sent = false;
+        }
+    }
+}
+
+/// One instruction the SG sends to each side: the other side's observed
+/// IPv4 address. 6 bytes, ipv4 || port.
+pub fn encode_punch_invite(peer_public: SocketAddr) -> Option<[u8; 6]> {
+    let SocketAddr::V4(v4) = peer_public else {
+        return None;
+    };
+    let mut out = [0u8; 6];
+    out[..4].copy_from_slice(&v4.ip().octets());
+    out[4..6].copy_from_slice(&v4.port().to_be_bytes());
+    Some(out)
 }
 
 pub fn probe_ttl(cellphone: bool) -> Duration {
@@ -289,6 +342,28 @@ mod tests {
         assert!(!book.begin_lan_probe(&dev, lan_b));
         assert!(!same_lan(public, lan_b));
         assert!(same_lan(lan_a, lan_b));
+    }
+
+    #[test]
+    fn punch_stays_down_until_answered() {
+        let mut book = DirectBook::new();
+        let dev = [2u8; 16];
+        let t0 = Instant::now();
+        let public_a: SocketAddr = "198.51.100.4:7777".parse().unwrap();
+        let public_b: SocketAddr = "198.51.100.9:7777".parse().unwrap();
+        let lan: SocketAddr = "192.168.0.4:7777".parse().unwrap();
+        book.note_observed(dev, public_a, t0);
+        let left = encode_punch_invite(public_a).unwrap();
+        let right = encode_punch_invite(public_b).unwrap();
+        assert_ne!(left, right);
+        assert!(book.begin_punch(&dev, public_b));
+        assert!(!book.punch_is_up(&dev, t0));
+        assert!(book.answer_punch(&dev, t0, Duration::from_secs(30)));
+        assert!(book.punch_is_up(&dev, t0));
+
+        book.note_observed(dev, lan, t0);
+        assert!(!book.begin_punch(&dev, "192.168.0.8:7777".parse().unwrap()));
+        assert!(!book.punch_is_up(&dev, t0));
     }
 
     #[test]
