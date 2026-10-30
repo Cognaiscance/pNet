@@ -92,6 +92,10 @@ pub(crate) const RELAY_PACKET_OP: u8 = 0x40;
 /// SG tells a peer the UDP address it observed for a device.
 /// Session plaintext is 22 bytes: device uuid || ipv4 || port.
 pub(crate) const OBSERVED_ADDR_OP: u8 = 0x16;
+/// Direct LAN probe. Body is the sender device uuid, 16 bytes. Not a session packet.
+pub(crate) const LAN_PROBE_OP: u8 = 0x17;
+/// Answer to a LAN probe. Body is the answering device uuid, 16 bytes.
+pub(crate) const LAN_PROBE_ACK_OP: u8 = 0x18;
 pub(crate) const APP_PACKET_OP: u8 = 0x41;
 
 pub(crate) const TUNNEL_INIT_OP: u8 = 0x50;

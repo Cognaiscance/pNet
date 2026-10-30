@@ -109,6 +109,8 @@ pub enum Action {
     MergeAck                 { src: SocketAddr, buf: Vec<u8> },
     RelayPacket        { src: SocketAddr, buf: Vec<u8> },
     ObservedAddr       { src: SocketAddr, buf: Vec<u8> },
+    LanProbe           { src: SocketAddr, buf: Vec<u8> },
+    LanProbeAck        { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
     // Tunnel
@@ -221,6 +223,8 @@ impl Action {
             Action::MergeAck { .. } => "MergeAck",
             Action::RelayPacket { .. } => "RelayPacket",
             Action::ObservedAddr { .. } => "ObservedAddr",
+            Action::LanProbe { .. } => "LanProbe",
+            Action::LanProbeAck { .. } => "LanProbeAck",
             Action::AppPacket { .. } => "AppPacket",
             Action::TunnelInit { .. } => "TunnelInit",
             Action::TunnelForward { .. } => "TunnelForward",
@@ -279,6 +283,8 @@ impl Action {
             Action::MergeAck                 { src, buf } => handlers::merge_ack(src, buf, ctx),
             Action::RelayPacket        { src, buf }   => handlers::relay_packet(src, buf, ctx),
             Action::ObservedAddr       { src, buf }   => handlers::observed_addr(src, buf, ctx),
+            Action::LanProbe           { src, buf }   => handlers::lan_probe(src, buf, ctx),
+            Action::LanProbeAck        { src, buf }   => handlers::lan_probe_ack(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
             Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),
             Action::TunnelForward        { src, buf } => handlers::tunnel_forward(src, buf, ctx),

@@ -59,7 +59,8 @@ fn share_observation(
         let node = ctx.node.read().unwrap();
         let local = node.device_uuid;
         let rank1 = routing::top_ranked_sg_for_device(&node, &sender).map(|c| c.device_uuid);
-        let recipients = crate::direct_path::observation_recipients(local, dest_device, rank1);
+        let recipients =
+            crate::direct_path::observation_recipients(local, sender, dest_device, rank1);
         let mut out = Vec::new();
         for id in recipients {
             let Some(conn) = node
@@ -97,8 +98,81 @@ pub fn observed_addr(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         eprintln!("[observed_addr] short body from {src}");
         return;
     };
-    if let Ok(mut book) = ctx.direct_book.lock() {
+    let local = ctx.node.read().unwrap().device_uuid;
+    let due = {
+        let Ok(mut book) = ctx.direct_book.lock() else {
+            return;
+        };
         book.note_observed(device, addr, std::time::Instant::now());
+        book.lan_probes_due(&local)
+    };
+    send_lan_probes(ctx, local, &due);
+}
+
+fn send_lan_probes(ctx: &WorkerContext, local: [u8; 16], due: &[([u8; 16], SocketAddr)]) {
+    for (_peer, addr) in due {
+        let mut pkt = Vec::with_capacity(17);
+        pkt.push(LAN_PROBE_OP);
+        pkt.extend_from_slice(&local);
+        send(ctx, *addr, &pkt);
+    }
+}
+
+/// Op 0x17 — a LAN probe. Answer it when the source is on our private range.
+/// The path stays down until our own probe is answered.
+pub fn lan_probe(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 16 {
+        return;
+    }
+    let local = ctx.node.read().unwrap().device_uuid;
+    let acceptable = {
+        let Ok(book) = ctx.direct_book.lock() else {
+            return;
+        };
+        match book.observed(&local) {
+            Some(ours) => crate::direct_path::same_lan(ours, src),
+            None => crate::direct_path::is_private(src),
+        }
+    };
+    if !acceptable {
+        return;
+    }
+    let mut ack = Vec::with_capacity(17);
+    ack.push(LAN_PROBE_ACK_OP);
+    ack.extend_from_slice(&local);
+    send(ctx, src, &ack);
+
+    // Their uuid is the probe body. Store that source if we did not have it,
+    // then send our own probe when the ranges match.
+    let mut peer = [0u8; 16];
+    peer.copy_from_slice(&buf[..16]);
+    let due = {
+        let Ok(mut book) = ctx.direct_book.lock() else {
+            return;
+        };
+        if book.observed(&peer).is_none() {
+            book.note_observed(peer, src, std::time::Instant::now());
+        }
+        book.lan_probes_due(&local)
+    };
+    send_lan_probes(ctx, local, &due);
+}
+
+/// Op 0x18 — the answer to our LAN probe. The path comes up only for the
+/// address we stored for that peer.
+pub fn lan_probe_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    if buf.len() < 16 {
+        return;
+    }
+    let mut peer = [0u8; 16];
+    peer.copy_from_slice(&buf[..16]);
+    if let Ok(mut book) = ctx.direct_book.lock() {
+        book.accept_lan_ack(
+            &peer,
+            src,
+            std::time::Instant::now(),
+            crate::direct_path::probe_ttl(false),
+        );
     }
 }
 

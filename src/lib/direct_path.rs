@@ -130,19 +130,23 @@ impl DirectBook {
 }
 
 /// Who should be told about an address the local node just observed.
-/// The local node already stored it. The destination hears it once. The
-/// sender's rank-1 SG hears it when that SG is someone else.
+/// The destination hears it once. The sender hears the address the SG saw
+/// for them, so they can compare ranges. The sender's rank-1 SG hears it
+/// when that SG is someone else.
 pub fn observation_recipients(
     local: [u8; 16],
+    sender: [u8; 16],
     dest: [u8; 16],
     rank1: Option<[u8; 16]>,
 ) -> Vec<[u8; 16]> {
     let mut out = Vec::new();
-    if dest != local {
-        out.push(dest);
+    for id in [dest, sender] {
+        if id != local && !out.contains(&id) {
+            out.push(id);
+        }
     }
     if let Some(rank1) = rank1 {
-        if rank1 != local && rank1 != dest {
+        if rank1 != local && !out.contains(&rank1) {
             out.push(rank1);
         }
     }
@@ -244,6 +248,10 @@ pub fn same_lan(a: SocketAddr, b: SocketAddr) -> bool {
     }
 }
 
+pub fn is_private(addr: SocketAddr) -> bool {
+    v4_octets(addr).and_then(private_block).is_some()
+}
+
 fn v4_octets(addr: SocketAddr) -> Option<[u8; 4]> {
     match addr {
         SocketAddr::V4(v) => Some(v.ip().octets()),
@@ -267,15 +275,66 @@ fn private_block(o: [u8; 4]) -> Option<u8> {
 impl DirectBook {
     /// Start a LAN probe when both observed addresses share a private range.
     /// Returns false when the ranges do not match. Does not mark the path up.
-    pub fn begin_lan_probe(&mut self, device: &[u8; 16], local_observed: SocketAddr) -> bool {
+    pub fn begin_lan_probe(
+        &mut self,
+        device: &[u8; 16],
+        local_observed: SocketAddr,
+        now: Instant,
+    ) -> bool {
         let Some(peer) = self.peers.get_mut(device) else {
             return false;
         };
         if !same_lan(peer.observed, local_observed) {
             return false;
         }
+        if peer.lan_probe_sent {
+            match peer.lan_up_until {
+                Some(until) if until > now => return false,
+                Some(_) => peer.lan_probe_sent = false,
+                None => return false,
+            }
+        }
         peer.lan_probe_sent = true;
         true
+    }
+
+    /// Peers that should be probed now. A peer already probed is skipped.
+    pub fn lan_probes_due(&mut self, local: &[u8; 16]) -> Vec<([u8; 16], SocketAddr)> {
+        let ids: Vec<[u8; 16]> = self
+            .peers
+            .keys()
+            .copied()
+            .filter(|id| id != local)
+            .collect();
+        let mut out = Vec::new();
+        for id in ids {
+            let ours = self.observed(local);
+            let theirs = self.observed(&id);
+            let (Some(ours), Some(theirs)) = (ours, theirs) else {
+                continue;
+            };
+            if self.begin_lan_probe(&id, ours, Instant::now()) {
+                out.push((id, theirs));
+            }
+        }
+        out
+    }
+
+    /// The probe answer counts only from the address we stored for that peer.
+    pub fn accept_lan_ack(
+        &mut self,
+        peer: &[u8; 16],
+        from: SocketAddr,
+        now: Instant,
+        ttl: Duration,
+    ) -> bool {
+        let Some(expected) = self.observed(peer) else {
+            return false;
+        };
+        if expected != from {
+            return false;
+        }
+        self.answer_lan(peer, now, ttl)
     }
 
     /// The LAN probe was answered. The path stays down until this is called.
@@ -399,17 +458,17 @@ mod tests {
         let other: SocketAddr = "10.1.1.5:7777".parse().unwrap();
         let public: SocketAddr = "203.0.113.8:7777".parse().unwrap();
         book.note_observed(dev, lan_a, t0);
-        assert!(book.begin_lan_probe(&dev, lan_b));
+        assert!(book.begin_lan_probe(&dev, lan_b, t0));
         assert!(!book.lan_is_up(&dev, t0));
         assert!(book.answer_lan(&dev, t0, Duration::from_secs(30)));
         assert!(book.lan_is_up(&dev, t0));
 
         book.note_observed(dev, other, t0);
-        assert!(!book.begin_lan_probe(&dev, lan_b));
+        assert!(!book.begin_lan_probe(&dev, lan_b, t0));
         assert!(!book.lan_is_up(&dev, t0));
 
         book.note_observed(dev, public, t0);
-        assert!(!book.begin_lan_probe(&dev, lan_b));
+        assert!(!book.begin_lan_probe(&dev, lan_b, t0));
         assert!(!same_lan(public, lan_b));
         assert!(same_lan(lan_a, lan_b));
     }
@@ -474,7 +533,7 @@ mod tests {
         let lan_a: SocketAddr = "10.0.0.2:7777".parse().unwrap();
         let lan_b: SocketAddr = "10.0.0.3:7777".parse().unwrap();
         book.note_observed(dev, lan_a, t0);
-        assert!(book.begin_lan_probe(&dev, lan_b));
+        assert!(book.begin_lan_probe(&dev, lan_b, t0));
         assert!(book.answer_lan(&dev, t0, Duration::from_secs(30)));
         let later = t0 + Duration::from_secs(31);
         assert!(!book.lan_is_up(&dev, later));
@@ -483,7 +542,7 @@ mod tests {
             PathChoice::Sg
         );
 
-        assert!(book.begin_lan_probe(&dev, lan_b));
+        assert!(book.begin_lan_probe(&dev, lan_b, later));
         assert!(book.answer_lan(&dev, t0, Duration::from_secs(30)));
         assert!(book.lan_is_up(&dev, t0 + Duration::from_secs(5)));
         book.note_peer_down(&dev);
@@ -565,20 +624,40 @@ mod tests {
         let local = [1u8; 16];
         let dest = [2u8; 16];
         let rank1 = [3u8; 16];
+        let sender = [4u8; 16];
         assert_eq!(
-            observation_recipients(local, dest, Some(rank1)),
+            observation_recipients(local, sender, dest, Some(rank1)),
+            vec![dest, sender, rank1]
+        );
+        assert_eq!(
+            observation_recipients(local, sender, dest, Some(dest)),
+            vec![dest, sender]
+        );
+        assert_eq!(
+            observation_recipients(local, dest, local, Some(rank1)),
             vec![dest, rank1]
         );
-        assert_eq!(
-            observation_recipients(local, dest, Some(dest)),
-            vec![dest]
-        );
-        assert_eq!(
-            observation_recipients(local, local, Some(rank1)),
-            vec![rank1]
-        );
-        assert!(observation_recipients(local, local, Some(local)).is_empty());
-        assert_eq!(observation_recipients(local, dest, None), vec![dest]);
+        assert!(observation_recipients(local, local, local, Some(local)).is_empty());
+    }
+
+    #[test]
+    fn lan_probe_is_sent_once_and_ack_must_come_from_that_address() {
+        let mut book = DirectBook::new();
+        let local = [1u8; 16];
+        let peer = [2u8; 16];
+        let t0 = Instant::now();
+        let mine: SocketAddr = "192.168.1.10:7777".parse().unwrap();
+        let theirs: SocketAddr = "192.168.1.20:7777".parse().unwrap();
+        let other: SocketAddr = "10.1.0.5:7777".parse().unwrap();
+        book.note_observed(local, mine, t0);
+        book.note_observed(peer, theirs, t0);
+        assert_eq!(book.lan_probes_due(&local), vec![(peer, theirs)]);
+        assert!(book.lan_probes_due(&local).is_empty());
+        assert!(!book.lan_is_up(&peer, t0));
+        assert!(!book.accept_lan_ack(&peer, other, t0, Duration::from_secs(30)));
+        assert!(!book.lan_is_up(&peer, t0));
+        assert!(book.accept_lan_ack(&peer, theirs, t0, Duration::from_secs(30)));
+        assert!(book.lan_is_up(&peer, t0));
     }
 
     #[test]

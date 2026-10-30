@@ -15,7 +15,7 @@ Apps are not asked to report receipt. The node probes.
 ## Path order
 
 1. The first app packet for a peer goes through the SG. The SG stores the UDP source address it saw for the sender. When that address is new or has changed, it sends the observation on the existing session to the destination and, when that is a different node, to the sender's rank-1 SG. A repeat of the same address is not sent again. The app packet still uses the relay.
-2. On a later packet, if both observed addresses are private and in the same range, each side sends a LAN probe. The app packet still goes through the SG until the probe is answered.
+2. On a later packet, if both observed addresses are private and in the same range, each side sends a LAN probe (op `0x17`) to the other's observed address and answers with op `0x18`. The sender is also told the address the SG saw, so it can make that comparison. The path is up only after the answer comes from that stored address. Until then the app packet still goes through the SG. A second probe is not sent while one is outstanding.
 3. After the LAN answer, a grade that wants speed sends on the LAN.
 4. If the ranges do not match, or the LAN probe is not answered, the app packet stays on the SG. The SG tells both sides the other's observed address and both send a hole-punch datagram.
 5. After the punch answer, speed-seeking packets use the punch. If the punch is not answered, packets stay on the SG.
