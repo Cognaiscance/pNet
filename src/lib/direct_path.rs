@@ -120,6 +120,54 @@ pub fn decode_observation(body: &[u8]) -> Option<([u8; 16], SocketAddr)> {
     Some((device, SocketAddr::from((ip, port))))
 }
 
+/// Where the next app packet goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathChoice {
+    Sg,
+    Lan,
+    Punch,
+}
+
+/// Grade an app names on send. Missing and unknown bytes are stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grade {
+    Stable,
+    Fast,
+    Cellphone,
+}
+
+impl Grade {
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            1 => Grade::Fast,
+            2 => Grade::Cellphone,
+            _ => Grade::Stable,
+        }
+    }
+
+    pub fn cellphone(self) -> bool {
+        matches!(self, Grade::Cellphone)
+    }
+}
+
+/// Pick a path. Stable never leaves the SG. Fast and cellphone use LAN when
+/// the probe is up. Punch is chosen only in a later step, when LAN is down.
+pub fn choose_path(grade: Grade, lan_up: bool, punch_up: bool, peer_unstable: bool) -> PathChoice {
+    if matches!(grade, Grade::Stable) {
+        return PathChoice::Sg;
+    }
+    if grade.cellphone() && peer_unstable {
+        return PathChoice::Sg;
+    }
+    if lan_up {
+        PathChoice::Lan
+    } else if punch_up {
+        PathChoice::Punch
+    } else {
+        PathChoice::Sg
+    }
+}
+
 /// How long a direct probe stays up after the last answer.
 /// Both addresses are private and sit in the same RFC1918 block.
 pub fn same_lan(a: SocketAddr, b: SocketAddr) -> bool {
@@ -241,6 +289,26 @@ mod tests {
         assert!(!book.begin_lan_probe(&dev, lan_b));
         assert!(!same_lan(public, lan_b));
         assert!(same_lan(lan_a, lan_b));
+    }
+
+    #[test]
+    fn lan_is_chosen_only_when_up_and_stable_stays_on_sg() {
+        assert_eq!(
+            choose_path(Grade::Fast, true, false, false),
+            PathChoice::Lan
+        );
+        assert_eq!(
+            choose_path(Grade::Fast, false, false, false),
+            PathChoice::Sg
+        );
+        assert_eq!(
+            choose_path(Grade::Stable, true, true, false),
+            PathChoice::Sg
+        );
+        assert_eq!(
+            choose_path(Grade::Cellphone, true, false, false),
+            PathChoice::Lan
+        );
     }
 
     #[test]
