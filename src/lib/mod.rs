@@ -6,6 +6,7 @@ pub mod app_web;
 pub mod certs;
 pub mod crypto;
 pub mod data_models;
+pub mod direct_path;
 pub mod keystore;
 pub mod dns_cache;
 /// Wire-format fuzz entry points and mutational campaign (§8.2).

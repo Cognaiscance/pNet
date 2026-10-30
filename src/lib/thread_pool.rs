@@ -110,6 +110,9 @@ mod tests {
                 super::super::dns_cache::DnsCache::new(),
             )),
             app_web: Arc::new(super::super::app_web::AppWebRegistry::new()),
+            direct_book: Arc::new(std::sync::Mutex::new(
+                super::super::direct_path::DirectBook::new(),
+            )),
         })
     }
 

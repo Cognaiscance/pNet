@@ -87,6 +87,8 @@ pub(crate) const GENERATE_INVITATION_REQUEST_OP: u8 = 0x35;
 pub(crate) const GENERATE_INVITATION_RESPONSE_OP: u8 = 0x36;
 
 pub(crate) const RELAY_PACKET_OP: u8 = 0x40;
+/// SG tells a peer the UDP address it observed for a device. Plain body, 22 bytes.
+pub(crate) const OBSERVED_ADDR_OP: u8 = 0x16;
 pub(crate) const APP_PACKET_OP: u8 = 0x41;
 
 pub(crate) const TUNNEL_INIT_OP: u8 = 0x50;

@@ -2762,6 +2762,7 @@ mod policy_ui_tests {
             app_rate_limits: Arc::new(std::sync::Mutex::new(crate::app_api::AppRateLimiter::new())),
             dns_cache: Arc::new(std::sync::Mutex::new(crate::dns_cache::DnsCache::new())),
             app_web: Arc::new(crate::app_web::AppWebRegistry::new()),
+            direct_book: Arc::new(std::sync::Mutex::new(crate::direct_path::DirectBook::new())),
         };
         (ctx, contact)
     }

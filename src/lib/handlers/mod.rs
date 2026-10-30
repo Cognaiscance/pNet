@@ -336,6 +336,14 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         None
     };
 
+    // The address on the datagram is what the SG actually saw. Recording it
+    // does not change which path carries the app bytes.
+    if let Some(sender) = sender_uuid {
+        if let Ok(mut book) = ctx.direct_book.lock() {
+            book.note_observed(sender, src, std::time::Instant::now());
+        }
+    }
+
     // Decrypt and parse the body into owned values so we can branch on dest after
     // releasing the lock.
     let (local_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload) = {
@@ -527,6 +535,9 @@ mod tests {
                     super::super::dns_cache::DnsCache::new(),
                 )),
                 app_web: Arc::new(super::super::app_web::AppWebRegistry::new()),
+                direct_book: Arc::new(std::sync::Mutex::new(
+                    super::super::direct_path::DirectBook::new(),
+                )),
             };
             TestCtx { ctx, app_socket, _writer_rx, _sched_rx }
         }

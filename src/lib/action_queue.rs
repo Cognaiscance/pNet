@@ -160,6 +160,8 @@ pub struct WorkerContext {
     pub dns_cache: Arc<std::sync::Mutex<super::dns_cache::DnsCache>>,
     /// Portal app web mounts (`/apps/<slug>/` → loopback). Node-local.
     pub app_web: Arc<super::app_web::AppWebRegistry>,
+    /// Observed peer addresses and direct-path probe state. Not persisted.
+    pub direct_book: Arc<std::sync::Mutex<super::direct_path::DirectBook>>,
 }
 
 impl WorkerContext {
