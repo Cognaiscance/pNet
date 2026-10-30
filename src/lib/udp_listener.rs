@@ -14,7 +14,8 @@ use super::wire::{
     CONTACT_REQUEST_OP, CONTACT_RESPONSE_OP, CONN_RESET_OP, CROSS_USER_PULL_REQUEST_OP,
     CROSS_USER_PULL_RESPONSE_OP, CROSS_USER_UPDATE_AVAILABLE_OP, DEVICE_REGISTER_OP,
     DG_KEEPALIVE_OP, GENERATE_INVITATION_REQUEST_OP, GENERATE_INVITATION_RESPONSE_OP,
-    MERGE_ACK_OP, MERGE_PROPOSAL_OP, RELAY_PACKET_OP, SG_PING_OP, SYNC_PULL_REQUEST_OP,
+    MERGE_ACK_OP, MERGE_PROPOSAL_OP, OBSERVED_ADDR_OP, RELAY_PACKET_OP, SG_PING_OP,
+    SYNC_PULL_REQUEST_OP,
     SYNC_PULL_RESPONSE_OP, SYNC_UPDATE_AVAILABLE_OP, SYNC_WRITE_ACK_OP, SYNC_WRITE_REQUEST_OP,
     TUNNEL_CONNECT_ACK_OP, TUNNEL_CONNECT_REQUEST_OP, TUNNEL_DELIVERY_OP, TUNNEL_FORWARD_OP,
     TUNNEL_INIT_OP, WATERMARK_PROBE_REQUEST_OP, WATERMARK_PROBE_RESPONSE_OP,
@@ -145,6 +146,7 @@ impl UdpListener {
                     WATERMARK_PROBE_RESPONSE_OP => {
                         Action::WatermarkProbeResponse { src, buf: payload }
                     }
+                    OBSERVED_ADDR_OP => Action::ObservedAddr { src, buf: payload },
                     RELAY_PACKET_OP => Action::RelayPacket { src, buf: payload },
                     APP_PACKET_OP => Action::AppPacket { src, buf: payload },
                     TUNNEL_INIT_OP => Action::TunnelInit { src, buf: payload },
@@ -212,6 +214,7 @@ mod tests {
             (0x32, |a| matches!(a, Action::DeviceRegistration { .. })),
             (0x35, |a| matches!(a, Action::GenerateInvitationRequest  { .. })),
             (0x36, |a| matches!(a, Action::GenerateInvitationResponse { .. })),
+            (0x16, |a| matches!(a, Action::ObservedAddr          { .. })),
             (0x70, |a| matches!(a, Action::SyncWriteRequest      { .. })),
             (0x71, |a| matches!(a, Action::SyncWriteAck          { .. })),
             (0x72, |a| matches!(a, Action::SyncUpdateAvailable   { .. })),

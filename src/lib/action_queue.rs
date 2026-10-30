@@ -108,6 +108,7 @@ pub enum Action {
     MergeProposal            { src: SocketAddr, buf: Vec<u8> },
     MergeAck                 { src: SocketAddr, buf: Vec<u8> },
     RelayPacket        { src: SocketAddr, buf: Vec<u8> },
+    ObservedAddr       { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
     // Tunnel
@@ -219,6 +220,7 @@ impl Action {
             Action::MergeProposal { .. } => "MergeProposal",
             Action::MergeAck { .. } => "MergeAck",
             Action::RelayPacket { .. } => "RelayPacket",
+            Action::ObservedAddr { .. } => "ObservedAddr",
             Action::AppPacket { .. } => "AppPacket",
             Action::TunnelInit { .. } => "TunnelInit",
             Action::TunnelForward { .. } => "TunnelForward",
@@ -276,6 +278,7 @@ impl Action {
             Action::MergeProposal            { src, buf } => handlers::merge_proposal(src, buf, ctx),
             Action::MergeAck                 { src, buf } => handlers::merge_ack(src, buf, ctx),
             Action::RelayPacket        { src, buf }   => handlers::relay_packet(src, buf, ctx),
+            Action::ObservedAddr       { src, buf }   => handlers::observed_addr(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
             Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),
             Action::TunnelForward        { src, buf } => handlers::tunnel_forward(src, buf, ctx),

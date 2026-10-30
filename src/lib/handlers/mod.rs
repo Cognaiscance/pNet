@@ -44,6 +44,64 @@ fn send_error(ctx: &WorkerContext, dest: SocketAddr, code: u8) {
     send(ctx, dest, &[STATUS_ERR, code]);
 }
 
+/// Encrypt one observed-address notice to each recipient that has a session.
+/// App bytes are not in this packet.
+fn share_observation(
+    ctx: &WorkerContext,
+    sender: [u8; 16],
+    dest_device: [u8; 16],
+    observed: SocketAddr,
+) {
+    let Some(body) = crate::direct_path::encode_observation(&sender, observed) else {
+        return;
+    };
+    let packets: Vec<(SocketAddr, Vec<u8>)> = {
+        let node = ctx.node.read().unwrap();
+        let local = node.device_uuid;
+        let rank1 = routing::top_ranked_sg_for_device(&node, &sender).map(|c| c.device_uuid);
+        let recipients = crate::direct_path::observation_recipients(local, dest_device, rank1);
+        let mut out = Vec::new();
+        for id in recipients {
+            let Some(conn) = node
+                .owner
+                .active_connections
+                .values()
+                .find(|c| c.device_uuid == id)
+            else {
+                continue;
+            };
+            out.push((
+                conn.peer_addr,
+                build_encrypted_packet(OBSERVED_ADDR_OP, conn, &body),
+            ));
+        }
+        out
+    };
+    for (addr, pkt) in packets {
+        send(ctx, addr, &pkt);
+    }
+}
+
+/// Op 0x16 — a peer reports the UDP address an SG saw for a device.
+/// The body is stored. No app packet is forwarded.
+pub fn observed_addr(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let plain = {
+        let node = ctx.node.read().unwrap();
+        decrypt_packet_body(&node, OBSERVED_ADDR_OP, &buf)
+    };
+    let Some(plain) = plain else {
+        eprintln!("[observed_addr] decryption failed from {src}");
+        return;
+    };
+    let Some((device, addr)) = crate::direct_path::decode_observation(&plain) else {
+        eprintln!("[observed_addr] short body from {src}");
+        return;
+    };
+    if let Ok(mut book) = ctx.direct_book.lock() {
+        book.note_observed(device, addr, std::time::Instant::now());
+    }
+}
+
 /// Structured fabric ops log (§6.2). Greppable: `[fabric] event=<name> k=v …`.
 /// Values with spaces or `=` are double-quoted; quotes inside are escaped.
 pub(crate) fn fabric_event(event: &str, fields: &[(&str, &str)]) {
@@ -336,14 +394,6 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         None
     };
 
-    // The address on the datagram is what the SG actually saw. Recording it
-    // does not change which path carries the app bytes.
-    if let Some(sender) = sender_uuid {
-        if let Ok(mut book) = ctx.direct_book.lock() {
-            book.note_observed(sender, src, std::time::Instant::now());
-        }
-    }
-
     // Decrypt and parse the body into owned values so we can branch on dest after
     // releasing the lock.
     let (local_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload) = {
@@ -390,6 +440,20 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
 
+    // Record the address the SG saw. A new or changed address is reported
+    // after the app packet, so a peer still reads the app datagram first.
+    let tell_observation = sender_uuid.and_then(|sender| {
+        ctx.direct_book.lock().ok().map(|mut book| {
+            (
+                sender,
+                !matches!(
+                    book.note_observed(sender, src, std::time::Instant::now()),
+                    crate::direct_path::Observe::Same
+                ),
+            )
+        })
+    });
+
     // If the destination is this device (i.e. the SG is both relay and recipient),
     // deliver directly to the local app without going through active_connections.
     if dest_device_uuid == local_uuid {
@@ -406,6 +470,9 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         push.extend_from_slice(&sender_app_id);
         push.extend_from_slice(&payload);
         send(ctx, SocketAddr::V4(app_host), &push);
+        if let Some((sender, true)) = tell_observation {
+            share_observation(ctx, sender, dest_device_uuid, src);
+        }
         return;
     }
 
@@ -431,6 +498,9 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     };
 
     send(ctx, dest, &pkt);
+    if let Some((sender, true)) = tell_observation {
+        share_observation(ctx, sender, dest_device_uuid, src);
+    }
 
     // Tunnel threshold: count relay packets per (sender, dest) pair on this SG.
     // Once the threshold is reached within the window, schedule tunnel setup.

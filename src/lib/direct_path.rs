@@ -129,6 +129,26 @@ impl DirectBook {
     }
 }
 
+/// Who should be told about an address the local node just observed.
+/// The local node already stored it. The destination hears it once. The
+/// sender's rank-1 SG hears it when that SG is someone else.
+pub fn observation_recipients(
+    local: [u8; 16],
+    dest: [u8; 16],
+    rank1: Option<[u8; 16]>,
+) -> Vec<[u8; 16]> {
+    let mut out = Vec::new();
+    if dest != local {
+        out.push(dest);
+    }
+    if let Some(rank1) = rank1 {
+        if rank1 != local && rank1 != dest {
+            out.push(rank1);
+        }
+    }
+    out
+}
+
 /// Body an SG sends so the other side learns `{device}` was seen at `addr`.
 /// Layout: device uuid (16) || ipv4 (4) || port (2). 22 bytes.
 pub fn encode_observation(device: &[u8; 16], addr: SocketAddr) -> Option<[u8; 22]> {
@@ -538,6 +558,27 @@ mod tests {
             choose_path(Grade::Cellphone, true, false, false),
             PathChoice::Lan
         );
+    }
+
+    #[test]
+    fn observation_goes_to_dest_and_rank1_once_each() {
+        let local = [1u8; 16];
+        let dest = [2u8; 16];
+        let rank1 = [3u8; 16];
+        assert_eq!(
+            observation_recipients(local, dest, Some(rank1)),
+            vec![dest, rank1]
+        );
+        assert_eq!(
+            observation_recipients(local, dest, Some(dest)),
+            vec![dest]
+        );
+        assert_eq!(
+            observation_recipients(local, local, Some(rank1)),
+            vec![rank1]
+        );
+        assert!(observation_recipients(local, local, Some(local)).is_empty());
+        assert_eq!(observation_recipients(local, dest, None), vec![dest]);
     }
 
     #[test]
