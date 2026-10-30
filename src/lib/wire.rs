@@ -65,6 +65,8 @@ pub(crate) const APP_REGISTER_OP: u8 = 0x00;
 pub(crate) const APP_UPDATE_OP: u8 = 0x01;
 pub(crate) const APP_GET_DATA_OP: u8 = 0x02;
 pub(crate) const APP_SEND_PACKET_OP: u8 = 0x03;
+/// Same body as op 0x03, plus one grade byte before the payload.
+pub(crate) const APP_SEND_GRADED_OP: u8 = 0x09;
 pub(crate) const APP_PUSH_OP: u8 = 0x04;
 
 // ── Peer fabric op bytes ──────────────────────────────────────────────────────

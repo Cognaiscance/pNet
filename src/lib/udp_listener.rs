@@ -8,7 +8,8 @@ use super::action_queue::{Action, PRIORITY_HIGH};
 use super::app_api::app_api_source_allowed;
 use super::thread_pool::SharedQueue;
 use super::wire::{
-    slice_arr, APP_GET_DATA_OP, APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_PACKET_OP, APP_UPDATE_OP,
+    slice_arr, APP_GET_DATA_OP, APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_GRADED_OP,
+    APP_SEND_PACKET_OP, APP_UPDATE_OP,
     BOOTSTRAP_REQUEST_OP, BOOTSTRAP_RESPONSE_OP, CONNECT_ACK_OP, CONNECT_REQUEST_OP,
     CONTACT_REQUEST_OP, CONTACT_RESPONSE_OP, CONN_RESET_OP, CROSS_USER_PULL_REQUEST_OP,
     CROSS_USER_PULL_RESPONSE_OP, CROSS_USER_UPDATE_AVAILABLE_OP, DEVICE_REGISTER_OP,
@@ -76,7 +77,11 @@ impl UdpListener {
                 // Opt in with PNET_APP_API_REMOTE=1 (e.g. Docker sidecar apps).
                 let is_app_api = matches!(
                     op,
-                    APP_REGISTER_OP | APP_UPDATE_OP | APP_GET_DATA_OP | APP_SEND_PACKET_OP
+                    APP_REGISTER_OP
+                        | APP_UPDATE_OP
+                        | APP_GET_DATA_OP
+                        | APP_SEND_PACKET_OP
+                        | APP_SEND_GRADED_OP
                 );
                 if is_app_api && !app_api_source_allowed(src) {
                     eprintln!(
@@ -90,7 +95,8 @@ impl UdpListener {
                     APP_REGISTER_OP => Action::AppRegister { src, buf: payload },
                     APP_UPDATE_OP => Action::AppUpdate { src, buf: payload },
                     APP_GET_DATA_OP => Action::AppGetData { src, buf: payload },
-                    APP_SEND_PACKET_OP => Action::AppSendPacket { src, buf: payload },
+                    APP_SEND_PACKET_OP => Action::AppSendPacket { src, buf: payload, graded: false },
+                    APP_SEND_GRADED_OP => Action::AppSendPacket { src, buf: payload, graded: true },
                     SG_PING_OP => {
                         let Some(nonce) = slice_arr::<16>(&payload, 0) else {
                             eprintln!("[udp] sg_ping too short from {src}");
@@ -197,6 +203,7 @@ mod tests {
             (0x01, |a| matches!(a, Action::AppUpdate        { .. })),
             (0x02, |a| matches!(a, Action::AppGetData       { .. })),
             (0x03, |a| matches!(a, Action::AppSendPacket    { .. })),
+            (0x09, |a| matches!(a, Action::AppSendPacket    { .. })),
             (0x10, |a| matches!(a, Action::SgPing           { .. })),
             (0x20, |a| matches!(a, Action::ConnectRequest   { .. })),
             (0x21, |a| matches!(a, Action::ConnectAck       { .. })),

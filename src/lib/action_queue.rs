@@ -60,7 +60,7 @@ pub enum Action {
     AppRegister   { src: SocketAddr, buf: Vec<u8> },
     AppUpdate     { src: SocketAddr, buf: Vec<u8> },
     AppGetData    { src: SocketAddr, buf: Vec<u8> },
-    AppSendPacket { src: SocketAddr, buf: Vec<u8> },
+    AppSendPacket { src: SocketAddr, buf: Vec<u8>, graded: bool },
 
     // From HTTP UI
     UiRequest {
@@ -241,7 +241,9 @@ impl Action {
             Action::AppRegister   { src, buf } => handlers::app_register(src, buf, ctx),
             Action::AppUpdate     { src, buf } => handlers::app_update(src, buf, ctx),
             Action::AppGetData    { src, buf } => handlers::app_get_data(src, buf, ctx),
-            Action::AppSendPacket { src, buf } => handlers::app_send_packet(src, buf, ctx),
+            Action::AppSendPacket { src, buf, graded } => {
+                handlers::app_send_packet(src, buf, graded, ctx)
+            }
             Action::UiRequest {
                 stream, method, path, query, cookie, host, origin, referer, body,
             } => {

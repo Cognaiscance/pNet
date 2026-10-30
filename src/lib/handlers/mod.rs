@@ -820,7 +820,7 @@ mod tests {
     #[test]
     fn app_send_packet_rejects_bad_packet() {
         let t = TestCtx::new();
-        app_send_packet(t.app_addr(), vec![0u8; 10], &t.ctx);
+        app_send_packet(t.app_addr(), vec![0u8; 10], false, &t.ctx);
         let reply = t.recv_reply();
         assert_eq!(reply, vec![STATUS_ERR, ERR_BAD_PACKET]);
     }
@@ -832,7 +832,7 @@ mod tests {
         app_send_packet(
             t.app_addr(),
             send_packet(&[0xFFu8; 16], dest, dest, b"hi"),
-            &t.ctx,
+            false, &t.ctx,
         );
         let reply = t.recv_reply();
         assert_eq!(reply, vec![STATUS_ERR, ERR_TOKEN_UNKNOWN]);
@@ -847,7 +847,7 @@ mod tests {
         app_send_packet(
             t.app_addr(),
             send_packet(&token, dest, dest, b"hi"),
-            &t.ctx,
+            false, &t.ctx,
         );
         let reply = t.recv_reply();
         assert_eq!(reply, vec![STATUS_ERR, ERR_NOT_APPROVED]);
@@ -864,7 +864,7 @@ mod tests {
         app_send_packet(
             t.app_addr(),
             send_packet(&token, dest_device, dest_app, b"hi"),
-            &t.ctx,
+            false, &t.ctx,
         );
         let reply = t.recv_reply();
         assert_eq!(reply, vec![STATUS_ERR, ERR_NO_ROUTE]);
@@ -880,7 +880,7 @@ mod tests {
         app_send_packet(
             t.app_addr(),
             send_packet(&token, dest, dest, &oversized),
-            &t.ctx,
+            false, &t.ctx,
         );
         let reply = t.recv_reply();
         assert_eq!(reply, vec![STATUS_ERR, ERR_PAYLOAD_TOO_LARGE]);
@@ -959,7 +959,7 @@ mod tests {
         app_send_packet(
             t.app_addr(),
             send_packet(&token, dest_device, dest_app, b"via-tunnel"),
-            &t.ctx,
+            false, &t.ctx,
         );
         let mut buf = [0u8; 512];
         let (n, _) = capture.recv_from(&mut buf).expect("tunnel path should send to SG");
@@ -983,7 +983,7 @@ mod tests {
         app_send_packet(
             t.app_addr(),
             send_packet(&token, dest_device, dest_app, b"via-relay"),
-            &t.ctx,
+            false, &t.ctx,
         );
         let (n2, _) = capture
             .recv_from(&mut buf)
@@ -1045,7 +1045,7 @@ mod tests {
         app_send_packet(
             t.app_addr(),
             send_packet(&token, dest_device, dest_app, b"relay"),
-            &t.ctx,
+            false, &t.ctx,
         );
         let mut buf = [0u8; 512];
         let (n, _) = capture.recv_from(&mut buf).expect("relay send");
@@ -7557,6 +7557,7 @@ mod tests {
         app_send_packet(
             a.app_addr(),
             send_packet(&a_token, b_uuid, b_app_id, b"hello-fabric"),
+            false,
             &a.ctx,
         );
         let (n, _) = b

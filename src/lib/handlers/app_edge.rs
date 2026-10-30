@@ -461,7 +461,7 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 ///   - `ERR_NO_ROUTE` (0x05) — no session to dest and no reachable SG to relay
 ///   - `ERR_PAYLOAD_TOO_LARGE` (0x06) — payload longer than `MAX_APP_PAYLOAD`
 ///   - `ERR_RATE_LIMITED` (0x07) — per-IP / per-token send rate exceeded
-pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &WorkerContext) {
     const MIN_LEN: usize = 16 + 16 + 16;
     if buf.len() < MIN_LEN {
         return send_error(ctx, src, ERR_BAD_PACKET);
@@ -476,7 +476,9 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let Some(dest_app_id) = slice_arr::<16>(&buf, 32) else {
         return send_error(ctx, src, ERR_BAD_PACKET);
     };
-    let payload = &buf[48..];
+    let Some((grade, payload)) = crate::direct_path::Grade::split_tail(&buf[48..], graded) else {
+        return send_error(ctx, src, ERR_BAD_PACKET);
+    };
 
     if !ctx
         .app_rate_limits
@@ -601,7 +603,22 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
     };
 
-    if let Some((pkt, dest)) = out {
+    if let Some((pkt, mut dest)) = out {
+        if let Ok(book) = ctx.direct_book.lock() {
+            let now = std::time::Instant::now();
+            let lan = book.lan_is_up(&dest_device_uuid, now);
+            let punch = book.punch_is_up(&dest_device_uuid, now);
+            let unstable = book.peer(&dest_device_uuid).map(|p| p.unstable).unwrap_or(false);
+            let choice = crate::direct_path::choose_path(grade, lan, punch, unstable);
+            if matches!(
+                choice,
+                crate::direct_path::PathChoice::Lan | crate::direct_path::PathChoice::Punch
+            ) {
+                if let Some(observed) = book.observed(&dest_device_uuid) {
+                    dest = observed;
+                }
+            }
+        }
         send(ctx, dest, &pkt);
     }
 }

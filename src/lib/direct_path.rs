@@ -137,12 +137,23 @@ pub enum Grade {
 }
 
 impl Grade {
+    /// `0` and any unknown byte are stable. `1` is fast. `2` is cellphone.
     pub fn from_byte(b: u8) -> Self {
         match b {
             1 => Grade::Fast,
             2 => Grade::Cellphone,
             _ => Grade::Stable,
         }
+    }
+
+    /// Historical op `0x03` has no grade byte. Op `0x09` puts one byte in
+    /// front of the payload. An empty graded tail is not a packet.
+    pub fn split_tail(tail: &[u8], explicit: bool) -> Option<(Grade, &[u8])> {
+        if !explicit {
+            return Some((Grade::Stable, tail));
+        }
+        let (b, rest) = tail.split_first()?;
+        Some((Grade::from_byte(*b), rest))
     }
 
     pub fn cellphone(self) -> bool {
@@ -364,6 +375,36 @@ mod tests {
         book.note_observed(dev, lan, t0);
         assert!(!book.begin_punch(&dev, "192.168.0.8:7777".parse().unwrap()));
         assert!(!book.punch_is_up(&dev, t0));
+    }
+
+    #[test]
+    fn missing_or_unknown_grade_is_stable() {
+        let tail = b"payload";
+        assert_eq!(
+            Grade::split_tail(tail, false).unwrap().0,
+            Grade::Stable
+        );
+        assert_eq!(Grade::split_tail(tail, false).unwrap().1, tail);
+        assert!(Grade::split_tail(&[], true).is_none());
+        let mut graded = vec![1u8];
+        graded.extend_from_slice(tail);
+        let (g, p) = Grade::split_tail(&graded, true).unwrap();
+        assert_eq!(g, Grade::Fast);
+        assert_eq!(p, tail);
+        assert_eq!(Grade::from_byte(2), Grade::Cellphone);
+        assert_eq!(Grade::from_byte(9), Grade::Stable);
+        assert_eq!(
+            choose_path(Grade::from_byte(0), true, true, false),
+            PathChoice::Sg
+        );
+        assert_eq!(
+            choose_path(Grade::Fast, true, true, false),
+            PathChoice::Lan
+        );
+        assert_eq!(
+            choose_path(Grade::Cellphone, false, true, false),
+            PathChoice::Punch
+        );
     }
 
     #[test]

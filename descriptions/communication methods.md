@@ -111,6 +111,14 @@ packet when it decrypts the delivery.
 - Payload max: see **Fabric constant: `MAX_APP_PAYLOAD`** above (same limit on
   relay / AppPacket / tunnel delivery).
 - Node routes via active DG↔DG tunnel, direct session, or SG relay as available.
+- No grade byte. The node treats the send as stable: the server-grade relay, not a LAN or hole-punch path.
+
+### 9 — application send packet with a grade
+
+- Request: `[token:16][dest_device_uuid:16][dest_app_id:16][grade:u8][payload…]`
+- Grade: `0` stable, `1` fast, `2` cellphone. Any other byte is stable. A missing grade byte is `ERR_BAD_PACKET`.
+- Same success and error replies as op 3.
+- Fast uses the LAN probe when it is up, otherwise the hole punch when that probe is up, otherwise the relay. Cellphone uses that same order unless the peer is unstable. See `descriptions/direct-path.md`.
 
 ### 4 — push to app (node → app)
 
