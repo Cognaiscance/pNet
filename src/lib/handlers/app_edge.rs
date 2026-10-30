@@ -608,7 +608,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
             let now = std::time::Instant::now();
             let lan = book.lan_is_up(&dest_device_uuid, now);
             let punch = book.punch_is_up(&dest_device_uuid, now);
-            let unstable = book.peer(&dest_device_uuid).map(|p| p.unstable).unwrap_or(false);
+            let unstable = book.is_unstable(&dest_device_uuid);
             let choice = crate::direct_path::choose_path(grade, lan, punch, unstable);
             if matches!(
                 choice,

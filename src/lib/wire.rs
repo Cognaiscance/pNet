@@ -105,6 +105,9 @@ pub(crate) const PUNCH_ACK_OP: u8 = 0x1B;
 /// Direct paths for this device are down now. Body: device uuid (16) || fan (1).
 /// `fan` is 0 when the receiver should tell peers, 1 when it should only drop.
 pub(crate) const PATH_DOWN_OP: u8 = 0x1C;
+/// A device's unstable flag. Body: device uuid (16) || flag (1) || fan (1).
+/// Flag 1 means unstable. Fan 0 asks rank-1 to tell the other peers.
+pub(crate) const UNSTABLE_OP: u8 = 0x1D;
 pub(crate) const APP_PACKET_OP: u8 = 0x41;
 
 pub(crate) const TUNNEL_INIT_OP: u8 = 0x50;

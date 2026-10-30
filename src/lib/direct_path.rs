@@ -39,6 +39,11 @@ pub struct DirectBook {
     self_changes: Vec<Instant>,
     /// Pairs already told to punch. Order-independent.
     punch_invited: HashSet<([u8; 16], [u8; 16])>,
+    /// Unstable flags to publish. The bool is the new value.
+    flag_notices: Vec<([u8; 16], bool)>,
+    self_notice: Option<bool>,
+    /// Flags learned from a peer before we have stored an address for them.
+    remote_unstable: HashSet<[u8; 16]>,
 }
 
 const UNSTABLE_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -62,6 +67,7 @@ impl DirectBook {
     /// Record the UDP source the SG saw for `device`.
     /// A repeat of the same address is not an address change.
     pub fn note_observed(&mut self, device: [u8; 16], addr: SocketAddr, now: Instant) -> Observe {
+        let mut flipped = None;
         let result = match self.peers.get_mut(&device) {
             None => {
                 self.peers.insert(
@@ -90,12 +96,19 @@ impl DirectBook {
                 peer.punch_up_until = None;
                 peer.lan_probe_sent = false;
                 peer.punch_probe_sent = false;
-                peer.unstable = unstable_window(&peer.changes, now);
+                let next = unstable_window(&peer.changes, now);
+                if next != peer.unstable {
+                    peer.unstable = next;
+                    flipped = Some(next);
+                }
                 Observe::Replaced
             }
         };
         if result == Observe::Replaced {
             self.forget_punch_pair(device);
+        }
+        if let Some(flag) = flipped {
+            self.flag_notices.push((device, flag));
         }
         result
     }
@@ -110,7 +123,11 @@ impl DirectBook {
         if self.self_changes.len() > 3 {
             self.self_changes.drain(0..self.self_changes.len() - 3);
         }
-        self.self_unstable = unstable_window(&self.self_changes, now);
+        let next = unstable_window(&self.self_changes, now);
+        if next != self.self_unstable {
+            self.self_notice = Some(next);
+        }
+        self.self_unstable = next;
         self.self_unstable
     }
 
@@ -120,10 +137,47 @@ impl DirectBook {
 
     /// Five-minute maintenance. Clears the flag when the window no longer holds.
     pub fn sweep_unstable(&mut self, now: Instant) {
-        self.self_unstable = unstable_window(&self.self_changes, now);
-        for peer in self.peers.values_mut() {
-            peer.unstable = unstable_window(&peer.changes, now);
+        let next = unstable_window(&self.self_changes, now);
+        if next != self.self_unstable {
+            self.self_unstable = next;
+            self.self_notice = Some(next);
         }
+        let mut flipped = Vec::new();
+        for (id, peer) in self.peers.iter_mut() {
+            let next = unstable_window(&peer.changes, now);
+            if next != peer.unstable {
+                peer.unstable = next;
+                flipped.push((*id, next));
+            }
+        }
+        self.flag_notices.extend(flipped);
+    }
+
+    /// Notices queued since the last take. `local` is this node's own id,
+    /// used when its own flag changed.
+    pub fn take_unstable_notices(&mut self, local: [u8; 16]) -> Vec<([u8; 16], bool)> {
+        let mut out = std::mem::take(&mut self.flag_notices);
+        if let Some(flag) = self.self_notice.take() {
+            out.push((local, flag));
+        }
+        out
+    }
+
+    /// Apply a flag learned from a peer. Does not queue another notice.
+    pub fn set_unstable(&mut self, device: [u8; 16], unstable: bool) {
+        if let Some(peer) = self.peers.get_mut(&device) {
+            peer.unstable = unstable;
+        }
+        if unstable {
+            self.remote_unstable.insert(device);
+        } else {
+            self.remote_unstable.remove(&device);
+        }
+    }
+
+    pub fn is_unstable(&self, device: &[u8; 16]) -> bool {
+        self.remote_unstable.contains(device)
+            || self.peers.get(device).map(|p| p.unstable).unwrap_or(false)
     }
 
     pub fn observed(&self, device: &[u8; 16]) -> Option<SocketAddr> {
@@ -605,8 +659,12 @@ mod tests {
             choose_path(Grade::Cellphone, true, false, true),
             PathChoice::Sg
         );
+        let local = [9u8; 16];
+        let notices = book.take_unstable_notices(local);
+        assert_eq!(notices, vec![(local, true)]);
         book.sweep_unstable(t0 + Duration::from_secs(5 * 60 + 1));
         assert!(!book.self_unstable());
+        assert_eq!(book.take_unstable_notices(local), vec![(local, false)]);
 
         let dev = [8u8; 16];
         let a = addr(1);
@@ -614,8 +672,12 @@ mod tests {
         book.note_observed(dev, addr(2), t0);
         book.note_observed(dev, addr(3), t0 + Duration::from_secs(1));
         assert!(!book.peer(&dev).unwrap().unstable);
+        assert!(book.take_unstable_notices(local).is_empty());
         book.note_observed(dev, addr(4), t0 + Duration::from_secs(2));
         assert!(book.peer(&dev).unwrap().unstable);
+        assert_eq!(book.take_unstable_notices(local), vec![(dev, true)]);
+        book.set_unstable([7u8; 16], true);
+        assert!(book.is_unstable(&[7u8; 16]));
     }
 
     #[test]

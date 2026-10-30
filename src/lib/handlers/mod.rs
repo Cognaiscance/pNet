@@ -115,11 +115,98 @@ pub fn observed_addr(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
         announce_path_down(ctx, device);
     }
+    drain_unstable_notices(ctx);
     send_lan_probes(ctx, local, &due);
 }
 
 /// Tell rank-1, or the other peers when this node is rank-1, that `device`
 /// has no direct path. The app relay is unchanged.
+pub(crate) fn publish_unstable(ctx: &WorkerContext, device: [u8; 16], flag: bool) {
+    let packets = {
+        let node = ctx.node.read().unwrap();
+        let local = node.device_uuid;
+        let rank1 = routing::rank1_sg_uuid(&node, &device);
+        let we_are_rank1 = rank1 == Some(local) || rank1.is_none();
+        let connected: Vec<[u8; 16]> = node
+            .owner
+            .active_connections
+            .values()
+            .map(|c| c.device_uuid)
+            .collect();
+        let targets = crate::direct_path::path_down_recipients(
+            local,
+            device,
+            we_are_rank1,
+            rank1,
+            &connected,
+        );
+        let mut body = [0u8; 18];
+        body[..16].copy_from_slice(&device);
+        body[16] = u8::from(flag);
+        body[17] = u8::from(we_are_rank1);
+        let mut out = Vec::new();
+        for id in targets {
+            let Some(conn) = node
+                .owner
+                .active_connections
+                .values()
+                .find(|c| c.device_uuid == id)
+            else {
+                continue;
+            };
+            out.push((
+                conn.peer_addr,
+                build_encrypted_packet(UNSTABLE_OP, conn, &body),
+            ));
+        }
+        out
+    };
+    for (addr, pkt) in packets {
+        send(ctx, addr, &pkt);
+    }
+}
+
+fn drain_unstable_notices(ctx: &WorkerContext) {
+    let local = ctx.node.read().unwrap().device_uuid;
+    let notices = ctx
+        .direct_book
+        .lock()
+        .map(|mut book| book.take_unstable_notices(local))
+        .unwrap_or_default();
+    for (device, flag) in notices {
+        publish_unstable(ctx, device, flag);
+    }
+}
+
+pub fn unstable_notice(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let plain = {
+        let node = ctx.node.read().unwrap();
+        decrypt_packet_body(&node, UNSTABLE_OP, &buf)
+    };
+    let Some(plain) = plain else {
+        eprintln!("[unstable] decryption failed from {src}");
+        return;
+    };
+    if plain.len() < 18 {
+        return;
+    }
+    let mut device = [0u8; 16];
+    device.copy_from_slice(&plain[..16]);
+    if let Ok(mut book) = ctx.direct_book.lock() {
+        book.set_unstable(device, plain[16] != 0);
+    }
+    if plain[17] == 0 {
+        let we_are_rank1 = {
+            let node = ctx.node.read().unwrap();
+            let rank1 = routing::rank1_sg_uuid(&node, &device);
+            rank1 == Some(node.device_uuid) || rank1.is_none()
+        };
+        if we_are_rank1 {
+            publish_unstable(ctx, device, plain[16] != 0);
+        }
+    }
+}
+
 fn announce_path_down(ctx: &WorkerContext, device: [u8; 16]) {
     if let Ok(mut book) = ctx.direct_book.lock() {
         book.note_peer_down(&device);
@@ -737,6 +824,7 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         if let Some((sender, _, true)) = tell_observation {
             announce_path_down(ctx, sender);
         }
+        drain_unstable_notices(ctx);
         if let Some(sender) = sender_uuid {
             share_punch_invites(ctx, sender, dest_device_uuid);
         }
@@ -771,6 +859,7 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if let Some((sender, _, true)) = tell_observation {
         announce_path_down(ctx, sender);
     }
+    drain_unstable_notices(ctx);
     if let Some(sender) = sender_uuid {
         share_punch_invites(ctx, sender, dest_device_uuid);
     }
