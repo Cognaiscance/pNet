@@ -367,6 +367,22 @@ mod tests {
     }
 
     #[test]
+    fn punch_is_chosen_only_when_lan_is_down() {
+        assert_eq!(
+            choose_path(Grade::Fast, false, true, false),
+            PathChoice::Punch
+        );
+        assert_eq!(
+            choose_path(Grade::Fast, true, true, false),
+            PathChoice::Lan
+        );
+        assert_eq!(
+            choose_path(Grade::Fast, false, false, false),
+            PathChoice::Sg
+        );
+    }
+
+    #[test]
     fn lan_is_chosen_only_when_up_and_stable_stays_on_sg() {
         assert_eq!(
             choose_path(Grade::Fast, true, false, false),
