@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
+#[cfg(feature = "sg")]
+use std::net::TcpStream;
 use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
@@ -62,7 +64,8 @@ pub enum Action {
     AppGetData    { src: SocketAddr, buf: Vec<u8> },
     AppSendPacket { src: SocketAddr, buf: Vec<u8>, graded: bool },
 
-    // From HTTP UI
+    // From HTTP UI. Only the server build listens.
+    #[cfg(feature = "sg")]
     UiRequest {
         stream: TcpStream,
         method: String,
@@ -201,6 +204,7 @@ impl Action {
             Action::AppUpdate { .. } => "AppUpdate",
             Action::AppGetData { .. } => "AppGetData",
             Action::AppSendPacket { .. } => "AppSendPacket",
+            #[cfg(feature = "sg")]
             Action::UiRequest { .. } => "UiRequest",
             Action::SgPing { .. } => "SgPing",
             Action::DgKeepalive { .. } => "DgKeepalive",
@@ -260,6 +264,7 @@ impl Action {
             Action::AppSendPacket { src, buf, graded } => {
                 handlers::app_send_packet(src, buf, graded, ctx)
             }
+            #[cfg(feature = "sg")]
             Action::UiRequest {
                 stream, method, path, query, cookie, host, origin, referer, body,
             } => {

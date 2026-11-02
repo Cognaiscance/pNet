@@ -12,6 +12,7 @@ pub mod dns_cache;
 /// Wire-format fuzz entry points and mutational campaign (§8.2).
 pub mod fuzz;
 pub mod handlers;
+#[cfg(feature = "sg")]
 pub mod http_server;
 pub mod persistence;
 pub mod scheduler;

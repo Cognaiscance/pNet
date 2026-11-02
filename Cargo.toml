@@ -12,9 +12,21 @@ edition = "2024"
 name = "pnet"
 path = "src/lib/mod.rs"
 
+[features]
+sg = []
+
 [[bin]]
 name = "pnet"
 path = "src/main.rs"
+
+[[bin]]
+name = "pnet-dg"
+path = "src/main.rs"
+
+[[bin]]
+name = "pnet-sg"
+path = "src/main.rs"
+required-features = ["sg"]
 
 # Long-running mutational fuzzer for untrusted wire codecs (§8.2).
 # Usage: cargo run --bin pnet_fuzz_wire -- --iters 100000

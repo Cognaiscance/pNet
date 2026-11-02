@@ -472,6 +472,7 @@ mod app_edge;
 pub use app_edge::{app_get_data, app_packet, app_register, app_send_packet, app_update};
 
 mod sessions;
+pub(crate) use sessions::{own_user_sg_down_aliases, own_user_sg_partition};
 pub use sessions::{
     conn_reset, connect_ack, connect_request, dg_keepalive_receive,
     keepalive_dg, maintain_connections, poll_sg, sg_ping,
@@ -528,12 +529,19 @@ pub use tunnels::{
     tunnel_delivery, tunnel_forward, tunnel_init,
 };
 
+mod node_setup;
+pub use node_setup::{apply_new_user_setup, ensure_local_device_cert};
+pub(crate) use node_setup::{form_field, url_decode};
+
+#[cfg(feature = "sg")]
 mod admin_ui;
-pub use admin_ui::{apply_new_user_setup, ensure_local_device_cert, ui_request};
+#[cfg(feature = "sg")]
+pub use admin_ui::ui_request;
+#[cfg(feature = "sg")]
 pub(crate) use admin_ui::{
-    UI_ERR_PUBLISH_FAILED, UI_ERR_REMOVE_SELF, approve_app, complete_setup, form_field,
-    own_user_sg_partition, partition_banner, reject_app, remove_device, rename_app,
-    render_devices, render_diagnostics, url_decode,
+    UI_ERR_PUBLISH_FAILED, UI_ERR_REMOVE_SELF, approve_app, complete_setup,
+    partition_banner, reject_app, remove_device, rename_app,
+    render_devices, render_diagnostics,
 };
 
 
@@ -5426,6 +5434,7 @@ mod tests {
             "failed setup must not flip the node to initialized");
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn complete_setup_stores_password_hash_and_returns_session() {
         let t = TestCtx::new();
@@ -5441,6 +5450,7 @@ mod tests {
         assert!(!super::super::admin_auth::verify_password("wrongwrong", hash));
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn complete_setup_rejects_short_password() {
         let t = TestCtx::new();
@@ -5713,6 +5723,7 @@ mod tests {
 
     /// Seed a pending app (user_approved=false) on the local device and
     /// return its id.
+    #[cfg(feature = "sg")]
     fn seed_pending_app(t: &TestCtx, alias: &str) -> Uuid {
         let mut node = t.ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
@@ -5736,6 +5747,7 @@ mod tests {
     }
 
     /// Seed an approved app and return its id.
+    #[cfg(feature = "sg")]
     fn seed_approved_app(t: &TestCtx, alias: &str) -> Uuid {
         let id = seed_pending_app(t, alias);
         let mut node = t.ctx.node.write().unwrap();
@@ -5746,6 +5758,7 @@ mod tests {
         id
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn approve_app_success_publishes_and_returns_none() {
         let t = TestCtx::new();
@@ -5765,6 +5778,7 @@ mod tests {
                    "successful publish should bump public_version");
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn approve_app_unreachable_rolls_back_and_returns_publish_failed() {
         // Default TestCtx is a DG with no own SG — request_change Unreachable.
@@ -5782,6 +5796,7 @@ mod tests {
         assert!(!app.user_approved, "rollback should restore user_approved=false");
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn reject_app_success_publishes_and_returns_none() {
         let t = TestCtx::new();
@@ -5807,6 +5822,7 @@ mod tests {
                    "successful publish should bump public_version");
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn reject_app_unreachable_rolls_back_and_returns_publish_failed() {
         // DG with no writer.
@@ -5827,6 +5843,7 @@ mod tests {
                    "rollback should preserve the original alias");
     }
 
+    #[cfg(feature = "sg")]
     fn blank_device(alias: &str, uuid: Uuid) -> Device {
         Device {
             alias: alias.into(),
@@ -5843,6 +5860,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn remove_device_publishes_tombstone_and_drops_sessions() {
         let t = TestCtx::new();
@@ -5881,6 +5899,7 @@ mod tests {
         assert_eq!(removes, 1, "the writer log must record the tombstone");
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn remove_device_refuses_this_device() {
         let t = TestCtx::new();
@@ -5901,6 +5920,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn remove_device_unreachable_rolls_back() {
         let t = TestCtx::new();
@@ -5914,6 +5934,7 @@ mod tests {
         assert!(node.owner.user.devices.iter().any(|d| d.uuid == other && d.alias == "phone"));
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn render_devices_offers_remove_for_other_devices_only() {
         let t = TestCtx::new();
@@ -5932,6 +5953,7 @@ mod tests {
         assert!(err.contains("cannot remove itself"));
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn portal_pages_default_dark_and_remember_theme() {
         let t = TestCtx::new();
@@ -5944,6 +5966,7 @@ mod tests {
         assert!(html.contains("--gold: #d4b15a"));
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn rename_app_success_publishes_and_returns_none() {
         let t = TestCtx::new();
@@ -5966,6 +5989,7 @@ mod tests {
                    "successful publish should bump public_version");
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn rename_app_unreachable_rolls_back_and_returns_publish_failed() {
         // DG with no writer.
@@ -5983,6 +6007,7 @@ mod tests {
         assert_eq!(app.alias, "stays", "rollback should preserve the original alias");
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn rename_app_can_rename_peer_own_sg_device_app() {
         // Per the v2 design, any own-user SG can publish a rename for any
@@ -6036,12 +6061,14 @@ mod tests {
 
     // ── Partition banner + diagnostics (7c.8b) ──────────────────────────────
 
+    #[cfg(feature = "sg")]
     #[test]
     fn partition_banner_empty_with_no_own_sg_peers() {
         let t = TestCtx::new();
         assert!(partition_banner(&t.ctx).is_empty());
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn partition_banner_empty_when_peer_unpolled() {
         let t = TestCtx::new();
@@ -6067,6 +6094,7 @@ mod tests {
             "an unpolled peer should not falsely trigger the banner");
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn partition_banner_fires_when_all_peer_hosts_down() {
         let t = TestCtx::new();
@@ -6097,6 +6125,7 @@ mod tests {
         assert!(banner.contains("Partition detected"));
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn partition_banner_silent_when_any_host_up() {
         let t = TestCtx::new();
@@ -6128,6 +6157,7 @@ mod tests {
             "peer reachable via any host should not trigger the banner");
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn render_diagnostics_smoke() {
         let t = TestCtx::new();
@@ -6173,6 +6203,7 @@ mod tests {
         fabric_event("test_event", &[("a", "1"), ("b", "has space"), ("c", "")]);
     }
 
+    #[cfg(feature = "sg")]
     #[test]
     fn rename_app_no_op_when_alias_unchanged() {
         let t = TestCtx::new();

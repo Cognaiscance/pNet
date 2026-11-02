@@ -53,6 +53,34 @@ cmd_version() {
     require_version
 }
 
+# Side archive for the two-build pack. Not what releases/latest publishes.
+split_archive_name() {
+    printf 'pnet-%s-%s-split.tar.gz\n' "$1" "$2"
+}
+
+cmd_pack_split() {
+    local target="${1:-}" dg="${2:-}" sg="${3:-}"
+    [[ -n "$target" && -n "$dg" && -n "$sg" ]] || die "pack-split needs <target> <pnet-dg> <pnet-sg>"
+    require_target "$target"
+    [[ -f "$dg" && -f "$sg" ]] || die "pack-split needs both binaries"
+    local version name stage out
+    version="$(require_version)"
+    name="$(split_archive_name "$version" "$target")"
+    out="$(out_dir)"
+    mkdir -p "$out"
+    stage="$(mktemp -d)"
+    cp "$dg" "$stage/pnet-dg"
+    cp "$sg" "$stage/pnet-sg"
+    chmod 0755 "$stage/pnet-dg" "$stage/pnet-sg"
+    tar -C "$stage" -czf "$out/$name" pnet-dg pnet-sg
+    rm -rf "$stage"
+    (
+        cd "$out"
+        sha256sum "$name" >"$name.sha256"
+    )
+    echo "$out/$name"
+}
+
 cmd_pack() {
     local target="${1:-}" binary="${2:-}"
     [[ -n "$target" && -n "$binary" ]] || die "pack needs <target> <binary>"
@@ -176,6 +204,15 @@ PY
         die "index accepted a bad sha256"
     fi
     grep -q "sha256 is" "$work/index-err" || die "index failed for the wrong reason: $(cat "$work/index-err")"
+    printf '#!/bin/sh\necho pnet-dg %s\n' "$version" >"$work/fake-dg"
+    printf '#!/bin/sh\necho pnet-sg %s\n' "$version" >"$work/fake-sg"
+    chmod 0755 "$work/fake-dg" "$work/fake-sg"
+    DIST="$work" cmd_pack_split x86_64-unknown-linux-gnu "$work/fake-dg" "$work/fake-sg"
+    name="$(split_archive_name "$version" "x86_64-unknown-linux-gnu")"
+    members="$(tar -tzf "$work/$name" | sort)"
+    [[ "$members" == $'pnet-dg\npnet-sg' ]] || die "split archive members are: $members"
+    [[ "$(tar -xOf "$work/$name" pnet-dg)" == *"pnet-dg $version"* ]] || die "split archive dg body"
+    [[ "$(tar -xOf "$work/$name" pnet-sg)" == *"pnet-sg $version"* ]] || die "split archive sg body"
     rm -rf "$work"
 }
 
@@ -185,6 +222,8 @@ usage: scripts/release-assets.sh <command>
 
   version                 print the pnet package version
   pack <target> <binary>  archive that file as pnet inside dist/
+  pack-split <target> <pnet-dg> <pnet-sg>
+                          archive both binaries; not the published pack
   build <target>          cargo build --release and pack it
   index                   write dist/index.json (needs GITHUB_REPOSITORY)
   self-test               pack stand-in binaries and check the index
@@ -196,6 +235,7 @@ shift || true
 case "$cmd" in
     version) cmd_version ;;
     pack) cmd_pack "$@" ;;
+    pack-split) cmd_pack_split "$@" ;;
     build) cmd_build "$@" ;;
     index) cmd_index ;;
     self-test) cmd_self_test ;;

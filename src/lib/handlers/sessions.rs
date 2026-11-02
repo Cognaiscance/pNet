@@ -21,9 +21,36 @@ use super::super::data_models::{
 use super::super::wire::*;
 use super::{
     allocate_conn_id, best_address_for_device, cross_user_pull_on_reconnect, fabric_event,
-    ipv4_from, own_user_sg_partition, partition_reconcile_on_reconnect, rank1_failover_info,
+    ipv4_from, partition_reconcile_on_reconnect, rank1_failover_info,
     refresh_dns_for_known_hosts, send, sync_pull, uuid_hex, WriterTarget,
 };
+
+/// True when at least one other own-user SG has only polled-down hosts.
+/// Unpolled peers are not treated as down.
+pub(crate) fn own_user_sg_partition(node: &Node) -> bool {
+    !own_user_sg_down_aliases(node).is_empty()
+}
+
+/// Aliases of own-user SG peers that are unanimously down in `sg_statuses`.
+pub(crate) fn own_user_sg_down_aliases(node: &Node) -> Vec<String> {
+    let local_uuid = node.device_uuid;
+    let mut down = Vec::new();
+    for d in &node.owner.user.devices {
+        if !matches!(d.grade, DeviceGrade::SG) || d.uuid == local_uuid {
+            continue;
+        }
+        let polled: Vec<bool> = node
+            .sg_statuses
+            .iter()
+            .filter(|((u, _), _)| *u == d.uuid)
+            .map(|(_, s)| s.up)
+            .collect();
+        if !polled.is_empty() && polled.iter().all(|up| !*up) {
+            down.push(d.alias.clone());
+        }
+    }
+    down
+}
 
 /// The presented key must be that device's signing key, and the device
 /// certificate must chain to the user public key we already trust.
