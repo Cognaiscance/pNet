@@ -319,6 +319,15 @@ fn main() {
     let stop = Arc::new(AtomicBool::new(false));
 
     // ── 3. Start writer thread ───────────────────────────────────────────────
+    let app_web = pnet::app_web::AppWebRegistry::load(&dir);
+    let restored = app_web.list().len();
+    let dropped = app_web.drop_unreachable();
+    if restored > 0 || dropped > 0 {
+        println!(
+            "[app-web] restored {} mount(s), dropped {dropped} whose port is not listening",
+            restored.saturating_sub(dropped)
+        );
+    }
     let mut writer = WriterThread::start(dir);
 
     // ── 4. Start scheduler ───────────────────────────────────────────────────
@@ -342,15 +351,6 @@ fn main() {
     }
 
     // ── 6. Build WorkerContext and start worker threads ──────────────────────
-    let app_web = pnet::app_web::AppWebRegistry::load(&dir);
-    let restored = app_web.list().len();
-    let dropped = app_web.drop_unreachable();
-    if restored > 0 || dropped > 0 {
-        println!(
-            "[app-web] restored {} mount(s), dropped {dropped} whose port is not listening",
-            restored.saturating_sub(dropped)
-        );
-    }
     let ctx = Arc::new(WorkerContext {
         node:         Arc::clone(&node),
         udp_socket:   Arc::clone(&udp.socket),
