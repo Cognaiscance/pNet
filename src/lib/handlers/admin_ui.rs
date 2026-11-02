@@ -555,6 +555,10 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
         )
     };
 
+    let dropped = ctx.app_web.drop_unreachable();
+    if dropped > 0 {
+        println!("[app-web] dropped {dropped} mount(s) whose port is not listening");
+    }
     let mounts = ctx.app_web.list();
     let apps_section = if mounts.is_empty() {
         "\

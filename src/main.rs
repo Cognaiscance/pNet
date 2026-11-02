@@ -342,6 +342,15 @@ fn main() {
     }
 
     // ── 6. Build WorkerContext and start worker threads ──────────────────────
+    let app_web = pnet::app_web::AppWebRegistry::load(&dir);
+    let restored = app_web.list().len();
+    let dropped = app_web.drop_unreachable();
+    if restored > 0 || dropped > 0 {
+        println!(
+            "[app-web] restored {} mount(s), dropped {dropped} whose port is not listening",
+            restored.saturating_sub(dropped)
+        );
+    }
     let ctx = Arc::new(WorkerContext {
         node:         Arc::clone(&node),
         udp_socket:   Arc::clone(&udp.socket),
@@ -351,7 +360,7 @@ fn main() {
         sessions:     Arc::new(pnet::admin_auth::SessionStore::new()),
         app_rate_limits: Arc::new(std::sync::Mutex::new(pnet::app_api::AppRateLimiter::new())),
         dns_cache:    Arc::new(std::sync::Mutex::new(pnet::dns_cache::DnsCache::new())),
-        app_web:      Arc::new(pnet::app_web::AppWebRegistry::new()),
+        app_web:      Arc::new(app_web),
         direct_book:  Arc::new(std::sync::Mutex::new(pnet::direct_path::DirectBook::new())),
     });
 

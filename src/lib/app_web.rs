@@ -9,11 +9,14 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// One reverse-proxied app web surface on this node.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppWebMount {
     /// URL segment under `/apps/<slug>/…` (lowercase alphanumeric + hyphens).
     pub slug: String,
@@ -23,10 +26,18 @@ pub struct AppWebMount {
     pub title: String,
 }
 
-/// In-memory mount table (node-local; not fabric-synced).
+/// Mount table for this node. Not fabric-synced. When `load` is used, the
+/// table is also written to `app_web.toml` in the data directory.
 #[derive(Default)]
 pub struct AppWebRegistry {
     inner: Mutex<HashMap<String, AppWebMount>>,
+    path: Option<PathBuf>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct AppWebFile {
+    #[serde(default)]
+    mounts: Vec<AppWebMount>,
 }
 
 impl AppWebRegistry {
@@ -34,15 +45,99 @@ impl AppWebRegistry {
         Self::default()
     }
 
+    /// Load `data_dir/app_web.toml`. A missing file is an empty table. A file
+    /// that cannot be read or parsed is logged and ignored.
+    pub fn load(data_dir: &Path) -> Self {
+        let path = data_dir.join("app_web.toml");
+        let registry = Self {
+            inner: Mutex::new(HashMap::new()),
+            path: Some(path.clone()),
+        };
+        if !path.is_file() {
+            return registry;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                eprintln!("[app-web] app_web.toml unreadable: {err}");
+                return registry;
+            }
+        };
+        let file: AppWebFile = match toml::from_str(&text) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!("[app-web] app_web.toml ignored: {err}");
+                return registry;
+            }
+        };
+        let mut table = registry.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for mount in file.mounts {
+            if validate_slug(&mount.slug).is_ok() && mount.port != 0 {
+                table.insert(mount.slug.clone(), mount);
+            }
+        }
+        drop(table);
+        registry
+    }
+
     /// Insert or replace a mount. `slug` must already be validated.
     pub fn upsert(&self, mount: AppWebMount) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.insert(mount.slug.clone(), mount);
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.insert(mount.slug.clone(), mount);
+        }
+        self.save();
     }
 
     pub fn remove(&self, slug: &str) -> bool {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.remove(slug).is_some()
+        let removed = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.remove(slug).is_some()
+        };
+        if removed {
+            self.save();
+        }
+        removed
+    }
+
+    /// Remove mounts whose loopback port refuses a connection, and save when
+    /// the table changed. A listening socket accepts this connect.
+    pub fn drop_unreachable(&self) -> usize {
+        let live: Vec<(String, u16)> = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.values().map(|m| (m.slug.clone(), m.port)).collect()
+        };
+        let dead: Vec<String> = live
+            .into_iter()
+            .filter(|(_, port)| !loopback_accepts(*port))
+            .map(|(slug, _)| slug)
+            .collect();
+        if dead.is_empty() {
+            return 0;
+        }
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            for slug in &dead {
+                g.remove(slug);
+            }
+        }
+        self.save();
+        dead.len()
+    }
+
+    fn save(&self) {
+        let Some(path) = &self.path else { return };
+        let file = AppWebFile { mounts: self.list() };
+        let text = match toml::to_string(&file) {
+            Ok(text) => text,
+            Err(err) => {
+                eprintln!("[app-web] could not encode app_web.toml: {err}");
+                return;
+            }
+        };
+        if let Err(err) = super::writer::write_atomic(path, &text) {
+            eprintln!("[app-web] could not write {}: {err}", path.display());
+        }
     }
 
     pub fn get(&self, slug: &str) -> Option<AppWebMount> {
@@ -56,6 +151,11 @@ impl AppWebRegistry {
         v.sort_by(|a, b| a.slug.cmp(&b.slug));
         v
     }
+}
+
+fn loopback_accepts(port: u16) -> bool {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
 /// True if `addr` is IPv4/IPv6 loopback (app registration source check).
@@ -229,6 +329,34 @@ mod tests {
         assert!(r.remove("chat"));
         assert!(r.get("chat").is_none());
         assert_eq!(r.list().len(), 1);
+    }
+
+    #[test]
+    fn registry_persists_and_drops_a_closed_port() {
+        let dir = std::env::temp_dir().join(format!("pnet-app-web-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap().port();
+        let registry = AppWebRegistry::load(&dir);
+        registry.upsert(AppWebMount {
+            slug: "lan".into(),
+            port: open,
+            title: "pNet LAN".into(),
+        });
+        registry.upsert(AppWebMount {
+            slug: "gone".into(),
+            port: 1,
+            title: "Gone".into(),
+        });
+        assert_eq!(registry.drop_unreachable(), 1);
+        let loaded = AppWebRegistry::load(&dir);
+        let mounts = loaded.list();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].slug, "lan");
+        assert_eq!(mounts[0].port, open);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

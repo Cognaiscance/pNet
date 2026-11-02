@@ -31,7 +31,7 @@ pub fn ensure_data_dir(data_dir: &Path) -> io::Result<()> {
                 set_mode(parent, 0o700)?;
             }
         }
-        for name in ["node.toml", "apps.toml", "write_log.toml"] {
+        for name in ["node.toml", "apps.toml", "write_log.toml", "app_web.toml"] {
             let path = data_dir.join(name);
             if path.is_file() {
                 set_mode(&path, 0o600)?;
