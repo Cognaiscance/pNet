@@ -651,6 +651,29 @@ pub struct PendingDeviceAcceptance {
     pub expected_signing_pk: Ed25519PublicKey,
 }
 
+/// An app registered on a device, not yet a public card. The token and host
+/// stay on that device.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PendingApp {
+    #[serde(with = "serde_bytes_16")]
+    pub device_uuid: Uuid,
+    #[serde(with = "serde_bytes_16")]
+    pub app_id: Uuid,
+    pub alias: String,
+    pub protocol: String,
+    pub signing_pk: Ed25519PublicKey,
+}
+
+/// The server's approve or reject, waiting for the device to apply it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AppDecision {
+    #[serde(with = "serde_bytes_16")]
+    pub device_uuid: Uuid,
+    #[serde(with = "serde_bytes_16")]
+    pub app_id: Uuid,
+    pub approved: bool,
+}
+
 /// The local owner of this node. Extends User with contacts and a long-term key pair.
 #[derive(Serialize, Deserialize)]
 pub struct Owner {
@@ -679,6 +702,12 @@ pub struct Owner {
     /// Invitations we have sent and still publish to that contact.
     #[serde(default)]
     pub outbound_app_invitations: Vec<AppInvitation>,
+    /// Apps a device has registered and not yet approved. Not a public app card.
+    #[serde(default)]
+    pub pending_apps: Vec<PendingApp>,
+    /// Approve or reject, waiting for the device that owns the app.
+    #[serde(default)]
+    pub app_decisions: Vec<AppDecision>,
 
     /// Latest version of the user's **private** state held by this node.
     /// On the writer SG this is authoritative; on other nodes it's the
@@ -968,6 +997,8 @@ impl Node {
                 app_invitations:            Vec::new(),
                 seen_app_invitation_ids:    Vec::new(),
                 outbound_app_invitations:   Vec::new(),
+                pending_apps:               Vec::new(),
+                app_decisions:              Vec::new(),
                 private_version:            SyncVersion::zero(),
                 public_version:             SyncVersion::zero(),
                 write_log:                  Vec::new(),

@@ -821,7 +821,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
          <div class=\"card\">\
            <h2 style=\"margin-top:0;font-size:1.1rem\">Sections</h2>\
            <ul class=\"config-links\">\
-             <li><a href=\"/pending-apps\">Pending Apps</a> — approve or reject local app registrations</li>\
+             <li><a href=\"/pending-apps\">Pending Apps</a> — approve or reject apps on your devices</li>\
              <li><a href=\"/applications\">Applications</a> — approved apps on this device</li>\
              <li><a href=\"/contacts\">Contacts</a> — other users you are linked with</li>\
              <li><a href=\"/app-invitations\">App Invitations</a> — requests to accept an app from a contact</li>\
@@ -852,40 +852,70 @@ fn ui_error_banner(query: &str) -> String {
     }
 }
 
-fn render_pending_apps(ctx: &WorkerContext, query: &str) -> String {
-    let node        = ctx.node.read().unwrap();
-    let device_uuid = node.device_uuid;
-    let device      = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
+fn review_buttons(device: &Uuid, app_id: &Uuid) -> String {
+    let device_hex = uuid_hex(device);
+    let id_hex = uuid_hex(app_id);
+    format!(
+        "<form method='post' action='/pending-apps/approve'>\
+           <input type='hidden' name='device' value='{device_hex}'>\
+           <input type='hidden' name='id' value='{id_hex}'>\
+           <button class='approve' type='submit'>Approve</button>\
+         </form>\
+         <form method='post' action='/pending-apps/reject'>\
+           <input type='hidden' name='device' value='{device_hex}'>\
+           <input type='hidden' name='id' value='{id_hex}'>\
+           <button class='reject' type='submit'>Reject</button>\
+         </form>"
+    )
+}
 
-    let rows: String = device
-        .map(|d| {
-            d.applications.iter()
-                .filter(|a| !a.user_approved)
-                .map(|a| format!(
-                    "<tr>\
-                       <td>{}</td>\
-                       <td>{}</td>\
-                       <td>{}</td>\
-                       <td>\
-                         <form method='post' action='/pending-apps/approve'>\
-                           <input type='hidden' name='id' value='{}'>\
-                           <button class='approve' type='submit'>Approve</button>\
-                         </form>\
-                         <form method='post' action='/pending-apps/reject'>\
-                           <input type='hidden' name='id' value='{}'>\
-                           <button class='reject' type='submit'>Reject</button>\
-                         </form>\
-                       </td>\
-                     </tr>",
-                    html_escape(&a.alias),
-                    html_escape(&a.protocol),
-                    html_escape(&a.host.to_string()),
-                    uuid_hex(&a.id),
-                    uuid_hex(&a.id),
-                ))
-                .collect()
-        })
-        .unwrap_or_default();
+fn render_pending_apps(ctx: &WorkerContext, query: &str) -> String {
+    let node = ctx.node.read().unwrap();
+    let device_uuid = node.device_uuid;
+    let local = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
+    let server = local.map(|d| d.grade == DeviceGrade::SG).unwrap_or(false);
+
+    let mut rows = String::new();
+    if let Some(device) = local {
+        for app in device.applications.iter().filter(|a| !a.user_approved) {
+            rows.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&device.alias),
+                "this device",
+                html_escape(&app.alias),
+                html_escape(&app.protocol),
+                review_buttons(&device.uuid, &app.id),
+            ));
+        }
+    }
+    if server {
+        for pending in &node.owner.pending_apps {
+            if pending.device_uuid == device_uuid {
+                continue;
+            }
+            let Some(device) = node.owner.user.devices.iter().find(|d| d.uuid == pending.device_uuid) else {
+                continue;
+            };
+            let decision = node.owner.app_decisions.iter().find(|d| {
+                d.device_uuid == pending.device_uuid && d.app_id == pending.app_id
+            });
+            let action = match decision {
+                Some(d) if d.approved => "Waiting for the device".to_string(),
+                Some(_) => "Waiting for the device to remove it".to_string(),
+                None => review_buttons(&pending.device_uuid, &pending.app_id),
+            };
+            let grade = match device.grade {
+                DeviceGrade::SG => "server",
+                DeviceGrade::DG => "device",
+            };
+            rows.push_str(&format!(
+                "<tr><td>{}</td><td>{grade}</td><td>{}</td><td>{}</td><td>{action}</td></tr>",
+                html_escape(&device.alias),
+                html_escape(&pending.alias),
+                html_escape(&pending.protocol),
+            ));
+        }
+    }
 
     let error_banner = ui_error_banner(query);
     let table = if rows.is_empty() {
@@ -893,12 +923,17 @@ fn render_pending_apps(ctx: &WorkerContext, query: &str) -> String {
     } else {
         format!(
             "<table>\
-               <tr><th>Alias</th><th>Protocol</th><th>Host</th><th>Actions</th></tr>\
+               <tr><th>Device</th><th>Grade</th><th>Alias</th><th>Protocol</th><th>Actions</th></tr>\
                {rows}\
              </table>"
         )
     };
-    let body = format!("<h1>Pending Apps</h1>{error_banner}{table}");
+    let intro = if server {
+        "<p class='empty'>Apps installed on your devices wait here. Approve records the decision. The device signs the app when it next syncs, and until then the app cannot send.</p>"
+    } else {
+        "<p class='empty'>This device's apps. The primary server lists every device.</p>"
+    };
+    let body = format!("<h1>Pending Apps</h1>{intro}{error_banner}{table}");
     layout(ctx, "Pending Apps", &body)
 }
 
@@ -1553,6 +1588,21 @@ pub(crate) const UI_ERR_REMOVE_SELF: &str = "remove_self";
 pub(crate) fn approve_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     let id_str = form_field(body, "id")?;
     let id = uuid_from_hex(id_str)?;
+    let local = ctx.node.read().unwrap().device_uuid;
+    let device = form_field(body, "device").and_then(uuid_from_hex).unwrap_or(local);
+    if device != local {
+        return match request_change(Change::DecideApp {
+            device_uuid: device,
+            app_id: id,
+            approved: true,
+        }, ctx) {
+            Ok(()) => None,
+            Err(e) => {
+                eprintln!("[approve_app] decision failed for app {}: {e:?}", uuid_hex(&id));
+                Some(UI_ERR_PUBLISH_FAILED)
+            }
+        };
+    }
     let (was_approved, app_alias, signing_pk, cert_sig, cert_issued_at, cert_alias) = {
         let mut node    = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;
@@ -1655,6 +1705,21 @@ pub(crate) fn rename_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static st
 pub(crate) fn reject_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static str> {
     let id_str = form_field(body, "id")?;
     let id = uuid_from_hex(id_str)?;
+    let local = ctx.node.read().unwrap().device_uuid;
+    let device = form_field(body, "device").and_then(uuid_from_hex).unwrap_or(local);
+    if device != local {
+        return match request_change(Change::DecideApp {
+            device_uuid: device,
+            app_id: id,
+            approved: false,
+        }, ctx) {
+            Ok(()) => None,
+            Err(e) => {
+                eprintln!("[reject_app] decision failed for app {}: {e:?}", uuid_hex(&id));
+                Some(UI_ERR_PUBLISH_FAILED)
+            }
+        };
+    }
     let (device_uuid, removed) = {
         let mut node    = ctx.node.write().unwrap();
         let device_uuid = node.device_uuid;

@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::super::action_queue::WorkerContext;
 use super::super::crypto::{build_encrypted_packet, decrypt_packet_body};
 use super::super::data_models::{
-    AppGrant, AppInvitation, Application, Contact, Device, DeviceGrade, Ed25519KeyPair,
-    Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Node, Owner, Scope, SyncVersion, User,
+    AppDecision, AppGrant, AppInvitation, Application, Contact, Device, DeviceGrade, Ed25519KeyPair,
+    Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, Node, Owner, PendingApp, Scope, SyncVersion, User,
     Uuid, WriteLogEntry, X25519PublicKey, WRITE_LOG_RETENTION,
 };
 use super::super::wire::*;
@@ -438,6 +438,26 @@ pub enum Change {
         contact_uuid: Uuid,
         aliases: Vec<String>,
     },
+    /// Own-user only. A device registered an app that is not approved yet.
+    PutPendingApp {
+        device_uuid: Uuid,
+        app_id: Uuid,
+        alias: String,
+        protocol: String,
+        signing_pk: Ed25519PublicKey,
+    },
+    /// Own-user only. The server portal approved or rejected that pending app.
+    DecideApp {
+        device_uuid: Uuid,
+        app_id: Uuid,
+        approved: bool,
+    },
+    /// Own-user only. Drop the pending row and the decision. The device sends
+    /// this after a reject. An approval leaves by `AddApplication` instead.
+    DropAppReview {
+        device_uuid: Uuid,
+        app_id: Uuid,
+    },
 }
 
 /// Returns the scope(s) a given change is expected to bump on accept. Used
@@ -460,6 +480,9 @@ fn change_scopes(c: &Change) -> &'static [Scope] {
         Change::PutOutboundAppInvitation { .. } => &[Scope::Public],
         Change::ForgetOutboundAppInvitation { .. } => &[Scope::Public],
         Change::SetContactTheyAccept { .. }    => &[Scope::Public],
+        Change::PutPendingApp { .. }           => &[Scope::Public],
+        Change::DecideApp { .. }               => &[Scope::Public],
+        Change::DropAppReview { .. }           => &[Scope::Public],
     }
 }
 
@@ -575,6 +598,25 @@ pub(crate) fn serialize_change(c: &Change) -> Vec<u8> {
             for alias in aliases.iter().take(u8::MAX as usize) {
                 push_str(&mut buf, alias);
             }
+        }
+        Change::PutPendingApp { device_uuid, app_id, alias, protocol, signing_pk } => {
+            buf.push(CHANGE_KIND_PUT_PENDING_APP);
+            buf.extend_from_slice(device_uuid);
+            buf.extend_from_slice(app_id);
+            push_str(&mut buf, alias);
+            push_str(&mut buf, protocol);
+            buf.extend_from_slice(signing_pk.as_bytes());
+        }
+        Change::DecideApp { device_uuid, app_id, approved } => {
+            buf.push(CHANGE_KIND_DECIDE_APP);
+            buf.extend_from_slice(device_uuid);
+            buf.extend_from_slice(app_id);
+            buf.push(u8::from(*approved));
+        }
+        Change::DropAppReview { device_uuid, app_id } => {
+            buf.push(CHANGE_KIND_DROP_APP_REVIEW);
+            buf.extend_from_slice(device_uuid);
+            buf.extend_from_slice(app_id);
         }
     }
     buf
@@ -694,6 +736,25 @@ pub(crate) fn deserialize_change(data: &[u8]) -> Option<Change> {
             }
             Some(Change::SetContactTheyAccept { contact_uuid, aliases })
         }
+        CHANGE_KIND_PUT_PENDING_APP => {
+            let device_uuid: Uuid = read_arr(data, &mut pos)?;
+            let app_id: Uuid = read_arr(data, &mut pos)?;
+            let alias = read_str(data, &mut pos)?;
+            let protocol = read_str(data, &mut pos)?;
+            let signing_pk = Ed25519PublicKey(read_arr(data, &mut pos)?);
+            Some(Change::PutPendingApp { device_uuid, app_id, alias, protocol, signing_pk })
+        }
+        CHANGE_KIND_DECIDE_APP => {
+            let device_uuid: Uuid = read_arr(data, &mut pos)?;
+            let app_id: Uuid = read_arr(data, &mut pos)?;
+            let approved = *data.get(pos)? != 0;
+            Some(Change::DecideApp { device_uuid, app_id, approved })
+        }
+        CHANGE_KIND_DROP_APP_REVIEW => {
+            let device_uuid: Uuid = read_arr(data, &mut pos)?;
+            let app_id: Uuid = read_arr(data, &mut pos)?;
+            Some(Change::DropAppReview { device_uuid, app_id })
+        }
         _ => None,
     }
 }
@@ -739,7 +800,7 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
                 cert_issued_at: *cert_issued_at,
                 cert_alias: cert_alias.clone(),
             };
-            if let Some(existing) = dev.applications.iter_mut().find(|a| a.id == *app_id) {
+            let app_changed = if let Some(existing) = dev.applications.iter_mut().find(|a| a.id == *app_id) {
                 let before = (existing.cert_sig, existing.identity.public_key);
                 merge_app_public(existing, &incoming, false);
                 before != (existing.cert_sig, existing.identity.public_key)
@@ -748,7 +809,10 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
                 // originating DG holds the real token/host locally.
                 dev.applications.push(application_from_public(&incoming));
                 true
-            }
+            };
+            // The certificate arriving is what takes the app off the pending list.
+            let dropped = drop_app_review(owner, device_uuid, app_id);
+            app_changed || dropped
         }
         Change::RemoveApplication { device_uuid, app_id } => {
             let dev = owner.user.devices.iter_mut()
@@ -869,6 +933,51 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
             owner.outbound_app_invitations.retain(|i| i.id != *id);
             before != owner.outbound_app_invitations.len()
         }
+        Change::PutPendingApp { device_uuid, app_id, alias, protocol, signing_pk } => {
+            if !owner.user.devices.iter().any(|d| d.uuid == *device_uuid) {
+                return Err(WriteError::Validation(format!(
+                    "unknown device_uuid {device_uuid:?}"
+                )));
+            }
+            let row = PendingApp {
+                device_uuid: *device_uuid,
+                app_id: *app_id,
+                alias: alias.clone(),
+                protocol: protocol.clone(),
+                signing_pk: *signing_pk,
+            };
+            if let Some(existing) = owner.pending_apps.iter_mut().find(|p| {
+                p.device_uuid == *device_uuid && p.app_id == *app_id
+            }) {
+                if *existing == row { false } else { *existing = row; true }
+            } else {
+                owner.pending_apps.push(row);
+                true
+            }
+        }
+        Change::DecideApp { device_uuid, app_id, approved } => {
+            if !owner.user.devices.iter().any(|d| d.uuid == *device_uuid) {
+                return Err(WriteError::Validation(format!(
+                    "unknown device_uuid {device_uuid:?}"
+                )));
+            }
+            let row = AppDecision {
+                device_uuid: *device_uuid,
+                app_id: *app_id,
+                approved: *approved,
+            };
+            if let Some(existing) = owner.app_decisions.iter_mut().find(|d| {
+                d.device_uuid == *device_uuid && d.app_id == *app_id
+            }) {
+                if *existing == row { false } else { *existing = row; true }
+            } else {
+                owner.app_decisions.push(row);
+                true
+            }
+        }
+        Change::DropAppReview { device_uuid, app_id } => {
+            drop_app_review(owner, device_uuid, app_id)
+        }
         Change::SetContactTheyAccept { contact_uuid, aliases } => {
             let Some(contact) = owner.contact_users.iter_mut().find(|c| c.user.uuid == *contact_uuid) else {
                 return Ok(false);
@@ -885,6 +994,13 @@ fn apply_change_to_owner(owner: &mut Owner, change: &Change) -> Result<bool, Wri
         }
     };
     Ok(applied)
+}
+
+fn drop_app_review(owner: &mut Owner, device_uuid: &Uuid, app_id: &Uuid) -> bool {
+    let before = owner.pending_apps.len() + owner.app_decisions.len();
+    owner.pending_apps.retain(|p| p.device_uuid != *device_uuid || p.app_id != *app_id);
+    owner.app_decisions.retain(|d| d.device_uuid != *device_uuid || d.app_id != *app_id);
+    before != owner.pending_apps.len() + owner.app_decisions.len()
 }
 
 fn clear_contact_policy(owner: &mut Owner, contact_uuid: Uuid) {
@@ -1674,7 +1790,56 @@ pub(crate) fn serialize_public_state(node: &Node) -> Vec<u8> {
         }
     }
     push_policy_snapshot(&mut buf, node);
+    push_app_review(&mut buf, node);
     buf
+}
+
+const REVIEW_MARKER: u8 = 0xA2;
+
+fn push_app_review(buf: &mut Vec<u8>, node: &Node) {
+    buf.push(REVIEW_MARKER);
+    push_u16(buf, node.owner.pending_apps.len().min(u16::MAX as usize) as u16);
+    for row in node.owner.pending_apps.iter().take(u16::MAX as usize) {
+        buf.extend_from_slice(&row.device_uuid);
+        buf.extend_from_slice(&row.app_id);
+        push_str(buf, &row.alias);
+        push_str(buf, &row.protocol);
+        buf.extend_from_slice(row.signing_pk.as_bytes());
+    }
+    push_u16(buf, node.owner.app_decisions.len().min(u16::MAX as usize) as u16);
+    for row in node.owner.app_decisions.iter().take(u16::MAX as usize) {
+        buf.extend_from_slice(&row.device_uuid);
+        buf.extend_from_slice(&row.app_id);
+        buf.push(u8::from(row.approved));
+    }
+}
+
+fn read_app_review(data: &[u8], pos: &mut usize) -> Option<(Vec<PendingApp>, Vec<AppDecision>)> {
+    if *pos >= data.len() || data[*pos] != REVIEW_MARKER {
+        return None;
+    }
+    *pos += 1;
+    let pending_count = read_u16(data, pos)? as usize;
+    let mut pending = Vec::with_capacity(pending_count);
+    for _ in 0..pending_count {
+        pending.push(PendingApp {
+            device_uuid: read_arr(data, pos)?,
+            app_id: read_arr(data, pos)?,
+            alias: read_str(data, pos)?,
+            protocol: read_str(data, pos)?,
+            signing_pk: Ed25519PublicKey(read_arr(data, pos)?),
+        });
+    }
+    let decision_count = read_u16(data, pos)? as usize;
+    let mut decisions = Vec::with_capacity(decision_count);
+    for _ in 0..decision_count {
+        let device_uuid = read_arr(data, pos)?;
+        let app_id = read_arr(data, pos)?;
+        let approved = *data.get(*pos)? != 0;
+        *pos += 1;
+        decisions.push(AppDecision { device_uuid, app_id, approved });
+    }
+    Some((pending, decisions))
 }
 
 fn push_u16(buf: &mut Vec<u8>, n: u16) {
@@ -1874,6 +2039,18 @@ pub(crate) fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
         None
     };
 
+    // Absent tail: an older snapshot. Present but malformed: reject the apply
+    // before any write.
+    let review = if pos < state.len() {
+        if state[pos] != REVIEW_MARKER {
+            return false;
+        }
+        let Some(parsed) = read_app_review(state, &mut pos) else { return false; };
+        Some(parsed)
+    } else {
+        None
+    };
+
     // Apply.
     let mut node = ctx.node.write().unwrap();
     let local_uuid = node.device_uuid;
@@ -1973,9 +2150,162 @@ pub(crate) fn apply_public_state(state: &[u8], ctx: &WorkerContext) -> bool {
         }
     }
 
+    if let Some((pending, decisions)) = review {
+        node.owner.pending_apps = pending;
+        node.owner.app_decisions = decisions;
+    }
+
     drop(node);
     ctx.save_node();
+    apply_local_app_decisions(ctx);
     true
+}
+
+/// Publish each local unapproved app that the writer does not have yet.
+/// A missing writer leaves the registration in place; a later pass retries.
+pub(crate) fn publish_local_pending(ctx: &WorkerContext) {
+    let rows = {
+        let node = ctx.node.read().unwrap();
+        let local = node.device_uuid;
+        let Some(device) = node.owner.user.devices.iter().find(|d| d.uuid == local) else {
+            return;
+        };
+        device.applications.iter().filter(|a| !a.user_approved).filter(|a| {
+            !node.owner.pending_apps.iter().any(|p| p.device_uuid == local && p.app_id == a.id)
+        }).map(|a| PendingApp {
+            device_uuid: local,
+            app_id: a.id,
+            alias: a.alias.clone(),
+            protocol: a.protocol.clone(),
+            signing_pk: a.identity.public_key,
+        }).collect::<Vec<_>>()
+    };
+    if rows.is_empty() {
+        return;
+    }
+    if matches!(find_writer_sg(&ctx.node.read().unwrap()), WriterTarget::Unreachable) {
+        return;
+    }
+    for row in rows {
+        if let Err(err) = request_change_idempotent(Change::PutPendingApp {
+            device_uuid: row.device_uuid,
+            app_id: row.app_id,
+            alias: row.alias,
+            protocol: row.protocol,
+            signing_pk: row.signing_pk,
+        }, ctx) {
+            eprintln!("[pending app] publish failed: {err:?}");
+        }
+    }
+}
+
+/// Apply an approve or reject that names this device. The server does not
+/// sign another device's app; this runs on the device that holds the key.
+pub(crate) fn apply_local_app_decisions(ctx: &WorkerContext) {
+    if matches!(find_writer_sg(&ctx.node.read().unwrap()), WriterTarget::Unreachable) {
+        return;
+    }
+    let local = ctx.node.read().unwrap().device_uuid;
+    let decisions: Vec<AppDecision> = ctx.node.read().unwrap().owner.app_decisions.iter()
+        .filter(|d| d.device_uuid == local)
+        .cloned()
+        .collect();
+    for decision in decisions {
+        if decision.approved {
+            apply_local_approval(ctx, &decision);
+        } else {
+            apply_local_rejection(ctx, &decision);
+        }
+    }
+}
+
+fn approve_local_app(node: &mut Node, decision: &AppDecision) -> Option<Change> {
+    let signing = node.device_signing.clone();
+    let device = node.owner.user.devices.iter_mut().find(|d| d.uuid == decision.device_uuid)?;
+    let app = device.applications.iter_mut().find(|a| a.id == decision.app_id)?;
+    if app.user_approved {
+        return None;
+    }
+    app.user_approved = true;
+    crate::certs::issue_app_cert(&mut *app, &signing.private_key, &signing.public_key);
+    Some(Change::AddApplication {
+        device_uuid: decision.device_uuid,
+        app_id: decision.app_id,
+        app_alias: app.alias.clone(),
+        signing_pk: app.identity.public_key,
+        cert_sig: app.cert_sig,
+        cert_issued_at: app.cert_issued_at,
+        cert_alias: app.cert_alias.clone(),
+    })
+}
+
+fn reject_local_app(node: &mut Node, device_uuid: &Uuid, app_id: &Uuid) -> Option<Application> {
+    let device = node.owner.user.devices.iter_mut().find(|d| d.uuid == *device_uuid)?;
+    device.applications.iter().position(|a| a.id == *app_id)
+        .map(|pos| device.applications.remove(pos))
+}
+
+fn apply_local_approval(ctx: &WorkerContext, decision: &AppDecision) {
+    let prepared = {
+        let mut node = ctx.node.write().unwrap();
+        let device = node.owner.user.devices.iter().find(|d| d.uuid == decision.device_uuid);
+        let app = device.and_then(|d| d.applications.iter().find(|a| a.id == decision.app_id));
+        let Some(app) = app else { return };
+        if app.user_approved {
+            return;
+        }
+        let prior_approved = app.user_approved;
+        let prior_identity = app.identity.clone();
+        let prior_sig = app.cert_sig;
+        let prior_issued = app.cert_issued_at;
+        let prior_alias = app.cert_alias.clone();
+        let Some(change) = approve_local_app(&mut node, decision) else { return };
+        (prior_approved, prior_identity, prior_sig, prior_issued, prior_alias, change)
+    };
+    ctx.save_node();
+    let (prior_approved, prior_identity, prior_sig, prior_issued, prior_alias, change) = prepared;
+    if let Err(err) = request_change(change, ctx) {
+        let mut node = ctx.node.write().unwrap();
+        if let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == decision.device_uuid) {
+            if let Some(app) = device.applications.iter_mut().find(|a| a.id == decision.app_id) {
+                app.user_approved = prior_approved;
+                app.identity = prior_identity;
+                app.cert_sig = prior_sig;
+                app.cert_issued_at = prior_issued;
+                app.cert_alias = prior_alias;
+            }
+        }
+        drop(node);
+        ctx.save_node();
+        eprintln!("[pending app] approval publish failed: {err:?}");
+    }
+}
+
+fn apply_local_rejection(ctx: &WorkerContext, decision: &AppDecision) {
+    let removed = {
+        let mut node = ctx.node.write().unwrap();
+        reject_local_app(&mut node, &decision.device_uuid, &decision.app_id)
+    };
+    let Some(removed) = removed else {
+        let _ = request_change_idempotent(Change::DropAppReview {
+            device_uuid: decision.device_uuid,
+            app_id: decision.app_id,
+        }, ctx);
+        return;
+    };
+    ctx.save_node();
+    if let Err(err) = request_change(Change::DropAppReview {
+        device_uuid: decision.device_uuid,
+        app_id: decision.app_id,
+    }, ctx) {
+        let mut node = ctx.node.write().unwrap();
+        if let Some(device) = node.owner.user.devices.iter_mut().find(|d| d.uuid == decision.device_uuid) {
+            device.applications.push(removed);
+        }
+        drop(node);
+        ctx.save_node();
+        eprintln!("[pending app] rejection publish failed: {err:?}");
+    }
 }
 
 /// Send a SyncWriteRequest (op 0x70) to the writer SG identified by `writer_uuid`.
@@ -3732,6 +4062,7 @@ fn compute_state<'a, I: Iterator<Item = &'a WriteLogEntry>>(
                 state.outbound.entry(id).or_insert((contact_uuid, app_alias));
             }
             Change::ForgetAppInvitation { .. } | Change::ForgetOutboundAppInvitation { .. } => {}
+            Change::PutPendingApp { .. } | Change::DecideApp { .. } | Change::DropAppReview { .. } => {}
             Change::SetContactTheyAccept { contact_uuid, aliases } => {
                 if contact_tombstones.contains(&contact_uuid) {
                     continue;
@@ -4036,6 +4367,169 @@ mod policy_tests {
             cert_issued_at: 0,
             cert_alias: String::new(),
         }
+    }
+
+    #[test]
+    fn pending_registration_is_not_a_public_app() {
+        let mut node = Node::new();
+        node.owner.user.devices[0].grade = DeviceGrade::SG;
+        node.owner.user.devices[0].sg_rank = Some(1);
+        let dg = [9u8; 16];
+        node.owner.user.devices.push(Device {
+            uuid: dg,
+            alias: "tealface".into(),
+            grade: DeviceGrade::DG,
+            sg_rank: None,
+            hosts: Vec::new(),
+            applications: Vec::new(),
+            signing_pk: Ed25519PublicKey::ZERO,
+            dh_pk: X25519PublicKey::ZERO,
+            cert_sig: Ed25519Signature::ZERO,
+            cert_issued_at: 0,
+            cert_alias: String::new(),
+        });
+        super::apply_change_to_owner(&mut node.owner, &Change::PutPendingApp {
+            device_uuid: dg,
+            app_id: [3u8; 16],
+            alias: "pnet-lan-client".into(),
+            protocol: "application/pnet-lan".into(),
+            signing_pk: Ed25519PublicKey::ZERO,
+        }).unwrap();
+        assert!(node.owner.user.devices.iter().all(|d| d.applications.is_empty()));
+        let contact = serialize_contact_data_for(&node, [0x11; 16]);
+        assert!(!contact.windows(15).any(|w| w == b"pnet-lan-client"));
+        let blob = super::serialize_public_state(&node);
+        let at = blob.iter().position(|b| *b == super::REVIEW_MARKER).unwrap();
+        assert!(!blob[..at].windows(15).any(|w| w == b"pnet-lan-client"));
+        let mut pos = at;
+        let (pending, _) = super::read_app_review(&blob, &mut pos).unwrap();
+        assert_eq!(pending.len(), 1);
+        let mut end = at;
+        assert!(super::read_app_review(&blob[..at], &mut end).is_none());
+    }
+
+    #[test]
+    fn approval_signs_on_the_device_and_clears_the_pending_row() {
+        let mut writer = Node::new();
+        writer.owner.user.devices[0].grade = DeviceGrade::SG;
+        writer.owner.user.devices[0].sg_rank = Some(1);
+        let dg = [9u8; 16];
+        writer.owner.user.devices.push(Device {
+            uuid: dg,
+            alias: "tealface".into(),
+            grade: DeviceGrade::DG,
+            sg_rank: None,
+            hosts: Vec::new(),
+            applications: Vec::new(),
+            signing_pk: Ed25519PublicKey::ZERO,
+            dh_pk: X25519PublicKey::ZERO,
+            cert_sig: Ed25519Signature::ZERO,
+            cert_issued_at: 0,
+            cert_alias: String::new(),
+        });
+        let app_id = [4u8; 16];
+        super::apply_change_to_owner(&mut writer.owner, &Change::PutPendingApp {
+            device_uuid: dg,
+            app_id,
+            alias: "pnet-lan-client".into(),
+            protocol: "application/pnet-lan".into(),
+            signing_pk: Ed25519PublicKey::ZERO,
+        }).unwrap();
+        super::apply_change_to_owner(&mut writer.owner, &Change::DecideApp {
+            device_uuid: dg,
+            app_id,
+            approved: true,
+        }).unwrap();
+        assert_eq!(writer.owner.pending_apps.len(), 1);
+
+        let mut device = Node::new();
+        let keys = crate::crypto::generate_ed25519_keypair();
+        device.device_uuid = dg;
+        device.device_signing = keys.clone();
+        device.owner.user.devices[0].uuid = dg;
+        device.owner.user.devices[0].signing_pk = keys.public_key;
+        device.owner.user.devices[0].applications.push(Application {
+            id: app_id,
+            alias: "pnet-lan-client".into(),
+            protocol: "application/pnet-lan".into(),
+            host: "127.0.0.1:8792".parse().unwrap(),
+            user_approved: false,
+            token: [7u8; 16],
+            identity: Ed25519KeyPair::ZERO,
+            cert_sig: Ed25519Signature::ZERO,
+            cert_issued_at: 0,
+            cert_alias: String::new(),
+        });
+        device.owner.app_decisions.push(crate::data_models::AppDecision {
+            device_uuid: dg,
+            app_id,
+            approved: true,
+        });
+        let decision = device.owner.app_decisions[0].clone();
+        let change = super::approve_local_app(&mut device, &decision).unwrap();
+        let app = &device.owner.user.devices[0].applications[0];
+        assert!(app.user_approved);
+        assert_eq!(app.token, [7u8; 16]);
+        assert_eq!(app.host, "127.0.0.1:8792".parse().unwrap());
+        let Change::AddApplication { signing_pk, cert_sig, cert_issued_at, ref cert_alias, .. } = change else {
+            panic!("approval publishes the certificate");
+        };
+        assert!(crate::certs::verify_app_cert(
+            &cert_alias, &signing_pk, &keys.public_key, cert_issued_at, &cert_sig,
+        ));
+        super::apply_change_to_owner(&mut writer.owner, &change).unwrap();
+        assert!(writer.owner.pending_apps.is_empty());
+        assert!(writer.owner.app_decisions.is_empty());
+        assert!(writer.owner.user.devices.iter().any(|d| d.applications.iter().any(|a| a.id == app_id)));
+    }
+
+    #[test]
+    fn reject_deletes_the_device_app_and_publishes_no_card() {
+        let mut writer = Node::new();
+        let mut device = Node::new();
+        let dg = device.device_uuid;
+        writer.owner.user.devices.push(Device {
+            alias: "phone".into(),
+            uuid: dg,
+            grade: DeviceGrade::DG,
+            sg_rank: None,
+            hosts: Vec::new(),
+            applications: Vec::new(),
+            signing_pk: Ed25519PublicKey::ZERO,
+            dh_pk: X25519PublicKey::ZERO,
+            cert_sig: Ed25519Signature::ZERO,
+            cert_issued_at: 0,
+            cert_alias: String::new(),
+        });
+        super::apply_change_to_owner(&mut writer.owner, &Change::PutPendingApp {
+            device_uuid: dg,
+            app_id: [5u8; 16],
+            alias: "pnet-lan-client".into(),
+            protocol: "application/pnet-lan".into(),
+            signing_pk: Ed25519PublicKey::ZERO,
+        }).unwrap();
+        device.owner.user.devices[0].applications.push(Application {
+            id: [5u8; 16],
+            alias: "pnet-lan-client".into(),
+            protocol: "application/pnet-lan".into(),
+            host: "127.0.0.1:8792".parse().unwrap(),
+            user_approved: false,
+            token: [8u8; 16],
+            identity: Ed25519KeyPair::ZERO,
+            cert_sig: Ed25519Signature::ZERO,
+            cert_issued_at: 0,
+            cert_alias: String::new(),
+        });
+        let removed = super::reject_local_app(&mut device, &dg, &[5u8; 16]);
+        assert!(removed.is_some());
+        assert!(device.owner.user.devices[0].applications.is_empty());
+        super::apply_change_to_owner(&mut writer.owner, &Change::DropAppReview {
+            device_uuid: dg,
+            app_id: [5u8; 16],
+        }).unwrap();
+        assert!(writer.owner.pending_apps.is_empty());
+        let contact = serialize_contact_data_for(&writer, [0x11; 16]);
+        assert!(!contact.windows(15).any(|w| w == b"pnet-lan-client"));
     }
 
     #[test]

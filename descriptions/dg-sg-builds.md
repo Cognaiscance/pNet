@@ -45,6 +45,8 @@ Repo: `pnet_installer`. Pull request into `develop`. This can merge before the p
 
 ## Step 3 — approve a device's app from the server
 
+The single binary does this by grade. A device-grade node publishes the pending row. A server-grade node's `/pending-apps` page lists the other devices and records the decision. Separate `pnet-dg` and `pnet-sg` binaries are still the work in steps 1 and 2.
+
 Registration on a device stays local until someone approves it. The server does not hold the device signing key, so it cannot sign the app certificate. A directory pull also does not update an app the device already has: that copy keeps `user_approved`, the token, and the host.
 
 ### What the server stores
