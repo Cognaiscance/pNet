@@ -782,7 +782,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
            <h2 style=\"margin-top:0;font-size:1.1rem\">Sections</h2>\
            <ul class=\"config-links\">\
              <li><a href=\"/pending-apps\">Pending Apps</a> — approve or reject apps on your devices</li>\
-             <li><a href=\"/applications\">Applications</a> — approved apps on this device</li>\
+             <li><a href=\"/applications\">Applications</a> — approved apps on each of your devices</li>\
              <li><a href=\"/contacts\">Contacts</a> — other users you are linked with</li>\
              <li><a href=\"/app-invitations\">App Invitations</a> — requests to accept an app from a contact</li>\
              <li><a href=\"/devices\">Devices</a> — your devices; remove a lost one</li>\
@@ -829,116 +829,149 @@ fn review_buttons(device: &Uuid, app_id: &Uuid) -> String {
     )
 }
 
+fn device_section_title(alias: &str, grade: DeviceGrade, here: bool) -> String {
+    let grade = match grade {
+        DeviceGrade::SG => "server",
+        DeviceGrade::DG => "device",
+    };
+    let here = if here { " · this device" } else { "" };
+    format!(
+        "<h2 style='margin:1.25rem 0 .5rem'>{} \
+           <span style='color:var(--muted);font-weight:normal;font-size:.85rem'>{grade}{here}</span>\
+         </h2>",
+        html_escape(alias),
+    )
+}
+
 fn render_pending_apps(ctx: &WorkerContext, query: &str) -> String {
     let node = ctx.node.read().unwrap();
     let device_uuid = node.device_uuid;
     let local = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
     let server = local.map(|d| d.grade == DeviceGrade::SG).unwrap_or(false);
 
-    let mut rows = String::new();
-    if let Some(device) = local {
-        for app in device.applications.iter().filter(|a| !a.user_approved) {
-            rows.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                html_escape(&device.alias),
-                "this device",
-                html_escape(&app.alias),
-                html_escape(&app.protocol),
-                review_buttons(&device.uuid, &app.id),
-            ));
-        }
-    }
-    if server {
-        for pending in &node.owner.pending_apps {
-            if pending.device_uuid == device_uuid {
-                continue;
+    let mut order: Vec<usize> = (0..node.owner.user.devices.len()).collect();
+    order.sort_by_key(|i| node.owner.user.devices[*i].uuid != device_uuid);
+
+    let mut sections = String::new();
+    for i in order {
+        let device = &node.owner.user.devices[i];
+        let here = device.uuid == device_uuid;
+        let mut rows = String::new();
+        if here {
+            for app in device.applications.iter().filter(|a| !a.user_approved) {
+                rows.push_str(&format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    html_escape(&app.alias),
+                    html_escape(&app.protocol),
+                    review_buttons(&device.uuid, &app.id),
+                ));
             }
-            let Some(device) = node.owner.user.devices.iter().find(|d| d.uuid == pending.device_uuid) else {
-                continue;
-            };
-            let decision = node.owner.app_decisions.iter().find(|d| {
-                d.device_uuid == pending.device_uuid && d.app_id == pending.app_id
-            });
-            let action = match decision {
-                Some(d) if d.approved => "Waiting for the device".to_string(),
-                Some(_) => "Waiting for the device to remove it".to_string(),
-                None => review_buttons(&pending.device_uuid, &pending.app_id),
-            };
-            let grade = match device.grade {
-                DeviceGrade::SG => "server",
-                DeviceGrade::DG => "device",
-            };
-            rows.push_str(&format!(
-                "<tr><td>{}</td><td>{grade}</td><td>{}</td><td>{}</td><td>{action}</td></tr>",
-                html_escape(&device.alias),
-                html_escape(&pending.alias),
-                html_escape(&pending.protocol),
-            ));
+        } else if server {
+            for pending in node.owner.pending_apps.iter().filter(|p| p.device_uuid == device.uuid) {
+                let decision = node.owner.app_decisions.iter().find(|d| {
+                    d.device_uuid == pending.device_uuid && d.app_id == pending.app_id
+                });
+                let action = match decision {
+                    Some(d) if d.approved => "Waiting for the device".to_string(),
+                    Some(_) => "Waiting for the device to remove it".to_string(),
+                    None => review_buttons(&pending.device_uuid, &pending.app_id),
+                };
+                rows.push_str(&format!(
+                    "<tr><td>{}</td><td>{}</td><td>{action}</td></tr>",
+                    html_escape(&pending.alias),
+                    html_escape(&pending.protocol),
+                ));
+            }
         }
+        if rows.is_empty() {
+            continue;
+        }
+        sections.push_str(&device_section_title(&device.alias, device.grade, here));
+        sections.push_str(&format!(
+            "<table>\
+               <tr><th>Alias</th><th>Protocol</th><th>Actions</th></tr>\
+               {rows}\
+             </table>"
+        ));
     }
 
     let error_banner = ui_error_banner(query);
-    let table = if rows.is_empty() {
+    let list = if sections.is_empty() {
         "<p class='empty'>No pending applications.</p>".to_string()
     } else {
-        format!(
-            "<table>\
-               <tr><th>Device</th><th>Grade</th><th>Alias</th><th>Protocol</th><th>Actions</th></tr>\
-               {rows}\
-             </table>"
-        )
+        sections
     };
     let intro = if server {
-        "<p class='empty'>Apps installed on your devices wait here. Approve records the decision. The device signs the app when it next syncs, and until then the app cannot send.</p>"
+        "<p class='empty'>Apps installed on your devices wait here, grouped by device. Approve records the decision. The device signs the app when it next syncs, and until then the app cannot send.</p>"
     } else {
         "<p class='empty'>This device's apps. The primary server lists every device.</p>"
     };
-    let body = format!("<h1>Pending Apps</h1>{intro}{error_banner}{table}");
+    let body = format!("<h1>Pending Apps</h1>{intro}{error_banner}{list}");
     layout(ctx, "Pending Apps", &body)
 }
 
 fn render_applications(ctx: &WorkerContext, query: &str) -> String {
-    let node        = ctx.node.read().unwrap();
+    let node = ctx.node.read().unwrap();
     let device_uuid = node.device_uuid;
-    let device      = node.owner.user.devices.iter().find(|d| d.uuid == device_uuid);
 
-    let rows: String = device
-        .map(|d| {
-            d.applications.iter()
-                .filter(|a| a.user_approved)
-                .map(|a| format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td>\
-                     <td><form method='post' action='/applications/rename' style='margin:0;display:flex;gap:.25rem'>\
-                       <input type='hidden' name='id' value='{id_hex}'>\
-                       <input type='text' name='alias' value='{alias}' required>\
-                       <button type='submit'>Rename</button>\
-                     </form></td>\
-                     <td><form method='post' action='/applications/delete' style='margin:0'>\
-                       <input type='hidden' name='id' value='{id_hex}'>\
-                       <button type='submit'>Delete</button>\
-                     </form></td></tr>",
-                    html_escape(&a.alias),
-                    html_escape(&a.protocol),
-                    html_escape(&a.host.to_string()),
-                    id_hex = uuid_hex(&a.id),
-                    alias  = html_escape(&a.alias),
-                ))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut order: Vec<usize> = (0..node.owner.user.devices.len()).collect();
+    order.sort_by_key(|i| node.owner.user.devices[*i].uuid != device_uuid);
+
+    let mut sections = String::new();
+    for i in order {
+        let device = &node.owner.user.devices[i];
+        let here = device.uuid == device_uuid;
+        let approved: Vec<_> = device.applications.iter().filter(|a| a.user_approved).collect();
+        if approved.is_empty() {
+            continue;
+        }
+        sections.push_str(&device_section_title(&device.alias, device.grade, here));
+        if here {
+            let rows: String = approved.iter().map(|a| format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td>\
+                 <td><form method='post' action='/applications/rename' style='margin:0;display:flex;gap:.25rem'>\
+                   <input type='hidden' name='id' value='{id_hex}'>\
+                   <input type='text' name='alias' value='{alias}' required>\
+                   <button type='submit'>Rename</button>\
+                 </form></td>\
+                 <td><form method='post' action='/applications/delete' style='margin:0'>\
+                   <input type='hidden' name='id' value='{id_hex}'>\
+                   <button type='submit'>Delete</button>\
+                 </form></td></tr>",
+                html_escape(&a.alias),
+                html_escape(&a.protocol),
+                html_escape(&a.host.to_string()),
+                id_hex = uuid_hex(&a.id),
+                alias = html_escape(&a.alias),
+            )).collect();
+            sections.push_str(&format!(
+                "<table>\
+                   <tr><th>Alias</th><th>Protocol</th><th>Host</th><th>Rename</th><th></th></tr>\
+                   {rows}\
+                 </table>"
+            ));
+        } else {
+            let rows: String = approved.iter().map(|a| format!(
+                "<tr><td>{}</td></tr>",
+                html_escape(&a.alias),
+            )).collect();
+            sections.push_str(&format!(
+                "<table><tr><th>Alias</th></tr>{rows}</table>"
+            ));
+        }
+    }
 
     let error_banner = ui_error_banner(query);
-    let table = if rows.is_empty() {
+    let list = if sections.is_empty() {
         "<p class='empty'>No approved applications.</p>".to_string()
     } else {
-        format!(
-            "<table>\
-               <tr><th>Alias</th><th>Protocol</th><th>Host</th><th>Rename</th><th></th></tr>\
-               {rows}\
-             </table>"
-        )
+        sections
     };
-    let body = format!("<h1>Applications</h1>{error_banner}{table}");
+    let body = format!(
+        "<h1>Applications</h1>\
+         <p class='empty'>Each device is listed on its own. Protocol, host, rename, and delete are for this device. Other devices show the alias only.</p>\
+         {error_banner}{list}"
+    );
     layout(ctx, "Applications", &body)
 }
 
