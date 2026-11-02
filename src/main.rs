@@ -6,6 +6,7 @@ use pnet::action_queue::{Action, ActionQueue, WorkerContext, PRIORITY_LOW, PRIOR
 use pnet::data_models::{DeviceGrade, Ed25519SecretKey};
 use pnet::handlers::{apply_new_user_setup, ensure_local_device_cert, parse_pnet_hosts, start_bootstrap};
 use pnet::keystore;
+#[cfg(feature = "sg")]
 use pnet::http_server::{http_bind_ip, http_port, HttpServer};
 use pnet::persistence;
 use pnet::scheduler::SchedulerThread;
@@ -14,6 +15,44 @@ use pnet::udp_listener::{udp_port, UdpListener};
 use pnet::writer::{write_atomic, WriterThread};
 
 const WORKER_COUNT: usize = 4;
+const BUILD_IS_SG: bool = cfg!(feature = "sg");
+
+fn binary_label() -> &'static str {
+    match env!("CARGO_BIN_NAME") {
+        "pnet-sg" => "pnet-sg",
+        "pnet-dg" => "pnet-dg",
+        _ => "pnet",
+    }
+}
+
+enum BootStop {
+    GradeMismatch,
+    DeviceNeedsCode,
+}
+
+/// Stop before sockets when this binary does not match the stored grade, or
+/// when a device build has no connection code and no node yet.
+fn boot_stop(initialized: bool, stored_is_sg: bool, has_invitation_code: bool) -> Option<BootStop> {
+    if initialized {
+        if stored_is_sg != BUILD_IS_SG {
+            return Some(BootStop::GradeMismatch);
+        }
+        return None;
+    }
+    if !BUILD_IS_SG && !has_invitation_code {
+        return Some(BootStop::DeviceNeedsCode);
+    }
+    None
+}
+
+fn env_grade_conflicts() -> bool {
+    let Ok(grade) = std::env::var("PNET_GRADE") else { return false };
+    match grade.to_ascii_lowercase().as_str() {
+        "sg" => !BUILD_IS_SG,
+        "dg" => BUILD_IS_SG,
+        _ => false,
+    }
+}
 
 fn data_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -114,6 +153,7 @@ fn apply_env_setup(ctx: &WorkerContext) {
 
 /// If `PNET_ADMIN_PASSWORD` is set and the node has no admin hash yet, store it.
 /// Used by headless deploys so the UI is not left passwordless after env setup.
+#[cfg(feature = "sg")]
 fn apply_env_admin_password(ctx: &WorkerContext) {
     let Ok(password) = std::env::var("PNET_ADMIN_PASSWORD") else { return };
     if password.is_empty() { return; }
@@ -204,7 +244,7 @@ fn main() {
     // this line and must be able to run it without creating ~/.pnet.
     if let Some(arg) = std::env::args().nth(1) {
         if arg == "--version" || arg == "-V" {
-            println!("pnet {}", env!("CARGO_PKG_VERSION"));
+            println!("{} {}", binary_label(), env!("CARGO_PKG_VERSION"));
             return;
         }
     }
@@ -224,6 +264,41 @@ fn main() {
         }
     };
     abort_if_keys_unreadable(&loaded);
+    let initialized = loaded.is_initialized();
+    let local_uuid = loaded.device_uuid;
+    let stored_is_sg = loaded
+        .owner
+        .user
+        .devices
+        .iter()
+        .find(|d| d.uuid == local_uuid)
+        .is_some_and(|d| matches!(d.grade, DeviceGrade::SG));
+    let has_invitation_code = std::env::var("PNET_INVITATION_CODE")
+        .ok()
+        .is_some_and(|code| !code.trim().is_empty());
+    if !initialized && env_grade_conflicts() {
+        eprintln!(
+            "[main] this is the {} build and PNET_GRADE does not match it",
+            binary_label()
+        );
+        std::process::exit(1);
+    }
+    match boot_stop(initialized, stored_is_sg, has_invitation_code) {
+        Some(BootStop::GradeMismatch) => {
+            eprintln!(
+                "[main] this is the {} build and the stored node is the other grade",
+                binary_label()
+            );
+            std::process::exit(1);
+        }
+        Some(BootStop::DeviceNeedsCode) => {
+            eprintln!(
+                "[main] this device is not initialized. Set PNET_INVITATION_CODE and restart."
+            );
+            std::process::exit(1);
+        }
+        None => {}
+    }
     let node = Arc::new(RwLock::new(loaded));
 
     // ── 1a. Apply PNET_HOSTS (authoritative for the local SG device) ─────────
@@ -284,6 +359,7 @@ fn main() {
     apply_env_setup(&ctx);
     // Optional admin password for headless / first boot (also used when the
     // node was already initialized without a hash — sets it if still missing).
+    #[cfg(feature = "sg")]
     apply_env_admin_password(&ctx);
     // Upgrade path: a node that still holds the user seed but has no device
     // certificate mints one and publishes it.
@@ -304,15 +380,17 @@ fn main() {
         cvar.notify_all();
     }
 
-    // ── 8. Start HTTP server (owner portal: Home + Config + future app mounts)
-    // Default bind is loopback for all grades. Opt into remote access with
-    // PNET_HTTP_BIND=0.0.0.0 (or another IPv4). Docker / live harnesses that
-    // publish the portal must set this explicitly.
-    let http_bind = http_bind_ip();
-    let hport = http_port();
-    let http = HttpServer::start(http_bind, hport, Arc::clone(&queue), Arc::clone(&stop));
-
-    println!("[main] running. Owner portal HTTP on {http_bind}:{hport}");
+    // ── 8. Start HTTP server (owner portal). Device builds do not listen.
+    #[cfg(feature = "sg")]
+    let http = {
+        let http_bind = http_bind_ip();
+        let hport = http_port();
+        let http = HttpServer::start(http_bind, hport, Arc::clone(&queue), Arc::clone(&stop));
+        println!("[main] running. Owner portal HTTP on {http_bind}:{hport}");
+        http
+    };
+    #[cfg(not(feature = "sg"))]
+    println!("[main] running. This device has no website. Approve apps on a server portal.");
 
     // ── Wait for SIGINT / SIGTERM ─────────────────────────────────────────────
     ctrlc::set_handler({
@@ -337,6 +415,7 @@ fn main() {
 
     println!("[main] stopping producers...");
     udp.join();
+    #[cfg(feature = "sg")]
     http.join();
     scheduler.join();
 
@@ -405,6 +484,7 @@ mod tests {
         // the bug.
         let mut pool = ThreadPool::new(2, Arc::clone(&queue), Arc::clone(&stop), Arc::clone(&ctx));
 
+        #[cfg(feature = "sg")]
         let http = HttpServer::start(std::net::Ipv4Addr::LOCALHOST, 0, Arc::clone(&queue), Arc::clone(&stop));
 
         stop.store(true, Ordering::SeqCst);
@@ -418,6 +498,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let shutdown = std::thread::spawn(move || {
             udp.join();
+            #[cfg(feature = "sg")]
             http.join();
             scheduler.join();
             pool.join();
@@ -429,5 +510,37 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("shutdown hung — writer.join blocked on a live writer_tx clone");
         shutdown.join().unwrap();
+    }
+
+    #[test]
+    fn version_line_names_this_build() {
+        let line = format!("{} {}", binary_label(), env!("CARGO_PKG_VERSION"));
+        match env!("CARGO_BIN_NAME") {
+            "pnet-dg" => assert!(line.starts_with("pnet-dg ")),
+            "pnet-sg" => assert!(line.starts_with("pnet-sg ")),
+            "pnet" => {
+                assert!(line.starts_with("pnet "));
+                assert!(!line.starts_with("pnet-"));
+            }
+            other => panic!("unexpected bin {other}"),
+        }
+    }
+
+    #[test]
+    fn boot_stop_matches_grade_and_requires_a_device_code() {
+        assert!(super::boot_stop(true, super::BUILD_IS_SG, false).is_none());
+        assert!(matches!(
+            super::boot_stop(true, !super::BUILD_IS_SG, true),
+            Some(super::BootStop::GradeMismatch)
+        ));
+        if super::BUILD_IS_SG {
+            assert!(super::boot_stop(false, false, false).is_none());
+        } else {
+            assert!(matches!(
+                super::boot_stop(false, false, false),
+                Some(super::BootStop::DeviceNeedsCode)
+            ));
+            assert!(super::boot_stop(false, false, true).is_none());
+        }
     }
 }
