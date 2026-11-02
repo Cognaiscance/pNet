@@ -952,11 +952,18 @@ fn render_applications(ctx: &WorkerContext, query: &str) -> String {
             ));
         } else {
             let rows: String = approved.iter().map(|a| format!(
-                "<tr><td>{}</td></tr>",
+                "<tr><td>{}</td>\
+                 <td><form method='post' action='/applications/delete' style='margin:0'>\
+                   <input type='hidden' name='device' value='{device_hex}'>\
+                   <input type='hidden' name='id' value='{id_hex}'>\
+                   <button type='submit'>Delete</button>\
+                 </form></td></tr>",
                 html_escape(&a.alias),
+                device_hex = uuid_hex(&device.uuid),
+                id_hex = uuid_hex(&a.id),
             )).collect();
             sections.push_str(&format!(
-                "<table><tr><th>Alias</th></tr>{rows}</table>"
+                "<table><tr><th>Alias</th><th></th></tr>{rows}</table>"
             ));
         }
     }
@@ -969,7 +976,7 @@ fn render_applications(ctx: &WorkerContext, query: &str) -> String {
     };
     let body = format!(
         "<h1>Applications</h1>\
-         <p class='empty'>Each device is listed on its own. Protocol, host, rename, and delete are for this device. Other devices show the alias only.</p>\
+         <p class='empty'>Each device is listed on its own. Protocol, host, and rename are for this device. Delete removes the app from that device.</p>\
          {error_banner}{list}"
     );
     layout(ctx, "Applications", &body)
@@ -1701,6 +1708,49 @@ pub(crate) fn reject_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static st
     let local = ctx.node.read().unwrap().device_uuid;
     let device = form_field(body, "device").and_then(uuid_from_hex).unwrap_or(local);
     if device != local {
+        let approved = {
+            let node = ctx.node.read().unwrap();
+            node.owner.user.devices.iter()
+                .find(|d| d.uuid == device)
+                .and_then(|d| d.applications.iter().find(|a| a.id == id))
+                .is_some_and(|a| a.user_approved)
+        };
+        if !approved {
+            return match request_change(Change::DecideApp {
+                device_uuid: device,
+                app_id: id,
+                approved: false,
+            }, ctx) {
+                Ok(()) => None,
+                Err(e) => {
+                    eprintln!("[reject_app] decision failed for app {}: {e:?}", uuid_hex(&id));
+                    Some(UI_ERR_PUBLISH_FAILED)
+                }
+            };
+        }
+        let removed = {
+            let mut node = ctx.node.write().unwrap();
+            let device = node.owner.user.devices.iter_mut().find(|d| d.uuid == device)?;
+            device.applications.iter().position(|a| a.id == id)
+                .map(|pos| device.applications.remove(pos))
+        };
+        let removed = removed?;
+        ctx.save_node();
+        if let Err(e) = request_change(Change::RemoveApplication {
+            device_uuid: device,
+            app_id: id,
+        }, ctx) {
+            {
+                let mut node = ctx.node.write().unwrap();
+                if let Some(dev) = node.owner.user.devices.iter_mut().find(|d| d.uuid == device) {
+                    dev.applications.push(removed);
+                }
+            }
+            ctx.save_node();
+            eprintln!("[reject_app] publish failed for app {}: {e:?}", uuid_hex(&id));
+            return Some(UI_ERR_PUBLISH_FAILED);
+        }
+        // The device drops its own copy when it applies this decision.
         return match request_change(Change::DecideApp {
             device_uuid: device,
             app_id: id,
