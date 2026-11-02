@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the release archives the installer downloads.
 #
-# One gzip archive per target. The archive contains a single file, pnet.
+# One gzip archive per target. The archive contains pnet-dg and pnet-sg.
 # A sibling .sha256 is the GNU sha256sum line for that archive. index.json
 # lists version, target, URL, and the same sha256. See
 # descriptions/release-assets.md.
@@ -53,19 +53,14 @@ cmd_version() {
     require_version
 }
 
-# Side archive for the two-build pack. Not what releases/latest publishes.
-split_archive_name() {
-    printf 'pnet-%s-%s-split.tar.gz\n' "$1" "$2"
-}
-
-cmd_pack_split() {
+cmd_pack() {
     local target="${1:-}" dg="${2:-}" sg="${3:-}"
-    [[ -n "$target" && -n "$dg" && -n "$sg" ]] || die "pack-split needs <target> <pnet-dg> <pnet-sg>"
+    [[ -n "$target" && -n "$dg" && -n "$sg" ]] || die "pack needs <target> <pnet-dg> <pnet-sg>"
     require_target "$target"
-    [[ -f "$dg" && -f "$sg" ]] || die "pack-split needs both binaries"
+    [[ -f "$dg" && -f "$sg" ]] || die "pack needs both binaries"
     local version name stage out
     version="$(require_version)"
-    name="$(split_archive_name "$version" "$target")"
+    name="$(archive_name "$version" "$target")"
     out="$(out_dir)"
     mkdir -p "$out"
     stage="$(mktemp -d)"
@@ -73,28 +68,6 @@ cmd_pack_split() {
     cp "$sg" "$stage/pnet-sg"
     chmod 0755 "$stage/pnet-dg" "$stage/pnet-sg"
     tar -C "$stage" -czf "$out/$name" pnet-dg pnet-sg
-    rm -rf "$stage"
-    (
-        cd "$out"
-        sha256sum "$name" >"$name.sha256"
-    )
-    echo "$out/$name"
-}
-
-cmd_pack() {
-    local target="${1:-}" binary="${2:-}"
-    [[ -n "$target" && -n "$binary" ]] || die "pack needs <target> <binary>"
-    require_target "$target"
-    [[ -f "$binary" ]] || die "not a file: $binary"
-    local version name stage out
-    version="$(require_version)"
-    name="$(archive_name "$version" "$target")"
-    out="$(out_dir)"
-    mkdir -p "$out"
-    stage="$(mktemp -d)"
-    cp "$binary" "$stage/pnet"
-    chmod 0755 "$stage/pnet"
-    tar -C "$stage" -czf "$out/$name" pnet
     rm -rf "$stage"
     (
         cd "$out"
@@ -118,8 +91,14 @@ cmd_build() {
             || die "missing linker $CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
     fi
     rustup target add "$target"
-    cargo build --locked --release --target "$target" -p pnet --bin pnet
-    cmd_pack "$target" "target/$target/release/pnet"
+    # Two commands. One `cargo build --features sg` would compile the portal into both bins.
+    cargo build --locked --release --target "$target" -p pnet --bin pnet-dg
+    local held
+    held="$(mktemp -d)"
+    cp "target/$target/release/pnet-dg" "$held/pnet-dg"
+    cargo build --locked --release --target "$target" -p pnet --features sg --bin pnet-sg
+    cmd_pack "$target" "$held/pnet-dg" "target/$target/release/pnet-sg"
+    rm -rf "$held"
 }
 
 cmd_index() {
@@ -169,18 +148,19 @@ cmd_self_test() {
     work="$(mktemp -d)"
     DIST="$work" cmd_version >/dev/null
     version="$(require_version)"
-    printf '#!/bin/sh\necho pnet %s\n' "$version" >"$work/fake-pnet"
-    chmod 0755 "$work/fake-pnet"
-    DIST="$work" cmd_pack x86_64-unknown-linux-gnu "$work/fake-pnet"
-    DIST="$work" cmd_pack aarch64-unknown-linux-gnu "$work/fake-pnet"
+    printf '#!/bin/sh\necho pnet-dg %s\n' "$version" >"$work/fake-dg"
+    printf '#!/bin/sh\necho pnet-sg %s\n' "$version" >"$work/fake-sg"
+    chmod 0755 "$work/fake-dg" "$work/fake-sg"
+    DIST="$work" cmd_pack x86_64-unknown-linux-gnu "$work/fake-dg" "$work/fake-sg"
+    DIST="$work" cmd_pack aarch64-unknown-linux-gnu "$work/fake-dg" "$work/fake-sg"
     GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-Cognaiscance/pNet}" DIST="$work" cmd_index
     for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
         name="$(archive_name "$version" "$target")"
         (cd "$work" && sha256sum -c "$name.sha256")
-        [[ "$(tar -tzf "$work/$name")" == "pnet" ]] || die "archive $name is not a single pnet file"
-        local body
-        body="$(tar -xOf "$work/$name" pnet)"
-        [[ "$body" == *"pnet $version"* ]] || die "archive $name has the wrong binary"
+        members="$(tar -tzf "$work/$name" | sort)"
+        [[ "$members" == $'pnet-dg\npnet-sg' ]] || die "archive $name members are: $members"
+        [[ "$(tar -xOf "$work/$name" pnet-dg)" == *"pnet-dg $version"* ]] || die "archive $name dg body"
+        [[ "$(tar -xOf "$work/$name" pnet-sg)" == *"pnet-sg $version"* ]] || die "archive $name sg body"
     done
     python3 - "$work/index.json" "$version" <<'PY'
 import json, sys
@@ -204,15 +184,6 @@ PY
         die "index accepted a bad sha256"
     fi
     grep -q "sha256 is" "$work/index-err" || die "index failed for the wrong reason: $(cat "$work/index-err")"
-    printf '#!/bin/sh\necho pnet-dg %s\n' "$version" >"$work/fake-dg"
-    printf '#!/bin/sh\necho pnet-sg %s\n' "$version" >"$work/fake-sg"
-    chmod 0755 "$work/fake-dg" "$work/fake-sg"
-    DIST="$work" cmd_pack_split x86_64-unknown-linux-gnu "$work/fake-dg" "$work/fake-sg"
-    name="$(split_archive_name "$version" "x86_64-unknown-linux-gnu")"
-    members="$(tar -tzf "$work/$name" | sort)"
-    [[ "$members" == $'pnet-dg\npnet-sg' ]] || die "split archive members are: $members"
-    [[ "$(tar -xOf "$work/$name" pnet-dg)" == *"pnet-dg $version"* ]] || die "split archive dg body"
-    [[ "$(tar -xOf "$work/$name" pnet-sg)" == *"pnet-sg $version"* ]] || die "split archive sg body"
     rm -rf "$work"
 }
 
@@ -221,10 +192,9 @@ usage() {
 usage: scripts/release-assets.sh <command>
 
   version                 print the pnet package version
-  pack <target> <binary>  archive that file as pnet inside dist/
-  pack-split <target> <pnet-dg> <pnet-sg>
-                          archive both binaries; not the published pack
-  build <target>          cargo build --release and pack it
+  pack <target> <pnet-dg> <pnet-sg>
+                          archive both binaries inside dist/
+  build <target>          cargo build both bins and pack them
   index                   write dist/index.json (needs GITHUB_REPOSITORY)
   self-test               pack stand-in binaries and check the index
 EOF
@@ -235,7 +205,6 @@ shift || true
 case "$cmd" in
     version) cmd_version ;;
     pack) cmd_pack "$@" ;;
-    pack-split) cmd_pack_split "$@" ;;
     build) cmd_build "$@" ;;
     index) cmd_index ;;
     self-test) cmd_self_test ;;

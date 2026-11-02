@@ -1,8 +1,8 @@
 # Release assets
 
-**Status:** tag `v0.2.1` is the published release. `Cargo.toml` is `0.2.2`.
-The wire record for `v0.2.2` is in `descriptions/wire-versioning.md`. Pushing
-tag `v0.2.2` on the develop commit that contains this note creates the GitHub
+**Status:** tag `v0.2.2` is the published release. `Cargo.toml` is `0.3.0`.
+The wire record for `v0.3.0` is in `descriptions/wire-versioning.md`. Pushing
+tag `v0.3.0` on the develop commit that contains this note creates the GitHub
 Release. The tag must match `version` in the root `Cargo.toml`. `develop` is
 not a version.
 
@@ -16,7 +16,7 @@ uploaded by [.github/workflows/release.yml](../.github/workflows/release.yml).
 
 | File | Contents |
 |------|----------|
-| `pnet-<version>-<target>.tar.gz` | One file, named `pnet`, mode `0755`. |
+| `pnet-<version>-<target>.tar.gz` | `pnet-dg` and `pnet-sg`, each mode `0755`. |
 | `pnet-<version>-<target>.tar.gz.sha256` | `sha256sum` line for that archive. |
 | `index.json` | The version, the tag, and one row per archive. |
 
@@ -63,7 +63,7 @@ scripts/release-assets.sh build aarch64-unknown-linux-gnu
 GITHUB_REPOSITORY=Cognaiscance/pNet scripts/release-assets.sh index
 ```
 
-`build` uses `cargo build --locked --release --target <triple> -p pnet --bin pnet`.
+`build` runs two cargo commands: `--bin pnet-dg`, then `--features sg --bin pnet-sg`. The device binary is copied out before the second command.
 The aarch64 build needs `aarch64-linux-gnu-gcc` on `PATH` (or
 `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`). Archives land in `dist/`,
 which is gitignored.
