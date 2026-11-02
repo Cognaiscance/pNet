@@ -177,6 +177,9 @@ pub(crate) const CHANGE_KIND_FORGET_APP_INVITATION: u8 = 0x0A;
 pub(crate) const CHANGE_KIND_PUT_OUTBOUND_APP_INVITATION: u8 = 0x0B;
 pub(crate) const CHANGE_KIND_FORGET_OUTBOUND_APP_INVITATION: u8 = 0x0C;
 pub(crate) const CHANGE_KIND_SET_CONTACT_THEY_ACCEPT: u8 = 0x0D;
+pub(crate) const CHANGE_KIND_PUT_PENDING_APP: u8 = 0x0E;
+pub(crate) const CHANGE_KIND_DECIDE_APP: u8 = 0x0F;
+pub(crate) const CHANGE_KIND_DROP_APP_REVIEW: u8 = 0x10;
 
 // ── Shared min lengths (unencrypted headers / common envelopes) ───────────────
 

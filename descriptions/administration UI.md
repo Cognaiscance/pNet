@@ -100,8 +100,10 @@ An overview of the node's current state.
 
 ### Pending Apps
 A list of applications that have registered but not yet been approved.
-* Shows each app's alias and host
-* Owner can approve or reject each one
+* On a server-grade node, lists this server's own unapproved apps and every other device's pending row, with device alias and grade
+* Approve records the decision. The device signs the certificate when it next syncs. Until then the app cannot send, and the row stays as waiting
+* Reject records the decision. The row leaves when that device deletes the app
+* A device-grade node shows only its own unapproved apps
 
 ### Applications
 A list of all approved applications registered on this node.

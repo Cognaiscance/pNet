@@ -428,6 +428,9 @@ fn update_rank1_failover_flag(ctx: &WorkerContext) {
 ///
 /// Triggered at startup and then every MAINTAIN_CONNECTIONS_INTERVAL.
 pub fn maintain_connections(ctx: &WorkerContext) {
+    super::sync::publish_local_pending(ctx);
+    super::sync::apply_local_app_decisions(ctx);
+
     let now = SystemTime::now();
     let local = ctx.node.read().unwrap().device_uuid;
     let notices = if let Ok(mut book) = ctx.direct_book.lock() {

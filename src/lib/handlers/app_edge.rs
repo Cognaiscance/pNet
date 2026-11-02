@@ -187,6 +187,9 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
 
     ctx.save_node();
+    // The app is stored either way. Publishing the pending row can wait until
+    // the writer is reachable; startup and the maintenance pass retry it.
+    super::sync::publish_local_pending(ctx);
 
     // Reply: [OK][token: 16 bytes]
     let mut reply = [0u8; 17];
