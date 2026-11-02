@@ -1,6 +1,6 @@
 # Two pNet builds: device and server
 
-**Status:** step 1 is the `pnet-dg` / `pnet-sg` bins. The published archive is still one file named `pnet`. The installer does not choose a build yet (step 2).
+**Status:** `v0.3.0` publishes `pnet-dg` and `pnet-sg` in one archive. The installer copies one of them to `bin/pnet`.
 
 pNet ships two programs from one library. `pnet-dg` is the device. It joins with a connection code and has no website. `pnet-sg` is the server. It serves the portal, and that portal approves apps for every device. The installed path stays `bin/pnet`, so `start.sh` and systemd do not change.
 

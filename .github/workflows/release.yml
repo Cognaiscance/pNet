@@ -75,5 +75,5 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --notes "pNet ${version}. Each archive contains the \`pnet\` binary. \`index.json\` lists the sha256 of each archive." \
+            --notes "pNet ${version}. Each archive contains \`pnet-dg\` and \`pnet-sg\`. \`index.json\` lists the sha256 of each archive." \
             dist/*

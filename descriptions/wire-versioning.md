@@ -61,6 +61,7 @@ Each tag notes the on-disk `format_version` it writes (`data persistence.md`) an
 | `v0.2.0` | 2 | `v0.1.0` for connect, relay, and app packets. Own servers of one user upgrade together before grants are written. |
 | `v0.2.1` | 2 | no older tag. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 | `v0.2.2` | 2 | `v0.2.1`. Direct-path opcodes are ignored by an older node, which keeps relaying. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
+| `v0.3.0` | 2 | `v0.2.2`. The device and server binaries speak the same wire. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 
 ## Rollout expectation
 
