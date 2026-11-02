@@ -85,7 +85,7 @@ Repo: `pNet`. Pull request into `develop`.
 
 ## Rollout
 
-Step 1 and step 2 land before the release that contains both binaries. Until that tag, bootstrap still installs the single `pnet` from `v0.2.1`.
+Step 1 and step 2 land before the release that contains both binaries. Until that tag, bootstrap still installs the single `pnet` from the latest release.
 
 Publish the two-build release only when step 3 is merged and every server this user runs will move to it before any device publishes a pending row. An older writer rejects the new change. A device on the older build never applies the decision, so the page stays on waiting. Contacts on the previous version still pull the directory, because the new bytes sit after the policy block.
 
