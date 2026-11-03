@@ -306,13 +306,11 @@ impl Grade {
     }
 }
 
-/// Pick a path. Stable never leaves the SG. Fast and cellphone use LAN when
-/// the probe is up. Punch is chosen only in a later step, when LAN is down.
+/// Pick a path. An unstable peer stays on the SG. Every grade, including
+/// stable, uses the LAN when that probe is up, otherwise the punch.
 pub fn choose_path(grade: Grade, lan_up: bool, punch_up: bool, peer_unstable: bool) -> PathChoice {
-    if matches!(grade, Grade::Stable) {
-        return PathChoice::Sg;
-    }
-    if grade.cellphone() && peer_unstable {
+    let _ = grade;
+    if peer_unstable {
         return PathChoice::Sg;
     }
     if lan_up {
@@ -368,6 +366,9 @@ impl DirectBook {
             return false;
         };
         if !same_lan(peer.observed, local_observed) {
+            return false;
+        }
+        if self.self_unstable || peer.unstable {
             return false;
         }
         // An answered LAN path stays up until a notice. Do not probe again.
@@ -456,6 +457,9 @@ impl DirectBook {
         let addr_a = self.observed(&a)?;
         let addr_b = self.observed(&b)?;
         if same_lan(addr_a, addr_b) {
+            return None;
+        }
+        if self.self_unstable || self.is_unstable(&a) || self.is_unstable(&b) {
             return None;
         }
         let key = if a <= b { (a, b) } else { (b, a) };
@@ -653,10 +657,10 @@ mod tests {
         assert!(!book.note_self_change(t0 + Duration::from_secs(10)));
         assert!(book.note_self_change(t0 + Duration::from_secs(20)));
         assert!(book.self_unstable());
-        // Fast may still use a direct path. Cellphone may not.
+        // An unstable node does not use the LAN or the punch.
         assert_eq!(
             choose_path(Grade::Fast, true, false, book.self_unstable()),
-            PathChoice::Lan
+            PathChoice::Sg
         );
         assert_eq!(
             choose_path(Grade::Cellphone, true, false, true),
@@ -725,7 +729,7 @@ mod tests {
         assert_eq!(Grade::from_byte(9), Grade::Stable);
         assert_eq!(
             choose_path(Grade::from_byte(0), true, true, false),
-            PathChoice::Sg
+            PathChoice::Lan
         );
         assert_eq!(
             choose_path(Grade::Fast, true, true, false),
@@ -754,21 +758,29 @@ mod tests {
     }
 
     #[test]
-    fn lan_is_chosen_only_when_up_and_stable_stays_on_sg() {
+    fn lan_and_punch_are_for_a_stable_peer() {
         assert_eq!(
-            choose_path(Grade::Fast, true, false, false),
+            choose_path(Grade::Stable, true, true, false),
             PathChoice::Lan
         );
         assert_eq!(
-            choose_path(Grade::Fast, false, false, false),
+            choose_path(Grade::Stable, false, true, false),
+            PathChoice::Punch
+        );
+        assert_eq!(
+            choose_path(Grade::Stable, true, true, true),
             PathChoice::Sg
         );
         assert_eq!(
-            choose_path(Grade::Stable, true, true, false),
+            choose_path(Grade::Fast, true, false, true),
             PathChoice::Sg
         );
         assert_eq!(
-            choose_path(Grade::Cellphone, true, false, false),
+            choose_path(Grade::Cellphone, true, false, true),
+            PathChoice::Sg
+        );
+        assert_eq!(
+            choose_path(Grade::Fast, true, false, false),
             PathChoice::Lan
         );
     }
