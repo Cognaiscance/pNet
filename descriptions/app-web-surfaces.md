@@ -113,7 +113,7 @@ web-only; file sync is the flagship hybrid.
 - A `filesync` agent registers on each machine the user wants to keep in sync.
 - Watches a folder; chunks and versions are app-owned (pNet stays a dumb pipe).
 - Replicates over pNet to the user's other devices (intra-user via rank-1 hub;
-  lazy tunnels for bulk).
+  the server opens each relayed packet).
 - Optionally runs on the SG as well so an always-on replica/index exists.
 
 **Web (phone or any browser without the agent):**

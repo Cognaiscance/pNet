@@ -31,7 +31,7 @@ UUIDs (16 raw bytes) are local indexes: user, device, application, invitation, a
 
 `pnet --version` and `pnet -V` print `pnet 0.2.2` and exit before creating `~/.pnet`.
 
-Data lives in `$HOME/.pnet/data`. The directory is created mode `0700`, and `~/.pnet` is tightened to `0700` when that is the parent. `node.toml` holds the directory. `write_log.toml` holds the writer's append-only change log. Sessions, tunnels, SG poll results, and the admin cookie map are memory only and disappear on restart.
+Data lives in `$HOME/.pnet/data`. The directory is created mode `0700`, and `~/.pnet` is tightened to `0700` when that is the parent. `node.toml` holds the directory. `write_log.toml` holds the writer's append-only change log. Sessions, SG poll results, and the admin cookie map are memory only and disappear on restart.
 
 A file that exists and cannot be parsed, or whose `format_version` is outside 1, makes the process exit without rewriting the files. This build writes `format_version = 1`. A missing `node.toml` starts a fresh node.
 
@@ -83,7 +83,7 @@ A join sends `BootstrapRequest` and returns. The asynchronous `BootstrapResponse
 | DG keepalive | 20 s | Each DG sends an empty encrypted datagram on every live SG session. |
 | Sync pull | 30 min | Pull public and private versions from the current writer. |
 | Partition reconcile | 60 s | Each SG sends a public watermark probe to every connected own-user SG. |
-| Tunnel cleanup | 5 min | Drops idle tunnels. |
+
 
 A session lives 24 hours from the last successful handshake or DG keepalive. Maintenance renews a session when less than 2 hours remain. A `ConnectRequest` that gets no ack is forgotten after 5 seconds.
 
@@ -151,22 +151,21 @@ Approving an app signs its certificate and publishes `AddApplication`. Rejecting
 
 A local app registers, and after a person approves it (or auto-approve is set) it may send an opaque payload of at most 4096 bytes to another device's app id. Delivery order on the sender:
 
-1. An active DG-to-DG tunnel for that destination, if the tunnel session and an SG to carry it both exist.
-2. Otherwise a direct session to that device, if one exists and it is not the tunnel leg.
-3. Otherwise an encrypted relay through the best reachable SG for that destination.
+1. A direct session to that device, when one is up.
+2. Otherwise an encrypted relay through the best reachable SG for that destination. The server opens each packet and forwards it.
 
-The SG decrypts a relay, re-encrypts toward the destination, and after 10 relays between the same pair inside a 5-minute window it starts a tunnel setup. The tunnel's inner payload is encrypted with the two DGs' ephemeral keys. The SG forwards that ciphertext without decrypting it. If the tunnel cannot be used, the sender falls back to direct or relay.
+A stable peer may then move the same app bytes onto a LAN shortcut or a hole punch. There is no second line that forwards a sealed device-to-device blob the server does not open. Opcodes `0x50`–`0x54` are dropped.
 
 The destination pushes the payload to the approved app's registered UDP host. Success of a local send is silent. Failure is a two-byte error. Acceptance is not an end-to-end delivery receipt.
 
 ## Cryptography on the wire
 
-- X25519 for session, invitation, and tunnel secrets. The raw Diffie-Hellman output is never the cipher key.
-- HKDF-SHA256 with an empty salt and one of three info strings: `pnet-aead-v1-session`, `pnet-aead-v1-bootstrap`, `pnet-aead-v1-tunnel`.
+- X25519 for session and invitation secrets. The raw Diffie-Hellman output is never the cipher key.
+- HKDF-SHA256 with an empty salt and one of three info strings: `pnet-aead-v1-session`, `pnet-aead-v1-bootstrap`, `pnet-aead-v1-direct`.
 - XChaCha20-Poly1305 for those keys.
 - Ed25519 for certificates and for the connect handshake.
 
-Session packets are `[op][peer's connection id u16][nonce 24][ciphertext]`. The connection id is the receiver's id. The ciphertext's plaintext starts with that same opcode. A mismatch drops the packet. Tunnel delivery (`0x54`) also accepts an inner `0x51` from the forwarding server.
+Session packets are `[op][peer's connection id u16][nonce 24][ciphertext]`. The connection id is the receiver's id. The ciphertext's plaintext starts with that same opcode. A mismatch drops the packet.
 
 ## Sample apps in this workspace
 

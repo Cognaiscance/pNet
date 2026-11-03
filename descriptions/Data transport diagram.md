@@ -64,57 +64,8 @@ The same rule applies. All of a user's DGs keep their keep-alive with the user's
 
 ---
 
-## Lazy DG-to-DG tunnels
+## No opaque bulk tunnel
 
-### Motivation
+A device still sends app packets through a server. The server opens each one and forwards it. There is no second line that, after a packet count, carries a sealed device-to-device blob the server does not open.
 
-In the standard routing model, every packet that passes through a relay SG is fully decrypted and then re-encrypted for the next leg of the journey. For a high-throughput use case — such as a file sync app streaming many packets between two DGs — this per-packet decrypt/re-encrypt cost at the SG adds up. A **lazy tunnel** allows the relay SG to forward packets without touching the encrypted payload, using a direct DG-to-DG AEAD key (X25519 then HKDF with info `pnet-aead-v1-tunnel`) negotiated automatically once traffic between a pair crosses a threshold.
-
-### Threshold and trigger
-
-The relay SG maintains a rolling packet count per `(sender_uuid, dest_uuid)` pair. The counter resets if the threshold is not reached within a 5-minute window. Once a pair crosses **10 packets** in a single window, the SG automatically initiates a DG-to-DG key exchange — no action is required from the apps.
-
-### Key exchange
-
-The exchange reuses the same X25519 ephemeral key exchange mechanism used for standard DG-to-SG connections, relayed through the SG.
-
-```mermaid
-sequenceDiagram
-    participant DG_s  as DG_sender
-    participant SG    as Relay SG
-    participant DG_d  as DG_dest
-
-    Note over SG: packet count reaches threshold
-    SG->>DG_s: TUNNEL_INIT (0x50) [tunnel_id, dest_device_uuid]
-    DG_s->>SG: TUNNEL_CONNECT_REQUEST (0x52) [tunnel_id, sender_ephem_pk]
-    SG->>DG_d: TUNNEL_CONNECT_REQUEST (0x52) [tunnel_id, sender_ephem_pk, sender_device_uuid]
-    DG_d->>SG: TUNNEL_CONNECT_ACK (0x53) [tunnel_id, dest_ephem_pk]
-    Note over DG_d: records tunnel ephemerals (AEAD key via HKDF tunnel domain)
-    SG->>DG_s: TUNNEL_CONNECT_ACK (0x53) [tunnel_id, dest_ephem_pk]
-    Note over DG_s: records tunnel ephemerals (AEAD key via HKDF tunnel domain)
-    Note over SG: promotes to ActiveTunnel
-```
-
-### Tunnel packet forwarding
-
-Once the tunnel is established, the sender DG encrypts directly for the destination DG using the tunnel-domain AEAD key and sends a tunnel forward packet to the relay SG. The SG forwards it without decryption.
-
-```
-DG_sender → SG:  [0x51 TUNNEL_FORWARD][sender_conn_id: u16][tunnel_id: u16][nonce: 24][ciphertext]
-SG → DG_dest:    [0x54 TUNNEL_DELIVERY][tunnel_id: u16][nonce: 24][ciphertext]
-```
-
-The relay SG reads only `tunnel_id` to identify the outbound leg — the encrypted payload is forwarded as-is.
-
-### Why this is more efficient
-
-| | Standard packet | Tunnel packet |
-|---|---|---|
-| Relay SG work | decrypt → inspect → re-encrypt | read tunnel_id → forward |
-| Encryption hops | DG→SG (leg 1), SG→DG (leg 2) | DG→DG (end-to-end, one key) |
-| Latency benefit | baseline | lower per-packet CPU at SG |
-| Best for | low-volume, ad-hoc messages | high-throughput streams (file sync, video) |
-
-### Tunnel lifetime
-
-The `last_used_at` timestamp on `ActiveTunnel` allows idle tunnels to be cleaned up. If no tunnel packet has been forwarded within 5 minutes, the SG removes the tunnel record and traffic falls back to the standard relay path. The DG-to-DG `ActiveConnection` expires naturally after 24 hours.
+Opcodes `0x50`–`0x54` are retired. A node drops them. Bulk traffic uses the same server forward, or the LAN shortcut and hole punch in `descriptions/direct-path.md` when that path is up.

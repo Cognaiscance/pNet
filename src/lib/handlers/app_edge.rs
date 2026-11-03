@@ -9,8 +9,7 @@ use std::time::SystemTime;
 use super::super::action_queue::WorkerContext;
 use super::super::certs::issue_app_cert;
 use super::super::crypto::{
-    aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body, open_direct_app,
-    seal_with_opcode,
+    build_encrypted_packet, decrypt_packet_body, open_direct_app,
 };
 use super::super::data_models::{Application, Ed25519PublicKey, Uuid, generate_uuid};
 use super::super::wire::*;
@@ -495,9 +494,9 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 ///   [token: 16][dest_device_uuid: 16][dest_app_id: 16][payload: rest]
 ///
 /// Looks up the sending app by token (must be approved), then delivers via
-/// DG↔DG tunnel if one is active, a direct `AppPacket` if this node already
-/// has a session to the dest device, or a `RelayPacket` (op 0x40) through the
-/// best reachable SG for that destination.
+/// an `AppPacket` when this node already has a session to the dest device,
+/// or a `RelayPacket` (op 0x40) through the best reachable SG. The server
+/// opens each relayed packet. A stable direct path may reseal the same body.
 ///
 /// # Replies
 ///
@@ -544,7 +543,6 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
 
     // Build packet and look up the SG address under a single read lock.
     // The third value is the app body a direct send reseals for the peer.
-    // A tunnel packet stays None so it is not moved off the server.
     let out: Option<(Vec<u8>, SocketAddr, Option<Vec<u8>>)> = {
         let node = ctx.node.read().unwrap();
 
@@ -567,69 +565,11 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
         }
         let sender_app_id = sender_app.id;
 
-        // ── Tunnel path (optional) ────────────────────────────────────────────
-        // Prefer an active DG↔DG tunnel when present. If the tunnel session is
-        // gone, incomplete, or no SG can carry TUNNEL_FORWARD, fall through to
-        // direct/relay so teardown never black-holes delivery (§6.4).
-        let tunnel_info: Option<(u16, u16)> = node
-            .owner
-            .dg_tunnel_map
-            .iter()
-            .find(|(_tid, conn_id)| {
-                node.owner
-                    .active_connections
-                    .get(*conn_id)
-                    .map(|c| c.device_uuid == dest_device_uuid)
-                    .unwrap_or(false)
-            })
-            .map(|(tid, cid)| (*tid, *cid));
-
-        let tunnel_pkt: Option<(Vec<u8>, SocketAddr, Option<Vec<u8>>)> =
-            if let Some((tunnel_id, dg_dg_conn_id)) = tunnel_info {
-                (|| {
-                    let dg_dg_conn = node.owner.active_connections.get(&dg_dg_conn_id)?;
-                    let aead_key = aead_key_from_dh(
-                        &dg_dg_conn.key_pair.private_key,
-                        &dg_dg_conn.peer_public_key,
-                        aead_domain::TUNNEL,
-                    );
-                    let mut tunnel_body = Vec::with_capacity(32 + payload.len());
-                    tunnel_body.extend_from_slice(&dest_app_id);
-                    tunnel_body.extend_from_slice(&sender_app_id);
-                    tunnel_body.extend_from_slice(payload);
-                    // Inner opcode is 0x51, the byte on the packet the SG sees.
-                    // The SG rewrites the outer byte to 0x54 and leaves this sealed.
-                    let (ciphertext, nonce) =
-                        seal_with_opcode(TUNNEL_FORWARD_OP, &aead_key, &tunnel_body);
-                    let sg_conn =
-                        top_ranked_sg_for_device(&node, &dest_device_uuid).or_else(|| {
-                            let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
-                            best_sg_connection(&node, &candidates)
-                        })?;
-                    // Session body: the SG opens this with the device session
-                    // key, then forwards the still-sealed tunnel blob.
-                    let mut session_body = Vec::with_capacity(2 + 24 + ciphertext.len());
-                    session_body.extend_from_slice(&tunnel_id.to_be_bytes());
-                    session_body.extend_from_slice(&nonce);
-                    session_body.extend_from_slice(&ciphertext);
-                    let pkt = build_encrypted_packet(TUNNEL_FORWARD_OP, sg_conn, &session_body);
-                    Some((pkt, sg_conn.peer_addr, None))
-                })()
-            } else {
-                None
-            };
-
         let now = SystemTime::now();
-        if let Some(out) = tunnel_pkt {
-            Some(out)
-        } else if let Some(dest_conn) = node.owner.active_connections.values().find(|c| {
-            // Never AppPacket on a tunnel leg (session AEAD domain ≠ tunnel).
-            // Skip expired sessions (cleanup may leave the conn until renew).
-            c.device_uuid == dest_device_uuid
-                && c.timeout > now
-                && !node.owner.dg_tunnel_map.values().any(|cid| *cid == c.id)
+        if let Some(dest_conn) = node.owner.active_connections.values().find(|c| {
+            c.device_uuid == dest_device_uuid && c.timeout > now
         }) {
-            // ── Direct path (session to dest that is not the tunnel leg) ─────
+            // ── Direct session to the destination ─────
             let mut app_body = Vec::with_capacity(32 + payload.len());
             app_body.extend_from_slice(&dest_app_id);
             app_body.extend_from_slice(&sender_app_id);
@@ -637,7 +577,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
             let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
             Some((pkt, dest_conn.peer_addr, Some(app_body)))
         } else {
-            // ── Standard relay path (also the fallback after tunnel teardown) ─
+            // ── Standard relay path. The server opens each packet. ─
             let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid).or_else(|| {
                 let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
                 best_sg_connection(&node, &candidates)
