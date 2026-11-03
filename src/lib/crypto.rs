@@ -24,8 +24,11 @@ pub(crate) mod aead_domain {
     /// Device bootstrap and contact-invitation handshakes (ephemeral × invitation PK).
     pub const BOOTSTRAP: &[u8] = b"pnet-aead-v1-bootstrap";
     /// Lazy tunnel end-to-end payload (DG↔DG ephemerals). The SG opens the
-/// session wrapper on tunnel-forward (`0x51`) and still does not open this.
+    /// session wrapper on tunnel-forward (`0x51`) and still does not open this.
     pub const TUNNEL: &[u8] = b"pnet-aead-v1-tunnel";
+    /// Device static X25519 to device static X25519. Used by a LAN or punch
+    /// send so the peer can open the packet without a session.
+    pub const DIRECT: &[u8] = b"pnet-aead-v1-direct";
 }
 
 /// X25519 Diffie-Hellman: returns the 32-byte shared secret (raw IKM, not an AEAD key).
@@ -66,7 +69,7 @@ pub(crate) fn generate_x25519_keypair() -> X25519KeyPair {
     let sk = StaticSecret::from(generate_key_bytes());
     X25519KeyPair {
         private_key: X25519SecretKey(sk.to_bytes()),
-        public_key:  X25519PublicKey(*X25519Pk::from(&sk).as_bytes()),
+        public_key: X25519PublicKey(*X25519Pk::from(&sk).as_bytes()),
     }
 }
 
@@ -77,7 +80,7 @@ pub(crate) fn generate_ed25519_keypair() -> Ed25519KeyPair {
     let signing_key = SigningKey::from_bytes(&seed);
     Ed25519KeyPair {
         private_key: Ed25519SecretKey(seed),
-        public_key:  Ed25519PublicKey(*signing_key.verifying_key().as_bytes()),
+        public_key: Ed25519PublicKey(*signing_key.verifying_key().as_bytes()),
         private_key_sealed: String::new(),
     }
 }
@@ -179,11 +182,7 @@ fn split_opcode(outer: u8, plaintext: &[u8], also_accept: Option<u8>) -> Option<
 /// Header: `[op: 1][peer_active_conn_id: u16][nonce: 24]`
 /// Body: XChaCha20-Poly1305 of `[op][plaintext]`, keyed with the session AEAD
 /// key (`aead_domain::SESSION` over the connection's X25519 shared secret).
-pub(crate) fn build_encrypted_packet(
-    op: u8,
-    conn: &ActiveConnection,
-    plaintext: &[u8],
-) -> Vec<u8> {
+pub(crate) fn build_encrypted_packet(op: u8, conn: &ActiveConnection, plaintext: &[u8]) -> Vec<u8> {
     let key = aead_key_from_dh(
         &conn.key_pair.private_key,
         &conn.peer_public_key,
@@ -221,10 +220,50 @@ pub(crate) fn decrypt_packet_body(node: &Node, expected_op: u8, buf: &[u8]) -> O
     open_with_opcode(expected_op, &key, &nonce, ciphertext, None)
 }
 
+/// Seal an app body for `their_pk` using this device's static X25519 key.
+///
+/// Layout: `[op][sender_device:16][nonce:24][ciphertext]`.
+/// The ciphertext opens to `[opcode][body]`.
+pub(crate) fn seal_direct_app(
+    our_sk: &X25519SecretKey,
+    their_pk: &X25519PublicKey,
+    sender_device: &[u8; 16],
+    body: &[u8],
+) -> Vec<u8> {
+    use super::wire::DIRECT_APP_OP;
+    let key = aead_key_from_dh(our_sk, their_pk, aead_domain::DIRECT);
+    let (ct, nonce) = seal_with_opcode(DIRECT_APP_OP, &key, body);
+    let mut pkt = Vec::with_capacity(1 + 16 + 24 + ct.len());
+    pkt.push(DIRECT_APP_OP);
+    pkt.extend_from_slice(sender_device);
+    pkt.extend_from_slice(&nonce);
+    pkt.extend_from_slice(&ct);
+    pkt
+}
+
+/// Open a direct app packet (`buf` starts after the opcode).
+/// Returns the sender device id and the body after the inner opcode byte.
+pub(crate) fn open_direct_app(
+    our_sk: &X25519SecretKey,
+    their_pk: &X25519PublicKey,
+    buf_after_op: &[u8],
+) -> Option<([u8; 16], Vec<u8>)> {
+    use super::wire::DIRECT_APP_OP;
+    if buf_after_op.len() < 16 + 24 {
+        return None;
+    }
+    let mut sender = [0u8; 16];
+    sender.copy_from_slice(&buf_after_op[..16]);
+    let nonce: [u8; 24] = buf_after_op[16..40].try_into().ok()?;
+    let key = aead_key_from_dh(our_sk, their_pk, aead_domain::DIRECT);
+    let plain = open_with_opcode(DIRECT_APP_OP, &key, &nonce, &buf_after_op[40..], None)?;
+    Some((sender, plain))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::data_models::generate_uuid;
+    use super::*;
     use std::time::{Duration, SystemTime};
 
     #[test]
@@ -303,6 +342,31 @@ mod tests {
         let pt = xchacha20_decrypt(&key, &nonce, &ct).expect("decrypt");
         assert_eq!(pt, b"payload");
         assert!(xchacha20_decrypt(&key, &nonce, b"tampered").is_none());
+    }
+
+    #[test]
+    fn direct_app_opens_for_the_peer_and_not_a_session_key() {
+        let a = generate_x25519_keypair();
+        let b = generate_x25519_keypair();
+        let sender = [7u8; 16];
+        let body = b"dest-app-and-payload";
+        let pkt = seal_direct_app(&a.private_key, &b.public_key, &sender, body);
+        let (got_sender, plain) =
+            open_direct_app(&b.private_key, &a.public_key, &pkt[1..]).unwrap();
+        assert_eq!(got_sender, sender);
+        assert_eq!(plain, body);
+        let session = aead_key_from_dh(&b.private_key, &a.public_key, aead_domain::SESSION);
+        let nonce: [u8; 24] = pkt[17..41].try_into().unwrap();
+        assert!(
+            open_with_opcode(
+                super::super::wire::DIRECT_APP_OP,
+                &session,
+                &nonce,
+                &pkt[41..],
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -7,17 +7,17 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::time::SystemTime;
 
 use super::super::action_queue::WorkerContext;
-use super::super::crypto::{
-    aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body, seal_with_opcode,
-};
 use super::super::certs::issue_app_cert;
+use super::super::crypto::{
+    aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body, open_direct_app,
+    seal_with_opcode,
+};
 use super::super::data_models::{Application, Ed25519PublicKey, Uuid, generate_uuid};
 use super::super::wire::*;
 use super::{
-    best_sg_connection, ipv4_from, local_approved_app_host, push_device, request_change, send,
-    send_error, sender_may_deliver, sg_candidates_for_dest, top_ranked_sg_for_device, Change,
+    Change, best_sg_connection, ipv4_from, local_approved_app_host, push_device, request_change,
+    send, send_error, sender_may_deliver, sg_candidates_for_dest, top_ranked_sg_for_device,
 };
-
 
 /// Op 0 — Application registration.
 ///
@@ -140,9 +140,18 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 cert_alias: String::new(),
             });
             let published = if auto_approve {
-                let app = device.applications.iter_mut().find(|a| a.id == next_id).expect("just inserted");
+                let app = device
+                    .applications
+                    .iter_mut()
+                    .find(|a| a.id == next_id)
+                    .expect("just inserted");
                 issue_app_cert(&mut *app, &signing.private_key, &signing.public_key);
-                Some((app.identity.public_key, app.cert_sig, app.cert_issued_at, app.cert_alias.clone()))
+                Some((
+                    app.identity.public_key,
+                    app.cert_sig,
+                    app.cert_issued_at,
+                    app.cert_alias.clone(),
+                ))
             } else {
                 None
             };
@@ -162,18 +171,25 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         // a reachable writer SG cannot publish state changes — roll back the
         // local app and reject the registration. The caller is responsible
         // for retrying when a writer is online.
-        if let Err(e) = request_change(Change::AddApplication {
-            device_uuid,
-            app_id:    next_id,
-            app_alias: alias_for_log.clone(),
-            signing_pk,
-            cert_sig,
-            cert_issued_at,
-            cert_alias,
-        }, ctx) {
+        if let Err(e) = request_change(
+            Change::AddApplication {
+                device_uuid,
+                app_id: next_id,
+                app_alias: alias_for_log.clone(),
+                signing_pk,
+                cert_sig,
+                cert_issued_at,
+                cert_alias,
+            },
+            ctx,
+        ) {
             {
                 let mut node = ctx.node.write().unwrap();
-                if let Some(device) = node.owner.user.devices.iter_mut()
+                if let Some(device) = node
+                    .owner
+                    .user
+                    .devices
+                    .iter_mut()
                     .find(|d| d.uuid == device_uuid)
                 {
                     device.applications.retain(|a| a.id != next_id);
@@ -219,7 +235,7 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let mut pos = 17usize;
 
     let mut new_alias: Option<String> = None;
-    let mut new_port:  Option<u16>   = None;
+    let mut new_port: Option<u16> = None;
 
     if flags & 0x01 != 0 {
         if pos >= buf.len() {
@@ -249,7 +265,11 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // Port/host is private-scope — local-only, no sync v1 traffic.
     enum Outcome {
         NotFound,
-        Updated { device_uuid: Uuid, app_id: Uuid, old_alias: Option<String> },
+        Updated {
+            device_uuid: Uuid,
+            app_id: Uuid,
+            old_alias: Option<String>,
+        },
     }
     let outcome = {
         let mut node = ctx.node.write().unwrap();
@@ -275,7 +295,11 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                     app.host = SocketAddrV4::new(ip, port);
                 }
             }
-            Outcome::Updated { device_uuid, app_id, old_alias }
+            Outcome::Updated {
+                device_uuid,
+                app_id,
+                old_alias,
+            }
         } else {
             Outcome::NotFound
         }
@@ -284,7 +308,11 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     match outcome {
         Outcome::NotFound => send_error(ctx, src, ERR_TOKEN_UNKNOWN),
-        Outcome::Updated { device_uuid, app_id, old_alias } => {
+        Outcome::Updated {
+            device_uuid,
+            app_id,
+            old_alias,
+        } => {
             ctx.save_node();
 
             // Publish the alias change via sync v1 only if the alias actually
@@ -292,31 +320,45 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             if let Some(prior_alias) = old_alias {
                 let new_alias = {
                     let node = ctx.node.read().unwrap();
-                    node.owner.user.devices.iter()
+                    node.owner
+                        .user
+                        .devices
+                        .iter()
                         .find(|d| d.uuid == device_uuid)
                         .and_then(|d| d.applications.iter().find(|a| a.id == app_id))
                         .map(|a| a.alias.clone())
                         .unwrap_or_default()
                 };
-                if let Err(e) = request_change(Change::UpdateApplicationAlias {
-                    device_uuid,
-                    app_id,
-                    new_alias,
-                }, ctx) {
+                if let Err(e) = request_change(
+                    Change::UpdateApplicationAlias {
+                        device_uuid,
+                        app_id,
+                        new_alias,
+                    },
+                    ctx,
+                ) {
                     // Roll back the alias only; port/host change (if any) was
                     // private-scope and stays.
                     {
                         let mut node = ctx.node.write().unwrap();
-                        if let Some(dev) = node.owner.user.devices.iter_mut()
+                        if let Some(dev) = node
+                            .owner
+                            .user
+                            .devices
+                            .iter_mut()
                             .find(|d| d.uuid == device_uuid)
                         {
-                            if let Some(app) = dev.applications.iter_mut().find(|a| a.id == app_id) {
+                            if let Some(app) = dev.applications.iter_mut().find(|a| a.id == app_id)
+                            {
                                 app.alias = prior_alias;
                             }
                         }
                     }
                     ctx.save_node();
-                    eprintln!("[app_update] alias rollback for app {}: {e:?}", uuid_hex(&app_id));
+                    eprintln!(
+                        "[app_update] alias rollback for app {}: {e:?}",
+                        uuid_hex(&app_id)
+                    );
                     return send_error(ctx, src, ERR_NO_WRITER);
                 }
             }
@@ -383,12 +425,16 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         .find(|d| d.uuid == device_uuid)
         .expect("local device not found in node");
 
-    let app = device.applications.iter().find(|a| a.token == token).cloned();
+    let app = device
+        .applications
+        .iter()
+        .find(|a| a.token == token)
+        .cloned();
     drop(node);
 
     let app = match app {
         Some(a) => a,
-        None    => return send_error(ctx, src, ERR_TOKEN_UNKNOWN),
+        None => return send_error(ctx, src, ERR_TOKEN_UNKNOWN),
     };
 
     let node = ctx.node.read().unwrap();
@@ -429,9 +475,8 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         reply.push(contact.user.devices.len() as u8);
         for d in &contact.user.devices {
             push_device(&mut reply, d);
-            let approved: Vec<&Application> = d.applications.iter()
-                .filter(|a| a.user_approved)
-                .collect();
+            let approved: Vec<&Application> =
+                d.applications.iter().filter(|a| a.user_approved).collect();
             reply.push(approved.len() as u8);
             for a in approved {
                 reply.extend_from_slice(&a.id);
@@ -498,19 +543,23 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
     }
 
     // Build packet and look up the SG address under a single read lock.
-    let out: Option<(Vec<u8>, SocketAddr)> = {
+    // The third value is the app body a direct send reseals for the peer.
+    // A tunnel packet stays None so it is not moved off the server.
+    let out: Option<(Vec<u8>, SocketAddr, Option<Vec<u8>>)> = {
         let node = ctx.node.read().unwrap();
 
         // Find the sending app by token; distinguish unknown vs not approved.
         let device_uuid = node.device_uuid;
-        let Some(local_device) = node.owner.user.devices.iter()
+        let Some(local_device) = node
+            .owner
+            .user
+            .devices
+            .iter()
             .find(|d| d.uuid == device_uuid)
         else {
             return send_error(ctx, src, ERR_TOKEN_UNKNOWN);
         };
-        let Some(sender_app) = local_device.applications.iter()
-            .find(|a| a.token == token)
-        else {
+        let Some(sender_app) = local_device.applications.iter().find(|a| a.token == token) else {
             return send_error(ctx, src, ERR_TOKEN_UNKNOWN);
         };
         if !sender_app.user_approved {
@@ -535,7 +584,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
             })
             .map(|(tid, cid)| (*tid, *cid));
 
-        let tunnel_pkt: Option<(Vec<u8>, SocketAddr)> =
+        let tunnel_pkt: Option<(Vec<u8>, SocketAddr, Option<Vec<u8>>)> =
             if let Some((tunnel_id, dg_dg_conn_id)) = tunnel_info {
                 (|| {
                     let dg_dg_conn = node.owner.active_connections.get(&dg_dg_conn_id)?;
@@ -552,10 +601,11 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                     // The SG rewrites the outer byte to 0x54 and leaves this sealed.
                     let (ciphertext, nonce) =
                         seal_with_opcode(TUNNEL_FORWARD_OP, &aead_key, &tunnel_body);
-                    let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid).or_else(|| {
-                        let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
-                        best_sg_connection(&node, &candidates)
-                    })?;
+                    let sg_conn =
+                        top_ranked_sg_for_device(&node, &dest_device_uuid).or_else(|| {
+                            let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
+                            best_sg_connection(&node, &candidates)
+                        })?;
                     // Session body: the SG opens this with the device session
                     // key, then forwards the still-sealed tunnel blob.
                     let mut session_body = Vec::with_capacity(2 + 24 + ciphertext.len());
@@ -563,7 +613,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                     session_body.extend_from_slice(&nonce);
                     session_body.extend_from_slice(&ciphertext);
                     let pkt = build_encrypted_packet(TUNNEL_FORWARD_OP, sg_conn, &session_body);
-                    Some((pkt, sg_conn.peer_addr))
+                    Some((pkt, sg_conn.peer_addr, None))
                 })()
             } else {
                 None
@@ -585,7 +635,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
             app_body.extend_from_slice(&sender_app_id);
             app_body.extend_from_slice(payload);
             let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
-            Some((pkt, dest_conn.peer_addr))
+            Some((pkt, dest_conn.peer_addr, Some(app_body)))
         } else {
             // ── Standard relay path (also the fallback after tunnel teardown) ─
             let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid).or_else(|| {
@@ -593,7 +643,10 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                 best_sg_connection(&node, &candidates)
             });
             let Some(sg_conn) = sg_conn else {
-                eprintln!("[app_send_packet] no reachable SG for dest {:?}", dest_device_uuid);
+                eprintln!(
+                    "[app_send_packet] no reachable SG for dest {:?}",
+                    dest_device_uuid
+                );
                 return send_error(ctx, src, ERR_NO_ROUTE);
             };
             let mut plaintext = Vec::with_capacity(48 + payload.len());
@@ -602,29 +655,124 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
             plaintext.extend_from_slice(&sender_app_id);
             plaintext.extend_from_slice(payload);
             let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
-            Some((pkt, sg_conn.peer_addr))
+            let app_body = plaintext[16..].to_vec();
+            Some((pkt, sg_conn.peer_addr, Some(app_body)))
         }
     };
 
-    if let Some((pkt, mut dest)) = out {
-        if let Ok(book) = ctx.direct_book.lock() {
+    if let Some((mut pkt, mut dest, reseal)) = out {
+        let observed = ctx.direct_book.lock().ok().and_then(|book| {
             let now = std::time::Instant::now();
             let lan = book.lan_is_up(&dest_device_uuid);
             let punch = book.punch_is_up(&dest_device_uuid, now, grade.cellphone());
-            let unstable =
-                book.self_unstable() || book.is_unstable(&dest_device_uuid);
+            let unstable = book.self_unstable() || book.is_unstable(&dest_device_uuid);
             let choice = crate::direct_path::choose_path(grade, lan, punch, unstable);
             if matches!(
                 choice,
                 crate::direct_path::PathChoice::Lan | crate::direct_path::PathChoice::Punch
             ) {
-                if let Some(observed) = book.observed(&dest_device_uuid) {
-                    dest = observed;
-                }
+                book.observed(&dest_device_uuid)
+            } else {
+                None
+            }
+        });
+        if let (Some(addr), Some(body)) = (observed, reseal) {
+            if let Some(direct) = seal_direct_for(ctx, &dest_device_uuid, &body) {
+                pkt = direct;
+                dest = addr;
             }
         }
         send(ctx, dest, &pkt);
     }
+}
+
+/// Seal `body` for the destination device's static X25519 key.
+/// Returns nothing when that key is not in the directory, and the caller
+/// keeps the server relay.
+fn seal_direct_for(ctx: &WorkerContext, dest: &[u8; 16], body: &[u8]) -> Option<Vec<u8>> {
+    use crate::crypto::seal_direct_app;
+    let node = ctx.node.read().unwrap();
+    let their = device_dh_pk(&node, dest)?;
+    if their.as_bytes() == &[0u8; 32] {
+        return None;
+    }
+    Some(seal_direct_app(
+        &node.device_dh.private_key,
+        &their,
+        &node.device_uuid,
+        body,
+    ))
+}
+
+fn device_dh_pk(
+    node: &crate::data_models::Node,
+    id: &[u8; 16],
+) -> Option<crate::data_models::X25519PublicKey> {
+    if let Some(device) = node.owner.user.devices.iter().find(|d| d.uuid == *id) {
+        return Some(device.dh_pk);
+    }
+    node.owner.contact_users.iter().find_map(|contact| {
+        contact
+            .user
+            .devices
+            .iter()
+            .find(|d| d.uuid == *id)
+            .map(|d| d.dh_pk)
+    })
+}
+
+/// Op 0x1E — app bytes sealed to this device's static key, from a LAN or punch path.
+pub fn direct_app(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let (push_pkt, app_host) = {
+        let node = ctx.node.read().unwrap();
+        let mut sender = [0u8; 16];
+        if buf.len() < 16 {
+            return;
+        }
+        sender.copy_from_slice(&buf[..16]);
+        let Some(their) = device_dh_pk(&node, &sender) else {
+            eprintln!("[direct_app] unknown sender from {src}");
+            return;
+        };
+        let Some((claimed, plaintext)) = open_direct_app(&node.device_dh.private_key, &their, &buf)
+        else {
+            eprintln!("[direct_app] decryption failed from {src}");
+            return;
+        };
+        if claimed != sender || plaintext.len() < 32 {
+            eprintln!("[direct_app] bad body from {src}");
+            return;
+        }
+        let Some(dest_app_id) = slice_arr::<16>(&plaintext, 0) else {
+            return;
+        };
+        let Some(sender_app_id) = slice_arr::<16>(&plaintext, 16) else {
+            return;
+        };
+        let payload = &plaintext[32..];
+        if payload.len() > MAX_APP_PAYLOAD {
+            return;
+        }
+        if !sender_may_deliver(
+            &node,
+            Some(sender),
+            sender_app_id,
+            node.device_uuid,
+            dest_app_id,
+        ) {
+            eprintln!("[direct_app] sender is not allowed");
+            return;
+        }
+        let Some(app_host) = local_approved_app_host(&node, dest_app_id) else {
+            return;
+        };
+        let mut push = Vec::with_capacity(17 + payload.len());
+        push.push(APP_PUSH_OP);
+        push.extend_from_slice(&sender_app_id);
+        push.extend_from_slice(payload);
+        (push, app_host)
+    };
+    send(ctx, SocketAddr::V4(app_host), &push_pkt);
 }
 
 /// Op 0x41 — App packet (SG → destination node).
@@ -649,9 +797,13 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             eprintln!("[app_packet] plaintext too short from {src}");
             return;
         }
-        let Some(dest_app_id) = slice_arr::<16>(&plaintext, 0) else { return; };
-        let Some(sender_app_id) = slice_arr::<16>(&plaintext, 16) else { return; };
-        let payload             = &plaintext[32..];
+        let Some(dest_app_id) = slice_arr::<16>(&plaintext, 0) else {
+            return;
+        };
+        let Some(sender_app_id) = slice_arr::<16>(&plaintext, 16) else {
+            return;
+        };
+        let payload = &plaintext[32..];
         if payload.len() > MAX_APP_PAYLOAD {
             eprintln!(
                 "[app_packet] app payload too large ({} > {MAX_APP_PAYLOAD}) from {src}",
@@ -670,7 +822,10 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         }
         let Some(app_host) = local_approved_app_host(&node, dest_app_id) else {
-            eprintln!("[app_packet] no approved app with id {}", uuid_hex(&dest_app_id));
+            eprintln!(
+                "[app_packet] no approved app with id {}",
+                uuid_hex(&dest_app_id)
+            );
             return;
         };
 

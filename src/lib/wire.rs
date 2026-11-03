@@ -52,8 +52,7 @@ pub(crate) const MAX_APP_PAYLOAD: usize = 4096;
 /// Max `nonce ‖ ciphertext` size for the tunnel blob an SG forwards inside
 /// `0x54` after it has opened the session wrapper on `0x51`. Covers the AEAD
 /// tag, the inner opcode, the 32-byte app-id header, and the app payload.
-pub(crate) const MAX_TUNNEL_FORWARD_BLOB: usize =
-    24 /* nonce */
+pub(crate) const MAX_TUNNEL_FORWARD_BLOB: usize = 24 /* nonce */
     + 16 /* Poly1305 tag */
     + 1 /* inner opcode */
     + 32 /* dest+sender app id */
@@ -108,6 +107,10 @@ pub(crate) const PATH_DOWN_OP: u8 = 0x1C;
 /// A device's unstable flag. Body: device uuid (16) || flag (1) || fan (1).
 /// Flag 1 means unstable. Fan 0 asks rank-1 to tell the other peers.
 pub(crate) const UNSTABLE_OP: u8 = 0x1D;
+/// App bytes sealed for the destination device and sent to its observed address.
+/// Not a session packet. An older node drops the opcode and the sender still
+/// has the relay for the next packet.
+pub(crate) const DIRECT_APP_OP: u8 = 0x1E;
 pub(crate) const APP_PACKET_OP: u8 = 0x41;
 
 pub(crate) const TUNNEL_INIT_OP: u8 = 0x50;
@@ -279,8 +282,8 @@ pub(crate) fn read_sync_version(data: &[u8], pos: &mut usize) -> Option<SyncVers
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::data_models::SyncVersion;
+    use super::*;
 
     #[test]
     fn push_read_str_roundtrip() {

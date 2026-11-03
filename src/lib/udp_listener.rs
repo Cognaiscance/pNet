@@ -1,6 +1,6 @@
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -8,19 +8,17 @@ use super::action_queue::{Action, PRIORITY_HIGH};
 use super::app_api::app_api_source_allowed;
 use super::thread_pool::SharedQueue;
 use super::wire::{
-    slice_arr, APP_GET_DATA_OP, APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_GRADED_OP,
-    APP_SEND_PACKET_OP, APP_UPDATE_OP,
-    BOOTSTRAP_REQUEST_OP, BOOTSTRAP_RESPONSE_OP, CONNECT_ACK_OP, CONNECT_REQUEST_OP,
-    CONTACT_REQUEST_OP, CONTACT_RESPONSE_OP, CONN_RESET_OP, CROSS_USER_PULL_REQUEST_OP,
+    APP_GET_DATA_OP, APP_PACKET_OP, APP_REGISTER_OP, APP_SEND_GRADED_OP, APP_SEND_PACKET_OP,
+    APP_UPDATE_OP, BOOTSTRAP_REQUEST_OP, BOOTSTRAP_RESPONSE_OP, CONN_RESET_OP, CONNECT_ACK_OP,
+    CONNECT_REQUEST_OP, CONTACT_REQUEST_OP, CONTACT_RESPONSE_OP, CROSS_USER_PULL_REQUEST_OP,
     CROSS_USER_PULL_RESPONSE_OP, CROSS_USER_UPDATE_AVAILABLE_OP, DEVICE_REGISTER_OP,
-    DG_KEEPALIVE_OP, GENERATE_INVITATION_REQUEST_OP, GENERATE_INVITATION_RESPONSE_OP,
-    LAN_PROBE_ACK_OP, LAN_PROBE_OP, MERGE_ACK_OP, MERGE_PROPOSAL_OP, OBSERVED_ADDR_OP,
-    PATH_DOWN_OP, PUNCH_ACK_OP, PUNCH_INVITE_OP, PUNCH_OP, UNSTABLE_OP,
-    RELAY_PACKET_OP, SG_PING_OP,
-    SYNC_PULL_REQUEST_OP,
-    SYNC_PULL_RESPONSE_OP, SYNC_UPDATE_AVAILABLE_OP, SYNC_WRITE_ACK_OP, SYNC_WRITE_REQUEST_OP,
-    TUNNEL_CONNECT_ACK_OP, TUNNEL_CONNECT_REQUEST_OP, TUNNEL_DELIVERY_OP, TUNNEL_FORWARD_OP,
-    TUNNEL_INIT_OP, WATERMARK_PROBE_REQUEST_OP, WATERMARK_PROBE_RESPONSE_OP,
+    DG_KEEPALIVE_OP, DIRECT_APP_OP, GENERATE_INVITATION_REQUEST_OP,
+    GENERATE_INVITATION_RESPONSE_OP, LAN_PROBE_ACK_OP, LAN_PROBE_OP, MERGE_ACK_OP,
+    MERGE_PROPOSAL_OP, OBSERVED_ADDR_OP, PATH_DOWN_OP, PUNCH_ACK_OP, PUNCH_INVITE_OP, PUNCH_OP,
+    RELAY_PACKET_OP, SG_PING_OP, SYNC_PULL_REQUEST_OP, SYNC_PULL_RESPONSE_OP,
+    SYNC_UPDATE_AVAILABLE_OP, SYNC_WRITE_ACK_OP, SYNC_WRITE_REQUEST_OP, TUNNEL_CONNECT_ACK_OP,
+    TUNNEL_CONNECT_REQUEST_OP, TUNNEL_DELIVERY_OP, TUNNEL_FORWARD_OP, TUNNEL_INIT_OP, UNSTABLE_OP,
+    WATERMARK_PROBE_REQUEST_OP, WATERMARK_PROBE_RESPONSE_OP, slice_arr,
 };
 
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
@@ -40,8 +38,7 @@ impl UdpListener {
         // Bind before spawning so `local_addr` and `socket` are available immediately.
         let addr = format!("0.0.0.0:{port}");
         let socket = Arc::new(
-            UdpSocket::bind(&addr)
-                .unwrap_or_else(|e| panic!("UDP bind on {addr} failed: {e}")),
+            UdpSocket::bind(&addr).unwrap_or_else(|e| panic!("UDP bind on {addr} failed: {e}")),
         );
         socket
             .set_read_timeout(Some(READ_TIMEOUT))
@@ -60,7 +57,7 @@ impl UdpListener {
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        continue
+                        continue;
                     }
                     Err(e) => {
                         eprintln!("[udp] recv error: {e}");
@@ -98,8 +95,16 @@ impl UdpListener {
                     APP_REGISTER_OP => Action::AppRegister { src, buf: payload },
                     APP_UPDATE_OP => Action::AppUpdate { src, buf: payload },
                     APP_GET_DATA_OP => Action::AppGetData { src, buf: payload },
-                    APP_SEND_PACKET_OP => Action::AppSendPacket { src, buf: payload, graded: false },
-                    APP_SEND_GRADED_OP => Action::AppSendPacket { src, buf: payload, graded: true },
+                    APP_SEND_PACKET_OP => Action::AppSendPacket {
+                        src,
+                        buf: payload,
+                        graded: false,
+                    },
+                    APP_SEND_GRADED_OP => Action::AppSendPacket {
+                        src,
+                        buf: payload,
+                        graded: true,
+                    },
                     SG_PING_OP => {
                         let Some(nonce) = slice_arr::<16>(&payload, 0) else {
                             eprintln!("[udp] sg_ping too short from {src}");
@@ -156,13 +161,12 @@ impl UdpListener {
                     PUNCH_ACK_OP => Action::PunchAck { src, buf: payload },
                     PATH_DOWN_OP => Action::PathDown { src, buf: payload },
                     UNSTABLE_OP => Action::UnstableNotice { src, buf: payload },
+                    DIRECT_APP_OP => Action::DirectApp { src, buf: payload },
                     RELAY_PACKET_OP => Action::RelayPacket { src, buf: payload },
                     APP_PACKET_OP => Action::AppPacket { src, buf: payload },
                     TUNNEL_INIT_OP => Action::TunnelInit { src, buf: payload },
                     TUNNEL_FORWARD_OP => Action::TunnelForward { src, buf: payload },
-                    TUNNEL_CONNECT_REQUEST_OP => {
-                        Action::TunnelConnectRequest { src, buf: payload }
-                    }
+                    TUNNEL_CONNECT_REQUEST_OP => Action::TunnelConnectRequest { src, buf: payload },
                     TUNNEL_CONNECT_ACK_OP => Action::TunnelConnectAck { src, buf: payload },
                     TUNNEL_DELIVERY_OP => Action::TunnelDelivery { src, buf: payload },
                     _ => {
@@ -177,7 +181,11 @@ impl UdpListener {
             }
         });
 
-        UdpListener { local_addr, socket, handle }
+        UdpListener {
+            local_addr,
+            socket,
+            handle,
+        }
     }
 
     pub fn join(self) {
@@ -194,9 +202,9 @@ pub fn udp_port() -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::action_queue::{Action, ActionQueue};
     use super::*;
     use std::sync::{Condvar, Mutex};
-    use super::super::action_queue::{Action, ActionQueue};
 
     fn make_queue() -> SharedQueue {
         Arc::new((Mutex::new(ActionQueue::new()), Condvar::new()))
@@ -210,32 +218,37 @@ mod tests {
     #[test]
     fn op_bytes_map_to_correct_action_variants() {
         let cases: &[(u8, fn(&Action) -> bool)] = &[
-            (0x00, |a| matches!(a, Action::AppRegister      { .. })),
-            (0x01, |a| matches!(a, Action::AppUpdate        { .. })),
-            (0x02, |a| matches!(a, Action::AppGetData       { .. })),
-            (0x03, |a| matches!(a, Action::AppSendPacket    { .. })),
-            (0x09, |a| matches!(a, Action::AppSendPacket    { .. })),
-            (0x10, |a| matches!(a, Action::SgPing           { .. })),
-            (0x20, |a| matches!(a, Action::ConnectRequest   { .. })),
-            (0x21, |a| matches!(a, Action::ConnectAck       { .. })),
-            (0x30, |a| matches!(a, Action::BootstrapRequest   { .. })),
-            (0x31, |a| matches!(a, Action::BootstrapResponse  { .. })),
+            (0x00, |a| matches!(a, Action::AppRegister { .. })),
+            (0x01, |a| matches!(a, Action::AppUpdate { .. })),
+            (0x02, |a| matches!(a, Action::AppGetData { .. })),
+            (0x03, |a| matches!(a, Action::AppSendPacket { .. })),
+            (0x09, |a| matches!(a, Action::AppSendPacket { .. })),
+            (0x10, |a| matches!(a, Action::SgPing { .. })),
+            (0x20, |a| matches!(a, Action::ConnectRequest { .. })),
+            (0x21, |a| matches!(a, Action::ConnectAck { .. })),
+            (0x30, |a| matches!(a, Action::BootstrapRequest { .. })),
+            (0x31, |a| matches!(a, Action::BootstrapResponse { .. })),
             (0x32, |a| matches!(a, Action::DeviceRegistration { .. })),
-            (0x35, |a| matches!(a, Action::GenerateInvitationRequest  { .. })),
-            (0x36, |a| matches!(a, Action::GenerateInvitationResponse { .. })),
-            (0x16, |a| matches!(a, Action::ObservedAddr          { .. })),
-            (0x17, |a| matches!(a, Action::LanProbe             { .. })),
-            (0x18, |a| matches!(a, Action::LanProbeAck          { .. })),
-            (0x19, |a| matches!(a, Action::PunchInvite         { .. })),
-            (0x1A, |a| matches!(a, Action::PunchPacket         { .. })),
-            (0x1B, |a| matches!(a, Action::PunchAck            { .. })),
-            (0x1C, |a| matches!(a, Action::PathDown            { .. })),
-            (0x1D, |a| matches!(a, Action::UnstableNotice      { .. })),
-            (0x70, |a| matches!(a, Action::SyncWriteRequest      { .. })),
-            (0x71, |a| matches!(a, Action::SyncWriteAck          { .. })),
-            (0x72, |a| matches!(a, Action::SyncUpdateAvailable   { .. })),
-            (0x73, |a| matches!(a, Action::SyncPullRequest       { .. })),
-            (0x74, |a| matches!(a, Action::SyncPullResponse      { .. })),
+            (0x35, |a| {
+                matches!(a, Action::GenerateInvitationRequest { .. })
+            }),
+            (0x36, |a| {
+                matches!(a, Action::GenerateInvitationResponse { .. })
+            }),
+            (0x16, |a| matches!(a, Action::ObservedAddr { .. })),
+            (0x17, |a| matches!(a, Action::LanProbe { .. })),
+            (0x18, |a| matches!(a, Action::LanProbeAck { .. })),
+            (0x19, |a| matches!(a, Action::PunchInvite { .. })),
+            (0x1A, |a| matches!(a, Action::PunchPacket { .. })),
+            (0x1B, |a| matches!(a, Action::PunchAck { .. })),
+            (0x1C, |a| matches!(a, Action::PathDown { .. })),
+            (0x1D, |a| matches!(a, Action::UnstableNotice { .. })),
+            (0x1E, |a| matches!(a, Action::DirectApp { .. })),
+            (0x70, |a| matches!(a, Action::SyncWriteRequest { .. })),
+            (0x71, |a| matches!(a, Action::SyncWriteAck { .. })),
+            (0x72, |a| matches!(a, Action::SyncUpdateAvailable { .. })),
+            (0x73, |a| matches!(a, Action::SyncPullRequest { .. })),
+            (0x74, |a| matches!(a, Action::SyncPullResponse { .. })),
         ];
 
         for (op, check) in cases {
@@ -263,7 +276,10 @@ mod tests {
                         break;
                     }
                 }
-                assert!(std::time::Instant::now() < deadline, "timed out for op {op}");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out for op {op}"
+                );
                 std::thread::sleep(Duration::from_millis(10));
             }
 
@@ -282,7 +298,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
 
         let (lock, _) = &*queue;
-        assert!(lock.lock().unwrap().is_empty(), "unknown op should be dropped");
+        assert!(
+            lock.lock().unwrap().is_empty(),
+            "unknown op should be dropped"
+        );
 
         stop.store(true, Ordering::SeqCst);
         udp.join();
