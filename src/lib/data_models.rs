@@ -2,9 +2,6 @@ use std::collections::HashMap;
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant, SystemTime};
 
-pub const TUNNEL_THRESHOLD:      u32      = 10;
-pub const TUNNEL_COUNTER_WINDOW: Duration = Duration::from_secs(5 * 60);
-
 use serde::{Deserialize, Serialize};
 
 pub type Uuid = [u8; 16];
@@ -13,7 +10,7 @@ pub type Uuid = [u8; 16];
 //
 // Both are 32-byte Curve25519-family keys on the wire/disk, but they must not be
 // mixed at the type level: long-term identity keys are Ed25519 (sign/verify);
-// session, invitation, and tunnel ephemerals are X25519 (DH only).
+// session and invitation ephemerals are X25519 (DH only).
 
 /// Long-term identity public key (Ed25519 verifying key).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -221,7 +218,7 @@ impl<'de> Deserialize<'de> for Ed25519KeyPair {
     }
 }
 
-/// X25519 key pair for DH (sessions, invitations, tunnels). Never used for
+/// X25519 key pair for DH (sessions and invitations). Never used for
 /// Ed25519 sign/verify.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub struct X25519KeyPair {
@@ -766,23 +763,6 @@ pub struct Owner {
     #[serde(skip)]
     pub pending_device_acceptances: HashMap<Uuid, PendingDeviceAcceptance>,
 
-    // ── Tunnel state (all ephemeral, not persisted) ───────────────────────────
-
-    /// SG side: fully established tunnels keyed by tunnel_id.
-    #[serde(skip)]
-    pub active_tunnels: HashMap<u16, ActiveTunnel>,
-    /// SG side: tunnels mid-key-exchange, keyed by tunnel_id.
-    #[serde(skip)]
-    pub pending_tunnels: HashMap<u16, PendingTunnel>,
-    /// SG side: rolling relay-packet counts per (sender_uuid, dest_uuid) pair.
-    #[serde(skip)]
-    pub tunnel_counters: HashMap<(Uuid, Uuid), TunnelCounter>,
-    /// DG side: maps tunnel_id → ActiveConnection.id for the DG-to-DG connection.
-    #[serde(skip)]
-    pub dg_tunnel_map: HashMap<u16, u16>,
-    /// DG sender side: ephemeral key exchange state, keyed by tunnel_id.
-    #[serde(skip)]
-    pub pending_tunnel_connections: HashMap<u16, PendingTunnelConnection>,
 }
 
 /// A known contact. Extends User with their long-term Ed25519 identity.
@@ -824,40 +804,6 @@ pub struct AppInvitation {
     #[serde(with = "serde_bytes_16")]
     pub contact_uuid: Uuid,
     pub app_alias: String,
-}
-
-/// SG side: maps a tunnel_id to the two active connection IDs on this relay SG.
-/// Created once both legs of the DG-to-DG key exchange are complete.
-pub struct ActiveTunnel {
-    pub id:              u16,
-    pub connection_a_id: u16,  // sender DG's connection to this SG
-    pub connection_b_id: u16,  // dest DG's connection to this SG
-    pub last_used_at:    Instant,
-}
-
-/// SG side: ephemeral state held while the DG-to-DG key exchange is in progress.
-/// Keyed by tunnel_id in `Owner::pending_tunnels`.
-pub struct PendingTunnel {
-    pub tunnel_id:          u16,
-    pub sender_device_uuid: Uuid,
-    pub dest_device_uuid:   Uuid,
-    pub sender_ephem_pk:    Option<X25519PublicKey>,
-}
-
-/// SG side: rolling packet count between a (sender, dest) DG pair.
-/// Resets to (1, now) when the window expires before the threshold is reached.
-pub struct TunnelCounter {
-    pub count:        u32,
-    pub window_start: Instant,
-}
-
-/// DG side: ephemeral state on DG_sender while waiting for the tunnel key
-/// exchange to complete.  Keyed by tunnel_id in `Owner::pending_tunnel_connections`.
-pub struct PendingTunnelConnection {
-    pub tunnel_id:        u16,
-    pub our_conn_id:      u16,
-    pub our_key_pair:     X25519KeyPair,
-    pub dest_device_uuid: Uuid,
 }
 
 /// Runtime SG health telemetry for a single (device, advertised-host) pair.
@@ -1011,11 +957,6 @@ impl Node {
                 pending_contact_exchange:   None,
                 pending_bootstrap:          None,
                 pending_device_acceptances: HashMap::new(),
-                active_tunnels:             HashMap::new(),
-                pending_tunnels:            HashMap::new(),
-                tunnel_counters:            HashMap::new(),
-                dg_tunnel_map:              HashMap::new(),
-                pending_tunnel_connections: HashMap::new(),
             },
         }
     }

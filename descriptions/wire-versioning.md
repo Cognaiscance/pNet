@@ -24,7 +24,7 @@ Op ranges in use (hex):
 | `0x20–0x2F` | Session handshake |
 | `0x30–0x3F` | Bootstrap / invitations |
 | `0x40–0x4F` | Relay / app packet |
-| `0x50–0x5F` | Tunnels |
+| `0x50–0x5F` | Retired. Was the opaque bulk tunnel. Nodes drop these opcodes. |
 | `0x70–0x7F` | Sync v1/v2 |
 | unassigned | Reserved for future ops |
 

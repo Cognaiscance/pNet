@@ -122,18 +122,10 @@ pub enum Action {
     DirectApp          { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
-    // Tunnel
-    TunnelInit           { src: SocketAddr, buf: Vec<u8> },
-    TunnelForward        { src: SocketAddr, buf: Vec<u8> },
-    TunnelDelivery       { src: SocketAddr, buf: Vec<u8> },
-    TunnelConnectRequest { src: SocketAddr, buf: Vec<u8> },
-    TunnelConnectAck     { src: SocketAddr, buf: Vec<u8> },
-
     // Scheduled
     PollSG,
     MaintainConnections,
     KeepAliveDG,
-    CleanupTunnels,
     /// Periodic pull from the elected writer SG for both scopes. Also fired
     /// as a one-shot when an active connection to the writer SG is established.
     SyncPull,
@@ -142,7 +134,6 @@ pub enum Action {
     /// progresses even when the underlying connection survives the partition
     /// (i.e. no fresh `connect_ack` to trigger it).
     PartitionReconcile,
-    SetupTunnel   { sender_uuid: super::data_models::Uuid, dest_uuid: super::data_models::Uuid },
 }
 
 /// Sent by an action handler to schedule future work.
@@ -242,18 +233,11 @@ impl Action {
             Action::UnstableNotice { .. } => "UnstableNotice",
             Action::DirectApp { .. } => "DirectApp",
             Action::AppPacket { .. } => "AppPacket",
-            Action::TunnelInit { .. } => "TunnelInit",
-            Action::TunnelForward { .. } => "TunnelForward",
-            Action::TunnelDelivery { .. } => "TunnelDelivery",
-            Action::TunnelConnectRequest { .. } => "TunnelConnectRequest",
-            Action::TunnelConnectAck { .. } => "TunnelConnectAck",
             Action::PollSG => "PollSG",
             Action::MaintainConnections => "MaintainConnections",
             Action::KeepAliveDG => "KeepAliveDG",
-            Action::CleanupTunnels => "CleanupTunnels",
             Action::SyncPull => "SyncPull",
             Action::PartitionReconcile => "PartitionReconcile",
-            Action::SetupTunnel { .. } => "SetupTunnel",
         }
     }
 
@@ -309,18 +293,11 @@ impl Action {
             Action::UnstableNotice     { src, buf }   => handlers::unstable_notice(src, buf, ctx),
             Action::DirectApp          { src, buf }   => handlers::direct_app(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
-            Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),
-            Action::TunnelForward        { src, buf } => handlers::tunnel_forward(src, buf, ctx),
-            Action::TunnelDelivery       { src, buf } => handlers::tunnel_delivery(src, buf, ctx),
-            Action::TunnelConnectRequest { src, buf } => handlers::tunnel_connect_request(src, buf, ctx),
-            Action::TunnelConnectAck     { src, buf } => handlers::tunnel_connect_ack(src, buf, ctx),
             Action::PollSG                           => handlers::poll_sg(ctx),
             Action::MaintainConnections              => handlers::maintain_connections(ctx),
             Action::KeepAliveDG                      => handlers::keepalive_dg(ctx),
-            Action::CleanupTunnels                   => handlers::cleanup_tunnels(ctx),
             Action::SyncPull                         => handlers::sync_pull(ctx),
             Action::PartitionReconcile               => handlers::partition_reconcile_tick(ctx),
-            Action::SetupTunnel { sender_uuid, dest_uuid } => handlers::setup_tunnel(sender_uuid, dest_uuid, ctx),
         }
     }
 }

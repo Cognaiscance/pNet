@@ -16,16 +16,13 @@ use super::wire::ENCRYPTED_BODY_HEADER_LEN;
 /// HKDF-Expand `info` labels for AEAD key derivation from X25519 shared secrets.
 ///
 /// Never use the raw DH output as an AEAD key. Domain separation keeps session
-/// traffic, bootstrap/contact invitation exchanges, and DG↔DG tunnels from
-/// sharing key material even if the same DH output were ever reused.
+/// traffic and bootstrap/contact invitation exchanges from sharing key material
+/// even if the same DH output were ever reused.
 pub(crate) mod aead_domain {
     /// ActiveConnection-sealed packets (relay, app packet, sync, keepalive, invites over session).
     pub const SESSION: &[u8] = b"pnet-aead-v1-session";
     /// Device bootstrap and contact-invitation handshakes (ephemeral × invitation PK).
     pub const BOOTSTRAP: &[u8] = b"pnet-aead-v1-bootstrap";
-    /// Lazy tunnel end-to-end payload (DG↔DG ephemerals). The SG opens the
-    /// session wrapper on tunnel-forward (`0x51`) and still does not open this.
-    pub const TUNNEL: &[u8] = b"pnet-aead-v1-tunnel";
     /// Device static X25519 to device static X25519. Used by a LAN or punch
     /// send so the peer can open the packet without a session.
     pub const DIRECT: &[u8] = b"pnet-aead-v1-direct";
@@ -309,14 +306,14 @@ mod tests {
         assert_eq!(k1, k2);
         // Same IKM, different domains → different keys.
         let k_boot = derive_aead_key(&shared, aead_domain::BOOTSTRAP);
-        let k_tun = derive_aead_key(&shared, aead_domain::TUNNEL);
+        let k_direct = derive_aead_key(&shared, aead_domain::DIRECT);
         assert_ne!(k1, k_boot);
-        assert_ne!(k1, k_tun);
-        assert_ne!(k_boot, k_tun);
+        assert_ne!(k1, k_direct);
+        assert_ne!(k_boot, k_direct);
         // Raw DH output must not equal any derived key (except by astronomical chance).
         assert_ne!(shared, k1);
         assert_ne!(shared, k_boot);
-        assert_ne!(shared, k_tun);
+        assert_ne!(shared, k_direct);
         // Both sides of the DH agree on the derived key.
         let from_b = aead_key_from_dh(&b.private_key, &a.public_key, aead_domain::SESSION);
         assert_eq!(k1, from_b);

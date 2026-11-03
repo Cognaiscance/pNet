@@ -28,7 +28,7 @@ pub(crate) const ERR_TOKEN_UNKNOWN: u8 = 0x02;
 pub(crate) const ERR_NO_WRITER: u8 = 0x03;
 /// Token is valid but the app is not user-approved yet.
 pub(crate) const ERR_NOT_APPROVED: u8 = 0x04;
-/// No path to the destination (no session, no reachable SG for relay/tunnel).
+/// No path to the destination (no session and no reachable SG for relay).
 pub(crate) const ERR_NO_ROUTE: u8 = 0x05;
 /// App payload exceeds [`MAX_APP_PAYLOAD`].
 pub(crate) const ERR_PAYLOAD_TOO_LARGE: u8 = 0x06;
@@ -42,21 +42,11 @@ pub(crate) const ERR_RATE_LIMITED: u8 = 0x07;
 ///   rejected with `ERR_PAYLOAD_TOO_LARGE`
 /// - peer `RelayPacket` (0x40) plaintext after the 48-byte dest/sender header
 /// - peer `AppPacket` (0x41) plaintext after the 32-byte dest/sender app ids
-/// - tunnel delivery (0x54) decrypted body after the 32-byte app ids
 ///
 /// Inbound fabric paths that exceed this drop the packet (no error to the
 /// remote peer). Apps that care about WAN path-MTU should stay well under
 /// this (≈1 KiB is a practical no-fragmentation budget).
 pub(crate) const MAX_APP_PAYLOAD: usize = 4096;
-
-/// Max `nonce ‖ ciphertext` size for the tunnel blob an SG forwards inside
-/// `0x54` after it has opened the session wrapper on `0x51`. Covers the AEAD
-/// tag, the inner opcode, the 32-byte app-id header, and the app payload.
-pub(crate) const MAX_TUNNEL_FORWARD_BLOB: usize = 24 /* nonce */
-    + 16 /* Poly1305 tag */
-    + 1 /* inner opcode */
-    + 32 /* dest+sender app id */
-    + MAX_APP_PAYLOAD;
 
 // ── Local app op bytes ────────────────────────────────────────────────────────
 
@@ -112,12 +102,6 @@ pub(crate) const UNSTABLE_OP: u8 = 0x1D;
 /// has the relay for the next packet.
 pub(crate) const DIRECT_APP_OP: u8 = 0x1E;
 pub(crate) const APP_PACKET_OP: u8 = 0x41;
-
-pub(crate) const TUNNEL_INIT_OP: u8 = 0x50;
-pub(crate) const TUNNEL_FORWARD_OP: u8 = 0x51;
-pub(crate) const TUNNEL_CONNECT_REQUEST_OP: u8 = 0x52;
-pub(crate) const TUNNEL_CONNECT_ACK_OP: u8 = 0x53;
-pub(crate) const TUNNEL_DELIVERY_OP: u8 = 0x54;
 
 // Sync v1 (see descriptions/data sync.md).
 pub(crate) const SYNC_WRITE_REQUEST_OP: u8 = 0x70;

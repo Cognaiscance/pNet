@@ -19,8 +19,7 @@ use super::wire::{
     RELAY_PACKET_OP, SG_PING_OP,
     SYNC_PULL_REQUEST_OP,
     SYNC_PULL_RESPONSE_OP, SYNC_UPDATE_AVAILABLE_OP, SYNC_WRITE_ACK_OP, SYNC_WRITE_REQUEST_OP,
-    TUNNEL_CONNECT_ACK_OP, TUNNEL_CONNECT_REQUEST_OP, TUNNEL_DELIVERY_OP, TUNNEL_FORWARD_OP,
-    TUNNEL_INIT_OP, WATERMARK_PROBE_REQUEST_OP, WATERMARK_PROBE_RESPONSE_OP,
+    WATERMARK_PROBE_REQUEST_OP, WATERMARK_PROBE_RESPONSE_OP,
 };
 
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
@@ -159,13 +158,6 @@ impl UdpListener {
                     DIRECT_APP_OP => Action::DirectApp { src, buf: payload },
                     RELAY_PACKET_OP => Action::RelayPacket { src, buf: payload },
                     APP_PACKET_OP => Action::AppPacket { src, buf: payload },
-                    TUNNEL_INIT_OP => Action::TunnelInit { src, buf: payload },
-                    TUNNEL_FORWARD_OP => Action::TunnelForward { src, buf: payload },
-                    TUNNEL_CONNECT_REQUEST_OP => {
-                        Action::TunnelConnectRequest { src, buf: payload }
-                    }
-                    TUNNEL_CONNECT_ACK_OP => Action::TunnelConnectAck { src, buf: payload },
-                    TUNNEL_DELIVERY_OP => Action::TunnelDelivery { src, buf: payload },
                     _ => {
                         eprintln!("[udp] unknown op byte {op} from {src}");
                         continue;

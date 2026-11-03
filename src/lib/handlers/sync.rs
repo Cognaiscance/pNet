@@ -1163,45 +1163,7 @@ fn drop_sessions_and_tunnels_for_device(node: &mut Node, device_uuid: Uuid) {
     node.owner
         .pending_connections
         .retain(|_, p| p.peer_device_uuid != device_uuid);
-
-    // SG tunnel maps that reference those connection ids.
-    let dead_conn_ids: HashSet<u16> = node
-        .owner
-        .active_connections
-        .keys()
-        .copied()
-        .collect();
-    // Recompute: connections already retained — remove tunnels whose legs are gone.
-    let dead_tunnels: Vec<u16> = node
-        .owner
-        .active_tunnels
-        .iter()
-        .filter(|(_, t)| {
-            !node.owner.active_connections.contains_key(&t.connection_a_id)
-                || !node.owner.active_connections.contains_key(&t.connection_b_id)
-        })
-        .map(|(&id, _)| id)
-        .collect();
-    for id in dead_tunnels {
-        node.owner.active_tunnels.remove(&id);
-    }
-    node.owner.pending_tunnels.retain(|_, p| {
-        p.sender_device_uuid != device_uuid && p.dest_device_uuid != device_uuid
-    });
-    // DG tunnel map: drop entries whose conn was for this device (already gone).
-    let map_dead: Vec<u16> = node
-        .owner
-        .dg_tunnel_map
-        .iter()
-        .filter(|(_, cid)| !dead_conn_ids.contains(cid))
-        .map(|(&tid, _)| tid)
-        .collect();
-    for tid in map_dead {
-        node.owner.dg_tunnel_map.remove(&tid);
-        node.owner.pending_tunnel_connections.remove(&tid);
-    }
     node.sg_statuses.retain(|(u, _), _| *u != device_uuid);
-    let _ = dead_conn_ids;
 }
 
 /// Build `Application` stubs (public fields only — private fields zeroed) from
