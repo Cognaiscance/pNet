@@ -64,6 +64,7 @@ Each tag notes the on-disk `format_version` it writes (`data persistence.md`) an
 | `v0.3.0` | 2 | `v0.2.2`. The device and server binaries speak the same wire. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 | `v0.3.1` | 2 | `v0.3.0`. Portal app groups, remote app delete, and saved app mounts are local. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 | `v0.3.2` | 2 | `v0.3.1`. A stable peer uses the LAN or the punch. Direct app bytes are op `0x1E`, sealed for the other device. An older node drops `0x1E` and keeps relaying. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
+| `v0.3.3` | 2 | `v0.3.2`. The opaque bulk tunnel (`0x50`–`0x54`) is gone. An up LAN path is probed every five minutes and dropped when the answer does not come. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 
 ## Rollout expectation
 
