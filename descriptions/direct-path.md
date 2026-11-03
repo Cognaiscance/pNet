@@ -42,6 +42,6 @@ The node keeps the last three timestamps of its own address changes. Three chang
 
 ## Time-to-live
 
-A LAN path stays up after its probe answer until an address-change or link-down notice. Time alone does not drop it.
+A LAN path stays up after its probe answer until an address-change notice or a missed check. The same five-minute maintenance pass sends one LAN probe to each peer whose LAN path is up. The answer clears that check. If the next pass still has no answer, the path drops and the node sends the link-down notice. App traffic does not count as the answer.
 
 A punch path stays up for 30 seconds after its probe answer when the send is fast, and for 10 seconds when the send is cellphone. App packets do not move that deadline. When it passes, the next send uses the relay. A later punch answer starts the deadline again. A notify drops either path immediately.

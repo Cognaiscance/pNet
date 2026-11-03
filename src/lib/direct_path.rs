@@ -31,6 +31,8 @@ pub struct PeerPath {
     pub punch_answered_at: Option<Instant>,
     pub lan_probe_sent: bool,
     pub punch_probe_sent: bool,
+    /// A maintenance probe was sent and its answer has not arrived.
+    pub lan_check_pending: bool,
 }
 
 /// In-memory book shared by workers. Not persisted.
@@ -82,6 +84,7 @@ impl DirectBook {
                         punch_answered_at: None,
                         lan_probe_sent: false,
                         punch_probe_sent: false,
+                        lan_check_pending: false,
                     },
                 );
                 Observe::New
@@ -98,6 +101,7 @@ impl DirectBook {
                 peer.punch_answered_at = None;
                 peer.lan_probe_sent = false;
                 peer.punch_probe_sent = false;
+                peer.lan_check_pending = false;
                 let next = unstable_window(&peer.changes, now);
                 if next != peer.unstable {
                     peer.unstable = next;
@@ -421,7 +425,35 @@ impl DirectBook {
             return false;
         }
         peer.lan_up = true;
+        peer.lan_check_pending = false;
         true
+    }
+
+    /// Peers whose last maintenance probe was not answered. The LAN path drops.
+    pub fn expire_unanswered_lan_checks(&mut self) -> Vec<[u8; 16]> {
+        let mut dead = Vec::new();
+        for (id, peer) in self.peers.iter_mut() {
+            if peer.lan_check_pending {
+                peer.lan_up = false;
+                peer.lan_probe_sent = false;
+                peer.lan_check_pending = false;
+                dead.push(*id);
+            }
+        }
+        dead
+    }
+
+    /// LAN paths that are up and are not already waiting on a probe.
+    /// Marks each one pending so the next pass can drop it if no answer comes.
+    pub fn lan_liveness_due(&mut self) -> Vec<([u8; 16], SocketAddr)> {
+        let mut out = Vec::new();
+        for (id, peer) in self.peers.iter_mut() {
+            if peer.lan_up && !peer.lan_check_pending {
+                peer.lan_check_pending = true;
+                out.push((*id, peer.observed));
+            }
+        }
+        out
     }
 
     pub fn lan_is_up(&self, device: &[u8; 16]) -> bool {
@@ -511,6 +543,7 @@ impl DirectBook {
             peer.punch_answered_at = None;
             peer.lan_probe_sent = false;
             peer.punch_probe_sent = false;
+            peer.lan_check_pending = false;
         }
     }
 }
@@ -685,6 +718,30 @@ mod tests {
         assert_eq!(book.take_unstable_notices(local), vec![(dev, true)]);
         book.set_unstable([7u8; 16], true);
         assert!(book.is_unstable(&[7u8; 16]));
+    }
+
+    #[test]
+    fn a_missed_lan_check_drops_the_path_and_an_ack_keeps_it() {
+        let mut book = DirectBook::new();
+        let dev = [9u8; 16];
+        let now = Instant::now();
+        let peer = "192.168.1.5:7777".parse().unwrap();
+        let ours = "192.168.1.9:7777".parse().unwrap();
+        book.note_observed(dev, peer, now);
+        assert!(book.begin_lan_probe(&dev, ours));
+        assert!(book.answer_lan(&dev));
+
+        assert!(book.expire_unanswered_lan_checks().is_empty());
+        assert_eq!(book.lan_liveness_due(), vec![(dev, peer)]);
+        assert_eq!(book.expire_unanswered_lan_checks(), vec![dev]);
+        assert!(!book.lan_is_up(&dev));
+
+        assert!(book.begin_lan_probe(&dev, ours));
+        assert!(book.answer_lan(&dev));
+        assert_eq!(book.lan_liveness_due().len(), 1);
+        assert!(book.accept_lan_ack(&dev, peer));
+        assert!(book.expire_unanswered_lan_checks().is_empty());
+        assert!(book.lan_is_up(&dev));
     }
 
     #[test]
