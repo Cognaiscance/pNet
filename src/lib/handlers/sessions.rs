@@ -460,22 +460,31 @@ pub fn maintain_connections(ctx: &WorkerContext) {
 
     let now = SystemTime::now();
     let local = ctx.node.read().unwrap().device_uuid;
-    let (notices, dead_lan, lan_due) = if let Ok(mut book) = ctx.direct_book.lock() {
+    let port = crate::udp_listener::udp_port();
+    let fib = std::fs::read_to_string("/proc/net/fib_trie").unwrap_or_default();
+    let own_lan = crate::direct_path::lan_addrs_from_fib_trie(&fib, port);
+    let (notices, dead_lan, lan_due, tell_lan, probe_due) = if let Ok(mut book) = ctx.direct_book.lock() {
         book.sweep_unstable(std::time::Instant::now());
         let notices = book.take_unstable_notices(local);
+        let tell_lan = book.set_self_reported(own_lan);
         let dead_lan = book.expire_unanswered_lan_checks();
         let lan_due = book.lan_liveness_due();
-        (notices, dead_lan, lan_due)
+        let probe_due = book.lan_probes_due(&local);
+        (notices, dead_lan, lan_due, tell_lan, probe_due)
     } else {
-        (Vec::new(), Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new(), false, Vec::new())
     };
     for (device, flag) in notices {
         super::publish_unstable(ctx, device, flag);
+    }
+    if tell_lan {
+        super::publish_lan_addrs(ctx);
     }
     for device in dead_lan {
         super::announce_path_down(ctx, device);
     }
     super::send_lan_probes(ctx, local, &lan_due);
+    super::send_lan_probes(ctx, local, &probe_due);
 
     // ── Evict PendingConnections whose ConnectAck never arrived ───────────────
     // A silent rejection on the SG side (e.g. a ConnectRequest that lost the

@@ -33,6 +33,10 @@ pub struct PeerPath {
     pub punch_probe_sent: bool,
     /// A maintenance probe was sent and its answer has not arrived.
     pub lan_check_pending: bool,
+    /// Private addresses this device reported for itself, with its UDP port.
+    pub reported: Vec<SocketAddr>,
+    /// Address the LAN probe was sent to. Set when a reported or observed pair matches.
+    pub lan_target: Option<SocketAddr>,
 }
 
 /// In-memory book shared by workers. Not persisted.
@@ -48,6 +52,10 @@ pub struct DirectBook {
     self_notice: Option<bool>,
     /// Flags learned from a peer before we have stored an address for them.
     remote_unstable: HashSet<[u8; 16]>,
+    /// This node's own reported LAN addresses.
+    self_reported: Vec<SocketAddr>,
+    /// Reports that arrived before the SG observation created the peer.
+    pending_reports: HashMap<[u8; 16], Vec<SocketAddr>>,
 }
 
 const UNSTABLE_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -85,6 +93,8 @@ impl DirectBook {
                         lan_probe_sent: false,
                         punch_probe_sent: false,
                         lan_check_pending: false,
+                        reported: self.pending_reports.remove(&device).unwrap_or_default(),
+                        lan_target: None,
                     },
                 );
                 Observe::New
@@ -102,6 +112,7 @@ impl DirectBook {
                 peer.lan_probe_sent = false;
                 peer.punch_probe_sent = false;
                 peer.lan_check_pending = false;
+                peer.lan_target = None;
                 let next = unstable_window(&peer.changes, now);
                 if next != peer.unstable {
                     peer.unstable = next;
@@ -363,22 +374,75 @@ fn private_block(o: [u8; 4]) -> Option<u8> {
 }
 
 impl DirectBook {
-    /// Start a LAN probe when both observed addresses share a private range.
-    /// Returns false when the ranges do not match. Does not mark the path up.
-    pub fn begin_lan_probe(&mut self, device: &[u8; 16], local_observed: SocketAddr) -> bool {
-        let Some(peer) = self.peers.get_mut(device) else {
-            return false;
-        };
-        if !same_lan(peer.observed, local_observed) {
+    /// Record private addresses a device claims on its own interfaces.
+    /// A later observation keeps them. An unanswered probe may start again.
+    pub fn note_reported(&mut self, device: [u8; 16], addrs: Vec<SocketAddr>) {
+        let addrs: Vec<SocketAddr> = addrs.into_iter().filter(|a| is_private(*a)).collect();
+        if let Some(peer) = self.peers.get_mut(&device) {
+            peer.reported = addrs;
+            if !peer.lan_up {
+                peer.lan_probe_sent = false;
+            }
+        } else {
+            self.pending_reports.insert(device, addrs);
+        }
+    }
+
+    /// Replace this node's own LAN addresses. Returns whether the set changed.
+    pub fn self_reported(&self) -> Vec<SocketAddr> {
+        self.self_reported.clone()
+    }
+
+    pub fn set_self_reported(&mut self, addrs: Vec<SocketAddr>) -> bool {
+        let mut addrs: Vec<SocketAddr> = addrs.into_iter().filter(|a| is_private(*a)).collect();
+        addrs.sort();
+        addrs.dedup();
+        if addrs == self.self_reported {
             return false;
         }
+        self.self_reported = addrs;
+        for peer in self.peers.values_mut() {
+            if !peer.lan_up {
+                peer.lan_probe_sent = false;
+            }
+        }
+        true
+    }
+
+    /// Where an app packet goes when the path choice is LAN or punch.
+    pub fn path_addr(&self, device: &[u8; 16], lan: bool) -> Option<SocketAddr> {
+        let peer = self.peers.get(device)?;
+        if lan {
+            peer.lan_target.or(Some(peer.observed))
+        } else {
+            Some(peer.observed)
+        }
+    }
+
+    /// Start a LAN probe when any reported or observed pair shares a private range.
+    /// The probe is aimed at the matching address, which may differ from the one the SG saw.
+    pub fn begin_lan_probe(&mut self, device: &[u8; 16], local_observed: SocketAddr) -> bool {
+        let Some(peer) = self.peers.get(device) else {
+            return false;
+        };
+        let ours = {
+            let mut addrs = self.self_reported.clone();
+            addrs.push(local_observed);
+            addrs
+        };
+        let mut theirs = peer.reported.clone();
+        theirs.push(peer.observed);
+        let Some((_, dest)) = matching_lan(&ours, &theirs) else {
+            return false;
+        };
         if self.self_unstable || peer.unstable {
             return false;
         }
-        // An answered LAN path stays up until a notice. Do not probe again.
         if peer.lan_probe_sent {
             return false;
         }
+        let peer = self.peers.get_mut(device).unwrap();
+        peer.lan_target = Some(dest);
         peer.lan_probe_sent = true;
         true
     }
@@ -393,13 +457,16 @@ impl DirectBook {
             .collect();
         let mut out = Vec::new();
         for id in ids {
-            let ours = self.observed(local);
-            let theirs = self.observed(&id);
-            let (Some(ours), Some(theirs)) = (ours, theirs) else {
-                continue;
-            };
+            let ours = self
+                .observed(local)
+                .unwrap_or_else(|| SocketAddr::from(([203, 0, 113, 1], 9)));
             if self.begin_lan_probe(&id, ours) {
-                out.push((id, theirs));
+                let dest = self
+                    .peers
+                    .get(&id)
+                    .and_then(|p| p.lan_target)
+                    .unwrap_or(ours);
+                out.push((id, dest));
             }
         }
         out
@@ -407,7 +474,12 @@ impl DirectBook {
 
     /// The probe answer counts only from the address we stored for that peer.
     pub fn accept_lan_ack(&mut self, peer: &[u8; 16], from: SocketAddr) -> bool {
-        let Some(expected) = self.observed(peer) else {
+        let Some(expected) = self
+            .peers
+            .get(peer)
+            .and_then(|p| p.lan_target)
+            .or_else(|| self.observed(peer))
+        else {
             return false;
         };
         if expected != from {
@@ -437,6 +509,7 @@ impl DirectBook {
                 peer.lan_up = false;
                 peer.lan_probe_sent = false;
                 peer.lan_check_pending = false;
+                peer.lan_target = None;
                 dead.push(*id);
             }
         }
@@ -450,7 +523,7 @@ impl DirectBook {
         for (id, peer) in self.peers.iter_mut() {
             if peer.lan_up && !peer.lan_check_pending {
                 peer.lan_check_pending = true;
-                out.push((*id, peer.observed));
+                out.push((*id, peer.lan_target.unwrap_or(peer.observed)));
             }
         }
         out
@@ -466,7 +539,11 @@ impl DirectBook {
         let Some(peer) = self.peers.get_mut(device) else {
             return false;
         };
-        if same_lan(peer.observed, local_observed) {
+        let mut ours = self.self_reported.clone();
+        ours.push(local_observed);
+        let mut theirs = peer.reported.clone();
+        theirs.push(peer.observed);
+        if matching_lan(&ours, &theirs).is_some() {
             return false;
         }
         if peer.punch_probe_sent {
@@ -488,7 +565,13 @@ impl DirectBook {
         }
         let addr_a = self.observed(&a)?;
         let addr_b = self.observed(&b)?;
-        if same_lan(addr_a, addr_b) {
+        let reported_a = self.peers.get(&a).map(|p| p.reported.clone()).unwrap_or_default();
+        let reported_b = self.peers.get(&b).map(|p| p.reported.clone()).unwrap_or_default();
+        let mut side_a = reported_a;
+        side_a.push(addr_a);
+        let mut side_b = reported_b;
+        side_b.push(addr_b);
+        if matching_lan(&side_a, &side_b).is_some() {
             return None;
         }
         if self.self_unstable || self.is_unstable(&a) || self.is_unstable(&b) {
@@ -544,8 +627,44 @@ impl DirectBook {
             peer.lan_probe_sent = false;
             peer.punch_probe_sent = false;
             peer.lan_check_pending = false;
+            peer.lan_target = None;
         }
     }
+}
+
+/// First pair that shares a private range. Reported addresses should be listed
+/// before the address the server saw, so a shared LAN wins.
+pub fn matching_lan(ours: &[SocketAddr], theirs: &[SocketAddr]) -> Option<(SocketAddr, SocketAddr)> {
+    for a in ours {
+        for b in theirs {
+            if same_lan(*a, *b) {
+                return Some((*a, *b));
+            }
+        }
+    }
+    None
+}
+
+/// Private IPv4 addresses marked LOCAL in `/proc/net/fib_trie`.
+pub fn lan_addrs_from_fib_trie(text: &str, port: u16) -> Vec<SocketAddr> {
+    let mut prev = "";
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.contains("host LOCAL") {
+            if let Some(ip) = prev.split_whitespace().last().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()) {
+                let addr = SocketAddr::from((ip, port));
+                if is_private(addr) {
+                    out.push(addr);
+                }
+            }
+        }
+        if !line.trim().is_empty() {
+            prev = line;
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// One instruction the SG sends to each side: the other side's observed
@@ -742,6 +861,46 @@ mod tests {
         assert!(book.accept_lan_ack(&dev, peer));
         assert!(book.expire_unanswered_lan_checks().is_empty());
         assert!(book.lan_is_up(&dev));
+    }
+
+    #[test]
+    fn reported_lan_addresses_match_when_the_server_saw_different_ranges() {
+        let mut book = DirectBook::new();
+        let dev = [4u8; 16];
+        let now = Instant::now();
+        book.note_observed(dev, "203.0.113.8:7777".parse().unwrap(), now);
+        book.note_reported(dev, vec!["192.168.50.63:7777".parse().unwrap()]);
+        book.set_self_reported(vec!["192.168.50.154:7777".parse().unwrap()]);
+        assert!(book.begin_lan_probe(&dev, "10.8.0.10:7777".parse().unwrap()));
+        assert_eq!(
+            book.peer(&dev).unwrap().lan_target,
+            Some("192.168.50.63:7777".parse().unwrap())
+        );
+        assert!(!book.accept_lan_ack(&dev, "203.0.113.8:7777".parse().unwrap()));
+        assert!(book.accept_lan_ack(&dev, "192.168.50.63:7777".parse().unwrap()));
+        assert!(book.lan_is_up(&dev));
+        assert!(!book.begin_punch(&dev, "10.8.0.10:7777".parse().unwrap()));
+    }
+
+    #[test]
+    fn fib_trie_keeps_private_local_addresses() {
+        let text = "\
+           |-- 192.168.50.154\n\
+              /32 host LOCAL\n\
+           |-- 10.8.0.10\n\
+              /32 host LOCAL\n\
+           |-- 127.0.0.1\n\
+              /32 host LOCAL\n\
+           |-- 136.59.152.104\n\
+              /32 host LOCAL\n";
+        let got = lan_addrs_from_fib_trie(text, 7777);
+        assert_eq!(
+            got,
+            vec![
+                "10.8.0.10:7777".parse().unwrap(),
+                "192.168.50.154:7777".parse().unwrap(),
+            ]
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use super::wire::{
     CONTACT_REQUEST_OP, CONTACT_RESPONSE_OP, CONN_RESET_OP, CROSS_USER_PULL_REQUEST_OP,
     CROSS_USER_PULL_RESPONSE_OP, CROSS_USER_UPDATE_AVAILABLE_OP, DEVICE_REGISTER_OP,
     DG_KEEPALIVE_OP, GENERATE_INVITATION_REQUEST_OP, GENERATE_INVITATION_RESPONSE_OP,
-    LAN_PROBE_ACK_OP, LAN_PROBE_OP, MERGE_ACK_OP, MERGE_PROPOSAL_OP, OBSERVED_ADDR_OP,
+    LAN_ADDRS_OP, LAN_PROBE_ACK_OP, LAN_PROBE_OP, MERGE_ACK_OP, MERGE_PROPOSAL_OP, OBSERVED_ADDR_OP,
     DIRECT_APP_OP, PATH_DOWN_OP, PUNCH_ACK_OP, PUNCH_INVITE_OP, PUNCH_OP, UNSTABLE_OP,
     RELAY_PACKET_OP, SG_PING_OP,
     SYNC_PULL_REQUEST_OP,
@@ -156,6 +156,7 @@ impl UdpListener {
                     PATH_DOWN_OP => Action::PathDown { src, buf: payload },
                     UNSTABLE_OP => Action::UnstableNotice { src, buf: payload },
                     DIRECT_APP_OP => Action::DirectApp { src, buf: payload },
+                    LAN_ADDRS_OP => Action::LanAddrs { src, buf: payload },
                     RELAY_PACKET_OP => Action::RelayPacket { src, buf: payload },
                     APP_PACKET_OP => Action::AppPacket { src, buf: payload },
                     _ => {

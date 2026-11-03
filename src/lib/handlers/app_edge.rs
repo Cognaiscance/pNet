@@ -611,7 +611,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                 choice,
                 crate::direct_path::PathChoice::Lan | crate::direct_path::PathChoice::Punch
             ) {
-                book.observed(&dest_device_uuid)
+                book.path_addr(&dest_device_uuid, choice == crate::direct_path::PathChoice::Lan)
             } else {
                 None
             }

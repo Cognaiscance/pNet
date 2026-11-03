@@ -178,6 +178,126 @@ fn drain_unstable_notices(ctx: &WorkerContext) {
     }
 }
 
+pub(crate) fn publish_lan_addrs(ctx: &WorkerContext) {
+    let local = ctx.node.read().unwrap().device_uuid;
+    let addrs = ctx
+        .direct_book
+        .lock()
+        .map(|book| book.self_reported())
+        .unwrap_or_default();
+    send_lan_addr_notice(ctx, local, &addrs, false);
+}
+
+fn send_lan_addr_notice(ctx: &WorkerContext, device: [u8; 16], addrs: &[std::net::SocketAddr], fanned: bool) {
+    let packets = {
+        let node = ctx.node.read().unwrap();
+        let local = node.device_uuid;
+        let rank1 = routing::rank1_sg_uuid(&node, &device);
+        let we_are_rank1 = rank1 == Some(local) || rank1.is_none();
+        let connected: Vec<[u8; 16]> = node
+            .owner
+            .active_connections
+            .values()
+            .map(|c| c.device_uuid)
+            .collect();
+        let targets = if we_are_rank1 || fanned {
+            connected.into_iter().filter(|id| *id != local).collect::<Vec<_>>()
+        } else {
+            rank1.into_iter().collect::<Vec<_>>()
+        };
+        let fan = u8::from(we_are_rank1 || fanned);
+        let body = encode_lan_notice(&device, fan, addrs);
+        let mut out = Vec::new();
+        for id in targets {
+            let Some(conn) = node
+                .owner
+                .active_connections
+                .values()
+                .find(|c| c.device_uuid == id)
+            else {
+                continue;
+            };
+            out.push((
+                conn.peer_addr,
+                build_encrypted_packet(LAN_ADDRS_OP, conn, &body),
+            ));
+        }
+        out
+    };
+    for (addr, pkt) in packets {
+        send(ctx, addr, &pkt);
+    }
+}
+
+fn encode_lan_notice(device: &[u8; 16], fan: u8, addrs: &[std::net::SocketAddr]) -> Vec<u8> {
+    let v4: Vec<_> = addrs
+        .iter()
+        .filter_map(|a| match a {
+            std::net::SocketAddr::V4(v) => Some(*v),
+            _ => None,
+        })
+        .take(8)
+        .collect();
+    let mut body = Vec::with_capacity(18 + v4.len() * 6);
+    body.extend_from_slice(device);
+    body.push(fan);
+    body.push(v4.len() as u8);
+    for v in v4 {
+        body.extend_from_slice(&v.ip().octets());
+        body.extend_from_slice(&v.port().to_be_bytes());
+    }
+    body
+}
+
+pub fn lan_addrs(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    let plain = {
+        let node = ctx.node.read().unwrap();
+        decrypt_packet_body(&node, LAN_ADDRS_OP, &buf)
+    };
+    let Some(plain) = plain else {
+        eprintln!("[lan_addrs] decryption failed from {src}");
+        return;
+    };
+    if plain.len() < 18 {
+        return;
+    }
+    let mut device = [0u8; 16];
+    device.copy_from_slice(&plain[..16]);
+    let fan = plain[16];
+    let count = plain[17] as usize;
+    if plain.len() < 18 + count * 6 {
+        return;
+    }
+    let mut addrs = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = 18 + i * 6;
+        let ip = std::net::Ipv4Addr::new(plain[at], plain[at + 1], plain[at + 2], plain[at + 3]);
+        let port = u16::from_be_bytes([plain[at + 4], plain[at + 5]]);
+        addrs.push(std::net::SocketAddr::from((ip, port)));
+    }
+    if let Ok(mut book) = ctx.direct_book.lock() {
+        book.note_reported(device, addrs.clone());
+    }
+    let local = ctx.node.read().unwrap().device_uuid;
+    if fan == 0 {
+        let we_are_rank1 = {
+            let node = ctx.node.read().unwrap();
+            let rank1 = routing::rank1_sg_uuid(&node, &device);
+            rank1 == Some(node.device_uuid) || rank1.is_none()
+        };
+        if we_are_rank1 {
+            send_lan_addr_notice(ctx, device, &addrs, true);
+        }
+    }
+    let due = {
+        let Ok(mut book) = ctx.direct_book.lock() else {
+            return;
+        };
+        book.lan_probes_due(&local)
+    };
+    send_lan_probes(ctx, local, &due);
+}
+
 pub fn unstable_notice(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let plain = {
         let node = ctx.node.read().unwrap();

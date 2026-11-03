@@ -101,6 +101,10 @@ pub(crate) const UNSTABLE_OP: u8 = 0x1D;
 /// Not a session packet. An older node drops the opcode and the sender still
 /// has the relay for the next packet.
 pub(crate) const DIRECT_APP_OP: u8 = 0x1E;
+/// A device lists its own private IPv4 addresses. Session plaintext:
+/// device uuid (16) || fan (1) || count (1) || count times ipv4 (4) || port (2).
+/// Fan 0 asks rank-1 to tell the other peers. An older node drops this opcode.
+pub(crate) const LAN_ADDRS_OP: u8 = 0x1F;
 pub(crate) const APP_PACKET_OP: u8 = 0x41;
 
 // Sync v1 (see descriptions/data sync.md).

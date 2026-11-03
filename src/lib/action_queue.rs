@@ -120,6 +120,7 @@ pub enum Action {
     PathDown           { src: SocketAddr, buf: Vec<u8> },
     UnstableNotice     { src: SocketAddr, buf: Vec<u8> },
     DirectApp          { src: SocketAddr, buf: Vec<u8> },
+    LanAddrs           { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
     // Scheduled
@@ -232,6 +233,7 @@ impl Action {
             Action::PathDown { .. } => "PathDown",
             Action::UnstableNotice { .. } => "UnstableNotice",
             Action::DirectApp { .. } => "DirectApp",
+            Action::LanAddrs { .. } => "LanAddrs",
             Action::AppPacket { .. } => "AppPacket",
             Action::PollSG => "PollSG",
             Action::MaintainConnections => "MaintainConnections",
@@ -292,6 +294,7 @@ impl Action {
             Action::PathDown           { src, buf }   => handlers::path_down(src, buf, ctx),
             Action::UnstableNotice     { src, buf }   => handlers::unstable_notice(src, buf, ctx),
             Action::DirectApp          { src, buf }   => handlers::direct_app(src, buf, ctx),
+            Action::LanAddrs           { src, buf }   => handlers::lan_addrs(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
             Action::PollSG                           => handlers::poll_sg(ctx),
             Action::MaintainConnections              => handlers::maintain_connections(ctx),
