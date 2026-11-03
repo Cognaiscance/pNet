@@ -119,6 +119,7 @@ pub enum Action {
     PunchAck           { src: SocketAddr, buf: Vec<u8> },
     PathDown           { src: SocketAddr, buf: Vec<u8> },
     UnstableNotice     { src: SocketAddr, buf: Vec<u8> },
+    DirectApp          { src: SocketAddr, buf: Vec<u8> },
     AppPacket          { src: SocketAddr, buf: Vec<u8> },
 
     // Tunnel
@@ -239,6 +240,7 @@ impl Action {
             Action::PunchAck { .. } => "PunchAck",
             Action::PathDown { .. } => "PathDown",
             Action::UnstableNotice { .. } => "UnstableNotice",
+            Action::DirectApp { .. } => "DirectApp",
             Action::AppPacket { .. } => "AppPacket",
             Action::TunnelInit { .. } => "TunnelInit",
             Action::TunnelForward { .. } => "TunnelForward",
@@ -305,6 +307,7 @@ impl Action {
             Action::PunchAck           { src, buf }   => handlers::punch_ack(src, buf, ctx),
             Action::PathDown           { src, buf }   => handlers::path_down(src, buf, ctx),
             Action::UnstableNotice     { src, buf }   => handlers::unstable_notice(src, buf, ctx),
+            Action::DirectApp          { src, buf }   => handlers::direct_app(src, buf, ctx),
             Action::AppPacket          { src, buf }   => handlers::app_packet(src, buf, ctx),
             Action::TunnelInit           { src, buf } => handlers::tunnel_init(src, buf, ctx),
             Action::TunnelForward        { src, buf } => handlers::tunnel_forward(src, buf, ctx),

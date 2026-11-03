@@ -18,7 +18,7 @@ Apps are not asked to report receipt. The node probes.
 2. On a later packet, if both observed addresses are private and in the same range, each side sends a LAN probe (op `0x17`) to the other's observed address and answers with op `0x18`. The sender is also told the address the SG saw, so it can make that comparison. The path is up only after the answer comes from that stored address. Until then the app packet still goes through the SG. A second probe is not sent while one is outstanding.
 3. After the LAN answer, a grade that wants speed sends on the LAN.
 4. If the ranges do not match, the app packet stays on the SG. Once the SG has seen both addresses, it sends each side one punch invite (op `0x19`) naming the other's address. Each side sends a punch datagram (op `0x1A`) and answers with op `0x1B`. The punch is up only after that answer comes from the stored address, and only while the LAN path is down. A repeat invite is not sent for the same pair. A failed LAN probe on a private range does not punch; those packets stay on the SG.
-5. After the punch answer, speed-seeking packets use the punch. If the punch is not answered, packets stay on the SG.
+5. After the punch answer, a stable peer's app packet is sealed with the two devices' static X25519 keys (op `0x1E`) and sent to the observed address. The server relay packet is not reused. If the peer's key is missing, the packet stays on the SG. An older node drops `0x1E`.
 
 One peer has one live direct path. LAN wins when its probe is up. Otherwise the punch wins when its probe is up. Otherwise the SG.
 

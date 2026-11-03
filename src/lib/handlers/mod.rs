@@ -469,7 +469,9 @@ pub(crate) fn fabric_event(event: &str, fields: &[(&str, &str)]) {
 
 // Local app edge (register/update/get-data/send + inbound app_packet push).
 mod app_edge;
-pub use app_edge::{app_get_data, app_packet, app_register, app_send_packet, app_update};
+pub use app_edge::{
+    app_get_data, app_packet, app_register, app_send_packet, app_update, direct_app,
+};
 
 mod sessions;
 pub(crate) use sessions::{own_user_sg_down_aliases, own_user_sg_partition};
