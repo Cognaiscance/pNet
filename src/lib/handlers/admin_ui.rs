@@ -643,6 +643,19 @@ fn handle_app_web_proxy(
             None,
         );
     };
+    if crate::app_web::is_app_shell_request(method, &upstream_path, query) {
+        let title = if mount.title.is_empty() {
+            slug.to_string()
+        } else {
+            mount.title.clone()
+        };
+        let frame = format!(
+            "<iframe class=\"app-frame\" title=\"{}\" src=\"/apps/{}/?raw=1\"></iframe>",
+            html_escape(&title),
+            html_escape(slug),
+        );
+        return respond_html(&stream, 200, &layout(ctx, &title, &frame), None);
+    }
     if let Err(e) = proxy_to_loopback(
         &mut stream,
         method,
@@ -2394,6 +2407,14 @@ nav a:hover { color: var(--gold); }
 }
 .nav-actions { margin-left: auto; display: flex; align-items: center; gap: .6rem; }
 main { padding: 1.75rem 2rem 3rem; max-width: 960px; overflow-x: auto; }
+main:has(> iframe.app-frame) { padding: 0; max-width: none; overflow: hidden; }
+iframe.app-frame {
+  display: block;
+  width: 100%;
+  height: calc(100vh - 3.5rem);
+  border: 0;
+  background: var(--bg);
+}
 table {
   border-collapse: separate;
   border-spacing: 0;

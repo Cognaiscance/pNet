@@ -207,6 +207,14 @@ pub fn parse_apps_path(path: &str) -> Option<(&str, String)> {
     Some((slug, upstream))
 }
 
+/// The portal draws its own header for the app's main page. `?raw=1` and every
+/// other path or method are the app document, its assets, and its form posts.
+pub fn is_app_shell_request(method: &str, upstream_path: &str, query: &str) -> bool {
+    method == "GET"
+        && upstream_path == "/"
+        && !query.split('&').any(|part| part == "raw=1")
+}
+
 /// Proxy one HTTP request to `127.0.0.1:port` and write the response to `client`.
 ///
 /// Uses `Connection: close` and a short timeout. Not a full HTTP/1.1 proxy
@@ -305,6 +313,11 @@ mod tests {
 
     #[test]
     fn parse_apps_path_rejects() {
+        assert!(is_app_shell_request("GET", "/", ""));
+        assert!(!is_app_shell_request("GET", "/", "raw=1"));
+        assert!(!is_app_shell_request("GET", "/", "raw=1&x=2"));
+        assert!(!is_app_shell_request("POST", "/", ""));
+        assert!(!is_app_shell_request("GET", "/tree", ""));
         assert!(parse_apps_path("/apps/").is_none());
         assert!(parse_apps_path("/apps").is_none());
         assert!(parse_apps_path("/config").is_none());

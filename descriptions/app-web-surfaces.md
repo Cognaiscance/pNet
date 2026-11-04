@@ -12,7 +12,8 @@ The primary browser experience is a **pNet-hosted dashboard** on the rank-1 SG
 ```text
   https://<your-sg>/                  ←  Dashboard (pNet core)
        │
-       ├── links to app pages         ←  /apps/<slug>/…  (proxied to local apps)
+       ├── links to app pages         ←  /apps/<slug>/ shows the portal header;
+       │                                 the app loads in the frame beneath it
        ├── link to Config             ←  node / fabric control (see below)
        └── (later) App store          ←  FUTURE — do not implement now
 ```
@@ -230,6 +231,7 @@ pNet’s enduring strengths vs “just browse my home server”:
 |------|--------|
 | `/` | Dashboard (core) |
 | `/config/…` or legacy admin entry | Config (core) |
+| `/apps/<slug>/` | Portal header, app in a frame (`?raw=1` is the app itself) |
 | `/apps/<slug>/…` | App process (proxied) |
 
 Other product skins (per-user domain, raw IP:port) are fine if they map to the
