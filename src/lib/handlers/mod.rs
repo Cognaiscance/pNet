@@ -508,8 +508,9 @@ pub fn punch_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
 }
 
-/// Op 0x17 — a LAN probe. Answer it when the source is on our private range.
-/// The path stays down until our own probe is answered.
+/// Op 0x17 — a LAN probe. Answer it when the source matches a reported LAN
+/// address or the address the server saw. The path stays down until our own
+/// probe is answered.
 pub fn lan_probe(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 16 {
         return;
@@ -519,10 +520,7 @@ pub fn lan_probe(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let Ok(book) = ctx.direct_book.lock() else {
             return;
         };
-        match book.observed(&local) {
-            Some(ours) => crate::direct_path::same_lan(ours, src),
-            None => crate::direct_path::is_private(src),
-        }
+        book.accepts_lan_probe(&local, src)
     };
     if !acceptable {
         return;

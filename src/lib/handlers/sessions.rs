@@ -466,11 +466,12 @@ pub fn maintain_connections(ctx: &WorkerContext) {
     let (notices, dead_lan, lan_due, tell_lan, probe_due) = if let Ok(mut book) = ctx.direct_book.lock() {
         book.sweep_unstable(std::time::Instant::now());
         let notices = book.take_unstable_notices(local);
-        let tell_lan = book.set_self_reported(own_lan);
+        book.set_self_reported(own_lan);
         let dead_lan = book.expire_unanswered_lan_checks();
         let lan_due = book.lan_liveness_due();
+        book.retry_unanswered_lan_probes();
         let probe_due = book.lan_probes_due(&local);
-        (notices, dead_lan, lan_due, tell_lan, probe_due)
+        (notices, dead_lan, lan_due, true, probe_due)
     } else {
         (Vec::new(), Vec::new(), Vec::new(), false, Vec::new())
     };

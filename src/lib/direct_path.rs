@@ -393,6 +393,31 @@ impl DirectBook {
         self.self_reported.clone()
     }
 
+    /// A LAN probe is acceptable when its source shares a private range with
+    /// an address this node reported, or with the address the server saw.
+    /// A reported LAN address counts even when the server saw a public address.
+    pub fn accepts_lan_probe(&self, local: &[u8; 16], src: SocketAddr) -> bool {
+        if self.self_reported.iter().any(|a| same_lan(*a, src)) {
+            return true;
+        }
+        match self.observed(local) {
+            Some(ours) => same_lan(ours, src),
+            None => is_private(src),
+        }
+    }
+
+    /// An unanswered probe may be sent again. A path that is already up is left alone.
+    pub fn retry_unanswered_lan_probes(&mut self) {
+        if self.self_unstable {
+            return;
+        }
+        for peer in self.peers.values_mut() {
+            if !peer.lan_up && !peer.unstable {
+                peer.lan_probe_sent = false;
+            }
+        }
+    }
+
     pub fn set_self_reported(&mut self, addrs: Vec<SocketAddr>) -> bool {
         let mut addrs: Vec<SocketAddr> = addrs.into_iter().filter(|a| is_private(*a)).collect();
         addrs.sort();
@@ -880,6 +905,34 @@ mod tests {
         assert!(book.accept_lan_ack(&dev, "192.168.50.63:7777".parse().unwrap()));
         assert!(book.lan_is_up(&dev));
         assert!(!book.begin_punch(&dev, "10.8.0.10:7777".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_probe_from_a_reported_lan_is_accepted_when_the_server_saw_a_public_address() {
+        let mut book = DirectBook::new();
+        let local = [1u8; 16];
+        let now = Instant::now();
+        book.note_observed(local, "203.0.113.8:7777".parse().unwrap(), now);
+        book.set_self_reported(vec!["192.168.50.154:7777".parse().unwrap()]);
+        let lan_src: SocketAddr = "192.168.50.63:7777".parse().unwrap();
+        let public_src: SocketAddr = "198.51.100.9:7777".parse().unwrap();
+        assert!(book.accepts_lan_probe(&local, lan_src));
+        assert!(!book.accepts_lan_probe(&local, public_src));
+    }
+
+    #[test]
+    fn an_unanswered_probe_is_sent_again() {
+        let mut book = DirectBook::new();
+        let dev = [4u8; 16];
+        let now = Instant::now();
+        book.note_observed(dev, "192.168.50.63:7777".parse().unwrap(), now);
+        assert!(book.begin_lan_probe(&dev, "192.168.50.154:7777".parse().unwrap()));
+        assert!(!book.begin_lan_probe(&dev, "192.168.50.154:7777".parse().unwrap()));
+        book.retry_unanswered_lan_probes();
+        assert!(book.begin_lan_probe(&dev, "192.168.50.154:7777".parse().unwrap()));
+        assert!(book.answer_lan(&dev));
+        book.retry_unanswered_lan_probes();
+        assert!(!book.begin_lan_probe(&dev, "192.168.50.154:7777".parse().unwrap()));
     }
 
     #[test]
