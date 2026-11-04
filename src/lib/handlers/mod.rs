@@ -111,6 +111,7 @@ pub fn observed_addr(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         if device == local {
             if let Ok(mut book) = ctx.direct_book.lock() {
                 book.note_self_change(std::time::Instant::now());
+                book.drop_all_direct();
             }
         }
         announce_path_down(ctx, device);

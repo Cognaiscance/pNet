@@ -460,13 +460,10 @@ pub fn maintain_connections(ctx: &WorkerContext) {
 
     let now = SystemTime::now();
     let local = ctx.node.read().unwrap().device_uuid;
-    let port = crate::udp_listener::udp_port();
-    let fib = std::fs::read_to_string("/proc/net/fib_trie").unwrap_or_default();
-    let own_lan = crate::direct_path::lan_addrs_from_fib_trie(&fib, port);
     let (notices, dead_lan, lan_due, tell_lan, probe_due) = if let Ok(mut book) = ctx.direct_book.lock() {
         book.sweep_unstable(std::time::Instant::now());
         let notices = book.take_unstable_notices(local);
-        book.set_self_reported(own_lan);
+        let _ = book.set_self_reported(read_own_lan());
         let dead_lan = book.expire_unanswered_lan_checks();
         let lan_due = book.lan_liveness_due();
         book.retry_unanswered_lan_probes();
@@ -639,6 +636,26 @@ pub fn maintain_connections(ctx: &WorkerContext) {
     }
 }
 
+fn read_own_lan() -> Vec<std::net::SocketAddr> {
+    let port = crate::udp_listener::udp_port();
+    let fib = std::fs::read_to_string("/proc/net/fib_trie").unwrap_or_default();
+    crate::direct_path::lan_addrs_from_fib_trie(&fib, port)
+}
+
+/// Re-read this machine's private addresses. A LAN path whose target is no
+/// longer in one of those ranges is dropped. The new list is published when
+/// it changed. The keepalive pass calls this about every 20 seconds.
+fn refresh_own_lan(ctx: &WorkerContext) {
+    let changed = ctx
+        .direct_book
+        .lock()
+        .map(|mut book| book.set_self_reported(read_own_lan()))
+        .unwrap_or(false);
+    if changed {
+        super::publish_lan_addrs(ctx);
+    }
+}
+
 /// Scheduled every 20 seconds on DG devices.
 ///
 /// Sends encrypted keepalive packets (op `0x12`) to **every** SG this DG holds
@@ -657,6 +674,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
 /// the SG detect a stale/unknown connection and reply with a conn-reset
 /// (op `0x13`) so the DG reconnects immediately.
 pub fn keepalive_dg(ctx: &WorkerContext) {
+    refresh_own_lan(ctx);
     let outs: Vec<(Vec<u8>, SocketAddr)> = {
         let node       = ctx.node.read().unwrap();
         let local_uuid = node.device_uuid;

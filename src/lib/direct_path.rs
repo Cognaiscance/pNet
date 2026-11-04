@@ -431,7 +431,38 @@ impl DirectBook {
                 peer.lan_probe_sent = false;
             }
         }
+        let _ = self.drop_lan_paths_we_left();
         true
+    }
+
+    /// This machine's observed address moved. Every direct path was aimed at
+    /// the old network, so none of them stay up.
+    pub fn drop_all_direct(&mut self) {
+        let ids: Vec<[u8; 16]> = self.peers.keys().copied().collect();
+        for id in ids {
+            self.drop_direct(&id);
+        }
+    }
+
+    /// Drop a LAN path whose target is no longer in a private range we have.
+    fn drop_lan_paths_we_left(&mut self) -> Vec<[u8; 16]> {
+        let ours = self.self_reported.clone();
+        let stale: Vec<[u8; 16]> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| {
+                peer.lan_up
+                    && peer
+                        .lan_target
+                        .map(|target| !ours.iter().any(|a| same_lan(*a, target)))
+                        .unwrap_or(false)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &stale {
+            self.drop_direct(id);
+        }
+        stale
     }
 
     /// Where an app packet goes when the path choice is LAN or punch.
@@ -933,6 +964,28 @@ mod tests {
         assert!(book.answer_lan(&dev));
         book.retry_unanswered_lan_probes();
         assert!(!book.begin_lan_probe(&dev, "192.168.50.154:7777".parse().unwrap()));
+    }
+
+    #[test]
+    fn leaving_the_network_drops_the_lan_path_and_an_address_change_drops_every_path() {
+        let mut book = DirectBook::new();
+        let dev = [4u8; 16];
+        let now = Instant::now();
+        book.note_observed(dev, "192.168.50.63:7777".parse().unwrap(), now);
+        book.set_self_reported(vec!["192.168.50.154:7777".parse().unwrap()]);
+        assert!(book.begin_lan_probe(&dev, "203.0.113.8:7777".parse().unwrap()));
+        assert!(book.answer_lan(&dev));
+        assert!(book.lan_is_up(&dev));
+
+        book.set_self_reported(vec!["10.51.198.252:7777".parse().unwrap()]);
+        assert!(!book.lan_is_up(&dev));
+
+        book.set_self_reported(vec!["192.168.50.154:7777".parse().unwrap()]);
+        assert!(book.begin_lan_probe(&dev, "203.0.113.8:7777".parse().unwrap()));
+        assert!(book.answer_lan(&dev));
+        book.drop_all_direct();
+        assert!(!book.lan_is_up(&dev));
+        assert!(book.begin_lan_probe(&dev, "192.168.50.154:7777".parse().unwrap()));
     }
 
     #[test]
