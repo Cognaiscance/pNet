@@ -69,6 +69,7 @@ Each tag notes the on-disk `format_version` it writes (`data persistence.md`) an
 | `v0.3.5` | 2 | `v0.3.4`. A LAN probe is answered when its source matches a reported private address, not only the address the server saw. The address list and an unanswered probe are repeated every five minutes. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 | `v0.3.6` | 2 | `v0.3.5`. When this machine's address changes, every direct path drops at once. A LAN path also drops when its private range is no longer on this machine. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 | `v0.3.7` | 2 | `v0.3.6`. The portal header stays above an app page. The app loads in the frame beneath it. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
+| `v0.3.71` | 2 | `v0.3.7`. The portal header and sidebar follow the saved light or dark theme. The sidebar lists each registered app, with Settings at the bottom. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 
 ## Rollout expectation
 
