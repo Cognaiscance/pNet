@@ -68,6 +68,7 @@ Each tag notes the on-disk `format_version` it writes (`data persistence.md`) an
 | `v0.3.4` | 2 | `v0.3.3`. A node reports its own private IPv4 addresses (op `0x1F`). A shared one is the LAN probe target even when the server saw a different range. An older node drops `0x1F`. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 | `v0.3.5` | 2 | `v0.3.4`. A LAN probe is answered when its source matches a reported private address, not only the address the server saw. The address list and an unanswered probe are repeated every five minutes. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 | `v0.3.6` | 2 | `v0.3.5`. When this machine's address changes, every direct path drops at once. A LAN path also drops when its private range is no longer on this machine. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
+| `v0.3.7` | 2 | `v0.3.6`. The portal header stays above an app page. The app loads in the frame beneath it. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 
 ## Rollout expectation
 
