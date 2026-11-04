@@ -599,11 +599,11 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
          on <strong>{device_alias}</strong> ({grade_label}).</p>\
          {apps_section}\
          <div class=\"card\">\
-           <h2 style=\"margin-top:0;font-size:1.1rem\">Config</h2>\
+           <h2 style=\"margin-top:0;font-size:1.1rem\">Settings</h2>\
            <p style=\"margin:0 0 .75rem;color:var(--ink)\">Manage this node: devices, invitations, \
            applications, contacts, and diagnostics. Requires the same owner sign-in \
            (password today; passkeys/2FA later).</p>\
-           <p style=\"margin:0\"><a class=\"portal-btn\" href=\"/config\">Open Config</a></p>\
+           <p style=\"margin:0\"><a class=\"portal-btn\" href=\"/config\">Open Settings</a></p>\
          </div>"
     );
     layout(ctx, "Home", &body)
@@ -782,7 +782,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
     };
 
     let body = format!(
-        "<h1>Config</h1>\
+        "<h1>Settings</h1>\
          <p style=\"color:var(--muted);margin-top:-.5rem\">Node and fabric control plane \
          (same capabilities as the classic administration UI).</p>\
          <div class=\"stats\">\
@@ -808,7 +808,7 @@ fn render_config_hub(ctx: &WorkerContext) -> String {
            </ul>\
          </div>"
     );
-    layout(ctx, "Config", &body)
+    layout(ctx, "Settings", &body)
 }
 
 /// Render a red banner for UI error codes from approve, reject, rename, and
@@ -2363,9 +2363,9 @@ html[data-theme="light"] {
   --warn-border: #e2c56a;
   --code-bg: #f7f1e6;
   --input-bg: #fffdf9;
-  --nav: #2a2118;
-  --nav-link: #f6ead6;
-  --nav-border: rgba(246, 234, 214, 0.35);
+  --nav: #fffdf8;
+  --nav-link: #241c14;
+  --nav-border: rgba(141, 104, 24, 0.28);
   --stat: #8d6818;
   --link: #8a6412;
 }
@@ -2388,30 +2388,58 @@ h1 { margin: 0 0 1rem; font-size: 1.9rem; letter-spacing: 0.01em; }
 h2 { font-size: 1.15rem; }
 a { color: var(--link); }
 a:hover { color: var(--gold-hover); }
-nav {
+header.top {
   background: var(--nav);
-  border-bottom: 1px solid var(--line-strong);
-  padding: .85rem 1.5rem;
+  color: var(--ink);
+  border-bottom: 1px solid var(--line);
+  padding: .7rem 1.15rem;
   display: flex;
   align-items: center;
-  gap: 1.25rem;
-  flex-wrap: wrap;
+  gap: 1rem;
 }
-nav a { color: var(--nav-link); text-decoration: none; font-size: .92rem; }
-nav a:hover { color: var(--gold); }
-.brand {
+a.brand {
   color: var(--gold);
   font-size: 1.35rem;
-  margin-right: .35rem;
   letter-spacing: 0.04em;
+  text-decoration: none;
 }
+a.brand:hover { color: var(--gold-hover); }
 .nav-actions { margin-left: auto; display: flex; align-items: center; gap: .6rem; }
-main { padding: 1.75rem 2rem 3rem; max-width: 960px; overflow-x: auto; }
+.shell { display: flex; align-items: stretch; min-height: calc(100vh - 3.4rem); }
+aside.side {
+  width: 14rem;
+  flex: 0 0 14rem;
+  background: var(--nav);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  padding: .7rem .55rem .85rem;
+}
+.side-links { display: flex; flex-direction: column; gap: .15rem; }
+.side-links a, a.side-settings {
+  display: block;
+  color: var(--nav-link);
+  text-decoration: none;
+  font-size: .92rem;
+  padding: .42rem .7rem;
+  border-radius: 8px;
+}
+.side-links a:hover, a.side-settings:hover {
+  background: var(--gold-soft);
+  color: var(--gold);
+}
+a.side-settings {
+  margin-top: auto;
+  border-radius: 0;
+  border-top: 1px solid var(--line);
+  padding-top: .85rem;
+}
+main { flex: 1; min-width: 0; padding: 1.75rem 2rem 3rem; max-width: 960px; overflow-x: auto; }
 main:has(> iframe.app-frame) { padding: 0; max-width: none; overflow: hidden; }
 iframe.app-frame {
   display: block;
   width: 100%;
-  height: calc(100vh - 3.5rem);
+  height: calc(100vh - 3.4rem);
   border: 0;
   background: var(--bg);
 }
@@ -2487,7 +2515,7 @@ button.theme-toggle, button.nav-logout {
   font-weight: 600;
   padding: .28rem .7rem;
 }
-nav button.theme-toggle, button.nav-logout {
+header.top button.theme-toggle, button.nav-logout {
   color: var(--nav-link);
   border-color: var(--nav-border);
 }
@@ -2536,18 +2564,24 @@ pre code { background: transparent; border: none; padding: 0; }
 .subnav a:hover { color: var(--gold); }
 @media (max-width: 640px) {
   main { padding: 1.15rem 1rem 2.5rem; }
-  nav { padding: .75rem 1rem; }
+  header.top { padding: .65rem .85rem; }
+  .shell { flex-direction: column; min-height: 0; }
+  aside.side { width: auto; flex: none; border-right: 0; border-bottom: 1px solid var(--line); }
+  .side-links { flex-direction: row; flex-wrap: wrap; }
+  a.side-settings { margin-top: .35rem; width: 100%; }
+  iframe.app-frame { height: calc(100vh - 8rem); }
   h1 { font-size: 1.55rem; }
 }
 "##;
 
-/// Top-level portal nav: Home + Config entry + logout. Config section pages
-/// also show a secondary subnav of control-plane links.
+/// Header follows the saved theme. The sidebar lists each registered app,
+/// with Settings last. Settings pages also show the control-plane subnav.
 fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
     let banner = partition_banner(ctx);
     let show_config_subnav = matches!(
         title,
-        "Config"
+        "Settings"
+            | "Config"
             | "Pending Apps"
             | "Applications"
             | "Contacts"
@@ -2566,10 +2600,8 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
     html.push_str("</title>\n<style>");
     html.push_str(CSS);
     html.push_str("</style>\n</head>\n<body>\n");
-    html.push_str("<nav>\n");
-    html.push_str("  <span class=\"brand\">pNet</span>\n");
-    html.push_str("  <a href=\"/\">Home</a>\n");
-    html.push_str("  <a href=\"/config\">Config</a>\n");
+    html.push_str("<header class=\"top\">\n");
+    html.push_str("  <a class=\"brand\" href=\"/\">pNet</a>\n");
     html.push_str(
         "  <div class=\"nav-actions\">\
                    <button type=\"button\" class=\"theme-toggle\" \
@@ -2578,7 +2610,9 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
                    <button class=\"nav-logout\" type=\"submit\">Log out</button></form>\
                    </div>\n",
     );
-    html.push_str("</nav>\n<main>\n");
+    html.push_str("</header>\n<div class=\"shell\">\n");
+    html.push_str(&side_menu(ctx));
+    html.push_str("<main>\n");
     if show_config_subnav {
         html.push_str(
             "<div class=\"subnav\">\
@@ -2595,10 +2629,31 @@ fn layout(ctx: &WorkerContext, title: &str, body: &str) -> String {
     }
     html.push_str(&banner);
     html.push_str(body);
-    html.push_str("\n</main>\n");
+    html.push_str("\n</main>\n</div>\n");
     html.push_str(THEME_BOOT);
     html.push_str("</body>\n</html>");
     html
+}
+
+/// Registered app mounts, then Settings pinned to the bottom of the sidebar.
+fn side_menu(ctx: &WorkerContext) -> String {
+    let mounts = ctx.app_web.list();
+    let mut apps = String::new();
+    for m in &mounts {
+        let title = if m.title.is_empty() {
+            html_escape(&m.slug)
+        } else {
+            html_escape(&m.title)
+        };
+        let slug = html_escape(&m.slug);
+        apps.push_str(&format!("<a href=\"/apps/{slug}/\">{title}</a>"));
+    }
+    format!(
+        "<aside class=\"side\">\
+           <nav class=\"side-links\">{apps}</nav>\
+           <a class=\"side-settings\" href=\"/config\">Settings</a>\
+         </aside>"
+    )
 }
 
 /// Yellow/orange banners for partition and retention-fallback data-loss (§7.1).

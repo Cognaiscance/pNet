@@ -5583,6 +5583,11 @@ mod tests {
     #[test]
     fn portal_pages_default_dark_and_remember_theme() {
         let t = TestCtx::new();
+        t.ctx.app_web.upsert(super::super::app_web::AppWebMount {
+            slug: "wellbeing".into(),
+            port: 8810,
+            title: "Wellbeing".into(),
+        });
         let html = render_devices(&t.ctx, "");
         assert!(html.contains("data-theme=\"dark\""), "dark is the default before script");
         assert!(html.contains("localStorage.getItem(\"pnet-theme\")"));
@@ -5590,6 +5595,13 @@ mod tests {
         assert!(html.contains("class=\"theme-toggle\""));
         assert!(html.contains("html[data-theme=\"light\"]"));
         assert!(html.contains("--gold: #d4b15a"));
+        assert!(html.contains("header class=\"top\""));
+        assert!(html.contains("aside class=\"side\""));
+        assert!(html.contains("href=\"/config\">Settings</a>"));
+        let apps_at = html.find("href=\"/apps/wellbeing/\">Wellbeing</a>").expect("app link");
+        let settings_at = html.find("href=\"/config\">Settings</a>").expect("settings link");
+        assert!(apps_at < settings_at, "registered apps sit above Settings");
+        assert!(html.contains("--nav: #fffdf8"), "light header and sidebar follow the light theme");
     }
 
     #[cfg(feature = "sg")]
