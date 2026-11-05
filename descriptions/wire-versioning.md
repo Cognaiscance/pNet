@@ -70,6 +70,7 @@ Each tag notes the on-disk `format_version` it writes (`data persistence.md`) an
 | `v0.3.6` | 2 | `v0.3.5`. When this machine's address changes, every direct path drops at once. A LAN path also drops when its private range is no longer on this machine. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 | `v0.3.7` | 2 | `v0.3.6`. The portal header stays above an app page. The app loads in the frame beneath it. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 | `v0.3.71` | 2 | `v0.3.7`. The portal header and sidebar follow the saved light or dark theme. The sidebar lists each registered app, with Settings at the bottom. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
+| `v0.4.0` | 2 | `v0.3.71`. A private address is on the LAN only when the local route is a connected subnet on a real interface. `pnetlan`, `tun`, `wg`, and `tailscale` are not that interface. The server still sends one punch invite. The receiver punches when the peer is not on its own LAN. A sealed datagram from `v0.2.0` or `v0.1.0` does not open. |
 
 ## Rollout expectation
 
