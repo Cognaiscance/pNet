@@ -608,7 +608,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
             let unstable = book.self_unstable() || book.is_unstable(&dest_device_uuid);
             if lan {
                 if let Some(addr) = book.path_addr(&dest_device_uuid, true) {
-                    if crate::direct_path::routed_via_pnetlan(addr) {
+                    if !crate::direct_path::on_lan(addr) {
                         book.drop_lan(&dest_device_uuid);
                         lan = false;
                     }

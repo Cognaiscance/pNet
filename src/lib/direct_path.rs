@@ -56,6 +56,8 @@ pub struct DirectBook {
     self_reported: Vec<SocketAddr>,
     /// Reports that arrived before the SG observation created the peer.
     pending_reports: HashMap<[u8; 16], Vec<SocketAddr>>,
+    /// Replaces `/proc/net/route` in tests. Production reads the live table.
+    route_table: Option<String>,
 }
 
 const UNSTABLE_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -337,51 +339,65 @@ pub fn choose_path(grade: Grade, lan_up: bool, punch_up: bool, peer_unstable: bo
     }
 }
 
-/// Both addresses are private and share a /24. Home `192.168.1` and office
-/// `192.168.50` do not match, so those peers hole-punch instead of probing.
-pub fn same_lan(a: SocketAddr, b: SocketAddr) -> bool {
-    let (Some(ao), Some(bo)) = (v4_octets(a), v4_octets(b)) else {
-        return false;
-    };
-    private_block(ao).is_some() && private_block(bo).is_some() && ao[..3] == bo[..3]
+const RTF_UP: u32 = 0x1;
+const RTF_GATEWAY: u32 = 0x2;
+
+/// The kernel would deliver `addr` on a connected subnet of a real interface.
+/// A gateway route is another network. `pnetlan`, `tun`, `wg`, and `tailscale`
+/// are tunnels, so an on-link route there is not a LAN.
+pub fn on_lan(addr: SocketAddr) -> bool {
+    let text = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    on_lan_in_table(addr, &text)
 }
 
-/// The kernel would send `addr` out the `pnetlan` overlay. A direct probe to
-/// that address loops back into pNet, so the caller keeps the server relay.
-pub fn routed_via_pnetlan(addr: SocketAddr) -> bool {
+pub fn on_lan_in_table(addr: SocketAddr, text: &str) -> bool {
     let Some(octets) = v4_octets(addr) else {
         return false;
     };
-    let text = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
-    route_iface_from_table(&text, octets).as_deref() == Some("pnetlan")
+    if private_block(octets).is_none() {
+        return false;
+    }
+    let Some((iface, flags)) = route_from_table(text, octets) else {
+        return false;
+    };
+    flags & RTF_UP != 0 && flags & RTF_GATEWAY == 0 && !tunnel_iface(&iface)
 }
 
-/// Longest-prefix match from `/proc/net/route`. Destination and mask are the
-/// little-endian hex words that file prints.
-pub fn route_iface_from_table(text: &str, dest: [u8; 4]) -> Option<String> {
+fn tunnel_iface(name: &str) -> bool {
+    name == "pnetlan"
+        || name.starts_with("tun")
+        || name.starts_with("wg")
+        || name.starts_with("tailscale")
+}
+
+/// Longest-prefix match from `/proc/net/route`: interface and flags.
+/// Destination and mask are the little-endian hex words that file prints.
+pub fn route_from_table(text: &str, dest: [u8; 4]) -> Option<(String, u32)> {
     let ip = u32::from_be_bytes(dest);
-    let mut best: Option<(u32, u32, String)> = None;
+    let mut best: Option<(u32, u32, String, u32)> = None;
     for line in text.lines().skip(1) {
-        let mut cols = line.split_whitespace();
-        let Some(iface) = cols.next() else { continue };
-        let Some(route_dest) = cols.next().and_then(parse_route_word) else { continue };
-        let Some(metric_hex) = cols.nth(4) else { continue };
-        let metric = u32::from_str_radix(metric_hex, 16).unwrap_or(0);
-        let Some(mask) = cols.next().and_then(parse_route_word) else { continue };
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 8 {
+            continue;
+        }
+        let Some(route_dest) = parse_route_word(cols[1]) else { continue };
+        let Ok(flags) = u32::from_str_radix(cols[3], 16) else { continue };
+        let metric = u32::from_str_radix(cols[6], 16).unwrap_or(0);
+        let Some(mask) = parse_route_word(cols[7]) else { continue };
         if ip & mask != route_dest & mask {
             continue;
         }
         let better = match &best {
             None => true,
-            Some((best_mask, best_metric, _)) => {
+            Some((best_mask, best_metric, _, _)) => {
                 mask > *best_mask || (mask == *best_mask && metric < *best_metric)
             }
         };
         if better {
-            best = Some((mask, metric, iface.to_string()));
+            best = Some((mask, metric, cols[0].to_string(), flags));
         }
     }
-    best.map(|(_, _, iface)| iface)
+    best.map(|(_, _, iface, flags)| (iface, flags))
 }
 
 /// `/proc/net/route` prints each address as the little-endian memory word.
@@ -434,16 +450,21 @@ impl DirectBook {
         self.self_reported.clone()
     }
 
-    /// A LAN probe is acceptable when its source shares a private range with
-    /// an address this node reported, or with the address the server saw.
-    /// A reported LAN address counts even when the server saw a public address.
-    pub fn accepts_lan_probe(&self, local: &[u8; 16], src: SocketAddr) -> bool {
-        if self.self_reported.iter().any(|a| same_lan(*a, src)) {
-            return true;
-        }
-        match self.observed(local) {
-            Some(ours) => same_lan(ours, src),
-            None => is_private(src),
+    /// A LAN probe is acceptable when this machine would send to its source
+    /// on a connected subnet. The server's observed address is not enough.
+    pub fn accepts_lan_probe(&self, _local: &[u8; 16], src: SocketAddr) -> bool {
+        self.addr_on_lan(src)
+    }
+
+    /// Test double for `/proc/net/route`.
+    pub fn set_route_table(&mut self, text: impl Into<String>) {
+        self.route_table = Some(text.into());
+    }
+
+    fn addr_on_lan(&self, addr: SocketAddr) -> bool {
+        match &self.route_table {
+            Some(text) => on_lan_in_table(addr, text),
+            None => on_lan(addr),
         }
     }
 
@@ -485,20 +506,18 @@ impl DirectBook {
         }
     }
 
-    /// Drop a LAN path whose target is no longer in a private range we have.
+    /// Drop a LAN path whose target is no longer on a connected subnet.
     fn drop_lan_paths_we_left(&mut self) -> Vec<[u8; 16]> {
-        let ours = self.self_reported.clone();
-        let stale: Vec<[u8; 16]> = self
+        let targets: Vec<([u8; 16], SocketAddr)> = self
             .peers
             .iter()
-            .filter(|(_, peer)| {
-                peer.lan_up
-                    && peer
-                        .lan_target
-                        .map(|target| !ours.iter().any(|a| same_lan(*a, target)))
-                        .unwrap_or(false)
-            })
-            .map(|(id, _)| *id)
+            .filter(|(_, peer)| peer.lan_up)
+            .filter_map(|(id, peer)| peer.lan_target.map(|target| (*id, target)))
+            .collect();
+        let stale: Vec<[u8; 16]> = targets
+            .into_iter()
+            .filter(|(_, target)| !self.addr_on_lan(*target))
+            .map(|(id, _)| id)
             .collect();
         for id in &stale {
             self.drop_direct(id);
@@ -516,20 +535,15 @@ impl DirectBook {
         }
     }
 
-    /// Start a LAN probe when any reported or observed pair shares a private range.
-    /// The probe is aimed at the matching address, which may differ from the one the SG saw.
-    pub fn begin_lan_probe(&mut self, device: &[u8; 16], local_observed: SocketAddr) -> bool {
+    /// Start a LAN probe when a reported or observed address is on a connected
+    /// subnet of this machine. The probe is aimed at that address.
+    pub fn begin_lan_probe(&mut self, device: &[u8; 16], _local_observed: SocketAddr) -> bool {
         let Some(peer) = self.peers.get(device) else {
             return false;
         };
-        let ours = {
-            let mut addrs = self.self_reported.clone();
-            addrs.push(local_observed);
-            addrs
-        };
         let mut theirs = peer.reported.clone();
         theirs.push(peer.observed);
-        let Some((_, dest)) = matching_lan(&ours, &theirs) else {
+        let Some(dest) = theirs.into_iter().find(|addr| self.addr_on_lan(*addr)) else {
             return false;
         };
         if self.self_unstable || peer.unstable {
@@ -631,18 +645,19 @@ impl DirectBook {
     }
 
     /// Ask this side to punch toward `peer_public`. The path stays down
-    /// until `answer_punch`. A LAN that already matches is not a punch.
-    pub fn begin_punch(&mut self, device: &[u8; 16], local_observed: SocketAddr) -> bool {
+    /// until `answer_punch`. A peer on this machine's LAN is not a punch.
+    pub fn begin_punch(&mut self, device: &[u8; 16], _local_observed: SocketAddr) -> bool {
+        let Some(peer) = self.peers.get(device) else {
+            return false;
+        };
+        let mut theirs = peer.reported.clone();
+        theirs.push(peer.observed);
+        if theirs.iter().any(|addr| self.addr_on_lan(*addr)) {
+            return false;
+        }
         let Some(peer) = self.peers.get_mut(device) else {
             return false;
         };
-        let mut ours = self.self_reported.clone();
-        ours.push(local_observed);
-        let mut theirs = peer.reported.clone();
-        theirs.push(peer.observed);
-        if matching_lan(&ours, &theirs).is_some() {
-            return false;
-        }
         if peer.punch_probe_sent {
             return false;
         }
@@ -650,8 +665,10 @@ impl DirectBook {
         true
     }
 
-    /// Both addresses are known and not on the same LAN. Returns each side's
-    /// address once: `(addr_a, addr_b)` matching the arguments.
+    /// Both observed addresses are known. Returns each side's address once:
+    /// `(addr_a, addr_b)` matching the arguments. The SG does not know whether
+    /// those two machines share a LAN. The receiver punches only when the peer
+    /// is not on its own connected subnet.
     pub fn take_punch_invite(
         &mut self,
         a: [u8; 16],
@@ -662,15 +679,6 @@ impl DirectBook {
         }
         let addr_a = self.observed(&a)?;
         let addr_b = self.observed(&b)?;
-        let reported_a = self.peers.get(&a).map(|p| p.reported.clone()).unwrap_or_default();
-        let reported_b = self.peers.get(&b).map(|p| p.reported.clone()).unwrap_or_default();
-        let mut side_a = reported_a;
-        side_a.push(addr_a);
-        let mut side_b = reported_b;
-        side_b.push(addr_b);
-        if matching_lan(&side_a, &side_b).is_some() {
-            return None;
-        }
         if self.self_unstable || self.is_unstable(&a) || self.is_unstable(&b) {
             return None;
         }
@@ -739,19 +747,6 @@ impl DirectBook {
     }
 }
 
-/// First pair that shares a private range. Reported addresses should be listed
-/// before the address the server saw, so a shared LAN wins.
-pub fn matching_lan(ours: &[SocketAddr], theirs: &[SocketAddr]) -> Option<(SocketAddr, SocketAddr)> {
-    for a in ours {
-        for b in theirs {
-            if same_lan(*a, *b) {
-                return Some((*a, *b));
-            }
-        }
-    }
-    None
-}
-
 /// Private IPv4 addresses marked LOCAL in `/proc/net/fib_trie`.
 pub fn lan_addrs_from_fib_trie(text: &str, port: u16) -> Vec<SocketAddr> {
     let mut prev = "";
@@ -799,13 +794,32 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
 
+    /// Connected subnets the direct-path tests probe, plus a gateway default
+    /// and an overlay host route.
+    const ROUTES: &str = "\
+Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+eth0 0001A8C0 00000000 0001 0 0 0 00FFFFFF 0 0 0
+eth0 0032A8C0 00000000 0001 0 0 0 00FFFFFF 0 0 0
+eth0 0000A8C0 00000000 0001 0 0 0 00FFFFFF 0 0 0
+eth0 0000000A 00000000 0001 0 0 0 00FFFFFF 0 0 0
+eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
+pnetlan 0400420A 00000000 0005 0 0 0 FFFFFFFF 0 0 0
+tun0 0000080A 00000000 0001 0 0 0 00FFFFFF 0 0 0
+";
+
     fn addr(port: u16) -> SocketAddr {
         format!("203.0.113.5:{port}").parse().unwrap()
     }
 
+    fn test_book() -> DirectBook {
+        let mut book = DirectBook::new();
+        book.set_route_table(ROUTES);
+        book
+    }
+
     #[test]
     fn observation_stores_repeats_and_replaces() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let dev = [7u8; 16];
         let t0 = Instant::now();
         assert_eq!(book.note_observed(dev, addr(1), t0), Observe::New);
@@ -819,7 +833,7 @@ mod tests {
 
     #[test]
     fn lan_probe_only_when_ranges_match() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let dev = [1u8; 16];
         let t0 = Instant::now();
         let lan_a: SocketAddr = "192.168.1.10:7777".parse().unwrap();
@@ -838,19 +852,25 @@ mod tests {
 
         book.note_observed(dev, public, t0);
         assert!(!book.begin_lan_probe(&dev, lan_b));
-        assert!(!same_lan(public, lan_b));
-        assert!(same_lan(lan_a, lan_b));
-        let office: SocketAddr = "192.168.50.63:7777".parse().unwrap();
-        assert!(!same_lan(lan_a, office));
+        assert!(!on_lan_in_table(public, ROUTES));
+        assert!(on_lan_in_table(lan_a, ROUTES));
+        assert!(on_lan_in_table(lan_b, ROUTES));
     }
 
     #[test]
     fn different_private_subnets_punch_instead_of_probing() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let dev = [4u8; 16];
         let now = Instant::now();
         let home: SocketAddr = "192.168.1.234:7777".parse().unwrap();
         let office: SocketAddr = "192.168.50.63:7777".parse().unwrap();
+        book.set_route_table(
+            "\
+Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+eth0 0001A8C0 00000000 0001 0 0 0 00FFFFFF 0 0 0
+eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
+",
+        );
         book.note_observed(dev, office, now);
         book.note_reported(dev, vec![office]);
         book.set_self_reported(vec![home]);
@@ -865,34 +885,35 @@ Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
 eth0 00000000 0101A8C0 0003 0 0 00000064 00000000 0 0 0\n\
 pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
         assert_eq!(
-            route_iface_from_table(text, [10, 66, 0, 4]).as_deref(),
-            Some("pnetlan")
+            route_from_table(text, [10, 66, 0, 4]).map(|(iface, _)| iface),
+            Some("pnetlan".to_string())
         );
-        assert_eq!(
-            route_iface_from_table(text, [192, 168, 1, 40]).as_deref(),
-            Some("eth0")
-        );
+        assert!(!on_lan_in_table("10.66.0.4:7777".parse().unwrap(), text));
+        let home = "\
+Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+eth0 0001A8C0 00000000 0001 0 0 0 00FFFFFF 0 0 0
+eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
+";
+        assert!(on_lan_in_table("192.168.1.40:7777".parse().unwrap(), home));
+        assert!(!on_lan_in_table("192.168.50.63:7777".parse().unwrap(), home));
+        assert!(!on_lan_in_table("10.8.0.14:7777".parse().unwrap(), ROUTES));
     }
 
     #[test]
     fn an_overlay_target_drops_the_lan_path_and_keeps_the_punch() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let dev = [4u8; 16];
         let now = Instant::now();
         let overlay: SocketAddr = "10.66.0.4:7777".parse().unwrap();
         let local: SocketAddr = "10.66.0.10:7777".parse().unwrap();
         book.note_observed(dev, overlay, now);
-        assert!(book.begin_lan_probe(&dev, local));
-        assert!(book.answer_lan(&dev));
-        assert!(book.lan_is_up(&dev));
-        book.drop_lan(&dev);
+        assert!(!book.begin_lan_probe(&dev, local));
         assert!(!book.lan_is_up(&dev));
-        assert!(book.peer(&dev).unwrap().lan_target.is_none());
     }
 
     #[test]
     fn punch_invite_is_one_pair_when_ranges_differ() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let a = [1u8; 16];
         let b = [2u8; 16];
         let t0 = Instant::now();
@@ -907,12 +928,13 @@ pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
         assert!(book.take_punch_invite(b, a).is_none());
         book.note_observed(a, lan_a, t0);
         book.note_observed(b, lan_b, t0);
-        assert!(book.take_punch_invite(a, b).is_none());
+        assert_eq!(book.take_punch_invite(a, b), Some((lan_a, lan_b)));
+        assert!(!book.begin_punch(&b, lan_a));
     }
 
     #[test]
     fn punch_stays_down_until_answered() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let dev = [2u8; 16];
         let t0 = Instant::now();
         let public_a: SocketAddr = "198.51.100.4:7777".parse().unwrap();
@@ -934,7 +956,7 @@ pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
 
     #[test]
     fn punch_expires_sooner_for_cellphone_and_lan_does_not_expire() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let dev = [5u8; 16];
         let t0 = Instant::now();
         let public_a: SocketAddr = "198.51.100.4:7777".parse().unwrap();
@@ -958,7 +980,7 @@ pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
 
     #[test]
     fn three_changes_in_five_minutes_marks_unstable_and_a_quiet_window_clears_it() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let t0 = Instant::now();
         assert!(!book.note_self_change(t0));
         assert!(!book.note_self_change(t0 + Duration::from_secs(10)));
@@ -996,7 +1018,7 @@ pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
 
     #[test]
     fn a_missed_lan_check_drops_the_path_and_an_ack_keeps_it() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let dev = [9u8; 16];
         let now = Instant::now();
         let peer = "192.168.1.5:7777".parse().unwrap();
@@ -1020,7 +1042,7 @@ pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
 
     #[test]
     fn reported_lan_addresses_match_when_the_server_saw_different_ranges() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let dev = [4u8; 16];
         let now = Instant::now();
         book.note_observed(dev, "203.0.113.8:7777".parse().unwrap(), now);
@@ -1039,7 +1061,7 @@ pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
 
     #[test]
     fn a_probe_from_a_reported_lan_is_accepted_when_the_server_saw_a_public_address() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let local = [1u8; 16];
         let now = Instant::now();
         book.note_observed(local, "203.0.113.8:7777".parse().unwrap(), now);
@@ -1052,7 +1074,7 @@ pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
 
     #[test]
     fn an_unanswered_probe_is_sent_again() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let dev = [4u8; 16];
         let now = Instant::now();
         book.note_observed(dev, "192.168.50.63:7777".parse().unwrap(), now);
@@ -1067,7 +1089,7 @@ pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
 
     #[test]
     fn leaving_the_network_drops_the_lan_path_and_an_address_change_drops_every_path() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let dev = [4u8; 16];
         let now = Instant::now();
         book.note_observed(dev, "192.168.50.63:7777".parse().unwrap(), now);
@@ -1076,8 +1098,16 @@ pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
         assert!(book.answer_lan(&dev));
         assert!(book.lan_is_up(&dev));
 
+        book.set_route_table(
+            "\
+Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+eth0 00C6330A 00000000 0001 0 0 0 00FFFFFF 0 0 0
+eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
+",
+        );
         book.set_self_reported(vec!["10.51.198.252:7777".parse().unwrap()]);
         assert!(!book.lan_is_up(&dev));
+        book.set_route_table(ROUTES);
 
         book.set_self_reported(vec!["192.168.50.154:7777".parse().unwrap()]);
         assert!(book.begin_lan_probe(&dev, "203.0.113.8:7777".parse().unwrap()));
@@ -1110,7 +1140,7 @@ pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
 
     #[test]
     fn late_probe_goes_cold_and_a_notify_drops_sooner() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let dev = [4u8; 16];
         let t0 = Instant::now();
         let lan_a: SocketAddr = "10.0.0.2:7777".parse().unwrap();
@@ -1246,7 +1276,7 @@ pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
 
     #[test]
     fn lan_probe_is_sent_once_and_ack_must_come_from_that_address() {
-        let mut book = DirectBook::new();
+        let mut book = test_book();
         let local = [1u8; 16];
         let peer = [2u8; 16];
         let t0 = Instant::now();

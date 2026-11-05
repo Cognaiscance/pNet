@@ -406,7 +406,7 @@ pub fn path_down(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
 fn send_lan_probes(ctx: &WorkerContext, local: [u8; 16], due: &[([u8; 16], SocketAddr)]) {
     for (peer, addr) in due {
-        if crate::direct_path::routed_via_pnetlan(*addr) {
+        if !crate::direct_path::on_lan(*addr) {
             if let Ok(mut book) = ctx.direct_book.lock() {
                 book.drop_lan(peer);
             }
