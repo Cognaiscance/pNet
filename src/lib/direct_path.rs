@@ -337,16 +337,57 @@ pub fn choose_path(grade: Grade, lan_up: bool, punch_up: bool, peer_unstable: bo
     }
 }
 
-/// How long a direct probe stays up after the last answer.
-/// Both addresses are private and sit in the same RFC1918 block.
+/// Both addresses are private and share a /24. Home `192.168.1` and office
+/// `192.168.50` do not match, so those peers hole-punch instead of probing.
 pub fn same_lan(a: SocketAddr, b: SocketAddr) -> bool {
     let (Some(ao), Some(bo)) = (v4_octets(a), v4_octets(b)) else {
         return false;
     };
-    match (private_block(ao), private_block(bo)) {
-        (Some(x), Some(y)) => x == y,
-        _ => false,
+    private_block(ao).is_some() && private_block(bo).is_some() && ao[..3] == bo[..3]
+}
+
+/// The kernel would send `addr` out the `pnetlan` overlay. A direct probe to
+/// that address loops back into pNet, so the caller keeps the server relay.
+pub fn routed_via_pnetlan(addr: SocketAddr) -> bool {
+    let Some(octets) = v4_octets(addr) else {
+        return false;
+    };
+    let text = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    route_iface_from_table(&text, octets).as_deref() == Some("pnetlan")
+}
+
+/// Longest-prefix match from `/proc/net/route`. Destination and mask are the
+/// little-endian hex words that file prints.
+pub fn route_iface_from_table(text: &str, dest: [u8; 4]) -> Option<String> {
+    let ip = u32::from_be_bytes(dest);
+    let mut best: Option<(u32, u32, String)> = None;
+    for line in text.lines().skip(1) {
+        let mut cols = line.split_whitespace();
+        let Some(iface) = cols.next() else { continue };
+        let Some(route_dest) = cols.next().and_then(parse_route_word) else { continue };
+        let Some(metric_hex) = cols.nth(4) else { continue };
+        let metric = u32::from_str_radix(metric_hex, 16).unwrap_or(0);
+        let Some(mask) = cols.next().and_then(parse_route_word) else { continue };
+        if ip & mask != route_dest & mask {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((best_mask, best_metric, _)) => {
+                mask > *best_mask || (mask == *best_mask && metric < *best_metric)
+            }
+        };
+        if better {
+            best = Some((mask, metric, iface.to_string()));
+        }
     }
+    best.map(|(_, _, iface)| iface)
+}
+
+/// `/proc/net/route` prints each address as the little-endian memory word.
+fn parse_route_word(hex: &str) -> Option<u32> {
+    let word = u32::from_str_radix(hex, 16).ok()?;
+    Some(u32::from_be_bytes(word.to_le_bytes()))
 }
 
 pub fn is_private(addr: SocketAddr) -> bool {
@@ -686,6 +727,16 @@ impl DirectBook {
             peer.lan_target = None;
         }
     }
+
+    /// The LAN target is the overlay. Drop that path and leave a punch alone.
+    pub fn drop_lan(&mut self, device: &[u8; 16]) {
+        if let Some(peer) = self.peers.get_mut(device) {
+            peer.lan_up = false;
+            peer.lan_probe_sent = false;
+            peer.lan_check_pending = false;
+            peer.lan_target = None;
+        }
+    }
 }
 
 /// First pair that shares a private range. Reported addresses should be listed
@@ -789,6 +840,54 @@ mod tests {
         assert!(!book.begin_lan_probe(&dev, lan_b));
         assert!(!same_lan(public, lan_b));
         assert!(same_lan(lan_a, lan_b));
+        let office: SocketAddr = "192.168.50.63:7777".parse().unwrap();
+        assert!(!same_lan(lan_a, office));
+    }
+
+    #[test]
+    fn different_private_subnets_punch_instead_of_probing() {
+        let mut book = DirectBook::new();
+        let dev = [4u8; 16];
+        let now = Instant::now();
+        let home: SocketAddr = "192.168.1.234:7777".parse().unwrap();
+        let office: SocketAddr = "192.168.50.63:7777".parse().unwrap();
+        book.note_observed(dev, office, now);
+        book.note_reported(dev, vec![office]);
+        book.set_self_reported(vec![home]);
+        assert!(!book.begin_lan_probe(&dev, home));
+        assert!(book.begin_punch(&dev, home));
+    }
+
+    #[test]
+    fn route_table_prefers_the_pnetlan_host_route() {
+        let text = "\
+Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+eth0 00000000 0101A8C0 0003 0 0 00000064 00000000 0 0 0\n\
+pnetlan 0400420A 00000000 0001 0 0 00000000 FFFFFFFF 0 0 0\n";
+        assert_eq!(
+            route_iface_from_table(text, [10, 66, 0, 4]).as_deref(),
+            Some("pnetlan")
+        );
+        assert_eq!(
+            route_iface_from_table(text, [192, 168, 1, 40]).as_deref(),
+            Some("eth0")
+        );
+    }
+
+    #[test]
+    fn an_overlay_target_drops_the_lan_path_and_keeps_the_punch() {
+        let mut book = DirectBook::new();
+        let dev = [4u8; 16];
+        let now = Instant::now();
+        let overlay: SocketAddr = "10.66.0.4:7777".parse().unwrap();
+        let local: SocketAddr = "10.66.0.10:7777".parse().unwrap();
+        book.note_observed(dev, overlay, now);
+        assert!(book.begin_lan_probe(&dev, local));
+        assert!(book.answer_lan(&dev));
+        assert!(book.lan_is_up(&dev));
+        book.drop_lan(&dev);
+        assert!(!book.lan_is_up(&dev));
+        assert!(book.peer(&dev).unwrap().lan_target.is_none());
     }
 
     #[test]

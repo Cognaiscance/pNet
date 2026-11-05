@@ -405,7 +405,13 @@ pub fn path_down(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 }
 
 fn send_lan_probes(ctx: &WorkerContext, local: [u8; 16], due: &[([u8; 16], SocketAddr)]) {
-    for (_peer, addr) in due {
+    for (peer, addr) in due {
+        if crate::direct_path::routed_via_pnetlan(*addr) {
+            if let Ok(mut book) = ctx.direct_book.lock() {
+                book.drop_lan(peer);
+            }
+            continue;
+        }
         let mut pkt = Vec::with_capacity(17);
         pkt.push(LAN_PROBE_OP);
         pkt.extend_from_slice(&local);

@@ -601,11 +601,19 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
     };
 
     if let Some((mut pkt, mut dest, reseal)) = out {
-        let observed = ctx.direct_book.lock().ok().and_then(|book| {
+        let observed = ctx.direct_book.lock().ok().and_then(|mut book| {
             let now = std::time::Instant::now();
-            let lan = book.lan_is_up(&dest_device_uuid);
+            let mut lan = book.lan_is_up(&dest_device_uuid);
             let punch = book.punch_is_up(&dest_device_uuid, now, grade.cellphone());
             let unstable = book.self_unstable() || book.is_unstable(&dest_device_uuid);
+            if lan {
+                if let Some(addr) = book.path_addr(&dest_device_uuid, true) {
+                    if crate::direct_path::routed_via_pnetlan(addr) {
+                        book.drop_lan(&dest_device_uuid);
+                        lan = false;
+                    }
+                }
+            }
             let choice = crate::direct_path::choose_path(grade, lan, punch, unstable);
             if matches!(
                 choice,
