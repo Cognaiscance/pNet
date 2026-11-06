@@ -34,7 +34,7 @@ package_version() {
 require_version() {
     local version
     version="$(package_version)"
-    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Cargo.toml version is not major.minor.patch: ${version:-<missing>}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || die "Cargo.toml version is not major.minor.patch[.build]: ${version:-<missing>}"
     printf '%s\n' "$version"
 }
 

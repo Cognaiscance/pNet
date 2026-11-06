@@ -1,10 +1,9 @@
 # Release assets
 
-**Status:** tag `v0.3.7` is the published release. `Cargo.toml` is `0.4.0`.
-The wire record for `v0.4.0` is in `descriptions/wire-versioning.md`. Pushing
-tag `v0.4.0` on the develop commit that contains this note creates the GitHub
-Release. The tag must match `version` in the root `Cargo.toml`. `develop` is
-not a version.
+**Status:** `Cargo.toml` is `0.4.1`. The wire record for `v0.4.1` is in
+`descriptions/wire-versioning.md`. Pushing tag `v0.4.1` on the develop
+commit that contains this note creates the GitHub Release. The tag must match
+`version` in the root `Cargo.toml`. `develop` is not a version.
 
 The installer fetches `index.json` from that release. It does not fetch
 `develop`.
