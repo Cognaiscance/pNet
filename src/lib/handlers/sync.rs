@@ -1652,7 +1652,7 @@ pub fn sync_pull(ctx: &WorkerContext) {
     let writer_uuid = match target {
         WriterTarget::Local       => return,
         WriterTarget::Unreachable => {
-            println!("[sync_pull] no reachable own SG — skipping");
+            log::info!("[sync_pull] no reachable own SG — skipping");
             return;
         }
         WriterTarget::Remote(u)   => u,
@@ -1665,7 +1665,7 @@ pub fn sync_pull(ctx: &WorkerContext) {
             .map(|c| c.id)
     };
     let Some(conn_id) = conn_id else {
-        eprintln!("[sync_pull] pull source {writer_uuid:?} has no active connection");
+        log::error!("[sync_pull] pull source {writer_uuid:?} has no active connection");
         return;
     };
 
@@ -1690,7 +1690,7 @@ fn send_pull_request(scope: Scope, last_seen: SyncVersion, conn_id: u16, ctx: &W
             ))
     };
     let Some((pkt, addr)) = pkt_and_addr else {
-        eprintln!("[send_pull_request] no active connection {conn_id}");
+        log::error!("[send_pull_request] no active connection {conn_id}");
         return;
     };
     send(ctx, addr, &pkt);
@@ -2156,7 +2156,7 @@ pub(crate) fn publish_local_pending(ctx: &WorkerContext) {
             protocol: row.protocol,
             signing_pk: row.signing_pk,
         }, ctx) {
-            eprintln!("[pending app] publish failed: {err:?}");
+            log::error!("[pending app] publish failed: {err:?}");
         }
     }
 }
@@ -2239,7 +2239,7 @@ fn apply_local_approval(ctx: &WorkerContext, decision: &AppDecision) {
         }
         drop(node);
         ctx.save_node();
-        eprintln!("[pending app] approval publish failed: {err:?}");
+        log::error!("[pending app] approval publish failed: {err:?}");
     }
 }
 
@@ -2266,7 +2266,7 @@ fn apply_local_rejection(ctx: &WorkerContext, decision: &AppDecision) {
         }
         drop(node);
         ctx.save_node();
-        eprintln!("[pending app] rejection publish failed: {err:?}");
+        log::error!("[pending app] rejection publish failed: {err:?}");
     }
 }
 
@@ -2283,7 +2283,7 @@ fn send_sync_write_request(change: &Change, writer_uuid: Uuid, ctx: &WorkerConte
             ))
     };
     let Some((pkt, addr)) = pkt_and_addr else {
-        eprintln!("[send_sync_write_request] no active connection to writer {writer_uuid:?}");
+        log::error!("[send_sync_write_request] no active connection to writer {writer_uuid:?}");
         return;
     };
     send(ctx, addr, &pkt);
@@ -2306,7 +2306,7 @@ fn build_write_ack_body(result: u8, private: SyncVersion, public: SyncVersion) -
 /// NOT_WRITER and (in phase 5+6) re-elect on its next pull.
 pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
-        eprintln!("[sync_write_request] header too short from {src}");
+        log::error!("[sync_write_request] header too short from {src}");
         return;
     }
     let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
@@ -2316,14 +2316,14 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         match decrypt_packet_body(&node, SYNC_WRITE_REQUEST_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[sync_write_request] decryption failed from {src}");
+                log::error!("[sync_write_request] decryption failed from {src}");
                 return;
             }
         }
     };
 
     let Some(change) = deserialize_change(&plaintext) else {
-        eprintln!("[sync_write_request] unparseable change from {src}");
+        log::error!("[sync_write_request] unparseable change from {src}");
         return;
     };
 
@@ -2344,7 +2344,7 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                     (WRITE_ACK_OK, priv_v, pub_v, bumped)
                 }
                 Err(WriteError::Validation(msg)) => {
-                    eprintln!("[sync_write_request] validation error from {src}: {msg}");
+                    log::error!("[sync_write_request] validation error from {src}: {msg}");
                     let node = ctx.node.read().unwrap();
                     (WRITE_ACK_VALIDATION_ERROR, node.owner.private_version, node.owner.public_version, Vec::new())
                 }
@@ -2371,7 +2371,7 @@ pub fn sync_write_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             ))
     };
     let Some((pkt, addr)) = pkt_and_addr else {
-        eprintln!("[sync_write_request] no connection {conn_id} to ack from {src}");
+        log::error!("[sync_write_request] no connection {conn_id} to ack from {src}");
         return;
     };
     send(ctx, addr, &pkt);
@@ -2406,26 +2406,26 @@ pub fn sync_write_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         match decrypt_packet_body(&node, SYNC_WRITE_ACK_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[sync_write_ack] decryption failed from {src}");
+                log::error!("[sync_write_ack] decryption failed from {src}");
                 return;
             }
         }
     };
     let mut pos = 0usize;
     let Some(&result) = plaintext.get(pos) else {
-        eprintln!("[sync_write_ack] missing result from {src}");
+        log::error!("[sync_write_ack] missing result from {src}");
         return;
     };
     pos += 1;
     let Some(private_v) = read_sync_version(&plaintext, &mut pos) else {
-        eprintln!("[sync_write_ack] truncated private_version from {src}");
+        log::error!("[sync_write_ack] truncated private_version from {src}");
         return;
     };
     let Some(public_v) = read_sync_version(&plaintext, &mut pos) else {
-        eprintln!("[sync_write_ack] truncated public_version from {src}");
+        log::error!("[sync_write_ack] truncated public_version from {src}");
         return;
     };
-    println!(
+    log::info!(
         "[sync_write_ack] from {src} result={result} private=(e={},s={}) public=(e={},s={}) (phase 5: pull on accepted)",
         private_v.epoch, private_v.seq, public_v.epoch, public_v.seq,
     );
@@ -2440,7 +2440,7 @@ pub fn sync_write_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// surfaces partition-recovery situations the design doc covers.
 pub fn sync_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
-        eprintln!("[sync_update_available] header too short from {src}");
+        log::error!("[sync_update_available] header too short from {src}");
         return;
     }
     let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
@@ -2450,7 +2450,7 @@ pub fn sync_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext)
         match decrypt_packet_body(&node, SYNC_UPDATE_AVAILABLE_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[sync_update_available] decryption failed from {src}");
+                log::error!("[sync_update_available] decryption failed from {src}");
                 return;
             }
         }
@@ -2458,11 +2458,11 @@ pub fn sync_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext)
 
     let mut pos = 0usize;
     let Some(scope) = read_scope(&plaintext, &mut pos) else {
-        eprintln!("[sync_update_available] bad scope from {src}");
+        log::error!("[sync_update_available] bad scope from {src}");
         return;
     };
     let Some(announced) = read_sync_version(&plaintext, &mut pos) else {
-        eprintln!("[sync_update_available] truncated version from {src}");
+        log::error!("[sync_update_available] truncated version from {src}");
         return;
     };
 
@@ -2516,7 +2516,7 @@ pub fn sync_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext)
 /// variant currently bumps Private). Future phases will populate it.
 pub fn sync_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
-        eprintln!("[sync_pull_request] header too short from {src}");
+        log::error!("[sync_pull_request] header too short from {src}");
         return;
     }
     let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
@@ -2526,7 +2526,7 @@ pub fn sync_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         match decrypt_packet_body(&node, SYNC_PULL_REQUEST_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[sync_pull_request] decryption failed from {src}");
+                log::error!("[sync_pull_request] decryption failed from {src}");
                 return;
             }
         }
@@ -2534,11 +2534,11 @@ pub fn sync_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     let mut pos = 0usize;
     let Some(scope) = read_scope(&plaintext, &mut pos) else {
-        eprintln!("[sync_pull_request] bad scope from {src}");
+        log::error!("[sync_pull_request] bad scope from {src}");
         return;
     };
     let Some(last_seen) = read_sync_version(&plaintext, &mut pos) else {
-        eprintln!("[sync_pull_request] truncated version from {src}");
+        log::error!("[sync_pull_request] truncated version from {src}");
         return;
     };
 
@@ -2579,7 +2579,7 @@ pub fn sync_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             ))
     };
     let Some((pkt, addr)) = pkt_and_addr else {
-        eprintln!("[sync_pull_request] no connection {conn_id} to reply to from {src}");
+        log::error!("[sync_pull_request] no connection {conn_id} to reply to from {src}");
         return;
     };
     send(ctx, addr, &pkt);
@@ -2597,7 +2597,7 @@ pub fn sync_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         match decrypt_packet_body(&node, SYNC_PULL_RESPONSE_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[sync_pull_response] decryption failed from {src}");
+                log::error!("[sync_pull_response] decryption failed from {src}");
                 return;
             }
         }
@@ -2605,16 +2605,16 @@ pub fn sync_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     let mut pos = 0usize;
     let Some(scope) = read_scope(&plaintext, &mut pos) else {
-        eprintln!("[sync_pull_response] bad scope from {src}");
+        log::error!("[sync_pull_response] bad scope from {src}");
         return;
     };
     let Some(&result) = plaintext.get(pos) else {
-        eprintln!("[sync_pull_response] missing result from {src}");
+        log::error!("[sync_pull_response] missing result from {src}");
         return;
     };
     pos += 1;
     let Some(new_version) = read_sync_version(&plaintext, &mut pos) else {
-        eprintln!("[sync_pull_response] truncated version from {src}");
+        log::error!("[sync_pull_response] truncated version from {src}");
         return;
     };
 
@@ -2637,7 +2637,7 @@ pub fn sync_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 Scope::Private => state_blob.is_empty(),
             };
             if !applied {
-                eprintln!("[sync_pull_response] failed to apply state for {scope:?} from {src}");
+                log::error!("[sync_pull_response] failed to apply state for {scope:?} from {src}");
                 return;
             }
             let mut node = ctx.node.write().unwrap();
@@ -2649,7 +2649,7 @@ pub fn sync_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             ctx.save_node();
         }
         other => {
-            eprintln!("[sync_pull_response] unknown result {other} from {src}");
+            log::error!("[sync_pull_response] unknown result {other} from {src}");
         }
     }
 }
@@ -2675,7 +2675,7 @@ pub fn sync_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
 pub fn cross_user_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
-        eprintln!("[cross_user_update_available] header too short from {src}");
+        log::error!("[cross_user_update_available] header too short from {src}");
         return;
     }
     let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
@@ -2685,7 +2685,7 @@ pub fn cross_user_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
         match decrypt_packet_body(&node, CROSS_USER_UPDATE_AVAILABLE_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[cross_user_update_available] decryption failed from {src}");
+                log::error!("[cross_user_update_available] decryption failed from {src}");
                 return;
             }
         }
@@ -2693,15 +2693,15 @@ pub fn cross_user_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
 
     let mut pos = 0usize;
     let Some(scope) = read_scope(&plaintext, &mut pos) else {
-        eprintln!("[cross_user_update_available] bad scope from {src}");
+        log::error!("[cross_user_update_available] bad scope from {src}");
         return;
     };
     if !matches!(scope, Scope::Public) {
-        eprintln!("[cross_user_update_available] non-public scope ignored from {src}");
+        log::error!("[cross_user_update_available] non-public scope ignored from {src}");
         return;
     }
     let Some(announced) = read_sync_version(&plaintext, &mut pos) else {
-        eprintln!("[cross_user_update_available] truncated version from {src}");
+        log::error!("[cross_user_update_available] truncated version from {src}");
         return;
     };
 
@@ -2719,7 +2719,7 @@ pub fn cross_user_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
         }
     };
     if !conn_present {
-        eprintln!("[cross_user_update_available] no contact owns conn {conn_id} from {src}");
+        log::error!("[cross_user_update_available] no contact owns conn {conn_id} from {src}");
         return;
     }
 
@@ -2749,7 +2749,7 @@ pub fn cross_user_update_available(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
 
 pub fn cross_user_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
-        eprintln!("[cross_user_pull_request] header too short from {src}");
+        log::error!("[cross_user_pull_request] header too short from {src}");
         return;
     }
     let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
@@ -2759,7 +2759,7 @@ pub fn cross_user_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
         match decrypt_packet_body(&node, CROSS_USER_PULL_REQUEST_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[cross_user_pull_request] decryption failed from {src}");
+                log::error!("[cross_user_pull_request] decryption failed from {src}");
                 return;
             }
         }
@@ -2767,15 +2767,15 @@ pub fn cross_user_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
 
     let mut pos = 0usize;
     let Some(scope) = read_scope(&plaintext, &mut pos) else {
-        eprintln!("[cross_user_pull_request] bad scope from {src}");
+        log::error!("[cross_user_pull_request] bad scope from {src}");
         return;
     };
     if !matches!(scope, Scope::Public) {
-        eprintln!("[cross_user_pull_request] non-public scope ignored from {src}");
+        log::error!("[cross_user_pull_request] non-public scope ignored from {src}");
         return;
     }
     let Some(last_seen) = read_sync_version(&plaintext, &mut pos) else {
-        eprintln!("[cross_user_pull_request] truncated version from {src}");
+        log::error!("[cross_user_pull_request] truncated version from {src}");
         return;
     };
 
@@ -2818,7 +2818,7 @@ pub fn cross_user_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
             ))
     };
     let Some((pkt, addr)) = pkt_and_addr else {
-        eprintln!("[cross_user_pull_request] no connection {conn_id} from {src}");
+        log::error!("[cross_user_pull_request] no connection {conn_id} from {src}");
         return;
     };
     send(ctx, addr, &pkt);
@@ -2826,7 +2826,7 @@ pub fn cross_user_pull_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
 
 pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
-        eprintln!("[cross_user_pull_response] header too short from {src}");
+        log::error!("[cross_user_pull_response] header too short from {src}");
         return;
     }
     let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
@@ -2836,7 +2836,7 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
         match decrypt_packet_body(&node, CROSS_USER_PULL_RESPONSE_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[cross_user_pull_response] decryption failed from {src}");
+                log::error!("[cross_user_pull_response] decryption failed from {src}");
                 return;
             }
         }
@@ -2844,27 +2844,27 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
 
     let mut pos = 0usize;
     let Some(scope) = read_scope(&plaintext, &mut pos) else {
-        eprintln!("[cross_user_pull_response] bad scope from {src}");
+        log::error!("[cross_user_pull_response] bad scope from {src}");
         return;
     };
     if !matches!(scope, Scope::Public) {
-        eprintln!("[cross_user_pull_response] non-public scope ignored from {src}");
+        log::error!("[cross_user_pull_response] non-public scope ignored from {src}");
         return;
     }
     let Some(&result) = plaintext.get(pos) else {
-        eprintln!("[cross_user_pull_response] missing result from {src}");
+        log::error!("[cross_user_pull_response] missing result from {src}");
         return;
     };
     pos += 1;
     let Some(new_version) = read_sync_version(&plaintext, &mut pos) else {
-        eprintln!("[cross_user_pull_response] truncated version from {src}");
+        log::error!("[cross_user_pull_response] truncated version from {src}");
         return;
     };
 
     let contact_user_uuid = {
         let node = ctx.node.read().unwrap();
         let Some(conn) = node.owner.active_connections.get(&conn_id) else {
-            eprintln!("[cross_user_pull_response] no connection {conn_id} from {src}");
+            log::error!("[cross_user_pull_response] no connection {conn_id} from {src}");
             return;
         };
         let peer_uuid = conn.device_uuid;
@@ -2873,7 +2873,7 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
         {
             Some(c) => c.user.uuid,
             None    => {
-                eprintln!("[cross_user_pull_response] conn {conn_id} not a contact from {src}");
+                log::error!("[cross_user_pull_response] conn {conn_id} not a contact from {src}");
                 return;
             }
         }
@@ -2893,7 +2893,7 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
         PULL_RESULT_FULL_STATE => {
             let state_blob = &plaintext[pos..];
             let Some(data) = deserialize_contact_data(state_blob) else {
-                eprintln!("[cross_user_pull_response] failed to parse state from {src}");
+                log::error!("[cross_user_pull_response] failed to parse state from {src}");
                 return;
             };
             // Carry the contact's existing identity (alias + public_key); a
@@ -2923,7 +2923,7 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
                 if let Err(WriteError::Unreachable) = request_change_idempotent(Change::UpsertContact {
                     uuid: data.user_uuid, alias, public_key, devices: cards,
                 }, ctx) {
-                    eprintln!("[cross_user_pull_response] no reachable writer SG; refreshed \
+                    log::error!("[cross_user_pull_response] no reachable writer SG; refreshed \
                                snapshot for {:?} not logged this round", data.user_uuid);
                 }
                 let accepted = match &data.accepted_aliases {
@@ -2955,7 +2955,7 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
                     }, ctx);
                 }
             } else {
-                eprintln!("[cross_user_pull_response] data for unknown contact {:?}",
+                log::error!("[cross_user_pull_response] data for unknown contact {:?}",
                     data.user_uuid);
             }
             // Pin the cross-user pull baseline regardless of whether the
@@ -2971,7 +2971,7 @@ pub fn cross_user_pull_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
             ctx.save_node();
         }
         other => {
-            eprintln!("[cross_user_pull_response] unknown result {other} from {src}");
+            log::error!("[cross_user_pull_response] unknown result {other} from {src}");
         }
     }
 }
@@ -3049,7 +3049,7 @@ pub(crate) fn parse_watermark_map(data: &[u8]) -> Option<(Scope, Vec<(Uuid, Sync
 
 pub fn watermark_probe_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
-        eprintln!("[watermark_probe_request] header too short from {src}");
+        log::error!("[watermark_probe_request] header too short from {src}");
         return;
     }
     let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
@@ -3059,7 +3059,7 @@ pub fn watermark_probe_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
         match decrypt_packet_body(&node, WATERMARK_PROBE_REQUEST_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[watermark_probe_request] decryption failed from {src}");
+                log::error!("[watermark_probe_request] decryption failed from {src}");
                 return;
             }
         }
@@ -3067,7 +3067,7 @@ pub fn watermark_probe_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
 
     let mut pos = 0usize;
     let Some(scope) = read_scope(&plaintext, &mut pos) else {
-        eprintln!("[watermark_probe_request] bad scope from {src}");
+        log::error!("[watermark_probe_request] bad scope from {src}");
         return;
     };
 
@@ -3097,7 +3097,7 @@ pub fn watermark_probe_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
             ))
     };
     let Some((pkt, addr)) = pkt_and_addr else {
-        eprintln!("[watermark_probe_request] no connection {conn_id} to reply from {src}");
+        log::error!("[watermark_probe_request] no connection {conn_id} to reply from {src}");
         return;
     };
     send(ctx, addr, &pkt);
@@ -3105,7 +3105,7 @@ pub fn watermark_probe_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContex
 
 pub fn watermark_probe_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
-        eprintln!("[watermark_probe_response] header too short from {src}");
+        log::error!("[watermark_probe_response] header too short from {src}");
         return;
     }
     let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
@@ -3115,14 +3115,14 @@ pub fn watermark_probe_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
         match decrypt_packet_body(&node, WATERMARK_PROBE_RESPONSE_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[watermark_probe_response] decryption failed from {src}");
+                log::error!("[watermark_probe_response] decryption failed from {src}");
                 return;
             }
         }
     };
 
     let Some((scope, peer_map)) = parse_watermark_map(&plaintext) else {
-        eprintln!("[watermark_probe_response] malformed body from {src}");
+        log::error!("[watermark_probe_response] malformed body from {src}");
         return;
     };
 
@@ -3132,7 +3132,7 @@ pub fn watermark_probe_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerConte
         match node.owner.active_connections.get(&conn_id) {
             Some(conn) => conn.device_uuid,
             None => {
-                eprintln!("[watermark_probe_response] no connection {conn_id} from {src}");
+                log::error!("[watermark_probe_response] no connection {conn_id} from {src}");
                 return;
             }
         }
@@ -3439,7 +3439,7 @@ pub(crate) fn build_merge_proposal_for_peer(
 
 pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
-        eprintln!("[merge_proposal] header too short from {src}");
+        log::error!("[merge_proposal] header too short from {src}");
         return;
     }
     let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
@@ -3449,14 +3449,14 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         match decrypt_packet_body(&node, MERGE_PROPOSAL_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[merge_proposal] decryption failed from {src}");
+                log::error!("[merge_proposal] decryption failed from {src}");
                 return;
             }
         }
     };
 
     let Some(parsed) = parse_merge_proposal_body(&plaintext) else {
-        eprintln!("[merge_proposal] malformed body from {src}");
+        log::error!("[merge_proposal] malformed body from {src}");
         return;
     };
 
@@ -3465,7 +3465,7 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         match node.owner.active_connections.get(&conn_id) {
             Some(conn) => conn.device_uuid,
             None => {
-                eprintln!("[merge_proposal] no connection {conn_id} from {src}");
+                log::error!("[merge_proposal] no connection {conn_id} from {src}");
                 return;
             }
         }
@@ -3535,7 +3535,7 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     };
 
-    println!(
+    log::info!(
         "[merge_proposal] {} entries from peer {:02x?} (scope={scope:?}, sender_version epoch={}, seq={})",
         entries.len(),
         &peer_uuid[..4],
@@ -3546,7 +3546,7 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // 7c.6: actually run the merge. Receiving a proposal from a non-own-user
     // SG is a protocol violation — store nothing, ack malformed.
     if !is_own_sg {
-        eprintln!("[merge_proposal] from non-own-user-SG peer {:02x?}; replying malformed",
+        log::error!("[merge_proposal] from non-own-user-SG peer {:02x?}; replying malformed",
                   &peer_uuid[..4]);
         send_merge_ack(conn_id, scope, SyncVersion::zero(),
                        MERGE_ACK_RESULT_MALFORMED, ctx);
@@ -3598,7 +3598,7 @@ pub fn merge_proposal(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             match apply_change_to_owner(&mut node.owner, change) {
                 Ok(true)  => any_state_change = true,
                 Ok(false) => {}
-                Err(e) => eprintln!("[merge_proposal] applying {change:?} failed: {e:?}"),
+                Err(e) => log::error!("[merge_proposal] applying {change:?} failed: {e:?}"),
             }
         }
 
@@ -3699,7 +3699,7 @@ fn send_merge_ack(
 
 pub fn merge_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
-        eprintln!("[merge_ack] header too short from {src}");
+        log::error!("[merge_ack] header too short from {src}");
         return;
     }
     let plaintext = {
@@ -3707,13 +3707,13 @@ pub fn merge_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         match decrypt_packet_body(&node, MERGE_ACK_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[merge_ack] decryption failed from {src}");
+                log::error!("[merge_ack] decryption failed from {src}");
                 return;
             }
         }
     };
     let Some((scope, new_watermark, result)) = parse_merge_ack_body(&plaintext) else {
-        eprintln!("[merge_ack] malformed body from {src}");
+        log::error!("[merge_ack] malformed body from {src}");
         return;
     };
     let result_str = match result {

@@ -34,7 +34,7 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         .unwrap_or_else(|e| e.into_inner())
         .allow_register(src)
     {
-        eprintln!("[app_register] rate limited from {src}");
+        log::error!("[app_register] rate limited from {src}");
         return send_error(ctx, src, ERR_RATE_LIMITED);
     }
 
@@ -195,10 +195,10 @@ pub fn app_register(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 }
             }
             ctx.save_node();
-            eprintln!("[app_register] rejecting '{alias_for_log}': {e:?}");
+            log::error!("[app_register] rejecting '{alias_for_log}': {e:?}");
             return send_error(ctx, src, ERR_NO_WRITER);
         }
-        println!("[app_register] auto-approved '{alias_for_log}' via PNET_AUTO_APPROVE_APPS");
+        log::info!("[app_register] auto-approved '{alias_for_log}' via PNET_AUTO_APPROVE_APPS");
     }
 
     ctx.save_node();
@@ -354,7 +354,7 @@ pub fn app_update(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                         }
                     }
                     ctx.save_node();
-                    eprintln!(
+                    log::error!(
                         "[app_update] alias rollback for app {}: {e:?}",
                         uuid_hex(&app_id)
                     );
@@ -533,7 +533,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
         .unwrap_or_else(|e| e.into_inner())
         .allow_send(src, Some(token))
     {
-        eprintln!("[app_send_packet] rate limited from {src}");
+        log::error!("[app_send_packet] rate limited from {src}");
         return send_error(ctx, src, ERR_RATE_LIMITED);
     }
 
@@ -583,7 +583,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                 best_sg_connection(&node, &candidates)
             });
             let Some(sg_conn) = sg_conn else {
-                eprintln!(
+                log::error!(
                     "[app_send_packet] no reachable SG for dest {:?}",
                     dest_device_uuid
                 );
@@ -679,16 +679,16 @@ pub fn direct_app(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         }
         sender.copy_from_slice(&buf[..16]);
         let Some(their) = device_dh_pk(&node, &sender) else {
-            eprintln!("[direct_app] unknown sender from {src}");
+            log::error!("[direct_app] unknown sender from {src}");
             return;
         };
         let Some((claimed, plaintext)) = open_direct_app(&node.device_dh.private_key, &their, &buf)
         else {
-            eprintln!("[direct_app] decryption failed from {src}");
+            log::error!("[direct_app] decryption failed from {src}");
             return;
         };
         if claimed != sender || plaintext.len() < 32 {
-            eprintln!("[direct_app] bad body from {src}");
+            log::error!("[direct_app] bad body from {src}");
             return;
         }
         let Some(dest_app_id) = slice_arr::<16>(&plaintext, 0) else {
@@ -708,7 +708,7 @@ pub fn direct_app(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             node.device_uuid,
             dest_app_id,
         ) {
-            eprintln!("[direct_app] sender is not allowed");
+            log::error!("[direct_app] sender is not allowed");
             return;
         }
         let Some(app_host) = local_approved_app_host(&node, dest_app_id) else {
@@ -737,12 +737,12 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let node = ctx.node.read().unwrap();
 
         let Some(plaintext) = decrypt_packet_body(&node, APP_PACKET_OP, &buf) else {
-            eprintln!("[app_packet] decryption failed from {src}");
+            log::error!("[app_packet] decryption failed from {src}");
             return;
         };
 
         if plaintext.len() < 32 {
-            eprintln!("[app_packet] plaintext too short from {src}");
+            log::error!("[app_packet] plaintext too short from {src}");
             return;
         }
         let Some(dest_app_id) = slice_arr::<16>(&plaintext, 0) else {
@@ -753,7 +753,7 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         };
         let payload = &plaintext[32..];
         if payload.len() > MAX_APP_PAYLOAD {
-            eprintln!(
+            log::error!(
                 "[app_packet] app payload too large ({} > {MAX_APP_PAYLOAD}) from {src}",
                 payload.len()
             );
@@ -762,7 +762,7 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
         // Unapproved apps must never receive pushes.
         if !sender_may_deliver(&node, None, sender_app_id, node.device_uuid, dest_app_id) {
-            eprintln!(
+            log::error!(
                 "[app_packet] dropping app {}; sender {} is not allowed",
                 uuid_hex(&dest_app_id),
                 uuid_hex(&sender_app_id),
@@ -770,7 +770,7 @@ pub fn app_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         }
         let Some(app_host) = local_approved_app_host(&node, dest_app_id) else {
-            eprintln!(
+            log::error!(
                 "[app_packet] no approved app with id {}",
                 uuid_hex(&dest_app_id)
             );

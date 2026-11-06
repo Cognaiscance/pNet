@@ -209,7 +209,7 @@ pub fn refresh_device_secrets(node: &mut Node) {
     plain.extend_from_slice(node.device_dh.public_key.as_bytes());
     match seal(&plain) {
         Ok(env) => node.device_secrets_sealed = env,
-        Err(e) => eprintln!("[keystore] refusing to persist device secrets: {e}"),
+        Err(e) => log::error!("[keystore] refusing to persist device secrets: {e}"),
     }
 }
 
@@ -226,11 +226,11 @@ pub fn restore_secrets(node: &mut Node) {
                 seed.copy_from_slice(&bytes);
                 node.owner.key_pair.private_key = Ed25519SecretKey(seed);
             }
-            Some(_) => eprintln!("[keystore] user key envelope has an unexpected length"),
+            Some(_) => log::error!("[keystore] user key envelope has an unexpected length"),
             None => {
-                eprintln!("[keystore] could not open the user private key (passphrase?)");
+                log::error!("[keystore] could not open the user private key (passphrase?)");
                 if node.owner.key_pair.private_key != Ed25519SecretKey::ZERO {
-                    eprintln!("[keystore] keeping legacy plaintext user seed until the next save");
+                    log::error!("[keystore] keeping legacy plaintext user seed until the next save");
                 }
             }
         }
@@ -259,8 +259,8 @@ pub fn restore_secrets(node: &mut Node) {
                 private_key: X25519SecretKey(dh_sk),
             };
         }
-        Some(_) => eprintln!("[keystore] device secret envelope has an unexpected length"),
-        None => eprintln!("[keystore] could not open device secrets (passphrase?)"),
+        Some(_) => log::error!("[keystore] device secret envelope has an unexpected length"),
+        None => log::error!("[keystore] could not open device secrets (passphrase?)"),
     }
 }
 
@@ -282,8 +282,8 @@ fn open_identity(kp: &mut Ed25519KeyPair) {
             seed.copy_from_slice(&bytes);
             kp.private_key = Ed25519SecretKey(seed);
         }
-        Some(_) => eprintln!("[keystore] app key envelope has an unexpected length"),
-        None => eprintln!("[keystore] could not open an app identity key (passphrase?)"),
+        Some(_) => log::error!("[keystore] app key envelope has an unexpected length"),
+        None => log::error!("[keystore] could not open an app identity key (passphrase?)"),
     }
 }
 

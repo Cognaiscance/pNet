@@ -31,7 +31,7 @@ impl WriterThread {
                 };
                 let path = data_dir.join(filename);
                 if let Err(e) = write_atomic(&path, &content) {
-                    eprintln!("[writer] failed to write {}: {e}", path.display());
+                    log::error!("[writer] failed to write {}: {e}", path.display());
                 }
             }
             // Channel closed — sender(s) all dropped. Exit cleanly.

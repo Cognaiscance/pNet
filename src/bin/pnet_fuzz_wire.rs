@@ -17,7 +17,7 @@ use std::process;
 use pnet::fuzz::{fuzz_all_parsers, run_campaign, FuzzTarget};
 
 fn usage() -> ! {
-    eprintln!(
+    log::error!(
         "pnet_fuzz_wire — mutational fuzzer for pNet wire codecs
 
 Usage:
@@ -42,7 +42,7 @@ fn main() {
             "--help" | "-h" => usage(),
             "--list" => {
                 for t in FuzzTarget::ALL {
-                    println!("{}", t.name());
+                    log::info!("{}", t.name());
                 }
                 return;
             }
@@ -50,19 +50,19 @@ fn main() {
             "--iters" => {
                 let v = args.next().unwrap_or_else(|| usage());
                 iters = v.parse().unwrap_or_else(|_| {
-                    eprintln!("bad --iters");
+                    log::error!("bad --iters");
                     process::exit(2);
                 });
             }
             "--seed" => {
                 let v = args.next().unwrap_or_else(|| usage());
                 seed = v.parse().unwrap_or_else(|_| {
-                    eprintln!("bad --seed");
+                    log::error!("bad --seed");
                     process::exit(2);
                 });
             }
             other => {
-                eprintln!("unknown arg: {other}");
+                log::error!("unknown arg: {other}");
                 usage();
             }
         }
@@ -74,7 +74,7 @@ fn main() {
             .read_to_end(&mut buf)
             .expect("read stdin");
         fuzz_all_parsers(&buf);
-        eprintln!(
+        log::error!(
             "pnet_fuzz_wire: once ok ({} bytes, {} targets)",
             buf.len(),
             FuzzTarget::ALL.len()
@@ -82,10 +82,10 @@ fn main() {
         return;
     }
 
-    eprintln!(
+    log::error!(
         "pnet_fuzz_wire: campaign iters_per_target={iters} seed={seed} targets={}",
         FuzzTarget::ALL.len()
     );
     let (inputs, ok) = run_campaign(iters, seed);
-    eprintln!("pnet_fuzz_wire: done inputs={inputs} well_formed_accepts={ok}");
+    log::error!("pnet_fuzz_wire: done inputs={inputs} well_formed_accepts={ok}");
 }

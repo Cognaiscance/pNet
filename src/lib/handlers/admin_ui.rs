@@ -261,7 +261,7 @@ pub fn ui_request(
                 let holds = ctx.node.read().unwrap().owner.key_pair.private_key
                     != Ed25519SecretKey::ZERO;
                 if !holds {
-                    eprintln!(
+                    log::error!(
                         "[invitations] ignoring issuer checkbox; this node does not hold the user private key"
                     );
                 }
@@ -364,20 +364,20 @@ fn finish_invitation_mint(
                         );
                     }
                     Some(Err(())) => {
-                        eprintln!(
+                        log::error!(
                             "[finish_invitation_mint] SG reported mint failure (device={is_device})"
                         );
                         respond_redirect(&stream, "/invitations?error=no_host");
                     }
                     None => {
-                        eprintln!(
+                        log::error!(
                             "[finish_invitation_mint] timed out waiting for SG reply (device={is_device})"
                         );
                         respond_redirect(&stream, "/invitations?error=no_host");
                     }
                 }
             }) {
-                eprintln!("[finish_invitation_mint] failed to spawn waiter: {e}");
+                log::error!("[finish_invitation_mint] failed to spawn waiter: {e}");
             }
         }
     }
@@ -557,7 +557,7 @@ fn render_portal_home(ctx: &WorkerContext) -> String {
 
     let dropped = ctx.app_web.drop_unreachable();
     if dropped > 0 {
-        println!("[app-web] dropped {dropped} mount(s) whose port is not listening");
+        log::info!("[app-web] dropped {dropped} mount(s) whose port is not listening");
     }
     let mounts = ctx.app_web.list();
     let apps_section = if mounts.is_empty() {
@@ -664,7 +664,7 @@ fn handle_app_web_proxy(
         body,
         mount.port,
     ) {
-        eprintln!("[app-web] proxy /apps/{slug}/ → :{} failed: {e}", mount.port);
+        log::error!("[app-web] proxy /apps/{slug}/ → :{} failed: {e}", mount.port);
         // Client may already have received partial bytes; best-effort error page.
         let _ = respond_html(
             &stream,
@@ -712,7 +712,7 @@ fn handle_app_web_register(
         port,
         title,
     });
-    println!("[app-web] registered mount /apps/{slug}/ → 127.0.0.1:{port}");
+    log::info!("[app-web] registered mount /apps/{slug}/ → 127.0.0.1:{port}");
     respond_plain(stream, 200, &format!("ok slug={slug} port={port}\n"));
 }
 
@@ -731,7 +731,7 @@ fn handle_app_web_unregister(
         return respond_plain(stream, 400, "error: slug\n");
     }
     if ctx.app_web.remove(&slug) {
-        println!("[app-web] unregistered mount /apps/{slug}/");
+        log::info!("[app-web] unregistered mount /apps/{slug}/");
         respond_plain(stream, 200, "ok\n")
     } else {
         respond_plain(stream, 404, "error: not_found\n")
@@ -1078,7 +1078,7 @@ fn publish_policy(change: Change, ctx: &WorkerContext) -> Option<&'static str> {
     match request_change_idempotent(change, ctx) {
         Ok(()) => None,
         Err(e) => {
-            eprintln!("[app-policy] publish failed: {e:?}");
+            log::error!("[app-policy] publish failed: {e:?}");
             Some(UI_ERR_PUBLISH_FAILED)
         }
     }
@@ -1615,7 +1615,7 @@ pub(crate) fn approve_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static s
         }, ctx) {
             Ok(()) => None,
             Err(e) => {
-                eprintln!("[approve_app] decision failed for app {}: {e:?}", uuid_hex(&id));
+                log::error!("[approve_app] decision failed for app {}: {e:?}", uuid_hex(&id));
                 Some(UI_ERR_PUBLISH_FAILED)
             }
         };
@@ -1664,7 +1664,7 @@ pub(crate) fn approve_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static s
             drop(node);
             ctx.save_node();
         }
-        eprintln!("[approve_app] publish failed for app {}: {e:?}", uuid_hex(&id));
+        log::error!("[approve_app] publish failed for app {}: {e:?}", uuid_hex(&id));
         return Some(UI_ERR_PUBLISH_FAILED);
     }
     None
@@ -1713,7 +1713,7 @@ pub(crate) fn rename_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static st
             }
         }
         ctx.save_node();
-        eprintln!("[rename_app] publish failed for app {}: {e:?}", uuid_hex(&id));
+        log::error!("[rename_app] publish failed for app {}: {e:?}", uuid_hex(&id));
         return Some(UI_ERR_PUBLISH_FAILED);
     }
     None
@@ -1740,7 +1740,7 @@ pub(crate) fn reject_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static st
             }, ctx) {
                 Ok(()) => None,
                 Err(e) => {
-                    eprintln!("[reject_app] decision failed for app {}: {e:?}", uuid_hex(&id));
+                    log::error!("[reject_app] decision failed for app {}: {e:?}", uuid_hex(&id));
                     Some(UI_ERR_PUBLISH_FAILED)
                 }
             };
@@ -1764,7 +1764,7 @@ pub(crate) fn reject_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static st
                 }
             }
             ctx.save_node();
-            eprintln!("[reject_app] publish failed for app {}: {e:?}", uuid_hex(&id));
+            log::error!("[reject_app] publish failed for app {}: {e:?}", uuid_hex(&id));
             return Some(UI_ERR_PUBLISH_FAILED);
         }
         // The device drops its own copy when it applies this decision.
@@ -1775,7 +1775,7 @@ pub(crate) fn reject_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static st
         }, ctx) {
             Ok(()) => None,
             Err(e) => {
-                eprintln!("[reject_app] decision failed for app {}: {e:?}", uuid_hex(&id));
+                log::error!("[reject_app] decision failed for app {}: {e:?}", uuid_hex(&id));
                 Some(UI_ERR_PUBLISH_FAILED)
             }
         };
@@ -1805,7 +1805,7 @@ pub(crate) fn reject_app(body: &[u8], ctx: &WorkerContext) -> Option<&'static st
             }
         }
         ctx.save_node();
-        eprintln!("[reject_app] publish failed for app {}: {e:?}", uuid_hex(&id));
+        log::error!("[reject_app] publish failed for app {}: {e:?}", uuid_hex(&id));
         return Some(UI_ERR_PUBLISH_FAILED);
     }
     None
@@ -1825,7 +1825,7 @@ pub(crate) fn remove_device(body: &[u8], ctx: &WorkerContext) -> Option<&'static
     let id = uuid_from_hex(id_str)?;
     let local = ctx.node.read().unwrap().device_uuid;
     if id == local {
-        eprintln!("[remove_device] refusing to remove this device");
+        log::error!("[remove_device] refusing to remove this device");
         return Some(UI_ERR_REMOVE_SELF);
     }
     let removed = {
@@ -1841,7 +1841,7 @@ pub(crate) fn remove_device(body: &[u8], ctx: &WorkerContext) -> Option<&'static
             node.owner.user.devices.push(removed);
         }
         ctx.save_node();
-        eprintln!("[remove_device] publish failed for {}: {e:?}", uuid_hex(&id));
+        log::error!("[remove_device] publish failed for {}: {e:?}", uuid_hex(&id));
         return Some(UI_ERR_PUBLISH_FAILED);
     }
     // The local writer already dropped sessions inside `request_change`.

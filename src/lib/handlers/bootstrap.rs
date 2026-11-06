@@ -213,15 +213,15 @@ fn parse_bootstrap_request(buf: &[u8]) -> Option<BootstrapRequestBody> {
 /// The invitation is consumed (single-use).
 pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let Some(req) = parse_bootstrap_request(&buf) else {
-        eprintln!("[bootstrap_request] packet too short or malformed ({}) from {src}", buf.len());
+        log::error!("[bootstrap_request] packet too short or malformed ({}) from {src}", buf.len());
         return;
     };
     if !ed25519_verify(&req.signing_pk, &req.signed_prefix, &req.pop_sig) {
-        eprintln!("[bootstrap_request] device key proof failed from {src}");
+        log::error!("[bootstrap_request] device key proof failed from {src}");
         return;
     }
     if req.alias.is_empty() {
-        eprintln!("[bootstrap_request] empty device alias from {src}");
+        log::error!("[bootstrap_request] empty device alias from {src}");
         return;
     }
 
@@ -233,19 +233,19 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let pos = match node.owner.device_invitations.iter().position(|inv| inv.id == req.invitation_id) {
             Some(p) => p,
             None => {
-                eprintln!("[bootstrap_request] unknown invitation from {src}");
+                log::error!("[bootstrap_request] unknown invitation from {src}");
                 return;
             }
         };
         if node.owner.device_invitations[pos].expires_at <= now {
-            eprintln!("[bootstrap_request] expired invitation from {src}");
+            log::error!("[bootstrap_request] expired invitation from {src}");
             node.owner.device_invitations.remove(pos);
             return;
         }
 
         let inv: Invitation = node.owner.device_invitations.remove(pos);
         if node.owner.key_pair.private_key == Ed25519SecretKey::ZERO {
-            eprintln!("[bootstrap_request] this node cannot sign device certificates");
+            log::error!("[bootstrap_request] this node cannot sign device certificates");
             return;
         }
         if node.owner.user_cert_sig == Ed25519Signature::ZERO {
@@ -306,7 +306,7 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     pkt.push(BOOTSTRAP_RESPONSE_OP);
     pkt.extend_from_slice(&nonce);
     pkt.extend_from_slice(&ciphertext);
-    println!("[bootstrap_request] sending bootstrap response to {src}");
+    log::info!("[bootstrap_request] sending bootstrap response to {src}");
     send(ctx, src, &pkt);
 }
 
@@ -319,7 +319,7 @@ pub fn bootstrap_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// the received user data, then sends a DeviceRegistration back to the SG.
 pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 24 {
-        eprintln!("[bootstrap_response] packet too short ({}) from {src}", buf.len());
+        log::error!("[bootstrap_response] packet too short ({}) from {src}", buf.len());
         return;
     }
     let Some(nonce) = slice_arr::<24>(&buf, 0) else { return; };
@@ -329,11 +329,11 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let (shared_secret, invitation_id, sg_addr, device_alias, desired_grade, desired_sg_rank) = {
         let node = ctx.node.read().unwrap();
         let Some(pb) = &node.owner.pending_bootstrap else {
-            eprintln!("[bootstrap_response] no pending bootstrap, ignoring from {src}");
+            log::error!("[bootstrap_response] no pending bootstrap, ignoring from {src}");
             return;
         };
         if SocketAddr::V4(pb.sg_addr) != src {
-            eprintln!("[bootstrap_response] unexpected source {src}, ignoring");
+            log::error!("[bootstrap_response] unexpected source {src}, ignoring");
             return;
         }
         let ss = aead_key_from_dh(
@@ -345,11 +345,11 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     };
 
     let Some(plaintext) = open_with_opcode(BOOTSTRAP_RESPONSE_OP, &shared_secret, &nonce, ciphertext, None) else {
-        eprintln!("[bootstrap_response] decryption failed from {src}");
+        log::error!("[bootstrap_response] decryption failed from {src}");
         return;
     };
     let Some(data) = deserialize_bootstrap_payload(&plaintext) else {
-        eprintln!("[bootstrap_response] deserialization failed from {src}");
+        log::error!("[bootstrap_response] deserialization failed from {src}");
         return;
     };
     if !certs::verify_user_cert(
@@ -358,7 +358,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         data.user_cert_issued_at,
         &data.user_cert_sig,
     ) {
-        eprintln!("[bootstrap_response] user certificate did not verify from {src}");
+        log::error!("[bootstrap_response] user certificate did not verify from {src}");
         return;
     }
     let (our_signing, our_dh) = {
@@ -366,7 +366,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         (node.device_signing.public_key, node.device_dh.public_key)
     };
     if data.issued.signing_pk != our_signing || data.issued.dh_pk != our_dh {
-        eprintln!("[bootstrap_response] issued device certificate is not for our keys");
+        log::error!("[bootstrap_response] issued device certificate is not for our keys");
         return;
     }
     if !certs::verify_device_cert(
@@ -377,7 +377,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         data.issued.cert_issued_at,
         &data.issued.cert_sig,
     ) {
-        eprintln!("[bootstrap_response] device certificate did not verify from {src}");
+        log::error!("[bootstrap_response] device certificate did not verify from {src}");
         return;
     }
 
@@ -436,11 +436,11 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     ctx.save_node(); // applied user data from bootstrap
 
     if device_reg_payload.is_empty() {
-        eprintln!("[bootstrap_response] local device not found, cannot register");
+        log::error!("[bootstrap_response] local device not found, cannot register");
         return;
     }
 
-    println!("[bootstrap_response] bootstrap complete, sending device registration to {sg_addr}");
+    log::info!("[bootstrap_response] bootstrap complete, sending device registration to {sg_addr}");
     // Send DeviceRegistration: [op=0x32][invitation_id:16][nonce:24][encrypted device info]
     let (ciphertext, reg_nonce) = seal_with_opcode(DEVICE_REGISTER_OP, &shared_secret, &device_reg_payload);
     let mut pkt = Vec::with_capacity(1 + 16 + 24 + ciphertext.len());
@@ -469,7 +469,7 @@ pub fn bootstrap_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// and adds the new device to `owner.user.devices`.
 pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 16 + 24 {
-        eprintln!("[device_registration] packet too short ({}) from {src}", buf.len());
+        log::error!("[device_registration] packet too short ({}) from {src}", buf.len());
         return;
     }
     let Some(invitation_id) = slice_arr::<16>(&buf, 0) else { return; };
@@ -486,7 +486,7 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         match node.owner.pending_device_acceptances.remove(&invitation_id) {
             Some(pda) => (pda.shared_secret, pda.expected_signing_pk, user_pk),
             None => {
-                eprintln!("[device_registration] no pending acceptance for invitation from {src}");
+                log::error!("[device_registration] no pending acceptance for invitation from {src}");
                 return;
             }
         }
@@ -494,16 +494,16 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     };
 
     let Some(plaintext) = open_with_opcode(DEVICE_REGISTER_OP, &shared_secret, &nonce, ciphertext, None) else {
-        eprintln!("[device_registration] decryption failed from {src}");
+        log::error!("[device_registration] decryption failed from {src}");
         return;
     };
     let mut pos = 0usize;
     let Some(device) = read_device(&plaintext, &mut pos) else {
-        eprintln!("[device_registration] deserialization failed from {src}");
+        log::error!("[device_registration] deserialization failed from {src}");
         return;
     };
     if device.signing_pk != expected_signing_pk || !certs::device_on_record_verifies(&device, &user_pk) {
-        eprintln!("[device_registration] device certificate did not match the bootstrap proof from {src}");
+        log::error!("[device_registration] device certificate did not match the bootstrap proof from {src}");
         return;
     }
 
@@ -521,7 +521,7 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let inserted = {
         let mut node = ctx.node.write().unwrap();
         if !node.owner.user.devices.iter().any(|d| d.uuid == device.uuid) {
-            println!("[device_registration] new device '{}' registered from {src}", device.alias);
+            log::info!("[device_registration] new device '{}' registered from {src}", device.alias);
             node.owner.user.devices.push(device);
             true
         } else {
@@ -551,7 +551,7 @@ pub fn device_registration(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
                 node.owner.user.devices.retain(|d| d.uuid != device_uuid);
             }
             ctx.save_node();
-            eprintln!("[device_registration] rejecting device '{device_alias}': {e:?}");
+            log::error!("[device_registration] rejecting device '{device_alias}': {e:?}");
             return;
         }
     }
@@ -620,7 +620,7 @@ pub(crate) fn contact_payload_well_formed(data: &[u8]) -> bool {
 pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     const MIN_LEN: usize = 16 + 32 + 24;
     if buf.len() < MIN_LEN {
-        eprintln!("[contact_request] packet too short ({}) from {src}", buf.len());
+        log::error!("[contact_request] packet too short ({}) from {src}", buf.len());
         return;
     }
 
@@ -636,12 +636,12 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let pos = match node.owner.contact_invitations.iter().position(|inv| inv.id == invitation_id) {
             Some(p) => p,
             None => {
-                eprintln!("[contact_request] unknown invitation from {src}");
+                log::error!("[contact_request] unknown invitation from {src}");
                 return;
             }
         };
         if node.owner.contact_invitations[pos].expires_at <= now {
-            eprintln!("[contact_request] expired invitation from {src}");
+            log::error!("[contact_request] expired invitation from {src}");
             node.owner.contact_invitations.remove(pos);
             return;
         }
@@ -654,11 +654,11 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         );
 
         let Some(plaintext) = open_with_opcode(CONTACT_REQUEST_OP, &shared_secret, &nonce, ciphertext, None) else {
-            eprintln!("[contact_request] decryption failed from {src}");
+            log::error!("[contact_request] decryption failed from {src}");
             return;
         };
         let Some(data) = deserialize_contact_payload(&plaintext) else {
-            eprintln!("[contact_request] deserialization failed from {src}");
+            log::error!("[contact_request] deserialization failed from {src}");
             return;
         };
 
@@ -675,7 +675,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         // Build the contact upsert from the handshake payload. Don't mutate
         // contact_users inline — route it through request_change below so the
         // writer logs it and non-writer own SGs reconcile it via merge (Gap #2).
-        eprintln!("[contact_request] adding contact '{}' from {src}", data.alias);
+        log::error!("[contact_request] adding contact '{}' from {src}", data.alias);
         let contact_uuid = data.uuid;
         let contact_change = Change::UpsertContact {
             uuid:       data.uuid,
@@ -694,7 +694,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // logs and merges it back. Either way every own SG converges on the
     // contact, so all of them can validate its later connect_requests.
     if let Err(WriteError::Unreachable) = request_change_idempotent(contact_change, ctx) {
-        eprintln!("[contact_request] no reachable writer SG; contact {contact_uuid:?} \
+        log::error!("[contact_request] no reachable writer SG; contact {contact_uuid:?} \
                    not yet logged — own SGs will reconcile once a writer is online");
     }
     // Catch up on the new contact's public state now, in case the SG↔SG
@@ -726,7 +726,7 @@ pub fn contact_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// target as a contact.
 pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 24 {
-        eprintln!("[contact_response] packet too short ({}) from {src}", buf.len());
+        log::error!("[contact_response] packet too short ({}) from {src}", buf.len());
         return;
     }
 
@@ -736,11 +736,11 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     let shared_secret = {
         let node = ctx.node.read().unwrap();
         let Some(pce) = &node.owner.pending_contact_exchange else {
-            eprintln!("[contact_response] no pending contact exchange, ignoring from {src}");
+            log::error!("[contact_response] no pending contact exchange, ignoring from {src}");
             return;
         };
         if SocketAddr::V4(pce.sg_addr) != src {
-            eprintln!("[contact_response] unexpected source {src}, ignoring");
+            log::error!("[contact_response] unexpected source {src}, ignoring");
             return;
         }
         aead_key_from_dh(
@@ -751,15 +751,15 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     };
 
     let Some(plaintext) = open_with_opcode(CONTACT_RESPONSE_OP, &shared_secret, &nonce, ciphertext, None) else {
-        eprintln!("[contact_response] decryption failed from {src}");
+        log::error!("[contact_response] decryption failed from {src}");
         return;
     };
     let Some(data) = deserialize_contact_payload(&plaintext) else {
-        eprintln!("[contact_response] deserialization failed from {src}");
+        log::error!("[contact_response] deserialization failed from {src}");
         return;
     };
 
-    eprintln!("[contact_response] adding contact '{}' from {src}", data.alias);
+    log::error!("[contact_response] adding contact '{}' from {src}", data.alias);
     let contact_uuid = data.uuid;
     let contact_change = Change::UpsertContact {
         uuid:       data.uuid,
@@ -777,7 +777,7 @@ pub fn contact_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     // adds + logs + fans out; on a non-writer it forwards to the writer, which
     // logs and merges it back. Either way every own SG converges on the contact.
     if let Err(WriteError::Unreachable) = request_change_idempotent(contact_change, ctx) {
-        eprintln!("[contact_response] no reachable writer SG; contact {contact_uuid:?} \
+        log::error!("[contact_response] no reachable writer SG; contact {contact_uuid:?} \
                    not yet logged — own SGs will reconcile once a writer is online");
     }
     // Catch up on the new contact's public state now, in case the SG↔SG
@@ -940,7 +940,7 @@ fn generate_invitation(kind: u8, releases_user_key: bool, ctx: &WorkerContext) -
     };
 
     let Some(target) = target else {
-        eprintln!("[generate_invitation] no reachable SG to mint invitation");
+        log::error!("[generate_invitation] no reachable SG to mint invitation");
         return InvitationMint::Failed;
     };
 
@@ -979,7 +979,7 @@ fn start_invitation_from_sg(kind: u8, sg_uuid: Uuid, releases_user_key: bool, ct
             })
     };
     let Some((pkt, addr)) = pkt_and_addr else {
-        eprintln!("[start_invitation_from_sg] no reachable SG to mint invitation");
+        log::error!("[start_invitation_from_sg] no reachable SG to mint invitation");
         return InvitationMint::Failed;
     };
 
@@ -1010,7 +1010,7 @@ pub(crate) fn initiate_bootstrap(body: &[u8], ctx: &WorkerContext) {
     };
 
     if let Err(e) = start_bootstrap(device_alias.trim(), code_str, grade, sg_rank, ctx) {
-        eprintln!("[initiate_bootstrap] {e}");
+        log::error!("[initiate_bootstrap] {e}");
     }
 }
 
@@ -1032,7 +1032,7 @@ pub fn start_bootstrap(
         let mut cache = ctx.dns_cache.lock().unwrap();
         resolve_hosts(&mut cache, &hosts).into_iter().next()
     }) else {
-        eprintln!("[start_bootstrap] no host in invitation code resolved: {hosts:?}");
+        log::error!("[start_bootstrap] no host in invitation code resolved: {hosts:?}");
         return Err("no host resolved from invitation code");
     };
 
@@ -1076,7 +1076,7 @@ pub fn start_bootstrap(
     pkt.extend_from_slice(dh_pk.as_bytes());
     push_str(&mut pkt, &alias);
     pkt.extend_from_slice(&pop);
-    println!("[start_bootstrap] sending bootstrap request to {sg_addr} (picked {picked_host} from {hosts:?})");
+    log::info!("[start_bootstrap] sending bootstrap request to {sg_addr} (picked {picked_host} from {hosts:?})");
     send(ctx, SocketAddr::V4(sg_addr), &pkt);
     Ok(())
 }
@@ -1094,7 +1094,7 @@ pub(crate) fn generate_contact_invitation(ctx: &WorkerContext) -> InvitationMint
 /// `[token:16][result:1][code_utf8...]`.
 pub fn generate_invitation_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < 2 {
-        eprintln!("[generate_invitation_request] header too short from {src}");
+        log::error!("[generate_invitation_request] header too short from {src}");
         return;
     }
     let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
@@ -1104,13 +1104,13 @@ pub fn generate_invitation_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
         match decrypt_packet_body(&node, GENERATE_INVITATION_REQUEST_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[generate_invitation_request] decryption failed from {src}");
+                log::error!("[generate_invitation_request] decryption failed from {src}");
                 return;
             }
         }
     };
     if plaintext.len() < 1 + 16 {
-        eprintln!("[generate_invitation_request] body too short from {src}");
+        log::error!("[generate_invitation_request] body too short from {src}");
         return;
     }
     let kind = plaintext[0];
@@ -1128,7 +1128,7 @@ pub fn generate_invitation_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
         (local_device_hosts(&node), requester_is_sg)
     };
     let (result_byte, code) = if hosts.is_empty() {
-        eprintln!("[generate_invitation_request] this SG has no hosts configured — cannot mint");
+        log::error!("[generate_invitation_request] this SG has no hosts configured — cannot mint");
         (INVITE_RESULT_ERROR, String::new())
     } else {
         let (inv_id, inv_pk) = store_new_invitation(kind, asked_release && requester_is_sg, ctx);
@@ -1150,7 +1150,7 @@ pub fn generate_invitation_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerCo
             ))
     };
     let Some((pkt, addr)) = pkt_and_addr else {
-        eprintln!("[generate_invitation_request] no connection {conn_id} to reply from {src}");
+        log::error!("[generate_invitation_request] no connection {conn_id} to reply from {src}");
         return;
     };
     send(ctx, addr, &pkt);
@@ -1164,13 +1164,13 @@ pub fn generate_invitation_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerC
         match decrypt_packet_body(&node, GENERATE_INVITATION_RESPONSE_OP, &buf) {
             Some(pt) => pt,
             None => {
-                eprintln!("[generate_invitation_response] decryption failed from {src}");
+                log::error!("[generate_invitation_response] decryption failed from {src}");
                 return;
             }
         }
     };
     if plaintext.len() < 17 {
-        eprintln!("[generate_invitation_response] body too short from {src}");
+        log::error!("[generate_invitation_response] body too short from {src}");
         return;
     }
     let Some(token) = slice_arr::<16>(&plaintext, 0) else { return; };
@@ -1178,7 +1178,7 @@ pub fn generate_invitation_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerC
         match std::str::from_utf8(&plaintext[17..]) {
             Ok(code) => Ok(code.to_string()),
             Err(_) => {
-                eprintln!("[generate_invitation_response] non-utf8 code from {src}");
+                log::error!("[generate_invitation_response] non-utf8 code from {src}");
                 Err(())
             }
         }
@@ -1191,7 +1191,7 @@ pub fn generate_invitation_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerC
         *entry = Some(outcome);
         ctx.pending_invites.cv.notify_all();
     } else {
-        eprintln!("[generate_invitation_response] no waiter for token (late/duplicate reply) from {src}");
+        log::error!("[generate_invitation_response] no waiter for token (late/duplicate reply) from {src}");
     }
 }
 
@@ -1199,7 +1199,7 @@ pub fn generate_invitation_response(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerC
 pub(crate) fn initiate_contact_exchange(body: &[u8], ctx: &WorkerContext) {
     let Some(code_str) = form_field(body, "code") else { return };
     let Some((invitation_id, invitation_pk, hosts)) = decode_invitation_code(code_str) else {
-        eprintln!("[initiate_contact_exchange] invalid invitation code");
+        log::error!("[initiate_contact_exchange] invalid invitation code");
         return;
     };
 
@@ -1207,10 +1207,10 @@ pub(crate) fn initiate_contact_exchange(body: &[u8], ctx: &WorkerContext) {
         let mut cache = ctx.dns_cache.lock().unwrap();
         resolve_hosts(&mut cache, &hosts).into_iter().next()
     }) else {
-        eprintln!("[initiate_contact_exchange] no host in invitation code resolved: {hosts:?}");
+        log::error!("[initiate_contact_exchange] no host in invitation code resolved: {hosts:?}");
         return;
     };
-    println!("[initiate_contact_exchange] sending contact request to {sg_addr} (picked {picked_host} from {hosts:?})");
+    log::info!("[initiate_contact_exchange] sending contact request to {sg_addr} (picked {picked_host} from {hosts:?})");
 
     let ephem_kp = generate_x25519_keypair();
     let ephem_pk = ephem_kp.public_key;

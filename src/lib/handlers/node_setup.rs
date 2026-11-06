@@ -164,7 +164,7 @@ pub fn ensure_local_device_cert(ctx: &WorkerContext) {
     };
     ctx.save_node();
     if let Err(e) = request_change(change, ctx) {
-        eprintln!(
+        log::error!(
             "[ensure_local_device_cert] device certificate is local but was not published: {e:?}"
         );
     }

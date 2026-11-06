@@ -350,7 +350,7 @@ impl ActionQueue {
             let dropped = self.buckets[drop_prio]
                 .pop()
                 .expect("bucket non-empty after lowest_priority_strictly_below");
-            eprintln!(
+            log::error!(
                 "[queue] drop existing kind={} prio={} to admit kind={} prio={} depth={}/{}",
                 dropped.kind_name(),
                 drop_prio,
@@ -363,7 +363,7 @@ impl ActionQueue {
             return true;
         }
 
-        eprintln!(
+        log::error!(
             "[queue] drop incoming kind={} prio={} depth={}/{} (no lower-priority work to shed)",
             action.kind_name(),
             priority,

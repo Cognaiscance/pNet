@@ -62,7 +62,7 @@ impl UdpListener {
                         continue
                     }
                     Err(e) => {
-                        eprintln!("[udp] recv error: {e}");
+                        log::error!("[udp] recv error: {e}");
                         continue;
                     }
                 };
@@ -86,7 +86,7 @@ impl UdpListener {
                         | APP_SEND_GRADED_OP
                 );
                 if is_app_api && !app_api_source_allowed(src) {
-                    eprintln!(
+                    log::error!(
                         "[udp] drop app op {op:#04x} from non-loopback {src} \
                          (set PNET_APP_API_REMOTE=1 to allow)"
                     );
@@ -101,7 +101,7 @@ impl UdpListener {
                     APP_SEND_GRADED_OP => Action::AppSendPacket { src, buf: payload, graded: true },
                     SG_PING_OP => {
                         let Some(nonce) = slice_arr::<16>(&payload, 0) else {
-                            eprintln!("[udp] sg_ping too short from {src}");
+                            log::error!("[udp] sg_ping too short from {src}");
                             continue;
                         };
                         Action::SgPing { src, nonce }
@@ -160,7 +160,7 @@ impl UdpListener {
                     RELAY_PACKET_OP => Action::RelayPacket { src, buf: payload },
                     APP_PACKET_OP => Action::AppPacket { src, buf: payload },
                     _ => {
-                        eprintln!("[udp] unknown op byte {op} from {src}");
+                        log::error!("[udp] unknown op byte {op} from {src}");
                         continue;
                     }
                 };

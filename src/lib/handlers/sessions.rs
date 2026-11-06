@@ -99,7 +99,7 @@ pub fn sg_ping(src: SocketAddr, nonce: [u8; 16], ctx: &WorkerContext) {
 /// with a ConnectAck containing our ephemeral public key.
 pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < CONNECT_REQUEST_MIN_LEN {
-        eprintln!("[connect_request] packet too short ({} bytes) from {src}", buf.len());
+        log::error!("[connect_request] packet too short ({} bytes) from {src}", buf.len());
         return;
     }
 
@@ -118,7 +118,7 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     signed_msg[0] = CONNECT_REQUEST_OP;
     signed_msg[1..83].copy_from_slice(&buf[0..82]);
     if !ed25519_verify(&initiator_longterm_pk, &signed_msg, &signature) {
-        eprintln!("[connect_request] invalid signature from {src}");
+        log::error!("[connect_request] invalid signature from {src}");
         return;
     }
 
@@ -128,7 +128,7 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         find_device_uuid_for_pk(&node, &initiator_longterm_pk, &initiator_device_uuid).is_some()
     };
     if !known {
-        eprintln!("[connect_request] unknown public key or device UUID from {src}");
+        log::error!("[connect_request] unknown public key or device UUID from {src}");
         return;
     }
 
@@ -195,7 +195,7 @@ pub fn connect_request(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 /// Promotes the matching PendingConnection to an ActiveConnection.
 pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     if buf.len() < CONNECT_ACK_MIN_LEN {
-        eprintln!("[connect_ack] packet too short ({} bytes) from {src}", buf.len());
+        log::error!("[connect_ack] packet too short ({} bytes) from {src}", buf.len());
         return;
     }
 
@@ -208,7 +208,7 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     let mut node = ctx.node.write().unwrap();
     let Some(pending) = node.owner.pending_connections.remove(&our_conn_id) else {
-        eprintln!("[connect_ack] no pending connection for id {our_conn_id} from {src}");
+        log::error!("[connect_ack] no pending connection for id {our_conn_id} from {src}");
         return;
     };
 
@@ -217,7 +217,7 @@ pub fn connect_ack(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     signed_msg[0] = CONNECT_ACK_OP;
     signed_msg[1..37].copy_from_slice(&buf[0..36]);
     if !ed25519_verify(&pending.peer_longterm_pk, &signed_msg, &signature) {
-        eprintln!("[connect_ack] invalid signature from {src}");
+        log::error!("[connect_ack] invalid signature from {src}");
         // Put the pending connection back so we don't lose the slot.
         node.owner.pending_connections.insert(our_conn_id, pending);
         return;
@@ -318,7 +318,7 @@ pub fn poll_sg(ctx: &WorkerContext) {
     // Ephemeral socket so pong responses come back here, not to the main listener.
     let ping_socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
-        Err(e) => { eprintln!("[poll_sg] bind failed: {e}"); return; }
+        Err(e) => { log::error!("[poll_sg] bind failed: {e}"); return; }
     };
     ping_socket.set_read_timeout(Some(SG_PING_TIMEOUT)).ok();
 
@@ -498,7 +498,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
             .collect();
         for id in expired {
             if let Some(p) = node.owner.pending_connections.remove(&id) {
-                println!("[poll_connections] evicting stale pending conn {id} to peer {:02x?}",
+                log::info!("[poll_connections] evicting stale pending conn {id} to peer {:02x?}",
                     &p.peer_device_uuid[..4]);
             }
         }
@@ -620,7 +620,7 @@ pub fn maintain_connections(ctx: &WorkerContext) {
         let sig = ed25519_sign(&our_longterm_sk, &pkt[0..83]);
         pkt[83..147].copy_from_slice(&sig);
 
-        println!("[poll_connections] sending connect request to {peer_host} (peer {:02x?})", &peer_uuid[..4]);
+        log::info!("[poll_connections] sending connect request to {peer_host} (peer {:02x?})", &peer_uuid[..4]);
         send(ctx, SocketAddr::V4(peer_host), &pkt);
         issued += 1;
     }
@@ -792,7 +792,7 @@ pub fn conn_reset(src: SocketAddr, ctx: &WorkerContext) {
     };
 
     if !evicted {
-        eprintln!("[conn_reset] from {src} — no matching active connection");
+        log::error!("[conn_reset] from {src} — no matching active connection");
         return;
     }
 

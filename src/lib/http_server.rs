@@ -43,7 +43,7 @@ pub fn parse_http_bind(bind: Option<&str>, bind_all: bool) -> Ipv4Addr {
             match s.parse::<Ipv4Addr>() {
                 Ok(ip) => return ip,
                 Err(_) => {
-                    eprintln!(
+                    log::error!(
                         "[http] PNET_HTTP_BIND={s:?} is not a valid IPv4 address; using 127.0.0.1"
                     );
                     return Ipv4Addr::LOCALHOST;
@@ -93,7 +93,7 @@ impl HttpServer {
                         thread::sleep(Duration::from_millis(100));
                     }
                     Err(e) => {
-                        eprintln!("[http] accept error: {e}");
+                        log::error!("[http] accept error: {e}");
                     }
                 }
             }

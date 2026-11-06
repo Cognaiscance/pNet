@@ -59,14 +59,14 @@ impl AppWebRegistry {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(err) => {
-                eprintln!("[app-web] app_web.toml unreadable: {err}");
+                log::error!("[app-web] app_web.toml unreadable: {err}");
                 return registry;
             }
         };
         let file: AppWebFile = match toml::from_str(&text) {
             Ok(file) => file,
             Err(err) => {
-                eprintln!("[app-web] app_web.toml ignored: {err}");
+                log::error!("[app-web] app_web.toml ignored: {err}");
                 return registry;
             }
         };
@@ -131,12 +131,12 @@ impl AppWebRegistry {
         let text = match toml::to_string(&file) {
             Ok(text) => text,
             Err(err) => {
-                eprintln!("[app-web] could not encode app_web.toml: {err}");
+                log::error!("[app-web] could not encode app_web.toml: {err}");
                 return;
             }
         };
         if let Err(err) = super::writer::write_atomic(path, &text) {
-            eprintln!("[app-web] could not write {}: {err}", path.display());
+            log::error!("[app-web] could not write {}: {err}", path.display());
         }
     }
 

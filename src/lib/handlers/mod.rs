@@ -36,7 +36,7 @@ pub fn parse_pnet_hosts() -> Vec<String> {
 
 fn send(ctx: &WorkerContext, dest: SocketAddr, data: &[u8]) {
     if let Err(e) = ctx.udp_socket.send_to(data, dest) {
-        eprintln!("[send] send_to {dest} failed: {e}");
+        log::error!("[send] send_to {dest} failed: {e}");
     }
 }
 
@@ -91,11 +91,11 @@ pub fn observed_addr(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         decrypt_packet_body(&node, OBSERVED_ADDR_OP, &buf)
     };
     let Some(plain) = plain else {
-        eprintln!("[observed_addr] decryption failed from {src}");
+        log::error!("[observed_addr] decryption failed from {src}");
         return;
     };
     let Some((device, addr)) = crate::direct_path::decode_observation(&plain) else {
-        eprintln!("[observed_addr] short body from {src}");
+        log::error!("[observed_addr] short body from {src}");
         return;
     };
     let local = ctx.node.read().unwrap().device_uuid;
@@ -256,7 +256,7 @@ pub fn lan_addrs(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         decrypt_packet_body(&node, LAN_ADDRS_OP, &buf)
     };
     let Some(plain) = plain else {
-        eprintln!("[lan_addrs] decryption failed from {src}");
+        log::error!("[lan_addrs] decryption failed from {src}");
         return;
     };
     if plain.len() < 18 {
@@ -305,7 +305,7 @@ pub fn unstable_notice(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         decrypt_packet_body(&node, UNSTABLE_OP, &buf)
     };
     let Some(plain) = plain else {
-        eprintln!("[unstable] decryption failed from {src}");
+        log::error!("[unstable] decryption failed from {src}");
         return;
     };
     if plain.len() < 18 {
@@ -381,7 +381,7 @@ pub fn path_down(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         decrypt_packet_body(&node, PATH_DOWN_OP, &buf)
     };
     let Some(plain) = plain else {
-        eprintln!("[path_down] decryption failed from {src}");
+        log::error!("[path_down] decryption failed from {src}");
         return;
     };
     if plain.len() < 17 {
@@ -462,7 +462,7 @@ pub fn punch_invite(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         decrypt_packet_body(&node, PUNCH_INVITE_OP, &buf)
     };
     let Some(plain) = plain else {
-        eprintln!("[punch_invite] decryption failed from {src}");
+        log::error!("[punch_invite] decryption failed from {src}");
         return;
     };
     let Some((peer, addr)) = crate::direct_path::decode_observation(&plain) else {
@@ -587,7 +587,7 @@ pub(crate) fn fabric_event(event: &str, fields: &[(&str, &str)]) {
             line.push_str(v);
         }
     }
-    println!("{line}");
+    log::info!("{line}");
 }
 
 /// Extract an IPv4 address from a SocketAddr, mapping IPv4-in-IPv6 if needed.
@@ -864,24 +864,24 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let node = ctx.node.read().unwrap();
 
         let Some(plaintext) = decrypt_packet_body(&node, RELAY_PACKET_OP, &buf) else {
-            eprintln!("[relay_packet] decryption failed from {src}");
+            log::error!("[relay_packet] decryption failed from {src}");
             return;
         };
 
         // Parse body.
         if plaintext.len() < 48 {
-            eprintln!("[relay_packet] plaintext too short from {src}");
+            log::error!("[relay_packet] plaintext too short from {src}");
             return;
         }
         let Some(dest_device_uuid) = slice_arr::<16>(&plaintext, 0) else {
-            eprintln!("[relay_packet] plaintext too short from {src}");
+            log::error!("[relay_packet] plaintext too short from {src}");
             return;
         };
         let Some(dest_app_id) = slice_arr::<16>(&plaintext, 16) else { return; };
         let Some(sender_app_id) = slice_arr::<16>(&plaintext, 32) else { return; };
         let payload = plaintext[48..].to_vec();
         if payload.len() > MAX_APP_PAYLOAD {
-            eprintln!(
+            log::error!(
                 "[relay_packet] app payload too large ({} > {MAX_APP_PAYLOAD}) from {src}",
                 payload.len()
             );
@@ -896,7 +896,7 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         sender_may_deliver(&node, sender_uuid, sender_app_id, dest_device_uuid, dest_app_id)
     };
     if !allowed {
-        eprintln!(
+        log::error!(
             "[relay_packet] dropping app {} for device {}; sender is not allowed",
             uuid_hex(&dest_app_id),
             uuid_hex(&dest_device_uuid),
@@ -925,7 +925,7 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             local_approved_app_host(&node, dest_app_id)
         };
         let Some(app_host) = app_host else {
-            eprintln!("[relay_packet] no approved local app with id {}", uuid_hex(&dest_app_id));
+            log::error!("[relay_packet] no approved local app with id {}", uuid_hex(&dest_app_id));
             return;
         };
         let mut push = Vec::with_capacity(17 + payload.len());
@@ -953,7 +953,7 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         let Some(dest_conn) = node.owner.active_connections.values()
             .find(|c| c.device_uuid == dest_device_uuid)
         else {
-            eprintln!("[relay_packet] no active connection to dest {:?}", dest_device_uuid);
+            log::error!("[relay_packet] no active connection to dest {:?}", dest_device_uuid);
             return;
         };
 

@@ -80,10 +80,10 @@ pub fn load(data_dir: &Path) -> Result<Node, String> {
                 FORMAT_VERSION
             ));
         }
-        println!("[persistence] loaded node from {}", path.display());
+        log::info!("[persistence] loaded node from {}", path.display());
         node
     } else {
-        println!("[persistence] no saved state — creating new node");
+        log::info!("[persistence] no saved state — creating new node");
         Node::new()
     };
 
@@ -92,7 +92,7 @@ pub fn load(data_dir: &Path) -> Result<Node, String> {
         match std::fs::read_to_string(&log_path) {
             Ok(content) => match toml::from_str::<WriteLogFile>(&content) {
                 Ok(file) => {
-                    println!(
+                    log::info!(
                         "[persistence] loaded write log ({} entries) from {}",
                         file.entries.len(),
                         log_path.display()
@@ -100,12 +100,12 @@ pub fn load(data_dir: &Path) -> Result<Node, String> {
                     // Prefer split file over any legacy embedded log.
                     node.owner.write_log = file.entries;
                 }
-                Err(e) => eprintln!("[persistence] failed to parse write_log.toml: {e}"),
+                Err(e) => log::error!("[persistence] failed to parse write_log.toml: {e}"),
             },
-            Err(e) => eprintln!("[persistence] failed to read write_log.toml: {e}"),
+            Err(e) => log::error!("[persistence] failed to read write_log.toml: {e}"),
         }
     } else if !node.owner.write_log.is_empty() {
-        println!(
+        log::info!(
             "[persistence] write_log present in node.toml ({} entries); \
              next save will split to write_log.toml",
             node.owner.write_log.len()

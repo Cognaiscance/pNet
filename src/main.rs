@@ -59,6 +59,43 @@ fn data_dir() -> PathBuf {
     PathBuf::from(home).join(".pnet").join("data")
 }
 
+/// Keep the flexi_logger handle for the process lifetime. Dropping it shuts
+/// the logger down. Rotate the live file each day or at 32 MiB, and delete
+/// files older than 7 days. The live file is `logs/pnet_rCURRENT.log`.
+fn init_node_log() {
+    use std::sync::OnceLock;
+    static HANDLE: OnceLock<flexi_logger::LoggerHandle> = OnceLock::new();
+    let dir = data_dir().parent().unwrap_or(std::path::Path::new(".")).join("logs");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[main] could not create {}: {e}", dir.display());
+        return;
+    }
+    let spec = flexi_logger::FileSpec::default()
+        .directory(dir)
+        .basename("pnet")
+        .suffix("log");
+    match flexi_logger::Logger::try_with_str("info")
+        .and_then(|logger| {
+            logger
+                .log_to_file(spec)
+                .rotate(
+                    flexi_logger::Criterion::AgeOrSize(
+                        flexi_logger::Age::Day,
+                        32 * 1024 * 1024,
+                    ),
+                    flexi_logger::Naming::Timestamps,
+                    flexi_logger::Cleanup::KeepForDays(7),
+                )
+                .format(flexi_logger::detailed_format)
+                .start()
+        }) {
+        Ok(handle) => {
+            let _ = HANDLE.set(handle);
+        }
+        Err(e) => eprintln!("[main] log file not opened: {e}"),
+    }
+}
+
 /// Overwrite the local device's `hosts` list with the parsed `PNET_HOSTS`
 /// entries, if the node is already set up and the local device is SG-grade.
 /// Called on every startup — `PNET_HOSTS` is authoritative when set.
@@ -94,14 +131,14 @@ fn apply_env_setup(ctx: &WorkerContext) {
         "sg" => DeviceGrade::SG,
         "dg" => DeviceGrade::DG,
         other => {
-            eprintln!("[apply_env_setup] PNET_GRADE={other:?} not recognized; expected 'sg' or 'dg'");
+            log::error!("[apply_env_setup] PNET_GRADE={other:?} not recognized; expected 'sg' or 'dg'");
             return;
         }
     };
 
     let device_alias = std::env::var("PNET_DEVICE_ALIAS").unwrap_or_default();
     if device_alias.trim().is_empty() {
-        eprintln!("[apply_env_setup] PNET_DEVICE_ALIAS is required");
+        log::error!("[apply_env_setup] PNET_DEVICE_ALIAS is required");
         return;
     }
 
@@ -120,20 +157,20 @@ fn apply_env_setup(ctx: &WorkerContext) {
         Some(code) if !code.trim().is_empty() => {
             // SG-join or DG-join path.
             if let Err(e) = start_bootstrap(device_alias.trim(), code.trim(), grade, sg_rank, ctx) {
-                eprintln!("[apply_env_setup] bootstrap failed: {e}");
+                log::error!("[apply_env_setup] bootstrap failed: {e}");
                 return;
             }
-            println!("[apply_env_setup] bootstrap request sent; waiting for SG acceptance");
+            log::info!("[apply_env_setup] bootstrap request sent; waiting for SG acceptance");
         }
         _ => {
             // SG-new path — must be SG, must have user alias.
             if !matches!(grade, DeviceGrade::SG) {
-                eprintln!("[apply_env_setup] PNET_GRADE=dg requires PNET_INVITATION_CODE");
+                log::error!("[apply_env_setup] PNET_GRADE=dg requires PNET_INVITATION_CODE");
                 return;
             }
             let user_alias = std::env::var("PNET_USER_ALIAS").unwrap_or_default();
             if user_alias.trim().is_empty() {
-                eprintln!("[apply_env_setup] PNET_USER_ALIAS is required for SG-new setup");
+                log::error!("[apply_env_setup] PNET_USER_ALIAS is required for SG-new setup");
                 return;
             }
             if let Some(err) = apply_new_user_setup(
@@ -143,10 +180,10 @@ fn apply_env_setup(ctx: &WorkerContext) {
                 sg_rank,
                 ctx,
             ) {
-                eprintln!("[apply_env_setup] new-user setup failed: {err}");
+                log::error!("[apply_env_setup] new-user setup failed: {err}");
                 return;
             }
-            println!("[apply_env_setup] new-user SG setup complete");
+            log::info!("[apply_env_setup] new-user SG setup complete");
         }
     }
 }
@@ -162,7 +199,7 @@ fn apply_env_admin_password(ctx: &WorkerContext) {
         if node.admin_password_hash.is_some() { return; }
     }
     if password.len() < pnet::admin_auth::MIN_PASSWORD_LEN {
-        eprintln!(
+        log::error!(
             "[apply_env_admin_password] PNET_ADMIN_PASSWORD shorter than {} chars; ignored",
             pnet::admin_auth::MIN_PASSWORD_LEN
         );
@@ -171,7 +208,7 @@ fn apply_env_admin_password(ctx: &WorkerContext) {
     let hash = pnet::admin_auth::hash_password(&password);
     ctx.node.write().unwrap().admin_password_hash = Some(hash);
     ctx.save_node();
-    println!("[apply_env_admin_password] admin password hash stored from env");
+    log::info!("[apply_env_admin_password] admin password hash stored from env");
 }
 
 /// Install the key passphrase before any secret is read or written.
@@ -182,7 +219,7 @@ fn install_startup_passphrase() {
             keystore::install_passphrase(&p);
             return;
         }
-        Ok(_) => eprintln!(
+        Ok(_) => log::error!(
             "[main] PNET_KEY_PASSPHRASE shorter than {} characters; ignoring",
             keystore::MIN_PASSPHRASE_LEN
         ),
@@ -192,7 +229,7 @@ fn install_startup_passphrase() {
         if p.len() >= keystore::MIN_PASSPHRASE_LEN {
             keystore::install_passphrase(&p);
         } else {
-            eprintln!(
+            log::error!(
                 "[main] key passphrase shorter than {} characters",
                 keystore::MIN_PASSPHRASE_LEN
             );
@@ -223,7 +260,7 @@ fn abort_if_keys_unreadable(node: &pnet::data_models::Node) {
     let device_failed = !node.device_secrets_sealed.is_empty()
         && node.device_signing.private_key == Ed25519SecretKey::ZERO;
     if user_failed || device_failed {
-        eprintln!(
+        log::error!(
             "[main] a sealed private key did not open. Set PNET_KEY_PASSPHRASE to the key passphrase and restart."
         );
         std::process::exit(1);
@@ -232,7 +269,7 @@ fn abort_if_keys_unreadable(node: &pnet::data_models::Node) {
     // zero private key. That is normal. A node that still holds a seed
     // (including a legacy plaintext file) must have a passphrase before save.
     if !keystore::is_installed() && secrets_need_passphrase(node) {
-        eprintln!(
+        log::error!(
             "[main] this node holds a private key and no key passphrase is installed. Set PNET_KEY_PASSPHRASE and restart."
         );
         std::process::exit(1);
@@ -249,6 +286,7 @@ fn main() {
         }
     }
 
+    init_node_log();
     install_startup_passphrase();
 
     // ── 1. Load data from disk ───────────────────────────────────────────────
@@ -259,7 +297,7 @@ fn main() {
     let loaded = match persistence::load(&dir) {
         Ok(node) => node,
         Err(e) => {
-            eprintln!("[main] {e}");
+            log::error!("[main] {e}");
             std::process::exit(1);
         }
     };
@@ -277,7 +315,7 @@ fn main() {
         .ok()
         .is_some_and(|code| !code.trim().is_empty());
     if !initialized && env_grade_conflicts() {
-        eprintln!(
+        log::error!(
             "[main] this is the {} build and PNET_GRADE does not match it",
             binary_label()
         );
@@ -285,14 +323,14 @@ fn main() {
     }
     match boot_stop(initialized, stored_is_sg, has_invitation_code) {
         Some(BootStop::GradeMismatch) => {
-            eprintln!(
+            log::error!(
                 "[main] this is the {} build and the stored node is the other grade",
                 binary_label()
             );
             std::process::exit(1);
         }
         Some(BootStop::DeviceNeedsCode) => {
-            eprintln!(
+            log::error!(
                 "[main] this device is not initialized. Set PNET_INVITATION_CODE and restart."
             );
             std::process::exit(1);
@@ -309,7 +347,7 @@ fn main() {
         // Same atomic + 0600 path as the writer thread (no bare fs::write).
         write_atomic(&dir.join("node.toml"), &toml)
             .expect("could not persist PNET_HOSTS update");
-        println!("[main] PNET_HOSTS applied: {pnet_hosts:?}");
+        log::info!("[main] PNET_HOSTS applied: {pnet_hosts:?}");
     }
 
     // ── 2. Start the shared queue ────────────────────────────────────────────
@@ -323,7 +361,7 @@ fn main() {
     let restored = app_web.list().len();
     let dropped = app_web.drop_unreachable();
     if restored > 0 || dropped > 0 {
-        println!(
+        log::info!(
             "[app-web] restored {} mount(s), dropped {dropped} whose port is not listening",
             restored.saturating_sub(dropped)
         );
@@ -341,13 +379,13 @@ fn main() {
     // Must start before building WorkerContext so workers share the same socket.
     let port = udp_port();
     let udp = UdpListener::start(port, Arc::clone(&queue), Arc::clone(&stop));
-    println!("[main] UDP listening on port {}", udp.local_addr.port());
+    log::info!("[main] UDP listening on port {}", udp.local_addr.port());
     if pnet::app_api::app_api_remote_enabled() {
-        println!(
+        log::info!(
             "[main] app API accepts non-loopback sources (PNET_APP_API_REMOTE=1) — multi-user risk"
         );
     } else {
-        println!("[main] app API restricted to loopback (set PNET_APP_API_REMOTE=1 for remote apps)");
+        log::info!("[main] app API restricted to loopback (set PNET_APP_API_REMOTE=1 for remote apps)");
     }
 
     // ── 6. Build WorkerContext and start worker threads ──────────────────────
@@ -395,17 +433,17 @@ fn main() {
         let http_bind = http_bind_ip();
         let hport = http_port();
         let http = HttpServer::start(http_bind, hport, Arc::clone(&queue), Arc::clone(&stop));
-        println!("[main] running. Owner portal HTTP on {http_bind}:{hport}");
+        log::info!("[main] running. Owner portal HTTP on {http_bind}:{hport}");
         http
     };
     #[cfg(not(feature = "sg"))]
-    println!("[main] running. This device has no website. Approve apps on a server portal.");
+    log::info!("[main] running. This device has no website. Approve apps on a server portal.");
 
     // ── Wait for SIGINT / SIGTERM ─────────────────────────────────────────────
     ctrlc::set_handler({
         let stop = Arc::clone(&stop);
         move || {
-            println!("\n[main] shutdown signal received");
+            log::info!("\n[main] shutdown signal received");
             stop.store(true, Ordering::SeqCst);
         }
     })
@@ -422,13 +460,13 @@ fn main() {
         cvar.notify_all();
     }
 
-    println!("[main] stopping producers...");
+    log::info!("[main] stopping producers...");
     udp.join();
     #[cfg(feature = "sg")]
     http.join();
     scheduler.join();
 
-    println!("[main] draining queue and stopping workers...");
+    log::info!("[main] draining queue and stopping workers...");
     pool.join();
 
     // Drop the last `WorkerContext` Arc before joining the writer. The writer
@@ -439,10 +477,10 @@ fn main() {
     // blocks forever and SIGTERM never completes a clean shutdown.
     drop(ctx);
 
-    println!("[main] stopping writer...");
+    log::info!("[main] stopping writer...");
     writer.join();
 
-    println!("[main] clean shutdown complete.");
+    log::info!("[main] clean shutdown complete.");
 }
 
 #[cfg(test)]

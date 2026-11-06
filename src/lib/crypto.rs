@@ -167,7 +167,7 @@ fn split_opcode(outer: u8, plaintext: &[u8], also_accept: Option<u8>) -> Option<
     if inner == outer || also_accept == Some(inner) {
         Some(plaintext[1..].to_vec())
     } else {
-        eprintln!(
+        log::error!(
             "[aead] dropping packet: outer opcode {outer:#04x} does not match inner {inner:#04x}"
         );
         None
