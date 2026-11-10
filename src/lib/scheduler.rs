@@ -11,6 +11,8 @@ const POLL_SG_INTERVAL:              Duration = Duration::from_secs(30);
 const MAINTAIN_CONNECTIONS_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Must be safely under the typical 30-second UDP NAT mapping timeout.
 const KEEPALIVE_DG_INTERVAL:         Duration = Duration::from_secs(20);
+/// Under the 10-second cellphone punch deadline, so one answer keeps it up.
+const PUNCH_KEEPALIVE_INTERVAL:      Duration = Duration::from_secs(8);
 /// How often to pull state from the elected writer SG. The design says
 /// "every few hours" — 30 min is a starting point that catches dropped
 /// `UpdateAvailable` notifications quickly without burning bandwidth.
@@ -45,6 +47,7 @@ impl SchedulerThread {
             let mut last_poll_sg            = Instant::now();
             let mut last_maintain           = Instant::now();
             let mut last_keepalive          = Instant::now();
+            let mut last_punch_keepalive    = Instant::now();
             let mut last_sync_pull          = Instant::now();
             let mut last_partition_reconcile = Instant::now();
             let mut pending: Vec<(Instant, Action)> = Vec::new();
@@ -73,6 +76,10 @@ impl SchedulerThread {
                 if now.duration_since(last_keepalive) >= KEEPALIVE_DG_INTERVAL {
                     to_enqueue.push(Action::KeepAliveDG);
                     last_keepalive = now;
+                }
+                if now.duration_since(last_punch_keepalive) >= PUNCH_KEEPALIVE_INTERVAL {
+                    to_enqueue.push(Action::PunchKeepalive);
+                    last_punch_keepalive = now;
                 }
                 if now.duration_since(last_sync_pull) >= SYNC_PULL_INTERVAL {
                     to_enqueue.push(Action::SyncPull);

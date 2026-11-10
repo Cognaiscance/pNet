@@ -639,6 +639,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                 book.lan_rtt(&dest_device_uuid),
                 book.punch_rtt(&dest_device_uuid),
             );
+            let on_punch = choice == crate::direct_path::PathChoice::Punch;
             let direct_addr = if matches!(
                 choice,
                 crate::direct_path::PathChoice::Lan | crate::direct_path::PathChoice::Punch
@@ -652,14 +653,19 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
             } else {
                 (Vec::new(), None)
             };
-            (direct_addr, race)
+            (direct_addr, race, on_punch)
         });
-        let (direct_addr, race) = observed.unwrap_or((None, (Vec::new(), None)));
+        let (direct_addr, race, on_punch) = observed.unwrap_or((None, (Vec::new(), None), false));
         if let (Some(addr), Some(direct)) = (direct_addr, direct_pkt) {
             pkt = direct;
             dest = addr;
         }
-        send(ctx, dest, &pkt);
+        let sent = ctx.udp_socket.send_to(&pkt, dest).is_ok();
+        if sent && on_punch && direct_addr.is_some() {
+            if let Ok(mut book) = ctx.direct_book.lock() {
+                book.note_punch_send(&dest_device_uuid, std::time::Instant::now());
+            }
+        }
         let (lan, punch) = race;
         if !lan.is_empty() || punch.is_some() {
             super::race_beside_send(ctx, &dest_device_uuid, &lan, punch);

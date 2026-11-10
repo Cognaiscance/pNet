@@ -130,6 +130,8 @@ pub enum Action {
     PollSG,
     MaintainConnections,
     KeepAliveDG,
+    /// Punch datagrams for direct paths that are still inside their deadline.
+    PunchKeepalive,
     /// Periodic pull from the elected writer SG for both scopes. Also fired
     /// as a one-shot when an active connection to the writer SG is established.
     SyncPull,
@@ -242,6 +244,7 @@ impl Action {
             Action::PollSG => "PollSG",
             Action::MaintainConnections => "MaintainConnections",
             Action::KeepAliveDG => "KeepAliveDG",
+            Action::PunchKeepalive => "PunchKeepalive",
             Action::SyncPull => "SyncPull",
             Action::PartitionReconcile => "PartitionReconcile",
         }
@@ -304,6 +307,7 @@ impl Action {
             Action::PollSG                           => handlers::poll_sg(ctx),
             Action::MaintainConnections              => handlers::maintain_connections(ctx),
             Action::KeepAliveDG                      => handlers::keepalive_dg(ctx),
+            Action::PunchKeepalive                   => handlers::punch_keepalive(ctx),
             Action::SyncPull                         => handlers::sync_pull(ctx),
             Action::PartitionReconcile               => handlers::partition_reconcile_tick(ctx),
         }

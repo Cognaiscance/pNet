@@ -460,17 +460,15 @@ pub fn maintain_connections(ctx: &WorkerContext) {
 
     let now = SystemTime::now();
     let local = ctx.node.read().unwrap().device_uuid;
-    let (notices, dead_lan, lan_due, tell_lan, probe_due) = if let Ok(mut book) = ctx.direct_book.lock() {
+    let (notices, tell_lan, probe_due) = if let Ok(mut book) = ctx.direct_book.lock() {
         book.sweep_unstable(std::time::Instant::now());
         let notices = book.take_unstable_notices(local);
         let _ = book.set_self_reported(read_own_lan());
-        let dead_lan = book.expire_unanswered_lan_checks();
-        let lan_due = book.lan_liveness_due();
         book.retry_unanswered_lan_probes();
         let probe_due = book.lan_probes_due(&local);
-        (notices, dead_lan, lan_due, true, probe_due)
+        (notices, true, probe_due)
     } else {
-        (Vec::new(), Vec::new(), Vec::new(), false, Vec::new())
+        (Vec::new(), false, Vec::new())
     };
     for (device, flag) in notices {
         super::publish_unstable(ctx, device, flag);
@@ -478,10 +476,6 @@ pub fn maintain_connections(ctx: &WorkerContext) {
     if tell_lan {
         super::publish_lan_addrs(ctx);
     }
-    for device in dead_lan {
-        super::announce_path_down(ctx, device);
-    }
-    super::send_lan_probes(ctx, local, &lan_due);
     super::send_lan_probes(ctx, local, &probe_due);
 
     // ── Evict PendingConnections whose ConnectAck never arrived ───────────────
@@ -675,6 +669,7 @@ fn refresh_own_lan(ctx: &WorkerContext) {
 /// (op `0x13`) so the DG reconnects immediately.
 pub fn keepalive_dg(ctx: &WorkerContext) {
     refresh_own_lan(ctx);
+    lan_liveness(ctx);
     let outs: Vec<(Vec<u8>, SocketAddr)> = {
         let node       = ctx.node.read().unwrap();
         let local_uuid = node.device_uuid;
@@ -717,6 +712,47 @@ pub fn keepalive_dg(ctx: &WorkerContext) {
 
     for (pkt, dest) in outs {
         send(ctx, dest, &pkt);
+    }
+}
+
+/// LAN paths are checked on the keepalive cadence, about every 20 seconds.
+/// A probe that is still unanswered after that long drops the path.
+pub(crate) fn lan_liveness(ctx: &WorkerContext) {
+    let local = ctx.node.read().unwrap().device_uuid;
+    let now = std::time::Instant::now();
+    let (dead, due) = if let Ok(mut book) = ctx.direct_book.lock() {
+        let dead = book.expire_unanswered_lan_checks(now);
+        let due = book.lan_liveness_due(now);
+        (dead, due)
+    } else {
+        return;
+    };
+    for device in dead {
+        super::announce_path_down(ctx, device);
+    }
+    super::send_lan_probes(ctx, local, &due);
+}
+
+/// Punch paths that are still up get another punch datagram. The answer
+/// moves the deadline forward. One lost answer lets the 10s or 30s run out.
+pub fn punch_keepalive(ctx: &WorkerContext) {
+    let now = std::time::Instant::now();
+    let due = ctx
+        .direct_book
+        .lock()
+        .map(|book| book.punch_refresh_due(now))
+        .unwrap_or_default();
+    if due.is_empty() {
+        return;
+    }
+    let local = ctx.node.read().unwrap().device_uuid;
+    for (_peer, addr) in due {
+        let mut pkt = Vec::with_capacity(17);
+        pkt.push(super::super::wire::PUNCH_OP);
+        pkt.extend_from_slice(&local);
+        if ctx.udp_socket.send_to(&pkt, addr).is_err() {
+            super::announce_path_down(ctx, local);
+        }
     }
 }
 

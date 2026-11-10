@@ -622,7 +622,7 @@ mod sessions;
 pub(crate) use sessions::{own_user_sg_down_aliases, own_user_sg_partition};
 pub use sessions::{
     conn_reset, connect_ack, connect_request, dg_keepalive_receive,
-    keepalive_dg, maintain_connections, poll_sg, sg_ping,
+    keepalive_dg, maintain_connections, poll_sg, punch_keepalive, sg_ping,
 };
 
 mod bootstrap;

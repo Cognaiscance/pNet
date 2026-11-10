@@ -33,6 +33,8 @@ pub struct PeerPath {
     pub punch_probe_sent: bool,
     /// A maintenance probe was sent and its answer has not arrived.
     pub lan_check_pending: bool,
+    /// When that maintenance probe was sent.
+    pub lan_check_sent_at: Option<Instant>,
     /// Private addresses this device reported for itself, with its UDP port.
     pub reported: Vec<SocketAddr>,
     /// Address the LAN probe was sent to. Set when a reported or observed pair matches.
@@ -66,6 +68,8 @@ pub struct DirectBook {
 }
 
 const UNSTABLE_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// A LAN path with no probe answer for this long is down.
+pub const LAN_CHECK_TTL: Duration = Duration::from_secs(20);
 
 /// Three address changes inside five minutes, and the newest still inside
 /// that window, marks the node unstable.
@@ -100,6 +104,7 @@ impl DirectBook {
                         lan_probe_sent: false,
                         punch_probe_sent: false,
                         lan_check_pending: false,
+                        lan_check_sent_at: None,
                         reported: self.pending_reports.remove(&device).unwrap_or_default(),
                         lan_target: None,
                         lan_inflight: Vec::new(),
@@ -123,6 +128,7 @@ impl DirectBook {
                 peer.lan_probe_sent = false;
                 peer.punch_probe_sent = false;
                 peer.lan_check_pending = false;
+                peer.lan_check_sent_at = None;
                 peer.lan_target = None;
                 peer.lan_inflight.clear();
                 peer.lan_rtt = None;
@@ -667,17 +673,24 @@ impl DirectBook {
         }
         peer.lan_up = true;
         peer.lan_check_pending = false;
+        peer.lan_check_sent_at = None;
         true
     }
 
-    /// Peers whose last maintenance probe was not answered. The LAN path drops.
-    pub fn expire_unanswered_lan_checks(&mut self) -> Vec<[u8; 16]> {
+    /// LAN paths whose keepalive probe was not answered within [`LAN_CHECK_TTL`].
+    pub fn expire_unanswered_lan_checks(&mut self, now: Instant) -> Vec<[u8; 16]> {
         let mut dead = Vec::new();
         for (id, peer) in self.peers.iter_mut() {
-            if peer.lan_check_pending {
+            let stale = peer.lan_check_pending
+                && peer
+                    .lan_check_sent_at
+                    .map(|sent| now.saturating_duration_since(sent) >= LAN_CHECK_TTL)
+                    .unwrap_or(false);
+            if stale {
                 peer.lan_up = false;
                 peer.lan_probe_sent = false;
                 peer.lan_check_pending = false;
+                peer.lan_check_sent_at = None;
                 peer.lan_target = None;
                 peer.lan_inflight.clear();
                 peer.lan_rtt = None;
@@ -688,12 +701,13 @@ impl DirectBook {
     }
 
     /// LAN paths that are up and are not already waiting on a probe.
-    /// Marks each one pending so the next pass can drop it if no answer comes.
-    pub fn lan_liveness_due(&mut self) -> Vec<([u8; 16], SocketAddr)> {
+    /// Marks each one pending so a later pass can drop it if no answer comes.
+    pub fn lan_liveness_due(&mut self, now: Instant) -> Vec<([u8; 16], SocketAddr)> {
         let mut out = Vec::new();
         for (id, peer) in self.peers.iter_mut() {
             if peer.lan_up && !peer.lan_check_pending {
                 peer.lan_check_pending = true;
+                peer.lan_check_sent_at = Some(now);
                 out.push((*id, peer.lan_target.unwrap_or(peer.observed)));
             }
         }
@@ -759,7 +773,7 @@ impl DirectBook {
         self.answer_punch(peer, now)
     }
 
-    /// A punch answer starts the short deadline. App traffic does not refresh it.
+    /// A punch answer starts the deadline. A later answer or a direct send moves it.
     pub fn answer_punch(&mut self, device: &[u8; 16], now: Instant) -> bool {
         let Some(peer) = self.peers.get_mut(device) else {
             return false;
@@ -767,11 +781,43 @@ impl DirectBook {
         if !peer.punch_probe_sent {
             return false;
         }
-        if let Some(sent) = peer.punch_sent_at {
-            peer.punch_rtt = Some(now.saturating_duration_since(sent));
+        if peer.punch_rtt.is_none() {
+            if let Some(sent) = peer.punch_sent_at {
+                peer.punch_rtt = Some(now.saturating_duration_since(sent));
+            }
         }
         peer.punch_answered_at = Some(now);
         true
+    }
+
+    /// A direct app send on the punch path is proof of life for this side.
+    /// The deadline runs from this send, not from the original probe.
+    pub fn note_punch_send(&mut self, device: &[u8; 16], now: Instant) {
+        let Some(peer) = self.peers.get_mut(device) else {
+            return;
+        };
+        if peer.punch_answered_at.is_some() {
+            peer.punch_answered_at = Some(now);
+        }
+    }
+
+    /// Punch paths still inside the longer deadline. The caller sends a punch
+    /// datagram so the answer can move that deadline forward.
+    pub fn punch_refresh_due(&self, now: Instant) -> Vec<([u8; 16], SocketAddr)> {
+        if self.self_unstable {
+            return Vec::new();
+        }
+        self.peers
+            .iter()
+            .filter(|(_, peer)| {
+                !peer.unstable
+                    && peer
+                        .punch_answered_at
+                        .map(|at| now.saturating_duration_since(at) < probe_ttl(false))
+                        .unwrap_or(false)
+            })
+            .map(|(id, peer)| (*id, peer.observed))
+            .collect()
     }
 
     pub fn lan_rtt(&self, device: &[u8; 16]) -> Option<Duration> {
@@ -854,6 +900,7 @@ impl DirectBook {
             peer.lan_probe_sent = false;
             peer.punch_probe_sent = false;
             peer.lan_check_pending = false;
+            peer.lan_check_sent_at = None;
             peer.lan_target = None;
             peer.lan_inflight.clear();
             peer.lan_rtt = None;
@@ -868,6 +915,7 @@ impl DirectBook {
             peer.lan_up = false;
             peer.lan_probe_sent = false;
             peer.lan_check_pending = false;
+            peer.lan_check_sent_at = None;
             peer.lan_target = None;
             peer.lan_inflight.clear();
             peer.lan_rtt = None;
@@ -1155,17 +1203,36 @@ eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
         assert!(book.begin_lan_probe(&dev, ours));
         assert!(book.answer_lan(&dev));
 
-        assert!(book.expire_unanswered_lan_checks().is_empty());
-        assert_eq!(book.lan_liveness_due(), vec![(dev, peer)]);
-        assert_eq!(book.expire_unanswered_lan_checks(), vec![dev]);
+        assert!(book.expire_unanswered_lan_checks(now).is_empty());
+        assert_eq!(book.lan_liveness_due(now), vec![(dev, peer)]);
+        assert!(book.expire_unanswered_lan_checks(now).is_empty());
+        assert_eq!(
+            book.expire_unanswered_lan_checks(now + LAN_CHECK_TTL),
+            vec![dev]
+        );
         assert!(!book.lan_is_up(&dev));
 
         assert!(book.begin_lan_probe(&dev, ours));
         assert!(book.answer_lan(&dev));
-        assert_eq!(book.lan_liveness_due().len(), 1);
+        assert_eq!(book.lan_liveness_due(now).len(), 1);
         assert!(book.accept_lan_ack(&dev, peer));
-        assert!(book.expire_unanswered_lan_checks().is_empty());
+        assert!(book.expire_unanswered_lan_checks(now + LAN_CHECK_TTL).is_empty());
         assert!(book.lan_is_up(&dev));
+    }
+
+    #[test]
+    fn a_direct_send_moves_the_punch_deadline() {
+        let mut book = test_book();
+        let dev = [5u8; 16];
+        let t0 = Instant::now();
+        book.note_observed(dev, "198.51.100.4:7777".parse().unwrap(), t0);
+        assert!(book.begin_punch(&dev, "198.51.100.9:7777".parse().unwrap()));
+        assert!(book.answer_punch(&dev, t0));
+        let later = t0 + Duration::from_secs(25);
+        book.note_punch_send(&dev, later);
+        assert!(book.punch_is_up(&dev, later + Duration::from_secs(29), false));
+        assert!(!book.punch_is_up(&dev, later + Duration::from_secs(30), false));
+        assert!(book.punch_refresh_due(later).iter().any(|(id, _)| *id == dev));
     }
 
     #[test]
