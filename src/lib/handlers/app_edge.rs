@@ -618,10 +618,17 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
     };
 
     if let Some((mut pkt, mut dest, direct_pkt, via_sg)) = out {
+        let barred = {
+            let node = ctx.node.read().unwrap();
+            super::punch_barred(&node, &node.device_uuid, &dest_device_uuid)
+        };
         let observed = ctx.direct_book.lock().ok().map(|mut book| {
             let now = std::time::Instant::now();
+            if barred {
+                book.drop_punch(&dest_device_uuid);
+            }
             let mut lan = book.lan_is_up(&dest_device_uuid);
-            let punch = book.punch_is_up(&dest_device_uuid, now, grade.cellphone());
+            let punch = !barred && book.punch_is_up(&dest_device_uuid, now, grade.cellphone());
             let unstable = book.self_unstable() || book.is_unstable(&dest_device_uuid);
             if lan {
                 if let Some(addr) = book.path_addr(&dest_device_uuid, true) {
@@ -649,7 +656,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                 None
             };
             let race = if direct_addr.is_none() {
-                book.take_race(&dest_device_uuid, now)
+                book.take_race(&dest_device_uuid, now, !barred)
             } else {
                 (Vec::new(), None)
             };

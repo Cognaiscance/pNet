@@ -867,6 +867,7 @@ impl DirectBook {
         &mut self,
         device: &[u8; 16],
         now: Instant,
+        allow_punch: bool,
     ) -> (Vec<SocketAddr>, Option<SocketAddr>) {
         if !self.probe_cooled(device, now) {
             return (Vec::new(), None);
@@ -890,7 +891,10 @@ impl DirectBook {
             .collect();
         let observed = peer.observed;
         let unanswered = Self::probe_unanswered(peer, now);
-        let mut punch = if !peer.punch_probe_sent && (!self.addr_on_lan(observed) || unanswered) {
+        let mut punch = if allow_punch
+            && !peer.punch_probe_sent
+            && (!self.addr_on_lan(observed) || unanswered)
+        {
             Some(observed)
         } else {
             None
@@ -941,11 +945,15 @@ impl DirectBook {
 
     /// Observed addresses to punch because the LAN probe was not answered.
     /// The app packet stays on the server until the punch itself is answered.
-    pub fn take_lan_fallthrough(&mut self, now: Instant) -> Vec<([u8; 16], SocketAddr)> {
+    pub fn take_lan_fallthrough(
+        &mut self,
+        now: Instant,
+        allow_punch: impl Fn(&[u8; 16]) -> bool,
+    ) -> Vec<([u8; 16], SocketAddr)> {
         let ids: Vec<[u8; 16]> = self.peers.keys().copied().collect();
         let mut out = Vec::new();
         for id in ids {
-            if !self.probe_cooled(&id, now) {
+            if !allow_punch(&id) || !self.probe_cooled(&id, now) {
                 continue;
             }
             let Some(peer) = self.peers.get(&id) else {
@@ -995,6 +1003,16 @@ impl DirectBook {
             peer.lan_target = None;
             peer.lan_inflight.clear();
             peer.lan_rtt = None;
+            peer.punch_sent_at = None;
+            peer.punch_rtt = None;
+        }
+    }
+
+    /// Drop a punch that should not be used. A LAN path is left alone.
+    pub fn drop_punch(&mut self, device: &[u8; 16]) {
+        if let Some(peer) = self.peers.get_mut(device) {
+            peer.punch_answered_at = None;
+            peer.punch_probe_sent = false;
             peer.punch_sent_at = None;
             peer.punch_rtt = None;
         }
@@ -1334,10 +1352,10 @@ eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
         let now = Instant::now();
         book.note_observed(dev, "203.0.113.8:7777".parse().unwrap(), now);
         book.note_reported(dev, vec!["192.168.50.63:7777".parse().unwrap()]);
-        let (lan, punch) = book.take_race(&dev, now);
+        let (lan, punch) = book.take_race(&dev, now, true);
         assert_eq!(lan, vec!["192.168.50.63:7777".parse().unwrap()]);
         assert_eq!(punch, Some("203.0.113.8:7777".parse().unwrap()));
-        let (again_lan, again_punch) = book.take_race(&dev, now);
+        let (again_lan, again_punch) = book.take_race(&dev, now, true);
         assert!(again_lan.is_empty());
         assert!(again_punch.is_none());
         assert!(book.accept_lan_ack(&dev, "192.168.50.63:7777".parse().unwrap()));
@@ -1397,15 +1415,30 @@ eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
         book.note_observed(dev, "203.0.113.8:7777".parse().unwrap(), now);
         book.note_reported(dev, vec!["192.168.50.63:7777".parse().unwrap()]);
         book.set_unstable(dev, true);
-        let (lan, punch) = book.take_race(&dev, now);
+        let (lan, punch) = book.take_race(&dev, now, true);
         assert_eq!(lan, vec!["192.168.50.63:7777".parse().unwrap()]);
         assert!(punch.is_none());
-        let (again_lan, again_punch) = book.take_race(&dev, now);
+        let (again_lan, again_punch) = book.take_race(&dev, now, true);
         assert!(again_lan.is_empty());
         assert!(again_punch.is_none());
-        let (later_lan, later_punch) = book.take_race(&dev, now + LAN_CHECK_TTL);
+        let (later_lan, later_punch) = book.take_race(&dev, now + LAN_CHECK_TTL, true);
         assert!(later_lan.is_empty());
         assert_eq!(later_punch, Some("203.0.113.8:7777".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_barred_punch_is_not_started() {
+        let mut book = test_book();
+        let dev = [4u8; 16];
+        let now = Instant::now();
+        book.note_observed(dev, "203.0.113.8:7777".parse().unwrap(), now);
+        let (lan, punch) = book.take_race(&dev, now, false);
+        assert!(lan.is_empty());
+        assert!(punch.is_none());
+        assert!(!book.peer(&dev).unwrap().punch_probe_sent);
+        assert!(book
+            .take_lan_fallthrough(now + LAN_CHECK_TTL, |_| false)
+            .is_empty());
     }
 
     #[test]
@@ -1417,11 +1450,13 @@ eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
         book.note_observed(dev, observed, now);
         book.set_self_reported(vec!["192.168.50.154:7777".parse().unwrap()]);
         assert!(book.begin_lan_probe(&dev, "192.168.50.154:7777".parse().unwrap()));
-        assert!(book.take_lan_fallthrough(now).is_empty());
+        assert!(book.take_lan_fallthrough(now, |_| true).is_empty());
         assert!(!book.begin_punch(&dev, "192.168.50.154:7777".parse().unwrap()));
-        let due = book.take_lan_fallthrough(now + LAN_CHECK_TTL + Duration::from_secs(1));
+        let due = book.take_lan_fallthrough(now + LAN_CHECK_TTL + Duration::from_secs(1), |_| true);
         assert_eq!(due, vec![(dev, observed)]);
-        assert!(book.take_lan_fallthrough(now + LAN_CHECK_TTL + Duration::from_secs(1)).is_empty());
+        assert!(book
+            .take_lan_fallthrough(now + LAN_CHECK_TTL + Duration::from_secs(1), |_| true)
+            .is_empty());
         assert!(!book.punch_is_up(&dev, now + LAN_CHECK_TTL, false));
     }
 

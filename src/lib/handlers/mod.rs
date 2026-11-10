@@ -34,6 +34,30 @@ pub fn parse_pnet_hosts() -> Vec<String> {
         .collect()
 }
 
+/// True when this device is a server-grade node in the local directory.
+/// A device that is not listed is treated as device-grade.
+pub(crate) fn device_is_sg(node: &Node, uuid: &Uuid) -> bool {
+    let listed = node
+        .owner
+        .user
+        .devices
+        .iter()
+        .chain(
+            node.owner
+                .contact_users
+                .iter()
+                .flat_map(|contact| contact.user.devices.iter()),
+        )
+        .find(|device| device.uuid == *uuid);
+    matches!(listed.map(|device| device.grade), Some(DeviceGrade::SG))
+}
+
+/// A punch skips a relay hop. When either end is server-grade, that hop is
+/// the session itself, so there is nothing for a punch to skip.
+pub(crate) fn punch_barred(node: &Node, local: &Uuid, peer: &Uuid) -> bool {
+    device_is_sg(node, local) || device_is_sg(node, peer)
+}
+
 fn send(ctx: &WorkerContext, dest: SocketAddr, data: &[u8]) {
     if let Err(e) = ctx.udp_socket.send_to(data, dest) {
         log::error!("[send] send_to {dest} failed: {e}");
@@ -444,6 +468,12 @@ fn send_lan_probes(ctx: &WorkerContext, local: [u8; 16], due: &[([u8; 16], Socke
 /// Op 0x19 — the SG tells this node to punch toward a peer's observed address.
 /// One instruction names one peer. This node sends the punch datagram.
 fn share_punch_invites(ctx: &WorkerContext, a: [u8; 16], b: [u8; 16]) {
+    {
+        let node = ctx.node.read().unwrap();
+        if device_is_sg(&node, &a) || device_is_sg(&node, &b) {
+            return;
+        }
+    }
     let Some((addr_a, addr_b)) = ctx.direct_book.lock().ok().and_then(|mut book| {
         book.take_punch_invite(a, b)
     }) else {
@@ -489,15 +519,24 @@ pub fn punch_invite(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     };
     let local = ctx.node.read().unwrap().device_uuid;
+    let barred = {
+        let node = ctx.node.read().unwrap();
+        punch_barred(&node, &local, &peer)
+    };
     let start = {
         let Ok(mut book) = ctx.direct_book.lock() else {
             return;
         };
         book.note_observed(peer, addr, std::time::Instant::now());
-        let ours = book
-            .observed(&local)
-            .unwrap_or_else(|| SocketAddr::from(([203, 0, 113, 1], 9)));
-        book.begin_punch(&peer, ours)
+        if barred {
+            book.drop_punch(&peer);
+            false
+        } else {
+            let ours = book
+                .observed(&local)
+                .unwrap_or_else(|| SocketAddr::from(([203, 0, 113, 1], 9)));
+            book.begin_punch(&peer, ours)
+        }
     };
     if start {
         let mut pkt = Vec::with_capacity(17);

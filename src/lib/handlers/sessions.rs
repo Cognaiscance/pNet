@@ -720,10 +720,30 @@ pub fn keepalive_dg(ctx: &WorkerContext) {
 pub(crate) fn lan_liveness(ctx: &WorkerContext) {
     let local = ctx.node.read().unwrap().device_uuid;
     let now = std::time::Instant::now();
+    let allow_punch = {
+        let node = ctx.node.read().unwrap();
+        let local_id = node.device_uuid;
+        let barred_local = super::device_is_sg(&node, &local_id);
+        let servers: Vec<[u8; 16]> = node
+            .owner
+            .user
+            .devices
+            .iter()
+            .chain(
+                node.owner
+                    .contact_users
+                    .iter()
+                    .flat_map(|contact| contact.user.devices.iter()),
+            )
+            .filter(|device| matches!(device.grade, DeviceGrade::SG))
+            .map(|device| device.uuid)
+            .collect();
+        move |peer: &[u8; 16]| !barred_local && !servers.contains(peer)
+    };
     let (dead, due, punches) = if let Ok(mut book) = ctx.direct_book.lock() {
         let dead = book.expire_unanswered_lan_checks(now);
         let due = book.lan_liveness_due(now);
-        let punches = book.take_lan_fallthrough(now);
+        let punches = book.take_lan_fallthrough(now, allow_punch);
         (dead, due, punches)
     } else {
         return;
@@ -746,15 +766,47 @@ pub(crate) fn lan_liveness(ctx: &WorkerContext) {
 /// moves the deadline forward. One lost answer lets the 10s or 30s run out.
 pub fn punch_keepalive(ctx: &WorkerContext) {
     let now = std::time::Instant::now();
-    let due = ctx
-        .direct_book
-        .lock()
-        .map(|book| book.punch_refresh_due(now))
-        .unwrap_or_default();
+    let (local, barred_local, servers) = {
+        let node = ctx.node.read().unwrap();
+        let servers: Vec<[u8; 16]> = node
+            .owner
+            .user
+            .devices
+            .iter()
+            .chain(
+                node.owner
+                    .contact_users
+                    .iter()
+                    .flat_map(|contact| contact.user.devices.iter()),
+            )
+            .filter(|device| matches!(device.grade, DeviceGrade::SG))
+            .map(|device| device.uuid)
+            .collect();
+        (
+            node.device_uuid,
+            super::device_is_sg(&node, &node.device_uuid),
+            servers,
+        )
+    };
+    let due = {
+        let mut book = match ctx.direct_book.lock() {
+            Ok(book) => book,
+            Err(_) => return,
+        };
+        let mut due = book.punch_refresh_due(now);
+        due.retain(|(peer, _)| {
+            if barred_local || servers.contains(peer) {
+                book.drop_punch(peer);
+                false
+            } else {
+                true
+            }
+        });
+        due
+    };
     if due.is_empty() {
         return;
     }
-    let local = ctx.node.read().unwrap().device_uuid;
     for (_peer, addr) in due {
         let mut pkt = Vec::with_capacity(17);
         pkt.push(super::super::wire::PUNCH_OP);
