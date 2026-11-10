@@ -37,6 +37,11 @@ pub struct PeerPath {
     pub reported: Vec<SocketAddr>,
     /// Address the LAN probe was sent to. Set when a reported or observed pair matches.
     pub lan_target: Option<SocketAddr>,
+    /// LAN addresses probed from an app send, with the send time.
+    pub lan_inflight: Vec<(SocketAddr, Instant)>,
+    pub lan_rtt: Option<Duration>,
+    pub punch_sent_at: Option<Instant>,
+    pub punch_rtt: Option<Duration>,
 }
 
 /// In-memory book shared by workers. Not persisted.
@@ -97,6 +102,10 @@ impl DirectBook {
                         lan_check_pending: false,
                         reported: self.pending_reports.remove(&device).unwrap_or_default(),
                         lan_target: None,
+                        lan_inflight: Vec::new(),
+                        lan_rtt: None,
+                        punch_sent_at: None,
+                        punch_rtt: None,
                     },
                 );
                 Observe::New
@@ -115,6 +124,10 @@ impl DirectBook {
                 peer.punch_probe_sent = false;
                 peer.lan_check_pending = false;
                 peer.lan_target = None;
+                peer.lan_inflight.clear();
+                peer.lan_rtt = None;
+                peer.punch_sent_at = None;
+                peer.punch_rtt = None;
                 let next = unstable_window(&peer.changes, now);
                 if next != peer.unstable {
                     peer.unstable = next;
@@ -337,6 +350,26 @@ pub fn choose_path(grade: Grade, lan_up: bool, punch_up: bool, peer_unstable: bo
     } else {
         PathChoice::Sg
     }
+}
+
+/// Same order as [`choose_path`], except a punch that answered faster than
+/// the LAN is used while both are up. A missing sample keeps the LAN ahead.
+pub fn choose_raced(
+    grade: Grade,
+    lan_up: bool,
+    punch_up: bool,
+    peer_unstable: bool,
+    lan_rtt: Option<Duration>,
+    punch_rtt: Option<Duration>,
+) -> PathChoice {
+    if lan_up && punch_up && !peer_unstable {
+        if let (Some(lan), Some(punch)) = (lan_rtt, punch_rtt) {
+            if punch < lan {
+                return PathChoice::Punch;
+            }
+        }
+    }
+    choose_path(grade, lan_up, punch_up, peer_unstable)
 }
 
 const RTF_UP: u32 = 0x1;
@@ -594,7 +627,32 @@ impl DirectBook {
             return false;
         };
         if expected != from {
-            return false;
+            let hit = self
+                .peers
+                .get(peer)
+                .and_then(|p| p.lan_inflight.iter().find(|(addr, _)| *addr == from).copied());
+            let Some((from, sent)) = hit else {
+                return false;
+            };
+            let rtt = Instant::now().saturating_duration_since(sent);
+            let path = self.peers.get_mut(peer).unwrap();
+            if path.lan_rtt.map(|old| rtt < old).unwrap_or(true) {
+                path.lan_rtt = Some(rtt);
+                path.lan_target = Some(from);
+            }
+            return self.answer_lan(peer);
+        }
+        if let Some(sent) = self
+            .peers
+            .get(peer)
+            .and_then(|p| p.lan_inflight.iter().find(|(addr, _)| *addr == from).map(|(_, t)| *t))
+        {
+            let rtt = Instant::now().saturating_duration_since(sent);
+            let path = self.peers.get_mut(peer).unwrap();
+            if path.lan_rtt.map(|old| rtt < old).unwrap_or(true) {
+                path.lan_rtt = Some(rtt);
+                path.lan_target = Some(from);
+            }
         }
         self.answer_lan(peer)
     }
@@ -621,6 +679,8 @@ impl DirectBook {
                 peer.lan_probe_sent = false;
                 peer.lan_check_pending = false;
                 peer.lan_target = None;
+                peer.lan_inflight.clear();
+                peer.lan_rtt = None;
                 dead.push(*id);
             }
         }
@@ -707,8 +767,70 @@ impl DirectBook {
         if !peer.punch_probe_sent {
             return false;
         }
+        if let Some(sent) = peer.punch_sent_at {
+            peer.punch_rtt = Some(now.saturating_duration_since(sent));
+        }
         peer.punch_answered_at = Some(now);
         true
+    }
+
+    pub fn lan_rtt(&self, device: &[u8; 16]) -> Option<Duration> {
+        self.peers.get(device).and_then(|p| p.lan_rtt)
+    }
+
+    pub fn punch_rtt(&self, device: &[u8; 16]) -> Option<Duration> {
+        self.peers.get(device).and_then(|p| p.punch_rtt)
+    }
+
+    /// Probes to send beside an app packet that is still on the server.
+    /// Each LAN candidate and the public observed address are tried once.
+    /// A later answer with the lower delay wins.
+    pub fn take_race(
+        &mut self,
+        device: &[u8; 16],
+        now: Instant,
+    ) -> (Vec<SocketAddr>, Option<SocketAddr>) {
+        if self.self_unstable || self.is_unstable(device) {
+            return (Vec::new(), None);
+        }
+        let Some(peer) = self.peers.get(device) else {
+            return (Vec::new(), None);
+        };
+        if peer.lan_up || peer.punch_answered_at.is_some() {
+            return (Vec::new(), None);
+        }
+        let mut theirs = peer.reported.clone();
+        theirs.push(peer.observed);
+        let mut seen = HashSet::new();
+        theirs.retain(|addr| seen.insert(*addr));
+        let already: HashSet<SocketAddr> = peer.lan_inflight.iter().map(|(a, _)| *a).collect();
+        let lan: Vec<SocketAddr> = theirs
+            .iter()
+            .copied()
+            .filter(|addr| self.addr_on_lan(*addr) && !already.contains(addr))
+            .filter(|addr| peer.lan_target != Some(*addr))
+            .collect();
+        let observed = peer.observed;
+        let punch = if !self.addr_on_lan(observed) && !peer.punch_probe_sent {
+            Some(observed)
+        } else {
+            None
+        };
+        let peer = self.peers.get_mut(device).unwrap();
+        if !lan.is_empty() {
+            peer.lan_probe_sent = true;
+            if peer.lan_target.is_none() {
+                peer.lan_target = lan.first().copied();
+            }
+            for addr in &lan {
+                peer.lan_inflight.push((*addr, now));
+            }
+        }
+        if punch.is_some() {
+            peer.punch_probe_sent = true;
+            peer.punch_sent_at = Some(now);
+        }
+        (lan, punch)
     }
 
     pub fn punch_is_up(&self, device: &[u8; 16], now: Instant, cellphone: bool) -> bool {
@@ -733,6 +855,10 @@ impl DirectBook {
             peer.punch_probe_sent = false;
             peer.lan_check_pending = false;
             peer.lan_target = None;
+            peer.lan_inflight.clear();
+            peer.lan_rtt = None;
+            peer.punch_sent_at = None;
+            peer.punch_rtt = None;
         }
     }
 
@@ -743,6 +869,8 @@ impl DirectBook {
             peer.lan_probe_sent = false;
             peer.lan_check_pending = false;
             peer.lan_target = None;
+            peer.lan_inflight.clear();
+            peer.lan_rtt = None;
         }
     }
 }
@@ -1038,6 +1166,49 @@ eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
         assert!(book.accept_lan_ack(&dev, peer));
         assert!(book.expire_unanswered_lan_checks().is_empty());
         assert!(book.lan_is_up(&dev));
+    }
+
+    #[test]
+    fn an_app_send_races_the_lan_and_the_public_address_once() {
+        let mut book = test_book();
+        let dev = [4u8; 16];
+        let now = Instant::now();
+        book.note_observed(dev, "203.0.113.8:7777".parse().unwrap(), now);
+        book.note_reported(dev, vec!["192.168.50.63:7777".parse().unwrap()]);
+        let (lan, punch) = book.take_race(&dev, now);
+        assert_eq!(lan, vec!["192.168.50.63:7777".parse().unwrap()]);
+        assert_eq!(punch, Some("203.0.113.8:7777".parse().unwrap()));
+        let (again_lan, again_punch) = book.take_race(&dev, now);
+        assert!(again_lan.is_empty());
+        assert!(again_punch.is_none());
+        assert!(book.accept_lan_ack(&dev, "192.168.50.63:7777".parse().unwrap()));
+        assert!(book.accept_punch_ack(&dev, "203.0.113.8:7777".parse().unwrap(), now));
+        assert_eq!(
+            choose_raced(
+                Grade::Fast,
+                true,
+                true,
+                false,
+                Some(Duration::from_millis(20)),
+                Some(Duration::from_millis(5)),
+            ),
+            PathChoice::Punch
+        );
+        assert_eq!(
+            choose_raced(
+                Grade::Fast,
+                true,
+                true,
+                false,
+                Some(Duration::from_millis(5)),
+                Some(Duration::from_millis(20)),
+            ),
+            PathChoice::Lan
+        );
+        assert_eq!(
+            choose_raced(Grade::Fast, true, true, false, None, Some(Duration::from_millis(5))),
+            PathChoice::Lan
+        );
     }
 
     #[test]

@@ -618,7 +618,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
     };
 
     if let Some((mut pkt, mut dest, direct_pkt)) = out {
-        let observed = ctx.direct_book.lock().ok().and_then(|mut book| {
+        let observed = ctx.direct_book.lock().ok().map(|mut book| {
             let now = std::time::Instant::now();
             let mut lan = book.lan_is_up(&dest_device_uuid);
             let punch = book.punch_is_up(&dest_device_uuid, now, grade.cellphone());
@@ -631,21 +631,39 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                     }
                 }
             }
-            let choice = crate::direct_path::choose_path(grade, lan, punch, unstable);
-            if matches!(
+            let choice = crate::direct_path::choose_raced(
+                grade,
+                lan,
+                punch,
+                unstable,
+                book.lan_rtt(&dest_device_uuid),
+                book.punch_rtt(&dest_device_uuid),
+            );
+            let direct_addr = if matches!(
                 choice,
                 crate::direct_path::PathChoice::Lan | crate::direct_path::PathChoice::Punch
             ) {
                 book.path_addr(&dest_device_uuid, choice == crate::direct_path::PathChoice::Lan)
             } else {
                 None
-            }
+            };
+            let race = if direct_addr.is_none() && !unstable {
+                book.take_race(&dest_device_uuid, now)
+            } else {
+                (Vec::new(), None)
+            };
+            (direct_addr, race)
         });
-        if let (Some(addr), Some(direct)) = (observed, direct_pkt) {
+        let (direct_addr, race) = observed.unwrap_or((None, (Vec::new(), None)));
+        if let (Some(addr), Some(direct)) = (direct_addr, direct_pkt) {
             pkt = direct;
             dest = addr;
         }
         send(ctx, dest, &pkt);
+        let (lan, punch) = race;
+        if !lan.is_empty() || punch.is_some() {
+            super::race_beside_send(ctx, &dest_device_uuid, &lan, punch);
+        }
     }
 }
 

@@ -404,6 +404,26 @@ pub fn path_down(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
     }
 }
 
+/// Probes started beside an app packet that stayed on the server.
+pub(crate) fn race_beside_send(
+    ctx: &WorkerContext,
+    peer: &[u8; 16],
+    lan: &[SocketAddr],
+    punch: Option<SocketAddr>,
+) {
+    let local = ctx.node.read().unwrap().device_uuid;
+    let due: Vec<([u8; 16], SocketAddr)> = lan.iter().map(|addr| (*peer, *addr)).collect();
+    send_lan_probes(ctx, local, &due);
+    if let Some(addr) = punch {
+        let mut pkt = Vec::with_capacity(17);
+        pkt.push(PUNCH_OP);
+        pkt.extend_from_slice(&local);
+        if ctx.udp_socket.send_to(&pkt, addr).is_err() {
+            announce_path_down(ctx, local);
+        }
+    }
+}
+
 fn send_lan_probes(ctx: &WorkerContext, local: [u8; 16], due: &[([u8; 16], SocketAddr)]) {
     for (peer, addr) in due {
         if !crate::direct_path::on_lan(*addr) {
