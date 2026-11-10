@@ -720,10 +720,11 @@ pub fn keepalive_dg(ctx: &WorkerContext) {
 pub(crate) fn lan_liveness(ctx: &WorkerContext) {
     let local = ctx.node.read().unwrap().device_uuid;
     let now = std::time::Instant::now();
-    let (dead, due) = if let Ok(mut book) = ctx.direct_book.lock() {
+    let (dead, due, punches) = if let Ok(mut book) = ctx.direct_book.lock() {
         let dead = book.expire_unanswered_lan_checks(now);
         let due = book.lan_liveness_due(now);
-        (dead, due)
+        let punches = book.take_lan_fallthrough(now);
+        (dead, due, punches)
     } else {
         return;
     };
@@ -731,6 +732,14 @@ pub(crate) fn lan_liveness(ctx: &WorkerContext) {
         super::announce_path_down(ctx, device);
     }
     super::send_lan_probes(ctx, local, &due);
+    for (_peer, addr) in punches {
+        let mut pkt = Vec::with_capacity(17);
+        pkt.push(super::super::wire::PUNCH_OP);
+        pkt.extend_from_slice(&local);
+        if ctx.udp_socket.send_to(&pkt, addr).is_err() {
+            super::announce_path_down(ctx, local);
+        }
+    }
 }
 
 /// Punch paths that are still up get another punch datagram. The answer

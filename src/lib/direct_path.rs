@@ -35,6 +35,8 @@ pub struct PeerPath {
     pub lan_check_pending: bool,
     /// When that maintenance probe was sent.
     pub lan_check_sent_at: Option<Instant>,
+    /// When the first LAN probe for this peer was sent.
+    pub lan_probe_started: Option<Instant>,
     /// Private addresses this device reported for itself, with its UDP port.
     pub reported: Vec<SocketAddr>,
     /// Address the LAN probe was sent to. Set when a reported or observed pair matches.
@@ -105,6 +107,7 @@ impl DirectBook {
                         punch_probe_sent: false,
                         lan_check_pending: false,
                         lan_check_sent_at: None,
+                        lan_probe_started: None,
                         reported: self.pending_reports.remove(&device).unwrap_or_default(),
                         lan_target: None,
                         lan_inflight: Vec::new(),
@@ -129,6 +132,7 @@ impl DirectBook {
                 peer.punch_probe_sent = false;
                 peer.lan_check_pending = false;
                 peer.lan_check_sent_at = None;
+                peer.lan_probe_started = None;
                 peer.lan_target = None;
                 peer.lan_inflight.clear();
                 peer.lan_rtt = None;
@@ -594,6 +598,9 @@ impl DirectBook {
         let peer = self.peers.get_mut(device).unwrap();
         peer.lan_target = Some(dest);
         peer.lan_probe_sent = true;
+        if peer.lan_probe_started.is_none() {
+            peer.lan_probe_started = Some(Instant::now());
+        }
         true
     }
 
@@ -719,14 +726,17 @@ impl DirectBook {
     }
 
     /// Ask this side to punch toward `peer_public`. The path stays down
-    /// until `answer_punch`. A peer on this machine's LAN is not a punch.
+    /// until `answer_punch`. A peer that still looks on-LAN is not a punch
+    /// until that LAN probe has gone unanswered.
     pub fn begin_punch(&mut self, device: &[u8; 16], _local_observed: SocketAddr) -> bool {
         let Some(peer) = self.peers.get(device) else {
             return false;
         };
         let mut theirs = peer.reported.clone();
         theirs.push(peer.observed);
-        if theirs.iter().any(|addr| self.addr_on_lan(*addr)) {
+        if theirs.iter().any(|addr| self.addr_on_lan(*addr))
+            && !Self::probe_unanswered(peer, Instant::now())
+        {
             return false;
         }
         let Some(peer) = self.peers.get_mut(device) else {
@@ -857,7 +867,8 @@ impl DirectBook {
             .filter(|addr| peer.lan_target != Some(*addr))
             .collect();
         let observed = peer.observed;
-        let punch = if !self.addr_on_lan(observed) && !peer.punch_probe_sent {
+        let unanswered = Self::probe_unanswered(peer, now);
+        let punch = if !peer.punch_probe_sent && (!self.addr_on_lan(observed) || unanswered) {
             Some(observed)
         } else {
             None
@@ -865,6 +876,9 @@ impl DirectBook {
         let peer = self.peers.get_mut(device).unwrap();
         if !lan.is_empty() {
             peer.lan_probe_sent = true;
+            if peer.lan_probe_started.is_none() {
+                peer.lan_probe_started = Some(now);
+            }
             if peer.lan_target.is_none() {
                 peer.lan_target = lan.first().copied();
             }
@@ -877,6 +891,51 @@ impl DirectBook {
             peer.punch_sent_at = Some(now);
         }
         (lan, punch)
+    }
+
+    /// The LAN probe was sent and not answered within [`LAN_CHECK_TTL`].
+    fn probe_unanswered(peer: &PeerPath, now: Instant) -> bool {
+        if peer.lan_up || !peer.lan_probe_sent {
+            return false;
+        }
+        let started = peer.lan_probe_started.or_else(|| {
+            peer.lan_inflight.iter().map(|(_, sent)| *sent).min()
+        });
+        started
+            .map(|sent| now.saturating_duration_since(sent) >= LAN_CHECK_TTL)
+            .unwrap_or(false)
+    }
+
+    /// Observed addresses to punch because the LAN probe was not answered.
+    /// The app packet stays on the server until the punch itself is answered.
+    pub fn take_lan_fallthrough(&mut self, now: Instant) -> Vec<([u8; 16], SocketAddr)> {
+        if self.self_unstable {
+            return Vec::new();
+        }
+        let ids: Vec<[u8; 16]> = self.peers.keys().copied().collect();
+        let mut out = Vec::new();
+        for id in ids {
+            if self.is_unstable(&id) {
+                continue;
+            }
+            let Some(peer) = self.peers.get(&id) else {
+                continue;
+            };
+            if peer.punch_probe_sent || peer.punch_answered_at.is_some() || peer.lan_up {
+                continue;
+            }
+            let looks_lan = self.addr_on_lan(peer.observed)
+                || peer.reported.iter().any(|addr| self.addr_on_lan(*addr));
+            if !looks_lan || !Self::probe_unanswered(peer, now) {
+                continue;
+            }
+            let addr = peer.observed;
+            let peer = self.peers.get_mut(&id).unwrap();
+            peer.punch_probe_sent = true;
+            peer.punch_sent_at = Some(now);
+            out.push((id, addr));
+        }
+        out
     }
 
     pub fn punch_is_up(&self, device: &[u8; 16], now: Instant, cellphone: bool) -> bool {
@@ -901,6 +960,7 @@ impl DirectBook {
             peer.punch_probe_sent = false;
             peer.lan_check_pending = false;
             peer.lan_check_sent_at = None;
+            peer.lan_probe_started = None;
             peer.lan_target = None;
             peer.lan_inflight.clear();
             peer.lan_rtt = None;
@@ -916,6 +976,7 @@ impl DirectBook {
             peer.lan_probe_sent = false;
             peer.lan_check_pending = false;
             peer.lan_check_sent_at = None;
+            peer.lan_probe_started = None;
             peer.lan_target = None;
             peer.lan_inflight.clear();
             peer.lan_rtt = None;
@@ -1295,6 +1356,23 @@ eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
         assert!(book.accept_lan_ack(&dev, "192.168.50.63:7777".parse().unwrap()));
         assert!(book.lan_is_up(&dev));
         assert!(!book.begin_punch(&dev, "10.8.0.10:7777".parse().unwrap()));
+    }
+
+    #[test]
+    fn an_unanswered_on_link_probe_punches_the_observed_address() {
+        let mut book = test_book();
+        let dev = [4u8; 16];
+        let now = Instant::now();
+        let observed: SocketAddr = "192.168.50.63:7777".parse().unwrap();
+        book.note_observed(dev, observed, now);
+        book.set_self_reported(vec!["192.168.50.154:7777".parse().unwrap()]);
+        assert!(book.begin_lan_probe(&dev, "192.168.50.154:7777".parse().unwrap()));
+        assert!(book.take_lan_fallthrough(now).is_empty());
+        assert!(!book.begin_punch(&dev, "192.168.50.154:7777".parse().unwrap()));
+        let due = book.take_lan_fallthrough(now + LAN_CHECK_TTL + Duration::from_secs(1));
+        assert_eq!(due, vec![(dev, observed)]);
+        assert!(book.take_lan_fallthrough(now + LAN_CHECK_TTL + Duration::from_secs(1)).is_empty());
+        assert!(!book.punch_is_up(&dev, now + LAN_CHECK_TTL, false));
     }
 
     #[test]
