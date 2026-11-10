@@ -805,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "pnet"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "argon2",
  "base64",
