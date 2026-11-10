@@ -34,11 +34,11 @@ The app names a grade on send. Omitted or unknown means stable.
 | fast | Same order as stable. |
 | cellphone | Same order, with a shorter punch time-to-live. |
 
-An unstable peer, or this node while it is unstable, does not start a LAN probe or a punch, and app packets for that peer stay on the SG. The grade does not override that.
+An unstable peer, or this node while it is unstable, still uses a LAN or punch path that is already up. New probes go out one candidate at a time, no more than once every 20 seconds. With nothing up, the app packet stays on the SG. The grade does not override that.
 
 ## Unstable
 
-The node keeps the last three timestamps of its own address changes. Three changes inside five minutes, with the newest still inside those five minutes, marks the node unstable. A maintenance pass every five minutes (the same cadence as `MaintainConnections`) clears the flag when the window no longer holds. While the flag is set, that device gets no LAN probe, no punch, and no direct app send. When the flag changes, the node tells its rank-1 SG with op `0x1D`. Rank-1 tells the other connected peers. A peer that hears the flag keeps that device on the relay.
+The node keeps the last three timestamps of its own address changes. Three changes inside five minutes, with the newest still inside those five minutes, marks the node unstable. A maintenance pass every five minutes (the same cadence as `MaintainConnections`) clears the flag when the window no longer holds. While the flag is set, new probes for that device are slowed to one candidate every 20 seconds. A direct path that is already answering stays in use. When the flag changes, the node tells its rank-1 SG with op `0x1D`. Rank-1 tells the other connected peers. A peer that hears the flag slows its probes the same way.
 
 ## Time-to-live
 

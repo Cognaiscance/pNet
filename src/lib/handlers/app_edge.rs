@@ -648,7 +648,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
             } else {
                 None
             };
-            let race = if direct_addr.is_none() && !unstable {
+            let race = if direct_addr.is_none() {
                 book.take_race(&dest_device_uuid, now)
             } else {
                 (Vec::new(), None)

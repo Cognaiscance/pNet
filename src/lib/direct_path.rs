@@ -46,6 +46,8 @@ pub struct PeerPath {
     pub lan_rtt: Option<Duration>,
     pub punch_sent_at: Option<Instant>,
     pub punch_rtt: Option<Duration>,
+    /// Last time a probe was started while this peer was unstable.
+    pub last_attempt: Option<Instant>,
 }
 
 /// In-memory book shared by workers. Not persisted.
@@ -114,6 +116,7 @@ impl DirectBook {
                         lan_rtt: None,
                         punch_sent_at: None,
                         punch_rtt: None,
+                        last_attempt: None,
                     },
                 );
                 Observe::New
@@ -346,13 +349,11 @@ impl Grade {
     }
 }
 
-/// Pick a path. An unstable peer stays on the SG. Every grade, including
-/// stable, uses the LAN when that probe is up, otherwise the punch.
+/// Pick a path. A path that is already up is used even when the peer is
+/// unstable. With nothing up, the packet stays on the SG. Every grade,
+/// including stable, prefers the LAN, then the punch.
 pub fn choose_path(grade: Grade, lan_up: bool, punch_up: bool, peer_unstable: bool) -> PathChoice {
-    let _ = grade;
-    if peer_unstable {
-        return PathChoice::Sg;
-    }
+    let _ = (grade, peer_unstable);
     if lan_up {
         PathChoice::Lan
     } else if punch_up {
@@ -372,7 +373,7 @@ pub fn choose_raced(
     lan_rtt: Option<Duration>,
     punch_rtt: Option<Duration>,
 ) -> PathChoice {
-    if lan_up && punch_up && !peer_unstable {
+    if lan_up && punch_up {
         if let (Some(lan), Some(punch)) = (lan_rtt, punch_rtt) {
             if punch < lan {
                 return PathChoice::Punch;
@@ -513,12 +514,34 @@ impl DirectBook {
 
     /// An unanswered probe may be sent again. A path that is already up is left alone.
     pub fn retry_unanswered_lan_probes(&mut self) {
-        if self.self_unstable {
-            return;
-        }
         for peer in self.peers.values_mut() {
-            if !peer.lan_up && !peer.unstable {
+            if !peer.lan_up {
                 peer.lan_probe_sent = false;
+            }
+        }
+    }
+
+    /// Three address changes slow new probes to one candidate per
+    /// [`LAN_CHECK_TTL`]. A path that is already up is not affected.
+    fn probe_slowed(&self, device: &[u8; 16]) -> bool {
+        self.self_unstable || self.is_unstable(device)
+    }
+
+    fn probe_cooled(&self, device: &[u8; 16], now: Instant) -> bool {
+        if !self.probe_slowed(device) {
+            return true;
+        }
+        self.peers
+            .get(device)
+            .and_then(|peer| peer.last_attempt)
+            .map(|at| now.saturating_duration_since(at) >= LAN_CHECK_TTL)
+            .unwrap_or(true)
+    }
+
+    fn mark_probe(&mut self, device: &[u8; 16], now: Instant) {
+        if let Some(peer) = self.peers.get_mut(device) {
+            if self.self_unstable || peer.unstable || self.remote_unstable.contains(device) {
+                peer.last_attempt = Some(now);
             }
         }
     }
@@ -589,7 +612,7 @@ impl DirectBook {
         let Some(dest) = theirs.into_iter().find(|addr| self.addr_on_lan(*addr)) else {
             return false;
         };
-        if self.self_unstable || peer.unstable {
+        if !self.probe_cooled(device, Instant::now()) {
             return false;
         }
         if peer.lan_probe_sent {
@@ -601,6 +624,8 @@ impl DirectBook {
         if peer.lan_probe_started.is_none() {
             peer.lan_probe_started = Some(Instant::now());
         }
+        let started = Instant::now();
+        self.mark_probe(device, started);
         true
     }
 
@@ -739,6 +764,9 @@ impl DirectBook {
         {
             return false;
         }
+        if !self.probe_cooled(device, Instant::now()) {
+            return false;
+        }
         let Some(peer) = self.peers.get_mut(device) else {
             return false;
         };
@@ -746,6 +774,8 @@ impl DirectBook {
             return false;
         }
         peer.punch_probe_sent = true;
+        let started = Instant::now();
+        self.mark_probe(device, started);
         true
     }
 
@@ -763,9 +793,6 @@ impl DirectBook {
         }
         let addr_a = self.observed(&a)?;
         let addr_b = self.observed(&b)?;
-        if self.self_unstable || self.is_unstable(&a) || self.is_unstable(&b) {
-            return None;
-        }
         let key = if a <= b { (a, b) } else { (b, a) };
         if !self.punch_invited.insert(key) {
             return None;
@@ -814,15 +841,10 @@ impl DirectBook {
     /// Punch paths still inside the longer deadline. The caller sends a punch
     /// datagram so the answer can move that deadline forward.
     pub fn punch_refresh_due(&self, now: Instant) -> Vec<([u8; 16], SocketAddr)> {
-        if self.self_unstable {
-            return Vec::new();
-        }
         self.peers
             .iter()
             .filter(|(_, peer)| {
-                !peer.unstable
-                    && peer
-                        .punch_answered_at
+                peer.punch_answered_at
                         .map(|at| now.saturating_duration_since(at) < probe_ttl(false))
                         .unwrap_or(false)
             })
@@ -846,7 +868,7 @@ impl DirectBook {
         device: &[u8; 16],
         now: Instant,
     ) -> (Vec<SocketAddr>, Option<SocketAddr>) {
-        if self.self_unstable || self.is_unstable(device) {
+        if !self.probe_cooled(device, now) {
             return (Vec::new(), None);
         }
         let Some(peer) = self.peers.get(device) else {
@@ -868,11 +890,18 @@ impl DirectBook {
             .collect();
         let observed = peer.observed;
         let unanswered = Self::probe_unanswered(peer, now);
-        let punch = if !peer.punch_probe_sent && (!self.addr_on_lan(observed) || unanswered) {
+        let mut punch = if !peer.punch_probe_sent && (!self.addr_on_lan(observed) || unanswered) {
             Some(observed)
         } else {
             None
         };
+        let mut lan = lan;
+        if self.probe_slowed(device) {
+            if !lan.is_empty() {
+                lan.truncate(1);
+                punch = None;
+            }
+        }
         let peer = self.peers.get_mut(device).unwrap();
         if !lan.is_empty() {
             peer.lan_probe_sent = true;
@@ -889,6 +918,10 @@ impl DirectBook {
         if punch.is_some() {
             peer.punch_probe_sent = true;
             peer.punch_sent_at = Some(now);
+        }
+        let started = !lan.is_empty() || punch.is_some();
+        if started {
+            self.mark_probe(device, now);
         }
         (lan, punch)
     }
@@ -909,13 +942,10 @@ impl DirectBook {
     /// Observed addresses to punch because the LAN probe was not answered.
     /// The app packet stays on the server until the punch itself is answered.
     pub fn take_lan_fallthrough(&mut self, now: Instant) -> Vec<([u8; 16], SocketAddr)> {
-        if self.self_unstable {
-            return Vec::new();
-        }
         let ids: Vec<[u8; 16]> = self.peers.keys().copied().collect();
         let mut out = Vec::new();
         for id in ids {
-            if self.is_unstable(&id) {
+            if !self.probe_cooled(&id, now) {
                 continue;
             }
             let Some(peer) = self.peers.get(&id) else {
@@ -933,6 +963,7 @@ impl DirectBook {
             let peer = self.peers.get_mut(&id).unwrap();
             peer.punch_probe_sent = true;
             peer.punch_sent_at = Some(now);
+            self.mark_probe(&id, now);
             out.push((id, addr));
         }
         out
@@ -1223,13 +1254,13 @@ eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
         assert!(!book.note_self_change(t0 + Duration::from_secs(10)));
         assert!(book.note_self_change(t0 + Duration::from_secs(20)));
         assert!(book.self_unstable());
-        // An unstable node does not use the LAN or the punch.
+        // A path that is already up stays up. With nothing up, the packet stays on the SG.
         assert_eq!(
             choose_path(Grade::Fast, true, false, book.self_unstable()),
-            PathChoice::Sg
+            PathChoice::Lan
         );
         assert_eq!(
-            choose_path(Grade::Cellphone, true, false, true),
+            choose_path(Grade::Cellphone, false, false, true),
             PathChoice::Sg
         );
         let local = [9u8; 16];
@@ -1356,6 +1387,25 @@ eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
         assert!(book.accept_lan_ack(&dev, "192.168.50.63:7777".parse().unwrap()));
         assert!(book.lan_is_up(&dev));
         assert!(!book.begin_punch(&dev, "10.8.0.10:7777".parse().unwrap()));
+    }
+
+    #[test]
+    fn an_unstable_peer_tries_one_candidate_at_a_time() {
+        let mut book = test_book();
+        let dev = [4u8; 16];
+        let now = Instant::now();
+        book.note_observed(dev, "203.0.113.8:7777".parse().unwrap(), now);
+        book.note_reported(dev, vec!["192.168.50.63:7777".parse().unwrap()]);
+        book.set_unstable(dev, true);
+        let (lan, punch) = book.take_race(&dev, now);
+        assert_eq!(lan, vec!["192.168.50.63:7777".parse().unwrap()]);
+        assert!(punch.is_none());
+        let (again_lan, again_punch) = book.take_race(&dev, now);
+        assert!(again_lan.is_empty());
+        assert!(again_punch.is_none());
+        let (later_lan, later_punch) = book.take_race(&dev, now + LAN_CHECK_TTL);
+        assert!(later_lan.is_empty());
+        assert_eq!(later_punch, Some("203.0.113.8:7777".parse().unwrap()));
     }
 
     #[test]
@@ -1536,15 +1586,15 @@ eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0
         );
         assert_eq!(
             choose_path(Grade::Stable, true, true, true),
-            PathChoice::Sg
+            PathChoice::Lan
         );
         assert_eq!(
             choose_path(Grade::Fast, true, false, true),
-            PathChoice::Sg
+            PathChoice::Lan
         );
         assert_eq!(
             choose_path(Grade::Cellphone, true, false, true),
-            PathChoice::Sg
+            PathChoice::Lan
         );
         assert_eq!(
             choose_path(Grade::Fast, true, false, false),
