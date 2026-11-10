@@ -105,7 +105,7 @@ not yet have the destination device key.
 ### 3 — application send packet
 
 - Request: `[token:16][dest_device_uuid:16][dest_app_id:16][payload…]`
-- **Success: no reply** (fire-and-forget; local acceptance ≠ end-to-end delivery)
+- **Success: `[0x00][path]`**. `path` is `0` server, `1` LAN, `2` punch, or `3` a session straight to the destination. Local acceptance is not end-to-end delivery. An older node sends no success reply.
 - **Error: `[0x01][error_code]`** with codes from the table above, including
   `ERR_TOKEN_UNKNOWN`, `ERR_NOT_APPROVED`, `ERR_NO_ROUTE`, `ERR_PAYLOAD_TOO_LARGE`
 - Payload max: see **Fabric constant: `MAX_APP_PAYLOAD`** above (same limit on

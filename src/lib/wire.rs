@@ -11,9 +11,10 @@ use super::data_models::{Scope, SyncVersion, Uuid};
 // Success: `[OK]` or `[OK][…]` depending on the op.
 // Error:   `[STATUS_ERR][error_code]` where error_code is one of ERR_* below.
 //
-// Op 3 (`app_send_packet`) is fire-and-forget on success (no reply). On failure
-// it uses the same two-byte error form so apps can optionally wait for a
-// rejection. See `handlers/app_edge.rs` and `descriptions/communication methods.md`.
+// Op 3 (`app_send_packet`) replies `[OK][path]` on success. `path` is
+// `PATH_SERVER`, `PATH_LAN`, `PATH_PUNCH`, or `PATH_SESSION`. On failure it
+// uses the two-byte error form. An older node sends no success reply.
+// See `handlers/app_edge.rs` and `descriptions/communication methods.md`.
 
 /// Status byte: request accepted / success payload follows.
 pub(crate) const OK: u8 = 0x00;
@@ -34,6 +35,13 @@ pub(crate) const ERR_NO_ROUTE: u8 = 0x05;
 pub(crate) const ERR_PAYLOAD_TOO_LARGE: u8 = 0x06;
 /// Register or send rate limit exceeded (token bucket).
 pub(crate) const ERR_RATE_LIMITED: u8 = 0x07;
+
+/// Path byte after `OK` on a successful app send.
+pub(crate) const PATH_SERVER: u8 = 0;
+pub(crate) const PATH_LAN: u8 = 1;
+pub(crate) const PATH_PUNCH: u8 = 2;
+/// A session straight to the destination, not a LAN or punch probe.
+pub(crate) const PATH_SESSION: u8 = 3;
 
 /// Fabric-wide maximum **opaque app payload** length in bytes.
 ///

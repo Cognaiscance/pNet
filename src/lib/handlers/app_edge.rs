@@ -547,7 +547,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
 
     // Build packet and look up the SG address under a single read lock.
     // The third value is the app body a direct send reseals for the peer.
-    let out: Option<(Vec<u8>, SocketAddr, Option<Vec<u8>>)> = {
+    let out: Option<(Vec<u8>, SocketAddr, Option<Vec<u8>>, bool)> = {
         let node = ctx.node.read().unwrap();
 
         // Find the sending app by token; distinguish unknown vs not approved.
@@ -580,10 +580,10 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
             c.device_uuid == dest_device_uuid && c.timeout > now
         }) {
             if let Some(pkt) = sealed.clone() {
-                Some((pkt, dest_conn.peer_addr, sealed))
+                Some((pkt, dest_conn.peer_addr, sealed, false))
             } else {
                 let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
-                Some((pkt, dest_conn.peer_addr, None))
+                Some((pkt, dest_conn.peer_addr, None, false))
             }
         } else {
             let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid).or_else(|| {
@@ -604,7 +604,7 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                 plaintext.extend_from_slice(&sender_app_id);
                 plaintext.extend_from_slice(&pkt_sealed);
                 let pkt = build_encrypted_packet(RELAY_SEALED_OP, sg_conn, &plaintext);
-                Some((pkt, sg_conn.peer_addr, Some(pkt_sealed)))
+                Some((pkt, sg_conn.peer_addr, Some(pkt_sealed), true))
             } else {
                 let mut plaintext = Vec::with_capacity(48 + payload.len());
                 plaintext.extend_from_slice(&dest_device_uuid);
@@ -612,12 +612,12 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                 plaintext.extend_from_slice(&sender_app_id);
                 plaintext.extend_from_slice(payload);
                 let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
-                Some((pkt, sg_conn.peer_addr, None))
+                Some((pkt, sg_conn.peer_addr, None, true))
             }
         }
     };
 
-    if let Some((mut pkt, mut dest, direct_pkt)) = out {
+    if let Some((mut pkt, mut dest, direct_pkt, via_sg)) = out {
         let observed = ctx.direct_book.lock().ok().map(|mut book| {
             let now = std::time::Instant::now();
             let mut lan = book.lan_is_up(&dest_device_uuid);
@@ -653,9 +653,19 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
             } else {
                 (Vec::new(), None)
             };
-            (direct_addr, race, on_punch)
+            let path = if direct_addr.is_some() && on_punch {
+                PATH_PUNCH
+            } else if direct_addr.is_some() {
+                PATH_LAN
+            } else if via_sg {
+                PATH_SERVER
+            } else {
+                PATH_SESSION
+            };
+            (direct_addr, race, on_punch, path)
         });
-        let (direct_addr, race, on_punch) = observed.unwrap_or((None, (Vec::new(), None), false));
+        let (direct_addr, race, on_punch, path) =
+            observed.unwrap_or((None, (Vec::new(), None), false, PATH_SERVER));
         if let (Some(addr), Some(direct)) = (direct_addr, direct_pkt) {
             pkt = direct;
             dest = addr;
@@ -670,6 +680,14 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
         if !lan.is_empty() || punch.is_some() {
             super::race_beside_send(ctx, &dest_device_uuid, &lan, punch);
         }
+        let label = match path {
+            PATH_LAN => "lan",
+            PATH_PUNCH => "punch",
+            PATH_SESSION => "session",
+            _ => "server",
+        };
+        super::fabric_event("app_path", &[("path", label)]);
+        send(ctx, src, &[OK, path]);
     }
 }
 
