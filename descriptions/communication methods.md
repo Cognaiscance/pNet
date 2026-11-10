@@ -71,13 +71,17 @@ ceiling for the **opaque app bytes** on every path that carries them:
 |------|-------------|
 | Local op 3 `app_send_packet` | Reject with `ERR_PAYLOAD_TOO_LARGE` |
 | Peer `RelayPacket` (0x40) | Drop (no forward / no local push). Also drop when the destination device is ours and the sender contact has no grant for that app alias |
+| Peer `RelaySealed` (0x42) | Drop when the sealed packet is larger than `MAX_SEALED_APP`, or its sender field is not the session device. The app body stays sealed; the grant check uses the clear header |
 | Peer `AppPacket` (0x41) | Drop (no local push) |
 
 This is not a path-MTU guarantee: stay ≈1 KiB or less if you want to avoid IP
 fragmentation on typical WANs. Larger app messages must be chunked by the app.
 
-A relay SG decrypts op 0x40, so it can drop a packet to one of its own devices
-when the sender's contact has not been accepted for that app alias.
+A relay SG reads the clear header of op 0x40 and op 0x42, so it can drop a packet
+to one of its own devices when the sender's contact has not been accepted for
+that app alias. Op 0x42 leaves the app body sealed to the destination device.
+Op 0x40 still carries the body in the server session, for a sender that does
+not yet have the destination device key.
 
 ### 0 — application registration
 

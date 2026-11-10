@@ -39,7 +39,10 @@ The remainder of the packet is encrypted using the ephemeral keys from the activ
 Opaque app payloads carried on `RelayPacket` (0x40) and `AppPacket` (0x41)
 share the same ceiling as the local app API:
 **`MAX_APP_PAYLOAD = 4096` bytes** (`src/lib/wire.rs`). Oversized bodies are
-dropped after decrypt. See `descriptions/communication methods.md`.
+dropped after decrypt. `RelaySealed` (0x42) carries an already sealed op `0x1E`
+packet after the same 48-byte header. The server forwards that packet and does
+not open it. The sealed packet must be at most `MAX_SEALED_APP` bytes.
+See `descriptions/communication methods.md`.
 
 ## Connection Handshake
 

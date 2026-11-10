@@ -16,7 +16,7 @@ use super::wire::{
     DG_KEEPALIVE_OP, GENERATE_INVITATION_REQUEST_OP, GENERATE_INVITATION_RESPONSE_OP,
     LAN_ADDRS_OP, LAN_PROBE_ACK_OP, LAN_PROBE_OP, MERGE_ACK_OP, MERGE_PROPOSAL_OP, OBSERVED_ADDR_OP,
     DIRECT_APP_OP, PATH_DOWN_OP, PUNCH_ACK_OP, PUNCH_INVITE_OP, PUNCH_OP, UNSTABLE_OP,
-    RELAY_PACKET_OP, SG_PING_OP,
+    RELAY_PACKET_OP, RELAY_SEALED_OP, SG_PING_OP,
     SYNC_PULL_REQUEST_OP,
     SYNC_PULL_RESPONSE_OP, SYNC_UPDATE_AVAILABLE_OP, SYNC_WRITE_ACK_OP, SYNC_WRITE_REQUEST_OP,
     WATERMARK_PROBE_REQUEST_OP, WATERMARK_PROBE_RESPONSE_OP,
@@ -158,6 +158,7 @@ impl UdpListener {
                     DIRECT_APP_OP => Action::DirectApp { src, buf: payload },
                     LAN_ADDRS_OP => Action::LanAddrs { src, buf: payload },
                     RELAY_PACKET_OP => Action::RelayPacket { src, buf: payload },
+                    RELAY_SEALED_OP => Action::RelaySealed { src, buf: payload },
                     APP_PACKET_OP => Action::AppPacket { src, buf: payload },
                     _ => {
                         log::error!("[udp] unknown op byte {op} from {src}");

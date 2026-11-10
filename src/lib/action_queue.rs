@@ -111,6 +111,9 @@ pub enum Action {
     MergeProposal            { src: SocketAddr, buf: Vec<u8> },
     MergeAck                 { src: SocketAddr, buf: Vec<u8> },
     RelayPacket        { src: SocketAddr, buf: Vec<u8> },
+    /// Op 0x42. Same routing header as a relay packet. The tail is an opaque
+    /// device-sealed app packet the server does not open.
+    RelaySealed        { src: SocketAddr, buf: Vec<u8> },
     ObservedAddr       { src: SocketAddr, buf: Vec<u8> },
     LanProbe           { src: SocketAddr, buf: Vec<u8> },
     LanProbeAck        { src: SocketAddr, buf: Vec<u8> },
@@ -224,6 +227,7 @@ impl Action {
             Action::MergeProposal { .. } => "MergeProposal",
             Action::MergeAck { .. } => "MergeAck",
             Action::RelayPacket { .. } => "RelayPacket",
+            Action::RelaySealed { .. } => "RelaySealed",
             Action::ObservedAddr { .. } => "ObservedAddr",
             Action::LanProbe { .. } => "LanProbe",
             Action::LanProbeAck { .. } => "LanProbeAck",
@@ -285,6 +289,7 @@ impl Action {
             Action::MergeProposal            { src, buf } => handlers::merge_proposal(src, buf, ctx),
             Action::MergeAck                 { src, buf } => handlers::merge_ack(src, buf, ctx),
             Action::RelayPacket        { src, buf }   => handlers::relay_packet(src, buf, ctx),
+            Action::RelaySealed        { src, buf }   => handlers::relay_sealed(src, buf, ctx),
             Action::ObservedAddr       { src, buf }   => handlers::observed_addr(src, buf, ctx),
             Action::LanProbe           { src, buf }   => handlers::lan_probe(src, buf, ctx),
             Action::LanProbeAck        { src, buf }   => handlers::lan_probe_ack(src, buf, ctx),

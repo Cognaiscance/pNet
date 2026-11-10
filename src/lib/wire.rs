@@ -78,6 +78,14 @@ pub(crate) const GENERATE_INVITATION_REQUEST_OP: u8 = 0x35;
 pub(crate) const GENERATE_INVITATION_RESPONSE_OP: u8 = 0x36;
 
 pub(crate) const RELAY_PACKET_OP: u8 = 0x40;
+/// DG → SG relay of an app body already sealed to the destination device.
+/// Session plaintext is the same 48-byte header as op 0x40, then the op 0x1E
+/// packet. The SG checks the header and forwards those bytes unchanged.
+/// An older node drops this opcode. A sender with no destination key still uses 0x40.
+pub(crate) const RELAY_SEALED_OP: u8 = 0x42;
+/// Largest op 0x1E packet a relay will forward: opcode, sender, nonce,
+/// Poly1305 tag, inner opcode, 32-byte app ids, and `MAX_APP_PAYLOAD`.
+pub(crate) const MAX_SEALED_APP: usize = 1 + 16 + 24 + 16 + 1 + 32 + MAX_APP_PAYLOAD;
 /// SG tells a peer the UDP address it observed for a device.
 /// Session plaintext is 22 bytes: device uuid || ipv4 || port.
 pub(crate) const OBSERVED_ADDR_OP: u8 = 0x16;

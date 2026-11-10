@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime};
 use super::action_queue::WorkerContext;
 use super::crypto::{
     aead_domain, aead_key_from_dh, build_encrypted_packet, decrypt_packet_body, ed25519_sign,
-    ed25519_verify, generate_ed25519_keypair, generate_x25519_keypair, seal_with_opcode,
-    xchacha20_decrypt,
+    ed25519_verify, generate_ed25519_keypair, generate_x25519_keypair, open_direct_app,
+    seal_direct_app, seal_with_opcode, xchacha20_decrypt,
 };
 use super::data_models::{
     ActiveConnection, AppGrant, Application, Contact, Device, DeviceGrade,
@@ -838,6 +838,17 @@ fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
 // ── Scheduled action handlers ─────────────────────────────────────────────────
 
 
+/// True when `sealed` is an op 0x1E packet whose sender field is this session's device.
+fn sealed_app_from(sealed: &[u8], sender: Option<Uuid>) -> bool {
+    let Some(sender) = sender else {
+        return false;
+    };
+    sealed.len() >= 17
+        && sealed.len() <= MAX_SEALED_APP
+        && sealed[0] == DIRECT_APP_OP
+        && sealed[1..17] == sender
+}
+
 /// Op 0x40 — Relay packet (DG → SG).
 ///
 /// The SG decrypts the body, reads the destination device UUID, re-encrypts
@@ -847,7 +858,24 @@ fn read_device(data: &[u8], pos: &mut usize) -> Option<Device> {
 ///
 /// App `payload` must be ≤ [`MAX_APP_PAYLOAD`]; oversized bodies are dropped
 /// (same budget as local `app_send_packet`).
+///
+/// A sender that has the destination device key uses [`relay_sealed`] instead,
+/// so this path remains for a missing key and for an older peer.
 pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    finish_relay(src, buf, ctx, RELAY_PACKET_OP);
+}
+
+/// Op 0x42 — Relay of a device-sealed app packet.
+///
+/// Session plaintext: the same 48-byte header as op 0x40, then an op 0x1E
+/// packet. The SG checks the grant from that header and from the session's
+/// device, and forwards the 0x1E bytes without opening them. When this node
+/// is the destination, it opens the 0x1E the same way a direct send does.
+pub fn relay_sealed(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
+    finish_relay(src, buf, ctx, RELAY_SEALED_OP);
+}
+
+fn finish_relay(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext, op: u8) {
     // Extract the sender device UUID from the connection ID in the packet header.
     let sender_uuid = if buf.len() >= 2 {
         let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
@@ -860,10 +888,10 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 
     // Decrypt and parse the body into owned values so we can branch on dest after
     // releasing the lock.
-    let (local_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload) = {
+    let (local_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload, sealed) = {
         let node = ctx.node.read().unwrap();
 
-        let Some(plaintext) = decrypt_packet_body(&node, RELAY_PACKET_OP, &buf) else {
+        let Some(plaintext) = decrypt_packet_body(&node, op, &buf) else {
             log::error!("[relay_packet] decryption failed from {src}");
             return;
         };
@@ -879,16 +907,25 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         };
         let Some(dest_app_id) = slice_arr::<16>(&plaintext, 16) else { return; };
         let Some(sender_app_id) = slice_arr::<16>(&plaintext, 32) else { return; };
-        let payload = plaintext[48..].to_vec();
-        if payload.len() > MAX_APP_PAYLOAD {
-            log::error!(
-                "[relay_packet] app payload too large ({} > {MAX_APP_PAYLOAD}) from {src}",
-                payload.len()
-            );
-            return;
-        }
+        let tail = &plaintext[48..];
+        let (payload, sealed) = if op == RELAY_SEALED_OP {
+            if !sealed_app_from(tail, sender_uuid) {
+                log::error!("[relay_packet] sealed app does not match the session from {src}");
+                return;
+            }
+            (Vec::new(), Some(tail.to_vec()))
+        } else {
+            if tail.len() > MAX_APP_PAYLOAD {
+                log::error!(
+                    "[relay_packet] app payload too large ({} > {MAX_APP_PAYLOAD}) from {src}",
+                    tail.len()
+                );
+                return;
+            }
+            (tail.to_vec(), None)
+        };
 
-        (node.device_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload)
+        (node.device_uuid, dest_device_uuid, dest_app_id, sender_app_id, payload, sealed)
     };
 
     let allowed = {
@@ -928,11 +965,16 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             log::error!("[relay_packet] no approved local app with id {}", uuid_hex(&dest_app_id));
             return;
         };
-        let mut push = Vec::with_capacity(17 + payload.len());
-        push.push(APP_PUSH_OP);
-        push.extend_from_slice(&sender_app_id);
-        push.extend_from_slice(&payload);
-        send(ctx, SocketAddr::V4(app_host), &push);
+        if let Some(sealed) = sealed {
+            // This node is the destination. Open the device seal here.
+            direct_app(src, sealed[1..].to_vec(), ctx);
+        } else {
+            let mut push = Vec::with_capacity(17 + payload.len());
+            push.push(APP_PUSH_OP);
+            push.extend_from_slice(&sender_app_id);
+            push.extend_from_slice(&payload);
+            send(ctx, SocketAddr::V4(app_host), &push);
+        }
         if let Some((sender, true, _)) = tell_observation {
             share_observation(ctx, sender, dest_device_uuid, src);
         }
@@ -946,7 +988,7 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
         return;
     }
 
-    let (pkt, dest, dest_uuid) = {
+    let outbound = {
         let node = ctx.node.read().unwrap();
 
         // Find active connection to destination.
@@ -957,17 +999,22 @@ pub fn relay_packet(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
             return;
         };
 
-        // AppPacket body: [dest_app_id: 16][sender_app_id: 16][payload]
-        let mut app_body = Vec::with_capacity(32 + payload.len());
-        app_body.extend_from_slice(&dest_app_id);
-        app_body.extend_from_slice(&sender_app_id);
-        app_body.extend_from_slice(&payload);
-
-        let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
-        (pkt, dest_conn.peer_addr, dest_device_uuid)
+        if let Some(sealed) = sealed {
+            Some((sealed, dest_conn.peer_addr))
+        } else {
+            // AppPacket body: [dest_app_id: 16][sender_app_id: 16][payload]
+            let mut app_body = Vec::with_capacity(32 + payload.len());
+            app_body.extend_from_slice(&dest_app_id);
+            app_body.extend_from_slice(&sender_app_id);
+            app_body.extend_from_slice(&payload);
+            let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
+            Some((pkt, dest_conn.peer_addr))
+        }
     };
 
-    send(ctx, dest, &pkt);
+    if let Some((pkt, dest)) = outbound {
+        send(ctx, dest, &pkt);
+    }
     if let Some((sender, true, _)) = tell_observation {
         share_observation(ctx, sender, dest_device_uuid, src);
     }
@@ -4090,6 +4137,142 @@ mod tests {
         assert_eq!(dest_id_bytes,   dest_app_id);
         assert_eq!(sender_id_bytes, sender_app_id);
         assert_eq!(&decrypted[32..], b"payload");
+    }
+
+    #[test]
+    fn relay_sealed_forwards_the_device_packet_unopened() {
+        let dg_sender_kp = generate_x25519_keypair();
+        let sg_from_dg_kp = generate_x25519_keypair();
+        let sender_dh = generate_x25519_keypair();
+        let dest_dh = generate_x25519_keypair();
+        let sender_device = generate_uuid();
+        let dest_device_uuid = generate_uuid();
+        let dest_app_id: Uuid = app_uuid(5);
+        let sender_app_id: Uuid = app_uuid(3);
+
+        let dest_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        dest_socket.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let dest_addr: std::net::SocketAddrV4 = dest_socket.local_addr().unwrap()
+            .to_string().parse().unwrap();
+
+        let t = TestCtx::new();
+        {
+            let mut node = t.ctx.node.write().unwrap();
+            node.owner.active_connections.insert(1, ActiveConnection {
+                id: 1,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: sg_from_dg_kp.clone(),
+                peer_public_key: dg_sender_kp.public_key,
+                peer_active_connection_id: 10,
+                device_uuid: sender_device,
+                peer_addr: "127.0.0.1:0".parse().unwrap(),
+            });
+            node.owner.active_connections.insert(2, ActiveConnection {
+                id: 2,
+                timeout: SystemTime::now() + Duration::from_secs(3600),
+                key_pair: generate_x25519_keypair(),
+                peer_public_key: generate_x25519_keypair().public_key,
+                peer_active_connection_id: 20,
+                device_uuid: dest_device_uuid,
+                peer_addr: SocketAddr::V4(dest_addr),
+            });
+            node.owner.contact_users.push(Contact {
+                public_key: Ed25519PublicKey(generate_key_bytes()),
+                user: User {
+                    alias: "contact".to_string(),
+                    uuid: generate_uuid(),
+                    devices: vec![Device {
+                        alias: "dest-dg".to_string(),
+                        uuid: dest_device_uuid,
+                        grade: DeviceGrade::DG,
+                        sg_rank: None,
+                        hosts: vec![dest_addr.to_string()],
+                        applications: Vec::new(),
+                        signing_pk: Ed25519PublicKey::ZERO,
+                        dh_pk: dest_dh.public_key,
+                        cert_sig: Ed25519Signature::ZERO,
+                        cert_issued_at: 0,
+                        cert_alias: String::new(),
+                    }],
+                },
+                they_accept: Vec::new(),
+                last_seen_public_version: SyncVersion::default(),
+            });
+        }
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&dest_app_id);
+        body.extend_from_slice(&sender_app_id);
+        body.extend_from_slice(b"payload");
+        let sealed = seal_direct_app(&sender_dh.private_key, &dest_dh.public_key, &sender_device, &body);
+
+        let mut relay_body = Vec::new();
+        relay_body.extend_from_slice(&dest_device_uuid);
+        relay_body.extend_from_slice(&dest_app_id);
+        relay_body.extend_from_slice(&sender_app_id);
+        relay_body.extend_from_slice(&sealed);
+
+        let sender_side_conn = ActiveConnection {
+            id: 10,
+            timeout: SystemTime::now() + Duration::from_secs(3600),
+            key_pair: dg_sender_kp,
+            peer_public_key: sg_from_dg_kp.public_key,
+            peer_active_connection_id: 1,
+            device_uuid: sender_device,
+            peer_addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        let relay_pkt = build_encrypted_packet(RELAY_SEALED_OP, &sender_side_conn, &relay_body);
+        relay_sealed(t.app_addr(), relay_pkt[1..].to_vec(), &t.ctx);
+
+        let mut buf = [0u8; 512];
+        let (len, _) = dest_socket.recv_from(&mut buf).expect("no sealed packet");
+        assert_eq!(&buf[..len], sealed.as_slice());
+        let (got_sender, plain) = open_direct_app(
+            &dest_dh.private_key,
+            &sender_dh.public_key,
+            &buf[1..len],
+        ).unwrap();
+        assert_eq!(got_sender, sender_device);
+        assert_eq!(&plain[32..], b"payload");
+        // The new address also produces an observation on this socket. Drain it.
+        while dest_socket.recv_from(&mut buf).is_ok() {}
+
+        // A different sender id inside the seal is not forwarded.
+        let other = generate_uuid();
+        let wrong = seal_direct_app(&sender_dh.private_key, &dest_dh.public_key, &other, &body);
+        let mut relay_body = Vec::new();
+        relay_body.extend_from_slice(&dest_device_uuid);
+        relay_body.extend_from_slice(&dest_app_id);
+        relay_body.extend_from_slice(&sender_app_id);
+        relay_body.extend_from_slice(&wrong);
+        let sender_side_conn = ActiveConnection {
+            id: 10,
+            timeout: SystemTime::now() + Duration::from_secs(3600),
+            key_pair: generate_x25519_keypair(),
+            peer_public_key: sg_from_dg_kp.public_key,
+            peer_active_connection_id: 1,
+            device_uuid: sender_device,
+            peer_addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        // The session key must match conn #1. Rebuild with the original sender key
+        // by reusing the already-consumed key: encrypt with sg side's peer, which
+        // is the original dg public key still stored on the node.
+        let _ = sender_side_conn;
+        let node = t.ctx.node.read().unwrap();
+        let sg_conn = node.owner.active_connections.get(&1).unwrap();
+        let key = aead_key_from_dh(
+            &sg_conn.key_pair.private_key,
+            &sg_conn.peer_public_key,
+            aead_domain::SESSION,
+        );
+        drop(node);
+        let (ct, nonce) = seal_with_opcode(RELAY_SEALED_OP, &key, &relay_body);
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&1u16.to_be_bytes());
+        pkt.extend_from_slice(&nonce);
+        pkt.extend_from_slice(&ct);
+        relay_sealed(t.app_addr(), pkt, &t.ctx);
+        assert!(dest_socket.recv_from(&mut buf).is_err());
     }
 
     #[test]

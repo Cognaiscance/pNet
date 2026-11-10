@@ -495,8 +495,12 @@ pub fn app_get_data(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) {
 ///
 /// Looks up the sending app by token (must be approved), then delivers via
 /// an `AppPacket` when this node already has a session to the dest device,
-/// or a `RelayPacket` (op 0x40) through the best reachable SG. The server
-/// opens each relayed packet. A stable direct path may reseal the same body.
+/// or a relay through the best reachable SG. When the destination device key
+/// is known, the app body is sealed to that device (op 0x1E). A session to
+/// the device carries that packet directly. A server session carries it as
+/// op 0x42, and the server forwards the sealed bytes after the grant check.
+/// A missing key still uses op 0x41 or op 0x40, which the server opens.
+/// A direct LAN or punch path sends the same op 0x1E packet to that address.
 ///
 /// # Replies
 ///
@@ -565,19 +569,23 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
         }
         let sender_app_id = sender_app.id;
 
+        let mut app_body = Vec::with_capacity(32 + payload.len());
+        app_body.extend_from_slice(&dest_app_id);
+        app_body.extend_from_slice(&sender_app_id);
+        app_body.extend_from_slice(payload);
+        let sealed = seal_direct_on(&node, &dest_device_uuid, &app_body);
+
         let now = SystemTime::now();
         if let Some(dest_conn) = node.owner.active_connections.values().find(|c| {
             c.device_uuid == dest_device_uuid && c.timeout > now
         }) {
-            // ── Direct session to the destination ─────
-            let mut app_body = Vec::with_capacity(32 + payload.len());
-            app_body.extend_from_slice(&dest_app_id);
-            app_body.extend_from_slice(&sender_app_id);
-            app_body.extend_from_slice(payload);
-            let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
-            Some((pkt, dest_conn.peer_addr, Some(app_body)))
+            if let Some(pkt) = sealed.clone() {
+                Some((pkt, dest_conn.peer_addr, sealed))
+            } else {
+                let pkt = build_encrypted_packet(APP_PACKET_OP, dest_conn, &app_body);
+                Some((pkt, dest_conn.peer_addr, None))
+            }
         } else {
-            // ── Standard relay path. The server opens each packet. ─
             let sg_conn = top_ranked_sg_for_device(&node, &dest_device_uuid).or_else(|| {
                 let candidates = sg_candidates_for_dest(&node, &dest_device_uuid);
                 best_sg_connection(&node, &candidates)
@@ -589,18 +597,27 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                 );
                 return send_error(ctx, src, ERR_NO_ROUTE);
             };
-            let mut plaintext = Vec::with_capacity(48 + payload.len());
-            plaintext.extend_from_slice(&dest_device_uuid);
-            plaintext.extend_from_slice(&dest_app_id);
-            plaintext.extend_from_slice(&sender_app_id);
-            plaintext.extend_from_slice(payload);
-            let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
-            let app_body = plaintext[16..].to_vec();
-            Some((pkt, sg_conn.peer_addr, Some(app_body)))
+            if let Some(pkt_sealed) = sealed {
+                let mut plaintext = Vec::with_capacity(48 + pkt_sealed.len());
+                plaintext.extend_from_slice(&dest_device_uuid);
+                plaintext.extend_from_slice(&dest_app_id);
+                plaintext.extend_from_slice(&sender_app_id);
+                plaintext.extend_from_slice(&pkt_sealed);
+                let pkt = build_encrypted_packet(RELAY_SEALED_OP, sg_conn, &plaintext);
+                Some((pkt, sg_conn.peer_addr, Some(pkt_sealed)))
+            } else {
+                let mut plaintext = Vec::with_capacity(48 + payload.len());
+                plaintext.extend_from_slice(&dest_device_uuid);
+                plaintext.extend_from_slice(&dest_app_id);
+                plaintext.extend_from_slice(&sender_app_id);
+                plaintext.extend_from_slice(payload);
+                let pkt = build_encrypted_packet(RELAY_PACKET_OP, sg_conn, &plaintext);
+                Some((pkt, sg_conn.peer_addr, None))
+            }
         }
     };
 
-    if let Some((mut pkt, mut dest, reseal)) = out {
+    if let Some((mut pkt, mut dest, direct_pkt)) = out {
         let observed = ctx.direct_book.lock().ok().and_then(|mut book| {
             let now = std::time::Instant::now();
             let mut lan = book.lan_is_up(&dest_device_uuid);
@@ -624,23 +641,23 @@ pub fn app_send_packet(src: SocketAddr, buf: Vec<u8>, graded: bool, ctx: &Worker
                 None
             }
         });
-        if let (Some(addr), Some(body)) = (observed, reseal) {
-            if let Some(direct) = seal_direct_for(ctx, &dest_device_uuid, &body) {
-                pkt = direct;
-                dest = addr;
-            }
+        if let (Some(addr), Some(direct)) = (observed, direct_pkt) {
+            pkt = direct;
+            dest = addr;
         }
         send(ctx, dest, &pkt);
     }
 }
 
 /// Seal `body` for the destination device's static X25519 key.
-/// Returns nothing when that key is not in the directory, and the caller
-/// keeps the server relay.
-fn seal_direct_for(ctx: &WorkerContext, dest: &[u8; 16], body: &[u8]) -> Option<Vec<u8>> {
+/// Returns nothing when that key is not in the directory.
+fn seal_direct_on(
+    node: &crate::data_models::Node,
+    dest: &[u8; 16],
+    body: &[u8],
+) -> Option<Vec<u8>> {
     use crate::crypto::seal_direct_app;
-    let node = ctx.node.read().unwrap();
-    let their = device_dh_pk(&node, dest)?;
+    let their = device_dh_pk(node, dest)?;
     if their.as_bytes() == &[0u8; 32] {
         return None;
     }
