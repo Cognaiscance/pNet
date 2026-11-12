@@ -111,7 +111,7 @@ impl UdpListener {
                     DG_KEEPALIVE_OP => Action::DgKeepalive { src, buf: payload },
                     // SG conn-reset: tells the DG its connection is gone so it
                     // can reconnect immediately.
-                    CONN_RESET_OP => Action::ConnReset { src },
+                    CONN_RESET_OP => Action::ConnReset { src, buf: payload },
                     CONNECT_REQUEST_OP => Action::ConnectRequest { src, buf: payload },
                     CONNECT_ACK_OP => Action::ConnectAck { src, buf: payload },
                     BOOTSTRAP_REQUEST_OP => Action::BootstrapRequest { src, buf: payload },

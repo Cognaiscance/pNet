@@ -1775,7 +1775,7 @@ mod tests {
             t.ctx.node.read().unwrap().owner.active_connections.len(),
             1
         );
-        conn_reset("127.0.0.1:19001".parse().unwrap(), &t.ctx);
+        conn_reset("127.0.0.1:19001".parse().unwrap(), &[], &t.ctx);
 
         let node = t.ctx.node.read().unwrap();
         assert!(
@@ -1793,6 +1793,52 @@ mod tests {
             "stale pending cleared or replaced"
         );
         let _ = sg_lt; // used in setup
+    }
+
+    /// A reset that names the session is enough when the reply comes from a
+    /// different address than the one stored at connect time.
+    #[test]
+    fn conn_reset_matches_the_echoed_connection_id() {
+        let t = TestCtx::new();
+        set_local_identity(&t, [0x80; 16], DeviceGrade::DG);
+
+        let sg_uuid: Uuid = [0xAA; 16];
+        let sg_lt = generate_ed25519_keypair().public_key;
+        {
+            let mut n = t.ctx.node.write().unwrap();
+            n.owner.user.devices.push(Device {
+                alias: "sg1".into(),
+                uuid: sg_uuid,
+                grade: DeviceGrade::SG,
+                sg_rank: Some(1),
+                hosts: vec!["136.59.152.104:7777".into()],
+                applications: Vec::new(),
+                signing_pk: crate::data_models::Ed25519PublicKey::ZERO,
+                dh_pk: crate::data_models::X25519PublicKey::ZERO,
+                cert_sig: crate::data_models::Ed25519Signature::ZERO,
+                cert_issued_at: 0,
+                cert_alias: String::new(),
+            });
+            n.owner.active_connections.insert(
+                7,
+                ActiveConnection {
+                    id: 7,
+                    timeout: SystemTime::now() + Duration::from_secs(3600),
+                    key_pair: generate_x25519_keypair(),
+                    peer_public_key: X25519PublicKey(generate_key_bytes()),
+                    peer_active_connection_id: 9,
+                    device_uuid: sg_uuid,
+                    peer_addr: "136.59.152.104:7777".parse().unwrap(),
+                },
+            );
+        }
+
+        conn_reset("192.168.1.116:7777".parse().unwrap(), &9u16.to_be_bytes(), &t.ctx);
+
+        let node = t.ctx.node.read().unwrap();
+        assert!(node.owner.active_connections.is_empty());
+        assert!(node.owner.pending_connections.values().any(|p| p.peer_device_uuid == sg_uuid));
+        let _ = sg_lt;
     }
 
     /// A DG must always initiate to its contacts' SGs (it punches out through

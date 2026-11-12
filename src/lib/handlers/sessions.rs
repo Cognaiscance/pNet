@@ -835,7 +835,15 @@ pub fn dg_keepalive_receive(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) 
         decrypt_packet_body(&node, DG_KEEPALIVE_OP, &buf).is_some()
     };
     if !ok {
-        send(ctx, src, &[CONN_RESET_OP]);
+        // Echo the connection id from the keepalive. The reply can arrive from
+        // a different address than the one stored on the session (NAT, or the
+        // LAN path versus the public host). The device-grade node matches that
+        // id and reconnects.
+        let mut pkt = vec![CONN_RESET_OP];
+        if buf.len() >= 2 {
+            pkt.extend_from_slice(&buf[..2]);
+        }
+        send(ctx, src, &pkt);
         return;
     }
 
@@ -856,25 +864,31 @@ pub fn dg_keepalive_receive(src: SocketAddr, buf: Vec<u8>, ctx: &WorkerContext) 
 /// `peer_addr` matches the reset source IP, then **run connection maintenance
 /// immediately** (§6.1) so reconnect does not wait for the next 5‑minute
 /// maintain tick (or even the next 1s scheduler wake).
-pub fn conn_reset(src: SocketAddr, ctx: &WorkerContext) {
-    let src_ip = match ipv4_from(src) {
-        Some(ip) => ip,
-        None => return,
+pub fn conn_reset(src: SocketAddr, buf: &[u8], ctx: &WorkerContext) {
+    let src_ip = ipv4_from(src);
+    let echoed = if buf.len() >= 2 {
+        Some(u16::from_be_bytes([buf[0], buf[1]]))
+    } else {
+        None
     };
 
     let (evicted, peer_uuids) = {
         let mut node = ctx.node.write().unwrap();
-        // Evict any connection whose peer_addr matches the reset source IP.
-        // This is strictly more correct than matching on a stored Device host
-        // — the connection already knows what address it's talking to.
+        // A one-byte reset matches the source IP, which is what an older server
+        // sends. A reset that echoes the keepalive's connection id matches that
+        // id even when the reply address is not the stored peer address.
         let mut dropped_peers = Vec::new();
         node.owner.active_connections.retain(|_, c| {
-            match c.peer_addr {
-                SocketAddr::V4(a) if *a.ip() == src_ip => {
-                    dropped_peers.push(c.device_uuid);
-                    false
-                }
-                _ => true,
+            let ip_match = matches!(
+                (src_ip, c.peer_addr),
+                (Some(ip), SocketAddr::V4(addr)) if *addr.ip() == ip
+            );
+            let id_match = echoed == Some(c.peer_active_connection_id);
+            if ip_match || id_match {
+                dropped_peers.push(c.device_uuid);
+                false
+            } else {
+                true
             }
         });
         // Drop half-open handshakes to the same peers so maintain can re-issue

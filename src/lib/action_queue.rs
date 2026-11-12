@@ -87,7 +87,7 @@ pub enum Action {
     // From peer pNet nodes
     SgPing             { src: SocketAddr, nonce: [u8; 16] },
     DgKeepalive        { src: SocketAddr, buf: Vec<u8> },
-    ConnReset          { src: SocketAddr },
+    ConnReset          { src: SocketAddr, buf: Vec<u8> },
     ConnectRequest     { src: SocketAddr, buf: Vec<u8> },
     ConnectAck         { src: SocketAddr, buf: Vec<u8> },
     BootstrapRequest   { src: SocketAddr, buf: Vec<u8> },
@@ -271,7 +271,7 @@ impl Action {
             }
             Action::SgPing             { src, nonce } => handlers::sg_ping(src, nonce, ctx),
             Action::DgKeepalive        { src, buf }   => handlers::dg_keepalive_receive(src, buf, ctx),
-            Action::ConnReset          { src }        => handlers::conn_reset(src, ctx),
+            Action::ConnReset          { src, buf }   => handlers::conn_reset(src, &buf, ctx),
             Action::ConnectRequest     { src, buf }   => handlers::connect_request(src, buf, ctx),
             Action::ConnectAck         { src, buf }   => handlers::connect_ack(src, buf, ctx),
             Action::BootstrapRequest   { src, buf }   => handlers::bootstrap_request(src, buf, ctx),
