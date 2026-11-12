@@ -79,6 +79,8 @@ pub enum Action {
         origin: String,
         /// Raw `Referer` header (may be empty).
         referer: String,
+        /// Raw `Content-Type` header. App uploads need this to keep their boundary.
+        content_type: String,
         body: Vec<u8>,
     },
 
@@ -261,10 +263,10 @@ impl Action {
             }
             #[cfg(feature = "sg")]
             Action::UiRequest {
-                stream, method, path, query, cookie, host, origin, referer, body,
+                stream, method, path, query, cookie, host, origin, referer, content_type, body,
             } => {
                 handlers::ui_request(
-                    stream, method, path, query, cookie, host, origin, referer, body, ctx,
+                    stream, method, path, query, cookie, host, origin, referer, content_type, body, ctx,
                 )
             }
             Action::SgPing             { src, nonce } => handlers::sg_ping(src, nonce, ctx),

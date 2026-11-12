@@ -224,6 +224,7 @@ pub fn proxy_to_loopback(
     method: &str,
     upstream_path: &str,
     query: &str,
+    content_type: &str,
     body: &[u8],
     port: u16,
 ) -> Result<(), String> {
@@ -243,9 +244,15 @@ pub fn proxy_to_loopback(
         format!("{upstream_path}?{query}")
     };
 
-    let mut req = format!(
+    let type_header = if content_type.is_empty() {
+        String::new()
+    } else {
+        format!("Content-Type: {content_type}\r\n")
+    };
+    let req = format!(
         "{method} {path_q} HTTP/1.1\r\n\
          Host: 127.0.0.1:{port}\r\n\
+         {type_header}\
          Connection: close\r\n\
          Content-Length: {}\r\n\
          \r\n",
@@ -401,7 +408,7 @@ mod tests {
         // Accept on another thread so proxy can write to client while we read
         let join = thread::spawn(move || {
             let (mut portal_half, _) = client_l.accept().unwrap();
-            proxy_to_loopback(&mut portal_half, "GET", "/hello", "", b"", port).unwrap();
+            proxy_to_loopback(&mut portal_half, "GET", "/hello", "", "", b"", port).unwrap();
         });
         // Wait for proxy to finish writing
         join.join().unwrap();

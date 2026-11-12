@@ -119,14 +119,14 @@ fn enqueue_request(stream: TcpStream, queue: &SharedQueue) {
 
     // If parsing fails, drop the stream (connection reset — acceptable for
     // malformed requests against a localhost admin UI).
-    let Some((method, path, query, cookie, host, origin, referer, body)) = result else {
+    let Some((method, path, query, cookie, host, origin, referer, content_type, body)) = result else {
         return;
     };
 
     let (lock, cvar) = &**queue;
     let mut guard = lock.lock().unwrap();
     guard.push(PRIORITY_NORMAL, Action::UiRequest {
-        stream, method, path, query, cookie, host, origin, referer, body,
+        stream, method, path, query, cookie, host, origin, referer, content_type, body,
     });
     cvar.notify_one();
 }
@@ -140,6 +140,7 @@ type ParsedRequest = (
     String, // host
     String, // origin
     String, // referer
+    String, // content-type
     Vec<u8>, // body
 );
 
@@ -165,6 +166,7 @@ fn parse_request(reader: &mut BufReader<&TcpStream>) -> Option<ParsedRequest> {
     let mut host = String::new();
     let mut origin = String::new();
     let mut referer = String::new();
+    let mut content_type = String::new();
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).is_err() {
@@ -185,19 +187,29 @@ fn parse_request(reader: &mut BufReader<&TcpStream>) -> Option<ParsedRequest> {
             origin = header_value(trimmed);
         } else if lower.starts_with("referer:") {
             referer = header_value(trimmed);
+        } else if lower.starts_with("content-type:") {
+            content_type = header_value(trimmed);
         }
     }
 
-    // Body (cap at 64 KiB — more than enough for a form submission).
+    // Portal forms stay small. An app upload, such as Drive, can be up to 32 MiB.
+    let cap = if path.starts_with("/apps/") {
+        32 * 1024 * 1024
+    } else {
+        65_536
+    };
+    if content_length > cap {
+        return None;
+    }
     let body = if content_length > 0 {
-        let mut buf = vec![0u8; content_length.min(65_536)];
+        let mut buf = vec![0u8; content_length];
         reader.read_exact(&mut buf).ok()?;
         buf
     } else {
         Vec::new()
     };
 
-    Some((method, path, query, cookie, host, origin, referer, body))
+    Some((method, path, query, cookie, host, origin, referer, content_type, body))
 }
 
 fn header_value(trimmed_line: &str) -> String {

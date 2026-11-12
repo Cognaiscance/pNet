@@ -50,6 +50,7 @@ pub fn ui_request(
     host:   String,
     origin: String,
     referer: String,
+    content_type: String,
     body:   Vec<u8>,
     ctx:    &WorkerContext,
 ) {
@@ -131,7 +132,7 @@ pub fn ui_request(
 
     // Reverse-proxy app web mounts (owner session required).
     if path.starts_with("/apps/") {
-        return handle_app_web_proxy(stream, &method, &path, &query, &body, ctx);
+        return handle_app_web_proxy(stream, &method, &path, &query, &content_type, &body, ctx);
     }
 
     if method == "GET" {
@@ -615,6 +616,7 @@ fn handle_app_web_proxy(
     method: &str,
     path: &str,
     query: &str,
+    content_type: &str,
     body: &[u8],
     ctx: &WorkerContext,
 ) {
@@ -661,6 +663,7 @@ fn handle_app_web_proxy(
         method,
         &upstream_path,
         query,
+        content_type,
         body,
         mount.port,
     ) {
