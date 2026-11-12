@@ -1,7 +1,7 @@
 # Release assets
 
-**Status:** `Cargo.toml` is `0.4.3`. The wire record for `v0.4.3` is in
-`descriptions/wire-versioning.md`. Pushing tag `v0.4.3` on the develop
+**Status:** `Cargo.toml` is `0.4.4`. The wire record for `v0.4.4` is in
+`descriptions/wire-versioning.md`. Pushing tag `v0.4.4` on the develop
 commit that contains this note creates the GitHub Release. The tag must match
 `version` in the root `Cargo.toml`. `develop` is not a version.
 
